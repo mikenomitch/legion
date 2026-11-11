@@ -101,7 +101,12 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
   detail that explains it. See [Node loss and fencing
   (at-most-one)](#node-loss-and-fencing-at-most-one).
 - `rescheduling`: its allocation died. The replacement will reuse the same
-  instance id and storage handle.
+  instance id and storage handle. When the allocation failed (rather than
+  being lost with its node or drained), the replacement first waits out the
+  task's reschedule backoff, and `legion instance get/list` shows a
+  `rescheduling:` detail with the failed attempt, its reason, and the next
+  attempt time. See [Manager-side move
+  logic](jobs-tasks-and-scheduling.md#manager-side-move-logic).
 - `stopped`: paused (keyed only). The allocation was stopped, but the row and
   storage handle are kept, so `legion instance start <id>` brings back the
   same identity with its data. A job stop puts keyed instances here. Stopped
@@ -230,9 +235,9 @@ Validation rules (enforced at `job validate` and submit time):
   the default `targetRatePerSecond`, a fleet past about 16,250 nodes is
   served 21s, so its window (105s) passes the 90s fence. A healthy worker
   still beats every 21s and only fences after about 70 seconds of failed
-  retries, but the margin shrinks with every rung, and past about 68,750
-  nodes the served interval itself nears the fence. See the known
-  limitations in
+  retries. The margin shrinks with every rung, which is why the served
+  interval stops at 55s by default (`heartbeat.maxInterval`), leaving about
+  30 seconds of retries. See the known limitations in
   [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md#known-limitations).
 
 ### Seed list (`initialInstances`) semantics
@@ -262,11 +267,13 @@ dispatch time, so they are present at process start for `exec` and
 | Variable | When | Meaning |
 | --- | --- | --- |
 | `LEGION_ALLOC_ID` | **all** tasks (stateless too) | Current allocation id. Changes with each placement. |
-| `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id. Survives reschedules. |
+| `LEGION_INSTANCE_ID` | stateful tasks | Stable, canonical instance id (`payments-prod/user-42`; bare in `default`). Survives reschedules. |
+| `LEGION_INSTANCE_KEY` | stateful tasks | The id without its namespace (`user-42`): what a caller named the instance. |
 | `LEGION_INSTANCE_MODE` | stateful tasks | `slot`, `keyed`, or `session` (an unnamed [session](session-mode.md)). |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
+| `LEGION_GANG_RANK`, `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, `LEGION_GANG_LEADER_ADDR` | [gang](gang-scheduling.md#starting-together) tasks only | The member's rank `0..size-1`, the gang's count, its quorum, and the address of the node running rank 0. Fixed when the member is placed. |
 | `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task has **no** `LEGION_ALLOC_ID` yet, and Legion doesn't set a placeholder. `LEGION_INSTANCE_ID` is correct from the start. |
 
 Key your app's durable state and "who am I" decisions on
@@ -341,6 +348,17 @@ together, one on each side of the partition.
    window. Once the manager answers and the worker re-registers, the normal
    watchdog takes over. Registration resets the node's loss on the manager
    too, so both clocks restart together.
+
+   A task fenced this way is reported like one the watchdog fences. The
+   worker records it (`boot_fenced.json`, beside `worker_state.json`), and
+   the restore after registration reports it failed with
+   `self-fenced: worker lost manager contact for <d> (> onLost.selfTerminateAfter <w>);
+   fenced at worker boot, before it reached a manager`. Its volumes are
+   unmounted then too. So are the volumes of any task that died while the
+   worker was down, except a volume a surviving allocation on the node
+   still uses. A worker that crashes between that restore and its next
+   heartbeat loses the report, and the manager learns of the fence only
+   from the allocation's absence.
 
    Because this record is a wall clock, a large clock step on the worker
    host while the worker is down moves the restart-time fence. A step
@@ -595,8 +613,11 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
   uses). If the task declares `stateful.storage`, the storage handle is
   created on first placement.
 - **Failure** of the allocation moves the instance to `rescheduling`. The
-  replacement allocation re-binds the same instance id and storage handle.
-  Allocation churn never terminates or stops a keyed instance.
+  replacement allocation re-binds the same instance id and storage handle,
+  after the task's reschedule backoff. Each instance backs off on its own,
+  so other instances of the task keep placing. `legion instance start <id>`
+  lifts the backoff and retries now. Allocation churn never terminates or
+  stops a keyed instance.
 - **Stop** (`StopInstance` or `legion instance stop`) pauses the instance. It
   stops the allocation through the normal allocation-stop path and moves the
   row to `stopped`, **keeping the row and its storage handle**. The id stays
@@ -648,10 +669,14 @@ legion instance create sandbox-demo --id a --id b --count 3 -j
 legion instance list sandbox-demo -j
 # => { "ok": true, "data": [ { "instanceId": "user-42", "jobId": "sandbox-demo",
 #      "group": "sandboxes", "task": "sandbox", "mode": "keyed",
-#      "state": "active", "currentAllocId": 7,
+#      "state": "active", "currentAllocId": 7, "nodeId": "node-a",
 #      "storageHandle": "local-dir/…", "createdAt": "…", "updatedAt": "…" } ] }
 
 legion instance get user-42 -j
+
+# `nodeId` (and the table's NODE column) is the node of the current
+# allocation, and unset while the instance has none (pending, rescheduling,
+# stopped, suspended, terminated).
 
 # Pause (reversible): stop the allocation, retain row + storage handle
 legion instance stop user-42 -j        # state -> "stopped"
@@ -673,7 +698,9 @@ fails instead of guessing.
 ### Stopping and starting
 
 `stop` and `start` work in keyed mode only. (In slot mode, the scheduler
-manages the lifecycle through `count.num`.) They let you pause a keyed
+manages the lifecycle through `count.num`. The one exception: `start` on a
+slot instance that is `rescheduling` lifts its reschedule backoff and places
+it now.) They let you pause a keyed
 instance and resume it later, unlike `destroy`, which is permanent:
 
 | | `stop` | `destroy` |
@@ -692,7 +719,9 @@ instance and resume it later, unlike `destroy`, which is permanent:
 - **Start** moves the instance from `stopped` to `pending` and enqueues
   placement. The new allocation re-binds the same instance id and its kept
   storage handle, so the revived sandbox is the same logical instance with
-  its data.
+  its data. On a `rescheduling` instance waiting out a reschedule backoff,
+  start lifts the backoff and places it now. On any other live instance it
+  is a no-op.
 - **Terminated** (destroyed) instances can't be stopped or started. The id is
   tombstoned for the job's lifetime, so create a new id instead.
 
@@ -724,10 +753,13 @@ Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
   create can't ask the server to mint ids (`--count`). Without it (the
   default), the server creates an id when the request omits one. A valid
   caller-supplied id is always used either way.
-- Ids are unique across the whole cluster and **never recycled for the
-  lifetime of the job that owns them**. Creating an id that matches any
-  existing instance row, in this job or another one, is rejected
-  (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
+- An id you choose is a **key, qualified by the job's
+  [namespace](namespaces.md#instances)** exactly as job ids are: `user-42` in
+  `default`, `payments-prod/user-42` in `payments-prod`. Ids are unique within
+  a namespace (two namespaces may each hold `user-42`) and **never recycled
+  for the lifetime of the job that owns them**. Creating an id that matches
+  any existing instance row of the namespace, in this job or another one, is
+  rejected (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
   tombstone. So a dead sandbox's identity (and its WI `sub`) can never
   be given to a new one while the job exists. Destroying the whole job (`job
   destroy`) clears its instance history, since rows are deleted with the job
@@ -786,7 +818,7 @@ and replace every live instance's allocation with one on the new config.
 ### Inspecting an instance in the UI
 
 Instance ids on the job page link to an instance page,
-`/jobs/<job>/instances/<id>`. It covers state, the current allocation and
+`/jobs/<namespace>/<job>/instances/<id>`. It covers state, the current allocation and
 node, storage, lineage, last stop, usage, the instance's snapshots, the
 instance actions, and a timeline of every event about the instance and the
 allocations that ran it. `legion events list --instance <id>` gives the same

@@ -43,7 +43,7 @@ type SharedIndexProps = {
   onPageChange: (page: number) => void
   onPageSizeChange: (size: number) => void
   emptyLabel: string
-  emptyHint?: string
+  emptyHint?: JSX.Element
   extraFilters?: JSX.Element
   // A second row under the search — status chips and the like.
   chips?: JSX.Element

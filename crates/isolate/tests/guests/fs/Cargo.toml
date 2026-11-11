@@ -1,0 +1,24 @@
+# A wasm32-wasip2 command that exercises std::fs (through wasi-libc) against
+# the isolate host's scratch filesystem. Not a workspace member: it builds
+# for a wasm target with `tests/guests/build.sh`, and the built component is
+# checked in as `tests/fixtures/fs.wasm` (CI has no wasm target).
+[package]
+name = "fs-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fs"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

@@ -3,6 +3,8 @@ import {
   SuspendedCapacity,
   AllocationUsage,
   CheckpointSupport,
+  DerivedContentEntry,
+  DerivedContentReport,
   GetNodeContentReply,
   GetNodeUsageReply,
   InstanceColdBoot,
@@ -466,7 +468,35 @@ export const nodeContent = new GetNodeContentReply({
   snapshots: [
     new NodeSnapshotContent({ snapshot: pass2Snapshots[0], capturedHere: false, partsHere: 3, partsTotal: 3, bytesHere: 512n * MIB }),
     new NodeSnapshotContent({ snapshot: snapshot({ snapshotId: 'snap-c4c4c4c4c4c4c4c4', instanceId: 'user-88', kind: 'disk', state: 'local', nodeId: 'w-04', totalBytes: 12n * MIB, createdAt: ago(7200_000) }), capturedHere: true }),
-  ],
+  ],  derived: new DerivedContentReport({
+    budgetBytes: 20n * GIB,
+    usedBytes: 1300n * MIB,
+    entryCount: 2n,
+    entries: [
+      new DerivedContentEntry({
+        kind: 'rootfs',
+        key: '7c1e5a0b9d3f42687c1e5a0b9d3f42687c1e5a0b9d3f42687c1e5a0b9d3f4268',
+        bytes: 940n * MIB,
+        inputs: {
+          'layer.0000': 'sha256:3f9a0c21d4e5b6a7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1',
+          guestBinary: 'sha256:aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00',
+          headroomMib: '256',
+        },
+        builderVersion: 'legion-0.1.0+rootfs.1',
+        createdAt: BigInt(Math.floor((Date.now() - 86_400_000) / 1000)),
+        lastUsedAt: BigInt(Math.floor((Date.now() - 120_000) / 1000)),
+      }),
+      new DerivedContentEntry({
+        kind: 'rootfs',
+        key: '0b9d3f42687c1e5a0b9d3f42687c1e5a0b9d3f42687c1e5a0b9d3f42687c1e5a',
+        bytes: 360n * MIB,
+        inputs: { 'layer.0000': 'sha256:bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11bb11', headroomMib: '256' },
+        builderVersion: 'legion-0.1.0+rootfs.1',
+        createdAt: BigInt(Math.floor((Date.now() - 7_200_000) / 1000)),
+        lastUsedAt: BigInt(Math.floor((Date.now() - 3_600_000) / 1000)),
+      }),
+    ],
+  }),
 })
 
 /** A node with no content store, or one whose report has not reached this manager. */

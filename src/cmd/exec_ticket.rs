@@ -229,9 +229,9 @@ async fn sign_cmd(matches: &ArgMatches) -> R<()> {
         allocation_id: arg("alloc")
             .parse()
             .context("--alloc must be an allocation id")?,
-        job: arg("job"),
+        job: crate::cmd::helpers::job_arg(matches, "job")?.unwrap_or_default(),
         task: arg("task"),
-        instance: matches.get_one::<String>("instance").cloned(),
+        instance: crate::cmd::helpers::instance_arg(matches, "instance")?,
         argv: matches
             .get_many::<String>("command")
             .map(|values| values.cloned().collect()),
@@ -267,7 +267,7 @@ async fn sign_cmd(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     match matches.subcommand() {
         Some(("mint", sub)) => mint_cmd(sub).await,
@@ -284,10 +284,7 @@ async fn mint_cmd(matches: &ArgMatches) -> R<()> {
             .with_context(|| format!("invalid allocation id `{raw}`"))?,
         None => 0,
     };
-    let instance_id = matches
-        .get_one::<String>("instance")
-        .cloned()
-        .unwrap_or_default();
+    let instance_id = crate::cmd::helpers::instance_arg(matches, "instance")?.unwrap_or_default();
     if allocation_id == 0 && instance_id.is_empty() {
         bail!("name the session's target: an allocation id or --instance <id>");
     }
@@ -352,7 +349,7 @@ async fn mint_cmd(matches: &ArgMatches) -> R<()> {
         println!("Worker:      {}", reply.worker_address);
         println!(
             "Verify as:   {}",
-            crate::manager::mesh_ca::node_dns_name(&reply.node)
+            crate::mesh_ca::node_dns_name(&reply.node)
         );
         println!("Redeem by:   {}", reply.expires_at);
         println!("Session cap: {}s", reply.max_session_seconds);
@@ -380,7 +377,7 @@ pub async fn worker_client(reply: &MintExecTicketReply) -> R<WorkerClient<Channe
     if reply.ca_pem.trim().is_empty() {
         bail!("the manager returned no cluster CA to verify the worker with");
     }
-    let name = crate::manager::mesh_ca::node_dns_name(&reply.node);
+    let name = crate::mesh_ca::node_dns_name(&reply.node);
     let roots = crate::cluster_tls::SwappableRoots::from_pem(&reply.ca_pem)?;
     let verifier = crate::cluster_tls::NamedServerVerifier::new(roots, &name)?;
     let config = crate::cluster_tls::client_config(verifier, None)?;

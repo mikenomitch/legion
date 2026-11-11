@@ -29,25 +29,25 @@ shape regressed outside noise.
 
 Candidate construction in the scheduler is a full linear scan. Every plan
 pass clones **every** available node (`available_nodes`,
-`src/manager/scheduler.rs:884`), then per task filters all of them:
+`crates/manager/src/manager/scheduler.rs:884`), then per task filters all of them:
 
 ```rust
 let base_eligible = nodes
     .iter()
     .filter(|node| constraint_set.is_satisfied(node, None) && permit_set.is_permitted(node))
-    .collect::<Vec<_>>();   // src/manager/scheduler.rs:1244
+    .collect::<Vec<_>>();   // crates/manager/src/manager/scheduler.rs:1244
 ```
 
 Each `is_satisfied` call walks every rule, and each rule does JSON-map
 lookups across three attribute bags (`node_attr`,
-`src/constraints.rs:396`). That is **O(nodes × rules)** per task, with
+`crates/common/src/constraints.rs:396`). That is **O(nodes × rules)** per task, with
 non-trivial per-node cost (JSON `Value` comparisons, regex, semver). A
 1,000-node cluster placing a 10-task job with 3 constraints each does
 ~30,000 JSON-rule evaluations before a single scoring decision — and again
 on every reschedule, rollout tick, and node-drop reconciliation.
 
 The only existing mitigation is `nodes_considered`
-(`src/manager/scheduler.rs:2017`), which *samples* a random subset before
+(`crates/manager/src/manager/scheduler.rs:2017`), which *samples* a random subset before
 scoring. Sampling reduces scoring cost but not filtering cost (the scan
 already happened), and it trades placement quality for speed blindly — it
 has no idea which nodes are worth considering.
@@ -77,7 +77,7 @@ by hand — split node fleets into many small pools of managers, or accept
     proximity resource fit), heartbeat-maintained in-memory indexes,
     ranking for fragmentation/locality.
   - **Reject:** the *hardcoded* 4-D space. Legion has arbitrary custom
-    resources (`src/resources.rs`) and arbitrary node attributes; a fixed
+    resources (`crates/common/src/resources.rs`) and arbitrary node attributes; a fixed
     CPU/RAM/disk/GPU tree contradicts both. Also reject true k-NN: for
     placement you want *nearest among nodes that fit* (a bounded orthant
     query), not nearest point — plain NN happily returns a node that is
@@ -148,39 +148,39 @@ placement quality.
 
 - **Node model.** Three free-form JSON attribute bags per node —
   `config_attrs`, `fingerprint_attrs`, `dynamic_attrs`
-  (`src/structs/node.rs`) — looked up in that order by `node_attr`
-  (`src/constraints.rs:396`). `pool` is a top-level column, *not* an
+  (`crates/common/src/structs/node.rs`) — looked up in that order by `node_attr`
+  (`crates/common/src/constraints.rs:396`). `pool` is a top-level column, *not* an
   attribute; permit checking special-cases it (`node_restrictions`,
-  `src/constraints.rs:416`).
+  `crates/common/src/constraints.rs:416`).
 - **Hard filters.** `ConstraintSet::is_satisfied`
-  (`src/constraints.rs:63`) over operators eq/neq/cmp/regex/semver/
+  (`crates/common/src/constraints.rs:63`) over operators eq/neq/cmp/regex/semver/
   contains/is_set/distinct; `PermitSet::is_permitted`
-  (`src/constraints.rs:101`) with implicit `pool=default`. `ConstraintSet`
-  exposes `distinct_keys()` (`src/constraints.rs:74`) — precedent for the
+  (`crates/common/src/constraints.rs:101`) with implicit `pool=default`. `ConstraintSet`
+  exposes `distinct_keys()` (`crates/common/src/constraints.rs:74`) — precedent for the
   accessor §6.5 needs.
 - **Resources.** Task requests are normalized by `ResourcePolicy`
-  (`src/resources.rs`; defaults cpu/memory/allocations). Node capacity
+  (`crates/common/src/resources.rs`; defaults cpu/memory/allocations). Node capacity
   comes from fingerprints plus `config_attrs.resources` for custom
-  resources (`ResourcePool::from_node`, `src/manager/scheduler.rs`).
+  resources (`ResourcePool::from_node`, `crates/manager/src/manager/scheduler.rs`).
   Fitting is enforced *after* filtering, at selection time, by
-  `ResourceLedger` (`src/manager/scheduler.rs:87`,
+  `ResourceLedger` (`crates/manager/src/manager/scheduler.rs:87`,
   `can_fit_task_request` at `:256`), which also handles reservations and
   device-set (`Items`) subset checks. Tasks already request `disk` as a
   custom resource by convention (`configs/jobs/maximal.jsonnet:215`), but
   workers do not fingerprint a schedulable disk resource — only
   stringly-typed totals and pass/fail health booleans
-  (`src/worker/node_check/node_checkers/disk.rs`).
+  (`crates/worker/src/worker/node_check/node_checkers/disk.rs`).
 - **Candidate flow.** `available_nodes` (`:884`) → per-task
   `base_eligible` scan (`:1244`, inside `build_task_plan` `:1214`) →
   per-placement `eligible_nodes` (`:1578`: permit + distinct + ledger
   fit) → optional `nodes_considered` subsample (`:2017`) → policy
   scoring. Group co-placement builds its own candidate sets from combined
   member constraints in `build_plan`.
-- **Read model.** `SchedulingReadModel` (`src/storage/store.rs:110`)
+- **Read model.** `SchedulingReadModel` (`crates/manager/src/storage/store.rs:110`)
   holds `nodes`, `allocations_by_node`, and `task_configs` behind one
   `RwLock`; `cached_nodes` (`:1492`) is the scheduler's only node source.
   Node join/drop, heartbeats, and `update_node_dynamic`
-  (`src/manager/server.rs:4439`) all write through it. This is the
+  (`crates/manager/src/manager/server.rs:4439`) all write through it. This is the
   consistency domain the indexes must live in — and the known
   epoch/cache-refresh fencing gap tracked in
   [`TODO.md`](../TODO.md) (Scheduling & placement) is exactly why the
@@ -311,7 +311,7 @@ Rollout ladder: shadow first, on later, with benchmark evidence (§8).
 Per index, per partition shard:
 
 ```rust
-// src/manager/scheduler/index.rs (new module)
+// crates/manager/src/manager/scheduler/index.rs (new module)
 type Cell = SmallVec<[u16; 4]>;             // one bucket coord per dim
 struct Shard {
     cells: HashMap<Cell, Vec<NodeId>>,      // sparse: only occupied cells
@@ -355,7 +355,7 @@ Per task (and per co-placement group), at `build_task_plan` time:
    constraints — needs one new accessor,
    `ConstraintSet::equality_bindings() -> Vec<(&str, &Value)>` (only
    `Operator::Eq` rules with scalar values; precedent: `distinct_keys()`,
-   `src/constraints.rs:74`). The `pool` binding comes from `PermitSet`
+   `crates/common/src/constraints.rs:74`). The `pool` binding comes from `PermitSet`
    (which always carries one, defaulting to `pool=default`). For groups,
    use the *intersection* of member bindings.
 2. **Filter usable indexes.** An index is usable iff **every**
@@ -376,7 +376,7 @@ Per task (and per co-placement group), at `build_task_plan` time:
 Feasibility check (the "is this reasonable?" question): steps 1–3 are a
 ~50-line pure function over data structures that already exist at the
 call site (`constraint_set`, `permit_set`, `task_request` are all built
-in `build_task_plan`, `src/manager/scheduler.rs:1214`); it is
+in `build_task_plan`, `crates/manager/src/manager/scheduler.rs:1214`); it is
 unit-testable without a store or a cluster, and it runs once per task,
 not per node. The one genuine risk is *silent non-use* — a user declares
 an index, a task doesn't bind a partition key, and the scan quietly runs
@@ -442,10 +442,10 @@ raft work used.
   validated at manager start (unknown dims types, >6 dims, non-numeric
   dim attrs, and `Items` dims all fail fast with actionable errors).
 - **Structs:** `SchedulingReadModel` gains `indexes: IndexSet`
-  (`src/storage/store.rs:110`). New module
-  `src/manager/scheduler/index.rs` (spec parsing, grid, selection). New
+  (`crates/manager/src/storage/store.rs:110`). New module
+  `crates/manager/src/manager/scheduler/index.rs` (spec parsing, grid, selection). New
   accessor `ConstraintSet::equality_bindings` and a pool accessor on
-  `PermitSet` (`src/constraints.rs`).
+  `PermitSet` (`crates/common/src/constraints.rs`).
 - **Persistence:** none — indexes are derived state.
 - **Docs:** on shipping, a public page `docs/scheduling-indexes.md` and
   updates to `docs/scheduler-and-eval-loop.md` (candidate-construction

@@ -3,6 +3,7 @@ import { For, Show, createMemo } from 'solid-js'
 import type { KvJobReference } from '../gen/legion_pb'
 import { groupKvReferences, type KvReadKind } from '../utils/kvRefs'
 import { Badge, Icon, Spinner, cx, linkClass, type IconName } from './ui'
+import { jobPath } from '../utils/namespaces'
 
 const KIND_ICON: Record<KvReadKind, IconName> = {
   env: 'terminal',
@@ -51,14 +52,14 @@ export function KvUsedBy(props: { references: readonly KvJobReference[] | null; 
                 <li class="space-y-1.5 px-3 py-2">
                   <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
                     <Icon name="layers" size={13} class="self-center text-faint" />
-                    <A href={`/jobs/${encodeURIComponent(group.jobId)}`} class={cx(linkClass, 'min-w-0 break-all text-sm')}>
+                    <A href={`${jobPath(group.jobId)}`} class={cx(linkClass, 'min-w-0 break-all text-sm')}>
                       {group.jobId}
                     </A>
                     {/* Normally one: the job version the reads were recorded from. */}
                     <For each={group.jobConfigIds}>
                       {(configId) => (
                         <A
-                          href={`/jobs/${encodeURIComponent(group.jobId)}/specs/${encodeURIComponent(configId)}`}
+                          href={`${jobPath(group.jobId)}/specs/${encodeURIComponent(configId)}`}
                           class="min-w-0 max-w-[14rem] truncate font-mono text-2xs text-faint hover:text-brass-strong"
                           title={`Recorded from job config ${configId}`}
                         >

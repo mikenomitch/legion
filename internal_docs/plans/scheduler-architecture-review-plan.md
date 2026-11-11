@@ -227,7 +227,7 @@ invalidated by the D4 generation counter. Pure scheduler-side cache.
 ### D7. Lanes topology (multi-raft) — **keep, promote in benchmarks**
 
 Already built and measured (lanes keep scheduler-lane latency flat under
-control/status flood — `tests/raft_perf_smoke.rs`, `docs/multi-raft.md`).
+control/status flood — `tests/integration/raft_perf_smoke.rs`, `docs/multi-raft.md`).
 The scale matrix should run raft3 in both `single` and `lanes` topology so
 the recorded numbers show what lanes buy; the AWS test runs lanes.
 No change to the design.

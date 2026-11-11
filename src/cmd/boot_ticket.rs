@@ -113,7 +113,7 @@ pub fn config() -> Command {
         .subcommand(list_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("create", arg_matches)) => create(arg_matches).await,
@@ -129,7 +129,8 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .cloned()
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
         .context("Must provide a job")?;
     let task = arg_matches
         .get_one::<String>("task")
@@ -244,7 +245,8 @@ async fn list(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .cloned()
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
         .unwrap_or_default();
 
     let mut client = connect_manager_client().await?;

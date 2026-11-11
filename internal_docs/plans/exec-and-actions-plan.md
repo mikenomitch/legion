@@ -264,7 +264,7 @@ client/bidi streaming over gRPC-Web**. Options compared:
 
 | Option | How | Verdict |
 | --- | --- | --- |
-| **A (chosen): gRPC bidi everywhere + thin WS bridge for browsers** | CLI and manager↔worker use native tonic bidi streams; a tower layer on the existing manager listener upgrades `GET /v1/exec/ws` to WebSocket and pumps binary frames ↔ the same internal session handler | One protocol, two transports. The `OidcHttpLayer` (`src/manager/oidc_http.rs`) already proves the "intercept a plain-HTTP path on the gRPC listener, no axum dependency" pattern; WS adds hyper's upgrade mechanism + `tokio-tungstenite` |
+| **A (chosen): gRPC bidi everywhere + thin WS bridge for browsers** | CLI and manager↔worker use native tonic bidi streams; a tower layer on the existing manager listener upgrades `GET /v1/exec/ws` to WebSocket and pumps binary frames ↔ the same internal session handler | One protocol, two transports. The `OidcHttpLayer` (`crates/manager/src/manager/oidc_http.rs`) already proves the "intercept a plain-HTTP path on the gRPC listener, no axum dependency" pattern; WS adds hyper's upgrade mechanism + `tokio-tungstenite` |
 | B: WebSocket only (Nomad's shape) | CLI also speaks WS | Throws away tonic's typed streams where they work fine; CLI gains a second client stack for no benefit |
 | C: stay pure gRPC-Web — server-stream for output + unary `SendExecInput(session_id, bytes)` for keystrokes | no new transport at all | Every keystroke is an HTTP request; ordering needs sequence numbers; sessions need server-side registry + GC for orphaned input RPCs. Strictly more machinery than a WS bridge, with worse latency |
 
@@ -276,7 +276,7 @@ existing channel/auth helpers in `src/cmd/helpers.rs`.
 
 ### 4.3 Worker side: PTY and plugin contract
 
-New trait surface on `TaskPlugin` (`src/task_plugins/mod.rs`), following the
+New trait surface on `TaskPlugin` (`crates/worker/src/task_plugins/mod.rs`), following the
 existing `supports_*` capability-flag idiom:
 
 ```rust
@@ -316,7 +316,7 @@ pub trait ExecSession: Send {
 
 Per-kind semantics:
 
-- **`exec` kind** (`src/task_plugins/exec.rs`): spawn the command as a new
+- **`exec` kind** (`crates/worker/src/task_plugins/exec.rs`): spawn the command as a new
   process with the *same execution context the task got*: same `user`, same
   `cgroup`, same `landlock` ruleset (landlock is inherited at spawn — it
   cannot be attached to a foreign process after the fact, so spawning a
@@ -328,7 +328,7 @@ Per-kind semantics:
   **Judgement call:** we deliberately do *not* try to join the namespace of
   the running task process (it has none — it's a plain host process);
   "same config, sibling process" is the honest semantic.
-- **`container` kind** (`src/task_plugins/container.rs`): delegate to the
+- **`container` kind** (`crates/worker/src/task_plugins/container.rs`): delegate to the
   detected runtime binary — `docker exec [-it] <container> CMD` / Apple
   `container exec`. `{exec: true, pty: true, host_level: false}`. The
   `youki` runtime path defers exec support (it needs `youki exec`, which
@@ -364,7 +364,7 @@ restart should die, not leak.
 
 ### 4.4 ACL model
 
-Two new resources extend the closed vocabulary (`src/structs/acl.rs`),
+Two new resources extend the closed vocabulary (`crates/common/src/structs/acl.rs`),
 keeping the existing `read`/`write` action pair and rule shape:
 
 | Resource | `read` | `write` |
@@ -422,13 +422,13 @@ Enforcement placement follows AGENTS.md ("Auth & ACL Checks"): the
 streaming handler authenticates the transport, then enforces on the parsed
 `ExecStart` (two-step `authenticate_acl` → `acl::enforce` form, coarse
 `AclScope::any()` gate before the alloc→job lookup to avoid existence
-probing). `tests/acl_endpoints.rs` gains entries for `ExecAllocation` and
+probing). `tests/integration/acl_endpoints.rs` gains entries for `ExecAllocation` and
 `ListJobActions` — the `every_manager_rpc_is_classified` test makes this
 non-optional.
 
 ### 4.5 Actions in the job spec
 
-`TaskConfig` (`src/structs/job.rs`) gains an `actions` field:
+`TaskConfig` (`crates/common/src/structs/job.rs`) gains an `actions` field:
 
 ```jsonnet
 // jobspec.jsonnet
@@ -630,7 +630,7 @@ interactive PTY over MCP.
    disconnect.
 2. **Manager proxy + CLI** — `Manager.ExecAllocation` (proxying,
    ACL `exec` resource + `host` selector, audit events,
-   `tests/acl_endpoints.rs` entries), `legion exec` with raw mode, resize,
+   `tests/integration/acl_endpoints.rs` entries), `legion exec` with raw mode, resize,
    exit-code propagation, `--job` convenience.
 3. **Browser path** — WS bridge tower layer (hyper upgrade +
    `tokio-tungstenite`, first-frame auth), `ExecSocket` TS module,
@@ -654,9 +654,9 @@ are split out into
 ## 7. References
 
 - `internal_docs/plans/auth-acl-plan.md` — ACL vocabulary rationale this plan extends.
-- `src/task_plugins/mod.rs` — `TaskPlugin` trait + `supports_*` idiom.
-- `src/manager/oidc_http.rs` — precedent for plain-HTTP routes on the gRPC listener.
-- `src/manager/dispatcher.rs` — manager→worker dialing reused by the exec proxy.
+- `crates/worker/src/task_plugins/mod.rs` — `TaskPlugin` trait + `supports_*` idiom.
+- `crates/manager/src/manager/oidc_http.rs` — precedent for plain-HTTP routes on the gRPC listener.
+- `crates/manager/src/manager/dispatcher.rs` — manager→worker dialing reused by the exec proxy.
 - Nomad: alloc exec API & PR #6604 (protocol), action block docs, issues
   #18627 / #19391 (params + per-action ACL gaps).
 - Kubernetes: WebSocket transition blog (1.31), `v5.channel.k8s.io`,

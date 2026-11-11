@@ -24,7 +24,7 @@ tasks = {
 
 `runtime` is required on every task. The worker resolves it against its
 task-plugin registry. The value is either a built-in (`exec`, `container`,
-`sandbox`) or the directory name of a dynamic plugin under
+`sandbox`, `isolate`) or the directory name of a dynamic plugin under
 `plugins/tasks/<runtime>/` (such as the bundled `noop`). The
 `config` object is runtime-specific and is validated against that runtime's
 schema. `legion job schema` emits the live per-runtime schemas under
@@ -39,7 +39,7 @@ schema. `legion job schema` emits the live per-runtime schemas under
 
 ## Plugin Contract
 
-Task runtimes implement `TaskPlugin` (`src/task_plugins/mod.rs`).
+Task runtimes implement `TaskPlugin` (`crates/worker/src/task_plugins/mod.rs`).
 
 Lifecycle hooks:
 
@@ -232,8 +232,8 @@ fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
 ```
 
 An `Err` rejects the job, and each returned string is a warning on the
-`job run` reply. `sandbox` uses it to warn when `config.memory_mib`
-disagrees with the guest size `resources` imply.
+`job run` reply. `sandbox` uses it to refuse a guest that `resources`
+size below what a Linux kernel boots in.
 Every governed task, whatever its mode, is also measured and reported as
 usage ([resource-enforcement.md](resource-enforcement.md#measuring-usage)).
 
@@ -313,12 +313,52 @@ worker's hierarchy, so the share mask governs it.
 Worker core does not touch a cgroup file for your task. Anything in the
 assignment that you do not apply is not enforced.
 
+### Resize
+
+A runtime that can change a running unit's size implements two more
+methods; both have defaults, so a plugin that predates them keeps compiling
+and answers every [resize](resize.md) `not_supported`.
+
+```rust
+/// What this runtime can change live. The default is nothing.
+fn resize_support(&self) -> ResizeSupport {
+    ResizeSupport::ALL // memory (reservation), memory_max (ceiling), cpu
+}
+
+/// Apply `change.to` to the running unit, or say why not.
+fn resize(
+    &self,
+    allocation: &Allocation,
+    task: &TaskConfig,
+    instance: &mut TaskInstance,
+    change: &ResizeChange,
+) -> R<ResizeAnswer> {
+    // A runtime confined by the cgroup at its assignment's path:
+    legion::worker::resources::resize_instance_cgroup(instance, change, None)
+}
+```
+
+- `change.from` and `change.to` are the unit's full effective `resources`
+  before and after. Worker core has already admitted the change (an
+  envelope's room for a session, the committed row for an allocation) and
+  only calls `resize` for resources `resize_support` claims.
+- Answer `ResizeAnswer::NeedsRestart(why)` for a change the runtime cannot
+  make while the unit runs, and `Refused(why)` for a shrink below current
+  use when `change.force` is false. **Never restart the unit**: the caller
+  decides what to do with the answer.
+- With `change.dry_run`, decide and change nothing.
+- On `Applied`, leave `instance.resource_assignment` describing what you
+  wrote. `resize_instance_cgroup` does all of this for a `WorkerCgroup`
+  runtime and for a `RuntimeApplied` one whose OCI runtime created the
+  cgroup at `cgroup_path`; pass a ceiling of your own as its third argument
+  when your cgroup holds more than the workload.
+
 ## Loading and Resolution
 
 `TaskPluginRegistry` behavior:
 
 - Caches plugins per `runtime`.
-- Loads built-ins for `exec`, `container`, and `sandbox` directly.
+- Loads built-ins for `exec`, `container`, `sandbox`, and `isolate` directly.
 - Loads other runtimes dynamically from plugin dir.
 
 Dynamic plugin requirements:
@@ -331,10 +371,15 @@ Dynamic plugin requirements:
 
 Worker task manager flow:
 
-1. Load built-ins at startup (`exec`, `container`, `sandbox`), and the
+1. Load built-ins at startup (`exec`, `container`, `sandbox`, `isolate`), and the
    bundled `noop` dylib if it is present.
 2. On allocation start:
    - resolve plugin by `task.runtime`
+   - allocate the task's assigned devices through their device plugins
+     ([docs/devices.md](devices.md)): their env goes into
+     `TaskInstance.extra_env` (`LEGION_DEVICE_<NAME>_IDS`, `CUDA_VISIBLE_DEVICES`),
+     and all their container edits (env, device nodes, mounts, hooks) into
+     `TaskInstance.devices`, for a runtime that isolates its workload to apply
    - run `prepare` then `start`
 3. On reconciliation stop:
    - write the stop notice, then call `stop_with`
@@ -352,9 +397,31 @@ runtime's start and stop behavior.
 
 ## Built-in and Bundled Runtimes
 
+What each runtime does with devices (`resources.devices`) and runtime
+classes:
+
+| Runtime | Devices | Runtime classes |
+| --- | --- | --- |
+| `exec` | Env only (no device cgroup) | — |
+| `container` | Device nodes, cgroup allow rules, mounts, hooks, env (Linux) | ✅ `config.runtimeClass` (Linux) |
+| `sandbox` | Refused at submit (no VFIO passthrough yet) | — |
+| `isolate` | Refused at submit (an isolate cannot use a device) | — |
+| `noop` and dylib runtimes | Env in `extra_env`; edits in `TaskInstance.devices` to apply or ignore | — |
+
+The `isolate` plugin only validates and normalizes its tasks: an isolate task
+is a session task whose units are never allocations, so its `start` and
+`stop` refuse. The worker's isolate supervisor runs its isolates against the
+task's envelope in a separate `legion-isolate` host process
+([isolate](task-runtime-isolate.md)).
+
+A dylib task runtime is **not** panic-contained yet (see
+[docs/plugin-system.md](plugin-system.md#panics-and-quarantine)): a panic in
+one takes the worker down.
+
 See per-runtime docs:
 
 - `docs/task-runtime-exec.md`
 - `docs/task-runtime-container.md`
 - `docs/task-runtime-sandbox.md`
+- `docs/task-runtime-isolate.md`
 - `docs/task-runtime-noop.md`

@@ -21,7 +21,10 @@ Install flow (`scripts/install-k8s.sh`, phase 4 of the plan):
    and `bench-slice=<i>`, and tainted `kwok.x-k8s.io/node=fake:NoSchedule`.
    It then runs one KWOK controller per worker instance
    (`kwok-slice.service`), each managing only its own slice, so the storm
-   drill can kill a slice by stopping one unit. The controllers run the
+   drill can kill a slice by stopping one unit. Slice `i` talks to
+   apiserver `i % 3`, so lease renewals and pod status writes spread over
+   all three control planes the way Nomad's simulated clients spread over
+   its three servers (`K8S_SPREAD_APISERVERS=0` puts them all on cp-0). The controllers run the
    release's `stage-fast.yaml` (KWOK 0.8 has no built-in stages): pods go
    Running immediately and node leases are heartbeated.
    `kwok-stages.yaml` here is the older equivalent, kept for reference
@@ -33,5 +36,8 @@ Install flow (`scripts/install-k8s.sh`, phase 4 of the plan):
 
 The fairness record captures the kubeadm/K8s version, the KWOK version,
 and the rendered kubeadm config. That config raises the scheduler's and
-controller-manager's API client QPS (see its header for why) and leaves
-every scheduling and eviction knob at its default.
+controller-manager's API client QPS and etcd's backend quota (see its
+header for why) and leaves every scheduling and eviction knob at its
+default. etcd's data dir, `/var/lib/etcd`, is bind-mounted onto the
+control plane's local NVMe by cloud-init, the same disk as Legion's and
+Nomad's stores.

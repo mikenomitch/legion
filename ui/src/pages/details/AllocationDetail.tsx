@@ -1,4 +1,5 @@
 import { A, useParams, useSearchParams } from '@solidjs/router'
+import { resizeOverrideNote } from '../../lib/resize'
 import { For, Index, Show, createMemo, createResource, createSignal, type JSX, type Resource } from 'solid-js'
 import type {
   InstanceInfo,
@@ -84,6 +85,7 @@ import {
 } from '../../utils/usage'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
 import { ENVELOPE_COPY, envelopeServes, sessionsPerEnvelope } from '../../utils/sessions'
+import { jobIdOf, jobNamespace, jobPath, servicePath } from '../../utils/namespaces'
 
 /*
  * One allocation: one placement of one task of one job version on one worker.
@@ -116,7 +118,7 @@ const valueOf = <T,>(resource: Resource<T>): T | undefined => (resource.error ==
 
 const scrollToSection = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
-const jobHref = (job: string) => `/jobs/${encodeURIComponent(job)}`
+const jobHref = (job: string) => `${jobPath(job)}`
 const taskHref = (job: string, task: string) => `${jobHref(job)}/tasks/${encodeURIComponent(task)}`
 const instanceHref = (job: string, instance: string) => `${jobHref(job)}/instances/${encodeURIComponent(instance)}`
 const nodeHref = (node: string) => `/nodes/${encodeURIComponent(node)}`
@@ -563,7 +565,13 @@ function AllocationDetailContent() {
     retainOnError(
       async ([service]: readonly [string, number]) => ({
         service,
-        endpoints: (await orAbsent(managerClient.resolveService({ service, includeUnhealthy: true }), undefined))?.endpoints ?? [],
+        endpoints:
+          (
+            await orAbsent(
+              managerClient.resolveService({ service: jobIdOf(jobNamespace(jobId() ?? ''), service), includeUnhealthy: true }),
+              undefined,
+            )
+          )?.endpoints ?? [],
       }),
       ([service]) => service,
     ),
@@ -1199,7 +1207,7 @@ function AllocationDetailContent() {
                           Service{' '}
                           <A
                             class="normal-case tracking-normal text-brass-strong hover:underline"
-                            href={`/services/${encodeURIComponent(taskSpec()!.service!.name ?? taskSpec()!.name)}`}
+                            href={servicePath(jobNamespace(jobId() ?? ''), taskSpec()!.service!.name ?? taskSpec()!.name)}
                           >
                             {taskSpec()!.service!.name ?? taskSpec()!.name}
                           </A>
@@ -1374,7 +1382,7 @@ function AllocationDetailContent() {
                     </Show>
 
                     <div>
-                      <p class="eyebrow mb-1.5">Reserved (as declared)</p>
+                      <p class="eyebrow mb-1.5">Reserved (effective)</p>
                       <Show
                         when={reservedResources().length > 0}
                         fallback={
@@ -1394,6 +1402,13 @@ function AllocationDetailContent() {
                             )}
                           </Index>
                         </dl>
+                      </Show>
+                      <Show when={resizeOverrideNote(ledgerEntry()?.resourcesOverride)}>
+                        {(note) => (
+                          <p class="mt-2 text-xs text-muted" title="legion alloc resize set these in place of the spec's amounts; the amounts above are the effective reservation">
+                            {note()}
+                          </p>
+                        )}
                       </Show>
                     </div>
                   </div>

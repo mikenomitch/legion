@@ -2,9 +2,10 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    DeleteKvRequest, GetKvRequest, KvEntry, KvValueType, ListKvRequest, PatchKvRequest,
-    PutKvRequest,
+    DeleteKvRequest, GetKvRequest, KvEntry, KvJobReference, KvValueType, ListKvRequest,
+    PatchKvRequest, PutKvRequest,
 };
+use serde::Serialize;
 use tabled::Tabled;
 
 pub fn config() -> Command {
@@ -52,7 +53,8 @@ pub fn config() -> Command {
                 .help("Key to fetch")
                 .required(true),
         )
-        .arg(json_flag());
+        .arg(json_flag())
+        .args(crate::cmd::watch::read_flags());
 
     let list_cmd = Command::new("list")
         .about("List key/value entries")
@@ -129,9 +131,10 @@ pub fn config() -> Command {
         .subcommand(list_cmd)
         .subcommand(delete_cmd)
         .subcommand(patch_cmd)
+        .subcommand(crate::cmd::watch::kv_watch_cmd())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("put", arg_matches)) => {
@@ -161,9 +164,9 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             let key = arg_matches
                 .get_one::<String>("key")
                 .context("Must provide key")?;
-            let format = OutputFormat::from_matches(arg_matches);
-            get_kv(key, format).await
+            get_kv(key, arg_matches).await
         }
+        Some(("watch", arg_matches)) => crate::cmd::watch::kv_watch(arg_matches).await,
         Some(("list", arg_matches)) => {
             let prefix = arg_matches
                 .get_one::<String>("prefix")
@@ -234,7 +237,7 @@ struct KvEntryPrint {
     updated_at: String,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn put_kv(
     key: &str,
     value: &str,
@@ -266,27 +269,38 @@ async fn put_kv(
     Ok(())
 }
 
-#[instrument(err, skip_all)]
-async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
+#[instrument(skip_all)]
+async fn get_kv(key: &str, matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
-    let request = GetKvRequest {
+    let mut request = tonic::Request::new(GetKvRequest {
         key: key.to_string(),
         metadata_only: false,
-    };
+    });
+    crate::cmd::watch::apply_read_flags(&mut request, matches)?;
     let response = output::resolve(
         format,
         "failed to get kv entry",
-        client.get_kv(tonic::Request::new(request)).await,
+        client.get_kv(request).await,
     )?;
     let reply = response.into_inner();
-    match reply.entry {
-        Some(entry) => print_entry(&entry, format)?,
+    let entry = match reply.entry {
+        Some(entry) => entry,
         // A missing key is a failure, in both formats: `{ok:false}` with
         // `NotFound` and a non-zero exit, so `legion kv get k || legion kv put
         // k v` does what it reads like (docs/kv-store.md).
         None => return Err(output::fail_local(format, missing_key_error(key))),
+    };
+    if format.is_json() {
+        output::print_success(&KvGetPrint {
+            entry,
+            references: reply.references,
+            revision: reply.revision,
+        });
+        return Ok(());
     }
-    if !format.is_json() && !reply.references.is_empty() {
+    print_entry(&entry, format)?;
+    if !reply.references.is_empty() {
         println!("used by:");
         for reference in &reply.references {
             println!("  {} {}", reference.job_id, reference.json_pointer);
@@ -294,6 +308,18 @@ async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
     }
 
     Ok(())
+}
+
+/// `kv get --json` data: the entry's own fields, plus the jobs that read it
+/// (`GetKvReply.references`), which the text output prints as `used by:`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvGetPrint {
+    #[serde(flatten)]
+    entry: KvEntry,
+    references: Vec<KvJobReference>,
+    /// What `--index` takes to wait for the key's next change.
+    revision: String,
 }
 
 /// The error `kv get` reports for a key with no entry.
@@ -305,12 +331,13 @@ fn missing_key_error(key: &str) -> CliError {
     )
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = ListKvRequest {
         prefix: prefix.to_string(),
         include_values,
+        include_locks: false,
     };
     let response = output::resolve(
         format,
@@ -323,21 +350,32 @@ async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<
         return Ok(());
     }
 
+    let locked = entries.iter().filter(|entry| entry.locked).count();
     let printable: Vec<KvEntryPrint> = entries
         .into_iter()
         .map(|entry| KvEntryPrint {
             key: entry.key.clone(),
-            value_type: value_type_label(entry.value_type).to_string(),
+            value_type: if entry.locked {
+                format!("{} (locked)", value_type_label(entry.value_type))
+            } else {
+                value_type_label(entry.value_type).to_string()
+            },
             version: entry.version,
             updated_at: entry.updated_at.clone(),
         })
         .collect();
     print_table(printable);
+    if locked > 0 {
+        eprintln!(
+            "{locked} value(s) are locked: this manager cannot decrypt them right now. \
+             `legion keyring status` names the data key."
+        );
+    }
 
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn delete_kv(
     key: &str,
     expected_version: Option<i64>,
@@ -364,7 +402,7 @@ async fn delete_kv(
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn patch_kv(
     key: &str,
     patch: &str,

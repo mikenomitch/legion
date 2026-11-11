@@ -383,13 +383,12 @@ function features(config: JsonObject): Feature[] {
       title: bool('edgeBoot.enabled') ? 'Nodes may start work named by a live boot ticket.' : undefined,
       detail: bool('edgeBoot.enabled') ? (
         <>
-          Tickets {mono(str(at(config, 'edgeBoot.defaultTicketTtl')))} by default, capped at {mono(str(at(config, 'edgeBoot.maxTicketTtl')))} ·{' '}
-          {mono(str(at(config, 'edgeBoot.maxProvisionalPerNode')))} provisional claims per node
+          Tickets {mono(str(at(config, 'edgeBoot.defaultTicketTtl')))} by default, capped at {mono(str(at(config, 'edgeBoot.maxTicketTtl')))}
         </>
       ) : (
         'Boot tickets and edge-initiated starts are off.'
       ),
-      extra: leftovers(config, 'edgeBoot', ['enabled', 'defaultTicketTtl', 'maxTicketTtl', 'maxProvisionalPerNode']),
+      extra: leftovers(config, 'edgeBoot', ['enabled', 'defaultTicketTtl', 'maxTicketTtl']),
     },
     {
       name: 'Auto-suspend',

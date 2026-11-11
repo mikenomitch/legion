@@ -42,17 +42,17 @@ pub fn catalog() -> Vec<Capability> {
         // --- Jobs: read ---
         Capability {
             name: "job.list",
-            cli: "legion job list [--status STATUS]",
+            cli: "legion job list [--status STATUS] [-n NAMESPACES | -A]",
             grpc: Some("Manager/ListJobs"),
-            summary: "List all jobs and their status, optionally filtered to one status.",
+            summary: "List jobs and their status in the active namespace (or -n globs, or -A for every namespace you can read), optionally filtered to one status.",
             mutates: false,
             read_only_safe: true,
         },
         Capability {
             name: "job.info",
-            cli: "legion job info <NAME>",
+            cli: "legion job info <NAME> [--index REVISION [--wait SECONDS]] [--consistent]",
             grpc: Some("Manager/GetJobInfo"),
-            summary: "Inspect a single job's current state.",
+            summary: "Inspect a single job's current state, its spec `version`, and the `revision` the answer reflects. --index blocks until the job changes after that revision (a blocking query); --consistent reads through the leader.",
             mutates: false,
             read_only_safe: true,
         },
@@ -68,32 +68,198 @@ pub fn catalog() -> Vec<Capability> {
             name: "job.plan",
             cli: "legion job plan <PATH>",
             grpc: Some("Manager/PlanJob"),
-            summary: "Dry-run: preview which nodes allocations would land on, and which running allocations the submit would preempt.",
+            summary: "Dry-run: preview which nodes allocations would land on, which running allocations the submit would preempt, and whether each gang would reach its quorum. Supports --allow-unknown-fields.",
             mutates: false,
             read_only_safe: true,
         },
         Capability {
             name: "job.validate",
             cli: "legion job validate <PATH>",
-            grpc: None,
-            summary: "Render and validate a jobspec locally without submitting.",
+            grpc: Some("Manager/GetJobSchema"),
+            summary: "Render and validate a jobspec without submitting. Unknown keys are errors with a suggestion; installed apps' keys are checked against their schemas when a manager is reachable (offline, they are reported as not checked); --allow-unknown-fields reports what a submit would keep and drop.",
             mutates: false,
             read_only_safe: true,
         },
         Capability {
             name: "job.schema",
             cli: "legion job schema",
-            grpc: None,
-            summary: "Emit the JSON Schema for jobspecs and built-in task runtimes.",
+            grpc: Some("Manager/GetJobSchema"),
+            summary: "Emit this cluster's jobspec JSON Schema: the core fields and built-in task runtimes, plus each key installed apps add at its point (the compiled-in schema, saying so, when no manager is reachable).",
             mutates: false,
             read_only_safe: true,
+        },
+        // --- Namespaces (docs/namespaces.md) ---
+        Capability {
+            name: "namespace.list",
+            cli: "legion namespace list",
+            grpc: Some("Manager/ListNamespaces"),
+            summary: "List the namespaces this token can see, with job counts.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.get",
+            cli: "legion namespace get <NAME>",
+            grpc: Some("Manager/GetNamespace"),
+            summary: "Show one namespace, what it holds by kind, and (with acl:read) the ACL rules that reach it.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.apply",
+            cli: "legion namespace create <NAME> | legion namespace apply -f <FILE>",
+            grpc: Some("Manager/ApplyNamespace"),
+            summary: "Create a namespace or update its description and meta. --dry-run reports the ACL rules that would reach it.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "namespace.delete",
+            cli: "legion namespace delete <NAME> [--cascade] [--dry-run]",
+            grpc: Some("Manager/DeleteNamespace"),
+            summary: "Delete a namespace. Refused while it holds anything; --cascade stops and destroys its contents first. --dry-run lists them.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "namespace.policy.list",
+            cli: "legion namespace policy list",
+            grpc: Some("Manager/ListNamespacePolicies"),
+            summary: "List namespace policies: quota, counts, pools, runtimes and host volumes over namespace globs. Needs acl:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.policy.get",
+            cli: "legion namespace policy get <POLICY>",
+            grpc: Some("Manager/GetNamespacePolicy"),
+            summary: "Show one namespace policy with its limits and charged usage across every namespace it matches. Needs acl:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.policy.apply",
+            cli: "legion namespace policy apply -f <FILE> [--dry-run]",
+            grpc: Some("Manager/ApplyNamespacePolicy"),
+            summary: "Create or replace a namespace policy. --dry-run lists what it would have refused among existing jobs and counts. Needs acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "namespace.policy.delete",
+            cli: "legion namespace policy delete <POLICY>",
+            grpc: Some("Manager/DeleteNamespacePolicy"),
+            summary: "Delete a namespace policy. Needs acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // --- Runtime disable (docs/runtime-disable.md) ---
+        // Deliberately not MCP tools: a cluster-wide stop of a runtime is an
+        // incident action for a human holding an `operator` token.
+        Capability {
+            name: "operator.runtime.disable",
+            cli: "legion operator runtime disable <RUNTIME> [--namespace <GLOB>]... [--reason <TEXT>] [--drain]",
+            grpc: Some("Manager/SetRuntimeEnabled"),
+            summary: "Refuse every new start of a task runtime (placements, session starts, edge claims, restarts), cluster-wide or for namespaces matching the globs: the switch for a runtime with a published escape. Running work is untouched unless --drain, which suspends what has a `suspend` block and gracefully stops the rest. Needs operator:write. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "operator.runtime.enable",
+            cli: "legion operator runtime enable <RUNTIME> [--namespace <GLOB>]...",
+            grpc: Some("Manager/SetRuntimeEnabled"),
+            summary: "Enable a disabled runtime again, everywhere or for the named globs of a scoped disable; blocked evals place on their own and refused callers succeed on retry. Needs operator:write. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "operator.runtime.status",
+            cli: "legion operator runtime status",
+            grpc: Some("Manager/ListRuntimeStates"),
+            summary: "List disabled runtimes with scope, reason, who and since, what is still running on each, the evals blocked on it, and the starts nodes refused. Needs operator:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        // --- App objects (docs/app-objects.md) ---
+        Capability {
+            name: "object.kinds",
+            cli: "legion object kinds [--app APP]",
+            grpc: Some("Manager/ListObjectKinds"),
+            summary: "List the object kinds installed apps declare: qualified name, scope, access, requires, schemas, state.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "object.explain",
+            cli: "legion object explain <KIND>[.<FIELD>]",
+            grpc: Some("Manager/ListObjectKinds"),
+            summary: "Describe a kind or one field: type, default, required, immutable, write-only, rules, examples.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "object.list",
+            cli: "legion object list [KIND] [-n NS|-A] [-l k=v] [--authority-lapsed]",
+            grpc: Some("Manager/ListObjects"),
+            summary: "List objects with their status summary and the kind's columns; --authority-lapsed lists those whose writer no longer holds what the object records.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "object.get",
+            cli: "legion object get <KIND> <NAME> [-n NS]",
+            grpc: Some("Manager/GetObject"),
+            summary: "Show one object: spec, status conditions and fields, summary, authority, managedBy.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "object.apply",
+            cli: "legion object apply -f FILE [--dry-run] [--expected-version N] [--force] [--wait]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Create or update objects; checks the closed schema and what the kind requires of the writer. --wait waits for the app to reconcile.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "object.delete",
+            cli: "legion object delete <KIND> <NAME> [--now] [--force] [--wait]",
+            grpc: Some("Manager/DeleteObject"),
+            summary: "Delete an object; a kind with a cleanup window waits for its app to release it.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // --- GitOps (docs/gitops.md) ---
+        Capability {
+            name: "gitops.status",
+            cli: "legion gitops status [REPO] [-n NS | -A]",
+            grpc: Some("Manager/ListObjects"),
+            summary: "Repos (gitops/Repo objects): each one's state, ref, deployed commit, and every job it deployed with its state (deployed, progressing, failed, stopped, pending).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "gitops.add",
+            cli: "legion gitops add <NAME> --url URL [--ref REF] [--path DIR] [--interval D] [--jobs A,B] [--host-level] [--no-prune] [--credentials-kv KEY] [--kv-key KEY]... [--dry-run] [--wait] [--idempotency-key K]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Create a Repo: gitops deploys every jobspec in the repository's path into the Repo's namespace and keeps it deployed. Writing it needs job:read and job:write there (on --jobs alone when given).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "gitops.sync",
+            cli: "legion gitops sync <REPO> [--wait] [--timeout D]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Sync a Repo now (sets its gitops/sync label, which gitops echoes); --wait waits until the commit is deployed and every rollout finished, and fails if one did not.",
+            mutates: true,
+            read_only_safe: false,
         },
         // --- Jobs: write ---
         Capability {
             name: "job.run",
-            cli: "legion job run <PATH>",
+            cli: "legion job run <PATH> [--expected-version N]",
             grpc: Some("Manager/RunJob"),
-            summary: "Submit or update a job. Supports --wait and --idempotency-key.",
+            summary: "Submit or update a job. Supports --wait, --idempotency-key, --allow-unknown-fields, and --expected-version (compare-and-set on the job's spec version; 0 = must not exist; a lost race is Aborted naming the current version).",
             mutates: true,
             read_only_safe: false,
         },
@@ -125,9 +291,9 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "job.scale",
-            cli: "legion job scale <NAME> [--count N | --reset]",
+            cli: "legion job scale <NAME> [--count N [--for D] | --min N --for D | --max N --for D | --release | --reset]",
             grpc: Some("Manager/ScaleTask"),
-            summary: "Change a task's count without a new job version or rollout (docs/autoscaling.md). Supports --idempotency-key.",
+            summary: "Change a task's count without a new job version or rollout (docs/autoscaling.md). On an autoscaled task a count is a time-boxed pin and needs --for; --min/--max pin a floor or ceiling; --release ends a pin. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -136,6 +302,116 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion job scale <NAME>",
             grpc: Some("Manager/GetJobScaleStatus"),
             summary: "Per-task spec vs override vs effective counts for a job.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        // --- Certificates (docs/cert-manager.md); certs/Issuer and
+        // certs/Certificate are objects, read and written with `object.*` ---
+        Capability {
+            name: "cert.renew",
+            cli: "legion cert renew <NAME> [-n NS] [--wait [--timeout D]]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Re-issue a certs/Certificate now (sets its certs/renew label; the certs app issues a new certificate and key once). --wait waits for the new one.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "cert.http01",
+            cli: "legion cert http01 (--issuer ISSUER | --thumbprint T) [--listen ADDR] [--no-redirect]",
+            grpc: Some("Manager/GetObject"),
+            summary: "Serve ACME HTTP-01 challenges for an Issuer on port 80, statelessly, and redirect other requests to HTTPS: a long-running responder to run as a job. Not agent-safe: it binds a port and runs until stopped.",
+            mutates: false,
+            read_only_safe: false,
+        },
+        // --- Task autoscaling (docs/autoscaling.md) ---
+        Capability {
+            name: "scaling.status",
+            cli: "legion scaling status [JOB] [-n NAMESPACES | -A]",
+            grpc: Some("Manager/GetScalingStatus"),
+            summary: "Every autoscaled task's, scaling policy's, and node group's count, wanted count, bounds, mode, and state (ok, held, limited, pinned, paused, dry-run, stale, ...), and whether the autoscaler app is running.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "scaling.explain",
+            cli: "legion scaling explain <JOB | NAME --kind KIND> [--group G] [--task T] [--policy] [-n NAMESPACE]",
+            grpc: Some("Manager/GetScalingStatus"),
+            summary: "Why an autoscaled task (or, with --kind scalingpolicy|nodegroup, one of the autoscaler's objects) is at its count: each check's reading and every safeguard stage of the last evaluation; with --policy, the effective policy and where each field came from.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "scaling.history",
+            cli: "legion scaling history <JOB | NAME --kind KIND> [--group G] [--task T] [--limit N] [-n NAMESPACE]",
+            grpc: Some("Manager/GetScaleHistory"),
+            summary: "The durable record of a job's (or a scaling policy's or node group's) count changes, newest first: people's and the autoscaler's, pins, dry-run \"would\" rows, failed target calls, and a node group's drains.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "scaling.pause",
+            cli: "legion scaling pause <JOB | NAME --kind KIND | --all> [--group G] [--task T] [--for D] [--reason R] [-n NAMESPACE]",
+            grpc: Some("Manager/PauseScaling"),
+            summary: "Freeze autoscaling for a task, a job, a scaling policy or node group (needs what writing it needs), or the cluster (--all, needs operator:write); the server refuses autoscaler writes while paused. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "scaling.resume",
+            cli: "legion scaling resume <JOB | NAME --kind KIND | --all> [--group G] [--task T] [-n NAMESPACE]",
+            grpc: Some("Manager/PauseScaling"),
+            summary: "Lift a pause set at the same scope.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "scaling.defaults.get",
+            cli: "legion scaling defaults get [-n NAMESPACE]",
+            grpc: Some("Manager/GetScalingDefaults"),
+            summary: "The cluster's scaling defaults, and the effective defaults for a namespace with the level each field came from.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "scaling.defaults.apply",
+            cli: "legion scaling defaults apply <FILE> [--dry-run] [--force]",
+            grpc: Some("Manager/ApplyScalingDefaults"),
+            summary: "Set the cluster's scaling defaults (needs operator:write); every inheriting task and scaling policy follows live. --dry-run lists the policies that would change; a change that invalidates some is refused unless --force. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "scaling.simulate",
+            cli: "legion scaling simulate <JOB | FILE> [--since D] [--series CSV] [--replay | --follow] [--cold] [--all]",
+            grpc: Some("Manager/GetScalingInputs"),
+            summary: "Run a policy (a running job's, a jobspec's, or an autoscaler/ScalingPolicy object file's) over up to an hour of recorded history or a CSV series and list the decisions it makes. The live policy over its own history makes the decisions the autoscaler made; an edited one shows what it would have done. Writes nothing.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "scaling.plugin.test",
+            cli: "legion scaling plugin test <COMMAND... | URL> [--config JSON] [--policy-config JSON] [--query Q]",
+            grpc: None,
+            summary: "Run the scaling-plugin conformance suite against a plugin program or URL: the handshake, schema, every method its kinds declare, unknown and malformed requests, crash and restart, and timeouts. Local; talks to no manager.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "job.scaling-inputs",
+            cli: "legion job info <NAME>",
+            grpc: Some("Manager/GetScalingInputs"),
+            summary: "Cluster-wide request vs usage per task, batched: ready/placed/desired/unplaced replicas, measured CPU and memory against reservations, service request rate/errors/latency (internal callers), rollout state, and data freshness, with up to an hour of 10-second history. Needs scale:read (docs/autoscaling.md, \"Scaling inputs\").",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "scaling.demand",
+            cli: "legion scaling demand [--pool P --cpu MHZ --memory MIB ... | -f nodes.ncl]",
+            grpc: Some("Manager/GetCapacityDemand"),
+            summary: "How many nodes of a node-group template the pending work needs, packed \
+                 with the scheduler's own rules, plus the replicas no template can host and \
+                 the rule that fails. Read-only; needs node:read (docs/autoscaling.md, \
+                 \"Capacity demand\").",
             mutates: false,
             read_only_safe: true,
         },
@@ -185,7 +461,7 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion template run <NAME> [--var K=V]... [--wait]",
             grpc: Some("Manager/RunJobTemplate"),
             summary:
-                "Render a template with variables and submit the job. Supports --idempotency-key.",
+                "Render a template with variables and submit the job. Supports --idempotency-key and --allow-unknown-fields.",
             mutates: true,
             read_only_safe: false,
         },
@@ -217,12 +493,18 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.create",
-            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>]",
+            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>] [--owner <ID>] | legion instance create <TASK> [--id <KEY>] --owner self",
             grpc: Some("Manager/CreateInstance"),
             summary: "Create a keyed-mode instance (never-recycled id), optionally restored from \
                  a snapshot of the job (needs snapshot:read). On a session task without --id, \
-                 start an unnamed session with no raft write (durable false). Supports \
-                 --idempotency-key.",
+                 start an unnamed session with no raft write (durable false). --owner <ID> \
+                 makes the unit a child of a running session, instance, or allocation of the \
+                 same job whose task names the task in children.tasks: a session child of a \
+                 session task, or a keyed child of a keyed task (an instance or allocation \
+                 owner only), which is stopped when its owner is stopped and destroyed when \
+                 it is destroyed, in the owner's own entry. Inside a task, `--owner self` asks \
+                 the node's worker over the allocation's API socket \
+                 (Workload/CreateChildInstance) with no token. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -297,6 +579,46 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "instance.resize",
+            cli: "legion instance resize <INSTANCE> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--move] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeInstance"),
+            summary: "Resize a running keyed instance or session in place (memory, memoryMax, \
+                 cpu) as an override over the spec: no new job version, no restart. A session's \
+                 resize is node-local and writes nothing to the store. An instance keeps its \
+                 size across suspend and resume. Answers applied, deferred, refused (with the \
+                 free room), needs_restart, or not_supported. --move resizes by suspending the \
+                 unit and resuming it at the new size on a node with room (a keyed instance \
+                 with a suspend block, or a store session; also needs job:write). Needs \
+                 scale:write. Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "job.resize",
+            cli: "legion job resize <JOB> [--task <TASK>] [--group <GROUP>] [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reset] [--replace] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeTask"),
+            summary: "Resize every allocation of a task without a deploy: a task-level size \
+                 override laid over the spec (no new job version, no rollout). Running \
+                 allocations are resized in place where they can be, with one answer each; \
+                 the rest keep their size until replaced, or are replaced now with --replace. \
+                 New allocations start at the overridden size. --reset returns to the spec. A \
+                 submit that changes the task's resources drops the override. Needs \
+                 scale:write. Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "alloc.resize",
+            cli: "legion alloc resize <ALLOCATION> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeAllocation"),
+            summary: "Resize one running allocation in place (memory, memoryMax, cpu): one \
+                 compare-and-set on its row, applied by its node's runtime. A grow takes only \
+                 free room and is refused with the room the node has. Needs scale:write. \
+                 Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "session.nodes",
             cli: "legion session nodes <JOB> [--task <TASK>] [--format envoy-eds|haproxy]",
             grpc: Some("Manager/ListSessionNodes"),
@@ -307,14 +629,84 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "session.run",
+            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--tier auto|isolate|vm] [--tenant <KEY>] [--session <ID>] [--arg <ARG>]... [--fallback vm] [--command <ARG>...]",
+            grpc: Some("Manager/RunSession"),
+            summary: "Run once in a fresh, single-use session of a session task with a `run` \
+                 block and return stdout, stderr, the exit status, result.json as `result`, and \
+                 the --get files; the session is always ended. A stopped run (run.wall, memory) \
+                 is ok:true with `stopped`. Needs job:write; --command also needs exec:write \
+                 and run.allowCommand. --idempotency-key is per node (reply kept 10 minutes); \
+                 --dry-run runs nothing. With --node and --ticket it is Worker/RunSession, with \
+                 no manager on the path. On an isolate task no run block is needed: the code \
+                 runs in an isolate or a VM, chosen before it runs (--tier, default auto); the \
+                 reply adds `tier`, `tierReason`, and `nextTier` (the tier to ask for next time \
+                 for the same code), and microsecond-precise cpuMs/wallMs. --tenant keys warm \
+                 instances, --arg passes arguments to the code (job:write only), --session runs \
+                 in a session isolate, and --fallback vm reruns a run \
+                 stopped in the isolate once in a VM (`ranTwice`: your code ran twice).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "isolate.stats",
+            cli: "legion isolate stats <JOB> [--task <TASK>]",
+            grpc: Some("Manager/GetIsolateStats"),
+            summary: "Per-node aggregates of a job's isolate tasks from the nodes' heartbeats: \
+                 resident, active, paged-out, and hibernated isolates, invocations and CPU per \
+                 second, VM runs per minute, child VMs, stops by reason and limit, refusals, \
+                 memory, the host processes serving them, and how old each report is \
+                 (`ageMs`). Isolates are never listed one by one. Needs job:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "isolate.get",
+            cli: "legion isolate get <SESSION_ID> [--on-node <NODE>]",
+            grpc: Some("Manager/GetIsolate"),
+            summary: "Describe one session isolate by asking the node its id names: state (hot, \
+                 paged_out, hibernated, empty), tenant, invocations, memory and state bytes, \
+                 checkpoint, and child VMs. --on-node names the node for an id derived from an \
+                 idempotency key. Unavailable (retryable) when the node cannot be reached. Needs \
+                 job:read on the isolate's job.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "session.start",
-            cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T>",
+            cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T> [--owner <ID>] | legion session start <TASK> --owner self",
             grpc: Some("Worker/StartSession"),
             summary: "Start a session on one node with a session ticket, with no manager call \
                  (the edge form, for testing and scripts). Supports --idempotency-key \
-                 (node-local).",
+                 (node-local). --owner <ID> starts it as a child of a unit running on that node \
+                 (it ends with its owner; the owner's task must name the task in \
+                 children.tasks). Inside a task, `--owner self` asks the node's worker over the \
+                 allocation's API socket (Workload/StartChildSession) with no ticket.",
             mutates: true,
             read_only_safe: false,
+        },
+        Capability {
+            name: "session.handoff",
+            cli: "legion session handoff <CHILD> --port <LABEL> --fd <N> [--wait]",
+            grpc: None,
+            summary: "Inside a task: hand an inbound connection the workload accepted (an \
+                 inherited file descriptor) to a port of one of its own session children on \
+                 the same node, over the allocation's handoff socket with no credential. The \
+                 worker moves the bytes with the datapath's splice path and the workload \
+                 leaves the byte path; --wait returns when the connection closed, with the \
+                 bytes moved.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "session.children",
+            cli: "legion session children",
+            grpc: Some("Workload/ListChildren"),
+            summary: "Inside a task: list the child sessions this workload owns on its node \
+                 (running, suspended, and the ones that ended in the last ten minutes with why), \
+                 over the allocation's API socket with no credential.",
+            mutates: false,
+            read_only_safe: true,
         },
         Capability {
             name: "session.get",
@@ -326,9 +718,11 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "session.stop",
-            cli: "legion session stop <SESSION> --node <ADDR> --ticket <T>",
+            cli: "legion session stop <SESSION> --node <ADDR> --ticket <T> | legion session stop <SESSION> --local",
             grpc: Some("Worker/StopSession"),
-            summary: "End a session on its node with a session ticket. Idempotent.",
+            summary: "End a session on its node with a session ticket. Idempotent. Ending a \
+                 session ends its children first. Inside a task, --local ends one of the \
+                 workload's own children over the API socket (Workload/StopChildSession).",
             mutates: true,
             read_only_safe: false,
         },
@@ -463,6 +857,17 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Devices and plugin seams (device-model-and-plugin-seams plan) ---
+        Capability {
+            name: "device.plugin.test",
+            cli: "legion device plugin test -- <COMMAND...>",
+            grpc: None,
+            summary: "Run the legion-device/1 conformance checks against a device plugin \
+                 locally (fingerprint twice, allocate one instance per group). No manager \
+                 needed. A node's devices show in `legion node info`.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",
@@ -497,6 +902,15 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         // --- Nodes ---
+        Capability {
+            name: "ledger",
+            cli: "legion ledger [--job <JOB>]",
+            grpc: Some("Manager/GetLedger"),
+            summary: "List every node's allocations (status, resources, job, instance, resize \
+                 override), or with --job only that job's allocations and the nodes they run on.",
+            mutates: false,
+            read_only_safe: true,
+        },
         Capability {
             name: "node.list",
             cli: "legion node list",
@@ -540,8 +954,9 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion node content <ID>",
             grpc: Some("Manager/GetNodeContent"),
             summary: "Show what a node holds for content locality: the content it advertises to \
-                 the manager's location index, which snapshot each entry belongs to, and its \
-                 snapshots with how many of their parts it holds.",
+                 the manager's location index, which snapshot each entry belongs to, its \
+                 snapshots with how many of their parts it holds, and its derived content \
+                 (what Legion built there and can rebuild, such as sandbox base root disks).",
             mutates: false,
             read_only_safe: true,
         },
@@ -574,10 +989,21 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "node.forget",
+            cli: "legion node forget <ID> [--force]",
+            grpc: Some("Manager/ForgetNode"),
+            summary: "Remove a dead node's record and revoke its node token in one write. \
+                 Refused without --force while it has allocations, is live and not cordoned, \
+                 or holds node-local volumes. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "node.join-token.create",
-            cli: "legion join-token create",
+            cli: "legion join-token create [--max-uses N] [--attr K=V]...",
             grpc: Some("Manager/CreateJoinToken"),
-            summary: "Create a join token that introduces a worker to the cluster.",
+            summary: "Create a join token that introduces a worker to the cluster, optionally \
+                 admitting at most N new nodes and stamping attributes on each.",
             mutates: true,
             read_only_safe: false,
         },
@@ -585,7 +1011,8 @@ pub fn catalog() -> Vec<Capability> {
             name: "node.join-token.list",
             cli: "legion join-token list",
             grpc: Some("Manager/ListJoinTokens"),
-            summary: "List worker join tokens (metadata only).",
+            summary: "List worker join tokens (metadata only), with uses against max_uses and \
+                 the attributes each stamps.",
             mutates: false,
             read_only_safe: true,
         },
@@ -769,10 +1196,11 @@ pub fn catalog() -> Vec<Capability> {
         // --- KV ---
         Capability {
             name: "kv.get",
-            cli: "legion kv get <KEY>",
+            cli: "legion kv get <KEY> [--index REVISION [--wait SECONDS]] [--consistent]",
             grpc: Some("Manager/GetKv"),
             summary: "Read a value from the KV store. A missing key is a `NotFound` error \
-                 (non-zero exit), so `kv get || kv put` works.",
+                 (non-zero exit), so `kv get || kv put` works. --index blocks until the key \
+                 changes after that revision; --consistent reads through the leader.",
             mutates: false,
             read_only_safe: true,
         },
@@ -823,6 +1251,27 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/RewrapRootKey"),
             summary: "Re-wrap every data key under the current root key (completes a root key rotation).",
             mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "keyring.root_key_generate",
+            cli: "legion keyring root-key generate",
+            grpc: None,
+            summary: "Print a new base64 root key line for the file or env provider. Runs \
+                 locally; nothing on the cluster changes until the key is installed and \
+                 `keyring root-key rewrap` runs.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "keyring.provider.test",
+            cli: "legion keyring provider test [--timeout D] -- <COMMAND...>",
+            grpc: None,
+            summary: "Conformance-test an exec root-key provider before pointing a manager at \
+                 it: describe, a wrap/unwrap round trip, a tampered ciphertext refused, and \
+                 randomized wrapping. Runs locally; never touches the cluster, but the \
+                 command really calls its KMS.",
+            mutates: false,
             read_only_safe: false,
         },
         Capability {
@@ -938,6 +1387,159 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        Capability {
+            name: "acl.grants.list",
+            cli: "legion acl grants list [--job JOB] [--all]",
+            grpc: Some("Manager/ListGrants"),
+            summary: "List job grants: what each job version's `legion` identity was granted at submit, and by whom.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "acl.grants.revoke",
+            cli: "legion acl grants revoke <JOB> [--version N]",
+            grpc: Some("Manager/RevokeGrant"),
+            summary: "Revoke a job's grants; its workload tokens lose them at their next request.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // --- Apps (docs/apps.md) ---
+        Capability {
+            name: "app.list",
+            cli: "legion app list",
+            grpc: Some("Manager/ListApps"),
+            summary: "List installed apps (Legion's add-ons): version, source, status, placement, replicas running, and UI slots.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.status",
+            cli: "legion app status <APP>",
+            grpc: Some("Manager/GetApp"),
+            summary: "Show one app: its record, grant, job status, the reconciler's last action and error, and its build marker.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.logs",
+            cli: "legion app logs <APP> [-f]",
+            grpc: Some("Manager/GetAllocationLogs"),
+            summary: "Fetch an app's task logs (the logs of its job, legion-system/<app>).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.config.get",
+            cli: "legion app config get <APP>",
+            grpc: Some("Manager/GetApp"),
+            summary: "Print an app's config: Nickel for people (valid input for `app config set`), the JSON envelope with --json.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.config.schema",
+            cli: "legion app config schema <APP>",
+            grpc: Some("Manager/GetApp"),
+            summary: "Print an app's config schema (JSON Schema, draft 7).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.config.set",
+            cli: "legion app config set <APP> -f <FILE> [--dry-run]",
+            grpc: Some("Manager/SetAppConfig"),
+            summary: "Replace an app's config, validated against its schema and the job's admission; the app's job rolls. Changing a code field needs the app's whole grant. --dry-run checks without changing.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.set",
+            cli: "legion app set <APP> [--replicas N|per-node] [--placement managers|workers|any] [--pool POOL] [--cpu MHZ] [--memory MIB] [--dry-run]",
+            grpc: Some("Manager/UpdateAppSettings"),
+            summary: "Change an app's settings (the only way to change its job's count or placement: direct writes to an app's job are refused); its job rolls with them. --dry-run checks without changing.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.enable",
+            cli: "legion app enable <APP> [--dry-run]",
+            grpc: Some("Manager/SetAppEnabled"),
+            summary: "Enable an app: its job runs again. On an enabled app, resubmits a job that does not run healthy at its current version (the retry for a failed upgrade).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.disable",
+            cli: "legion app disable <APP> [--dry-run]",
+            grpc: Some("Manager/SetAppEnabled"),
+            summary: "Disable an app: its job stops; its record, config, and grant are kept.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.install",
+            cli: "legion app install <FILE|URL> [--yes] [--dry-run] [--key POINT.KEY=NEW]",
+            grpc: Some("Manager/InstallApp"),
+            summary: "Install an app from a manifest. The caller must hold every permission it asks for; --dry-run shows the prompt and whether it does, and which stored jobspec values the app's keys would adopt. --key installs a key under another name when another app owns it.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.upgrade",
+            cli: "legion app upgrade <APP> <FILE|URL> [--yes] [--force] [--dry-run]",
+            grpc: Some("Manager/UpgradeApp"),
+            summary: "Replace an installed app's manifest; shows the permission diff, and new permissions need approval. --dry-run reports `uncovered` (a permission the token lacks) and `orphanedJobs`; dropping a jobspec key jobs use needs --force.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.uninstall",
+            cli: "legion app uninstall <APP> [--force] [--purge] [--dry-run]",
+            grpc: Some("Manager/UninstallApp"),
+            summary: "Uninstall an app: stop its job, revoke its grant, and drop its record (a corrupt record too). Needs --force when jobs set its jobspec keys; their values stay stored, flagged orphaned. --purge also deletes its KV under legion/apps/<app>/.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.extensions",
+            cli: "legion app extensions [APP]",
+            grpc: Some("Manager/ListApps"),
+            summary: "List the jobspec keys installed apps add: each key's point (job, group, task, volume, port, service), owner, description, schema, examples, and whether setting it needs an extra permission.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.views",
+            cli: "legion app view <APP>",
+            grpc: Some("Manager/ListUiExtensions"),
+            summary: "List what an app shows you in the UI, and where: sidebar pages, overview cards, job and node panels, task badges, filtered by each one's declared permission.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.view",
+            cli: "legion app view <APP> <nav|overview|job|task|node> [CTX...] [--view VIEW]",
+            grpc: Some("Manager/GetAppView"),
+            summary: "Render an app's declarative view (what its UI panel shows) as text, or its validated legion-view/1 JSON with -j; checked as you against the view's declared permission before the app is asked.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.action",
+            cli: "legion app view <APP> <job|task|node> <CTX...> (lists the view's actions; they run from the UI)",
+            grpc: Some("Manager/InvokeAppAction"),
+            summary: "Run an action an app declares (a button in its view) on a job, task, or node, checked as you against the action's declared permission there; audited as an app.action event and retry-safe with an idempotency key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.page",
+            cli: "legion app view <APP> (lists the app's sandboxed pages; they open in the UI)",
+            grpc: Some("Manager/GetAppPage"),
+            summary: "Fetch an app's sandboxed page (ui.pages): its single-file HTML bundle and the RPCs it may call through the UI's bridge as you, checked against the page's declared permission before the app is asked. For the UI, which mounts it in a sandboxed iframe.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Service discovery ---
         Capability {
             name: "service.list",
@@ -988,6 +1590,67 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/DeleteNetPolicy"),
             summary: "Delete a stored network policy; matching allocations lose it on their next \
                  heartbeat.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.plugin.new",
+            cli: "legion net plugin new <NAME> [--dir <DIR>]",
+            grpc: None,
+            summary: "Scaffold a WASM network plugin crate (proxy-wasm Rust SDK) and its object \
+                 file. Local only.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.test",
+            cli: "legion net plugin test <MODULE|NAME> --request '<METHOD> <URL>' [--label k=v] \
+                 [--config <JSON>]",
+            grpc: None,
+            summary: "Run a .wasm module or a stored plugin against one synthetic request, \
+                 locally: per stage what it did, what it changed, its time and fuel.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.apply",
+            cli: "legion net plugin apply -f <FILE> [--dry-run] [--idempotency-key <KEY>]",
+            grpc: Some("Manager/UpsertNetPlugin"),
+            summary: "Create or replace a network plugin object; --dry-run validates it and \
+                 every policy that uses it without writing.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.plugin.list",
+            cli: "legion net plugin list",
+            grpc: Some("Manager/ListNetPlugins"),
+            summary: "List stored network plugin objects.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.describe",
+            cli: "legion net plugin describe <NAME>",
+            grpc: Some("Manager/GetNetPlugin"),
+            summary: "Fetch one stored plugin object and the policies that use it.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.status",
+            cli: "legion net plugin status <NAME>",
+            grpc: Some("Manager/GetNetPluginStatus"),
+            summary: "Per node: the revision held, module state, calls, errors, last error, \
+                 and p99 callback time.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.delete",
+            cli: "legion net plugin delete <NAME>",
+            grpc: Some("Manager/DeleteNetPlugin"),
+            summary: "Delete a stored plugin object (refused while a policy uses it).",
             mutates: true,
             read_only_safe: false,
         },
@@ -1050,9 +1713,10 @@ pub fn catalog() -> Vec<Capability> {
             name: "net.ca.show",
             cli: "legion net ca show",
             grpc: Some("Manager/GetMeshCa"),
-            summary: "Print the cluster CA trust bundle (never a key), its pin, and the \
-                 rotation phase: what an outside client trusts to reach a mesh-TLS port or a \
-                 worker plane, or verifies a node certificate against.",
+            summary: "Print the cluster CA trust bundle (never a key), its pin, the rotation \
+                 phase, which provider supplies it (builtin, file, exec), and any problem that \
+                 stops this manager signing: what an outside client trusts to reach a mesh-TLS \
+                 port or a worker plane, or verifies a node certificate against.",
             mutates: false,
             read_only_safe: true,
         },
@@ -1060,10 +1724,23 @@ pub fn catalog() -> Vec<Capability> {
             name: "net.ca.rotate",
             cli: "legion net ca rotate",
             grpc: Some("Manager/RotateMeshCa"),
-            summary: "Rotate the cluster CA in two steps: the new CA, cross-signed by the old \
-                 one, signs at once and the old one stays trusted for 24h, so no connection \
-                 breaks. Nodes re-issue within one heartbeat.",
+            summary: "Rotate the built-in cluster CA in two steps: the new CA, cross-signed by \
+                 the old one, signs at once and the old one stays trusted for 24h, so no \
+                 connection breaks. Nodes re-issue within a 10-minute splay. `file` and `exec` \
+                 CAs rotate outside Legion; this refuses with the procedure.",
             mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.ca.provider.test",
+            cli: "legion net ca provider test (-- <COMMAND...> | --cert-path P --key-path P [--bundle-path P])",
+            grpc: None,
+            summary: "Conformance-test a cluster CA provider before pointing a manager at it: \
+                 an exec signer command or file CA material. Reads the trust bundle, has node \
+                 and manager certificates signed, and verifies each one as a manager would. \
+                 Runs locally; never touches the cluster, but an exec signer really issues the \
+                 test certificates.",
+            mutates: false,
             read_only_safe: false,
         },
         Capability {
@@ -1116,6 +1793,17 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "raft.members",
+            cli: "legion raft members",
+            grpc: Some("Manager/ListManagers"),
+            summary: "Every manager in the cluster from the replicated raft membership: role \
+                 (leader/follower/learner, or standalone outside raft), advertised address, \
+                 and whether the answering manager can reach it, with each reachable \
+                 member's term and applied index. Any manager answers with the full list.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "raft.history",
             cli: "legion raft history [--limit <N>]",
             grpc: Some("Manager/ListRaftHistory"),
@@ -1139,16 +1827,89 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Agent governance (internal_docs/plans/agent-governance-plan.md) ---
+        Capability {
+            name: "audit.list",
+            cli: "legion audit list [--accessor ID] [--operation RPC] [--target PREFIX] [--since 24h] [--follow]",
+            grpc: Some("Manager/ListAuditEvents"),
+            summary: "Query the durable audit journal: who (accessor, principal, on-behalf-of chain) did which write or was denied, on what target, with which outcome. Needs audit:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "acl.token.child",
+            cli: "legion acl token create --child --name NAME [--policy P]... [--ttl 1h] [--write-rate 5/s]",
+            grpc: Some("Manager/CreateChildToken"),
+            summary: "Mint a child of your own token for a sub-agent: a subset of its policies, expiring no later than it (default 1h, at most 24h), revoked with it. Needs no acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "approval.list",
+            cli: "legion approval list [--status pending] [--mine]",
+            grpc: Some("Manager/ListApprovals"),
+            summary: "List approval requests filed by governance.approvals gates (your own without approval:read).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "approval.get",
+            cli: "legion approval get <ID>",
+            grpc: Some("Manager/GetApproval"),
+            summary: "Show one approval request: what it gates, who asked, and whether it was decided or used.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "approval.decide",
+            cli: "legion approval approve|deny <ID> [--reason TEXT]",
+            grpc: Some("Manager/DecideApproval"),
+            summary: "Approve or deny a pending approval request (approval:write; never your own). The requester then retries with --approval <ID>.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "usage",
+            cli: "legion usage [--namespaces NS] [--by namespace|job|submitter|hour] [--since 7d] | legion namespace usage <NS>",
+            grpc: Some("Manager/GetUsage"),
+            summary: "Time-integrated reserved usage (CPU core-hours, memory GiB-hours, cores, allocation-hours, custom resources) per namespace, job, or submitting token.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        // --- Revisions and watches (revisions-and-watches plan) ---
+        Capability {
+            name: "job.watch",
+            cli: "legion job watch [NAME] [--allocations [--node NODE]] [--from REVISION] [--timeout SECONDS]",
+            grpc: Some("Manager/Watch"),
+            summary: "Stream each change to a job (status, versions, allocations) or to its allocations as it commits, resuming after a revision with --from. A revision older than the manager's journal is a ResyncRequired error: read again and watch from the read's revision. NDJSON with --json.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "kv.watch",
+            cli: "legion kv watch [PREFIX] [--from REVISION] [--timeout SECONDS]",
+            grpc: Some("Manager/Watch"),
+            summary: "Stream each write or delete of a KV key under a prefix as it commits, resuming after a revision with --from. NDJSON with --json.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Discovery ---
         Capability {
             name: "capabilities",
-            cli: "legion capabilities",
-            grpc: None,
-            summary: "List the operations described by this catalog.",
+            cli: "legion capabilities [--mine]",
+            grpc: Some("Manager/GetCallerCapabilities"),
+            summary: "List the operations described by this catalog; --mine marks each allowed, partial (some namespaces), or denied for your token.",
             mutates: false,
             read_only_safe: true,
         },
     ]
+}
+
+#[derive(Tabled)]
+struct MineRow {
+    name: String,
+    access: String,
+    permission: String,
 }
 
 #[derive(Tabled)]
@@ -1164,13 +1925,112 @@ struct CapabilityRow {
 pub fn config() -> Command {
     Command::new("capabilities")
         .about("List Legion's agent-callable operations (machine-readable with --json)")
+        .arg(
+            Arg::new("mine")
+                .long("mine")
+                .action(ArgAction::SetTrue)
+                .help("Ask the manager which of them your token may perform"),
+        )
         .arg(json_flag())
 }
 
+/// The catalog as `client`'s caller may use it: each entry gains `access`
+/// (`allowed`, `partial`, `denied`, `open`, or `local` for entries no RPC
+/// backs) and, for `partial`, the `namespaces` where it holds
+/// (`GetCallerCapabilities`).
+pub async fn caller_catalog(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+) -> Result<Value, tonic::Status> {
+    let reply = client
+        .get_caller_capabilities(crate::structs::GetCallerCapabilitiesRequest {})
+        .await?
+        .into_inner();
+    let by_rpc: HashMap<String, crate::structs::RpcAccess> = reply
+        .rpcs
+        .into_iter()
+        .map(|access| (access.rpc.clone(), access))
+        .collect();
+    let entries: Vec<Value> = catalog()
+        .into_iter()
+        .map(|cap| {
+            let mut entry = serde_json::to_value(&cap).unwrap_or(Value::Null);
+            let access = cap
+                .grpc
+                .and_then(|grpc| grpc.strip_prefix("Manager/"))
+                .and_then(|rpc| by_rpc.get(rpc));
+            if let Some(fields) = entry.as_object_mut() {
+                match access {
+                    Some(access) => {
+                        fields.insert("access".into(), json!(access.access));
+                        if !access.permission.is_empty() {
+                            fields.insert("permission".into(), json!(access.permission));
+                        }
+                        if !access.namespaces.is_empty() {
+                            fields.insert("namespaces".into(), json!(access.namespaces));
+                        }
+                    }
+                    None => {
+                        fields.insert("access".into(), json!("local"));
+                    }
+                }
+            }
+            entry
+        })
+        .collect();
+    Ok(json!({
+        "principal": reply.principal,
+        "accessorId": reply.accessor_id,
+        "source": reply.source,
+        "isManagement": reply.is_management,
+        "aclEnabled": reply.acl_enabled,
+        "capabilities": entries,
+    }))
+}
+
 /// Handle `legion capabilities`.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    if matches.get_flag("mine") {
+        let mut client = crate::cmd::helpers::connect_manager_client().await?;
+        let view = output::resolve(
+            format,
+            "Failed to read your capabilities",
+            caller_catalog(&mut client).await,
+        )?;
+        if format.is_json() {
+            output::print_success(&view);
+            return Ok(());
+        }
+        println!(
+            "Capabilities of {} ({}):",
+            view["principal"].as_str().unwrap_or("-"),
+            view["source"].as_str().unwrap_or("-")
+        );
+        let rows = view["capabilities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| MineRow {
+                name: entry["name"].as_str().unwrap_or_default().to_string(),
+                access: match entry["namespaces"].as_array() {
+                    Some(namespaces) => format!(
+                        "partial ({})",
+                        namespaces
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None => entry["access"].as_str().unwrap_or_default().to_string(),
+                },
+                permission: entry["permission"].as_str().unwrap_or("-").to_string(),
+            })
+            .collect::<Vec<_>>();
+        crate::cmd::helpers::print_table(rows);
+        return Ok(());
+    }
     let caps = catalog();
 
     if format.is_json() {

@@ -18,9 +18,12 @@ pub fn config() -> Command {
         .arg(
             Arg::new("jobs")
                 .long("jobs")
-                .value_name("GLOB")
+                .value_name("PATTERN")
                 .required(true)
-                .help("Job names the key's tickets may reach, e.g. 'agents-*'"),
+                .help(
+                    "Jobs the key's tickets may reach: 'agents-*' (names in default) or \
+                     'agents/*' (namespace-glob/name-glob)",
+                ),
         )
         .arg(
             Arg::new("public-key")
@@ -80,7 +83,7 @@ pub fn config() -> Command {
         .subcommand(delete_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     match matches.subcommand() {
         Some(("create", sub)) => create(sub).await,
@@ -118,6 +121,7 @@ async fn create(matches: &ArgMatches) -> R<()> {
                     message: format!("could not read {path}: {err}"),
                     hint: None,
                     retryable: false,
+                    details: None,
                 },
             ))
         }

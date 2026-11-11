@@ -259,7 +259,7 @@ registration payload it already sends, and the manager derives that node's
 lost window from it:
 
 ```rust
-// src/worker/daemon.rs, building the registration config_attrs
+// crates/worker/src/worker/daemon.rs, building the registration config_attrs
 config_attrs.insert("heartbeatSeconds".into(), json!(heartbeat_interval.as_secs()));
 ```
 
@@ -544,6 +544,10 @@ We keep the cost and add the stopping point.
 
 ## 14. The served interval is not checked against the stateful self-fence
 
+> **Superseded 2026-11-10.** Alternative (a) was taken: the default
+> `maxInterval` is 55s, and a ceiling at or past the 90s fence warns at
+> startup ([todo-closeout calls #1](todo-closeout-2026-11-10_calls.md)).
+
 **Call.** *(Phase 5, accepted limitation.)* The startup check that rejects a
 worker-type `missedBeatsBeforeLost x heartbeatSeconds` at or past
 `selfTerminateAfter` (entry 18) is not applied to the served interval. At the
@@ -749,7 +753,7 @@ is a much more confusing error to receive.
 
 **Call.** A new `GetHeartbeatCadence` RPC and a `legion node cadence` verb,
 with `--json`, a `catalog()` entry (`read_only_safe: true`), an MCP tool,
-and a `tests/acl_endpoints.rs` row (`node`/`read`/`any`).
+and a `tests/integration/acl_endpoints.rs` row (`node`/`read`/`any`).
 
 ```console
 $ legion node cadence
@@ -823,7 +827,7 @@ better one than a wrong answer.
 adaptive-on/adaptive-off reproduction that is the cadence plan's phase-4
 acceptance criterion — have **not** been run. Correctness is covered by unit
 tests over the pure decision functions and by integration tests on the
-`tests/raft_lanes.rs` 3-node harness; scale is not.
+`tests/integration/raft_lanes.rs` 3-node harness; scale is not.
 
 **Alternative.** Hold the change until the rig is available.
 

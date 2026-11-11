@@ -1,9 +1,10 @@
 # Metrics & Health Probes
 
 The manager exposes Prometheus metrics and Kubernetes-style health probes on
-a dedicated HTTP listener (implemented in `src/manager/telemetry.rs`). Use them
-to alert on and graph cluster health. The registry is hand-rolled on atomics
-(no prometheus crate) and renders the standard text exposition format, so any
+a dedicated HTTP listener (`crates/manager/src/manager/telemetry.rs`). Use them
+to alert on and graph cluster health. The registry
+(`crates/common/src/telemetry.rs`, shared with the worker) is hand-rolled on
+atomics (no prometheus crate) and renders the standard text exposition format, so any
 Prometheus-compatible scraper works unchanged.
 
 ## Endpoints
@@ -63,7 +64,9 @@ Optional `telemetry` block in the manager config:
 - `enabled` (default `true`): master switch for the listener.
 - `port` (default `server.port + 2`): the listener binds this port on
   `server.host`. The `+ 2` convention leaves `server.port + 1` for the exec
-  WebSocket listener.
+  WebSocket listener. A port another process holds fails the manager's
+  startup (`failed to bind the telemetry listener on ...`), the same as
+  the gRPC port, rather than leaving a manager up with no probes.
 
 ## Metric families
 
@@ -112,8 +115,9 @@ neighbor rules a cause in or out, and which knob to turn), see
   - `fallback`: applied, but at least one placement bound a lower-ranked
     candidate because of a race.
   - `rejected`: no candidate still fits. Causes are capacity, a late
-    constraint or cordon, or (for an edge-boot ratification only) an epoch
-    conflict.
+    constraint or cordon, or a job-config epoch conflict between two
+    scheduler plans. An edge-boot ratification never compares epochs, so
+    it is never rejected for a conflict.
 
   The outcomes are mutually exclusive. See
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
@@ -147,17 +151,34 @@ neighbor rules a cause in or out, and which knob to turn), see
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
 - **`legion_evals_blocked{key_kind}`** (gauge): evals waiting blocked on
-  capacity, by the kind of key they wait under: `class`, `node`, or
-  `escaped` (see
+  capacity, by the kind of key they wait under: `class`, `node`,
+  `escaped`, or `runtime` (the task's runtime is
+  [disabled](runtime-disable.md)) (see
   [Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). Set by the
   scheduler-lane leader's wake pass, so it reads 0 on other managers and is
   refreshed when a capacity event arrives. A rising `class` count is a
   capacity signal for that class; `escaped` means no node was schedulable.
+- **`legion_gang_blocked_jobs`** (gauge): jobs whose blocked eval is a
+  [gang](gang-scheduling.md) short of its quorum. A waiting gang holds
+  nothing, so smaller jobs can keep taking the capacity it waits for; a value
+  that stays up while the cluster churns is that starvation. Set by the
+  scheduler-lane leader's wake pass, like `legion_evals_blocked`.
+- **`legion_gang_outcomes_total{outcome}`** (counter): what happened to
+  gangs that lost a member or waited too long: `replace` (the member was
+  replaced alone, or the survivors kept running for a `replace` top-up),
+  `restart` (the survivors stopped so the whole gang re-places), `fail` (the
+  job failed: `onMemberLoss = "fail"` or the move budget ran out), and
+  `timeout` (the gang did not reach its quorum within `placementTimeout`).
+  A rising `restart` rate is a gang whose members keep dying; see
+  [When a member is lost](gang-scheduling.md#when-a-member-is-lost).
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a
-  node), `missed` (capacity appeared while the eval ran, so it never
-  blocked), or `startup`.
+  node), `recovered` (a changeset projection failed, so every available node
+  counted as changed), `missed` (capacity appeared while the eval ran, so it
+  never blocked), `startup`, `runtime_enabled` (the disabled runtime the eval
+  waited on was enabled), or `timeout` (a gang past its `placementTimeout`,
+  woken for its last attempt).
 - **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
   waited, from the entry that blocked it to the one that woke it. Buckets run
   from 100 ms to an hour.
@@ -197,9 +218,9 @@ See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
   worker claimed a non-planning eval (today `job_stop`) instead of the queue
   head. This counts the one cross-class priority inversion the admission gate
   introduces.
-- **`legion_preemptions_total{pool, band}`** (counter): allocations evicted
-  by scheduler preemption, labeled by the victim's node pool and its
-  priority band. Alert on the rate. Preemption of production-adjacent bands
+- **`legion_preemptions_total{pool, band, namespace}`** (counter):
+  allocations evicted by scheduler preemption, labeled by the victim's node
+  pool, its priority band, and its job's [namespace](namespaces.md). Alert on the rate. Preemption of production-adjacent bands
   should be rare. A rising rate in a `low` band is a capacity signal, and
   usually not an incident ([preemption-and-eviction.md](preemption-and-eviction.md)).
 - **`legion_preemption_plans_total{outcome}`** (counter): preemption passes
@@ -236,7 +257,11 @@ See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
   claimed eval, from handing it to the blocking pool to its outcome.
   Throughput is roughly `evalThreads` divided by this. The difference from
   the plan's `total` is everything an eval does outside `plan_and_apply`,
-  which `legion_eval_phase_seconds` breaks down.
+  which `legion_eval_phase_seconds` breaks down. Handle time well above the
+  sum of the phases means the eval worker waited for a tokio worker to
+  resume on after its handler finished: blocking gRPC handlers are holding
+  the runtime (see
+  [Diagnosing a manager throughput ceiling](#diagnosing-a-manager-throughput-ceiling)).
 - **`legion_eval_phase_seconds{kind, phase}`** (histogram): where one eval's
   handler time goes.
   - `queue_wait`: the wait for a blocking-pool thread, recorded for every
@@ -265,14 +290,6 @@ See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
   so it sits near zero while the fleet is stable. A rate that tracks the plan
   rate means nodes are changing under every plan, and each plan pays an
   O(fleet) rebuild.
-- **`legion_scheduler_lazy_sample_fallback_total`** (counter):
-  **retired, always 0.** It counted plans that re-ran with the eager
-  whole-fleet epoch sample because the read model changed mid-plan.
-  Plans now take their fence epochs from their own capacity snapshot and
-  never re-run (see "The epoch sample comes from the plan's own snapshot"
-  in [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)). Nothing
-  increments it anymore. It is still exported so dashboards that graph it
-  don't break.
 
 ### Content locality
 
@@ -348,6 +365,55 @@ instrument.
   (a half-applied recovery; see docs/node-liveness.md). `marked_lost` minus
   this is the fleet's net loss. A flapping fleet moves both.
 
+### Namespaces
+
+Workload families by [namespace](namespaces.md). The gauges refresh on the
+node-status-checker tick (`workerCheckSeconds`) and carry a series for every
+existing namespace, so an emptied namespace reads `0` instead of its last
+value. Past 256 namespaces a family folds the rest into `"other"`, like every
+family, so the per-namespace numbers stop being exact.
+
+- **`legion_namespace_jobs{namespace}`** (gauge): registered jobs, any state.
+- **`legion_namespace_allocations{namespace}`** (gauge): live allocations
+  (not `complete` or `failed`) of the namespace's jobs.
+- **`legion_namespace_reserved_cpu_mhz{namespace}`** (gauge): CPU in MHz
+  reserved by those allocations (`resources.cpu` after
+  `taskResourceDefaults`).
+- **`legion_namespace_reserved_memory_bytes{namespace}`** (gauge): memory
+  reserved by those allocations.
+- **`legion_job_submits_total{namespace}`** (counter): job submissions the
+  manager accepted (`RunJob` and `RunJobTemplate`; deduplicated retries and
+  refused submits excluded).
+
+The reserved gauges are live reservations. A [namespace
+policy](namespaces.md#namespace-policies)'s quota is checked against
+*charged* usage instead, which also counts demand a job has declared but not
+yet placed (`legion namespace get` shows it), so the gauges can read lower
+while admitted work is still placing.
+
+### Apps
+
+- **`legion_apps{status}`** (gauge): installed [apps](apps.md) by status,
+  `running`, `upgrading`, `degraded`, `pending`, `stopped`, or `corrupt`, as
+  `legion app list` derives it. Set by the control-lane leader's app
+  reconciler after each pass (at least once a minute); zero on other
+  managers. A `stopped` or `degraded` count is worth an alert: a bundled app
+  (the autoscaler) that is not running is a cluster-health finding, not a
+  silent absence. A `corrupt` count is a record this manager cannot decode
+  (logged once, with the reason): `legion app uninstall <app>` removes it.
+
+### Governance
+
+- **`legion_governance_events_total{event}`** (counter): agent-governance
+  events on this manager ([audit journal](audit-journal.md),
+  [approvals and rate limits](approvals-and-rate-limits.md)).
+  `audit_written` counts journaled records; `audit_dropped` records lost
+  to a full queue or a failed batch (alert on any); `audit_unjournaled`
+  records a follower that leads no raft lane could not forward to a lane
+  leader (no leader known, or unreachable) and logged to the `audit`
+  tracing target instead; `rate_limited`, `approval_required`,
+  `approval_invalid` and `approval_used` count the gates' answers.
+
 ### Node usage
 
 Per-node gauges from the usage reports workers with
@@ -366,9 +432,27 @@ across them by `node`.
   over the node's governed allocations.
 - **`legion_node_cpu_used_millicores{node}`** (gauge): CPU used by governed
   allocations over the last interval, in thousandths of a core.
+- **`legion_node_memory_pressure_some_avg10{node}`** (gauge): the node's
+  memory pressure, PSI `some avg10` from `/proc/pressure/memory`, in percent:
+  the share of the last 10 seconds in which at least one task stalled
+  waiting for memory. It is the number the node's
+  [pressure response](resource-enforcement.md#memory-pressure) compares with
+  `memoryPressure.maxStall`, and the `stall` figure in the `PRESSURE` column
+  of `legion node usage`. Reads `0` on a kernel without PSI.
 
-One series per reporting node. Reservations aren't exported as gauges. Read
-them with `legion node usage`.
+One series per reporting node.
+
+- **`legion_node_memory_reserved_bytes{node}`** (gauge): memory the live
+  allocations placed on the node reserve: every allocation that is not
+  complete or failed, including a suspended instance that holds its
+  reservation (`suspend.reserve`). Unlike the gauges above it is read from
+  the replicated store every few seconds, so it covers every node with a
+  live allocation, enforcement or not, and every manager reports the same
+  value: take `max` across managers, not `sum`. A node whose last live
+  allocation ends drops to `0`. Against `legion_node_memory_physical_bytes`
+  it shows how far a node is oversubscribed, and against
+  `legion_node_memory_used_bytes` how much of what is reserved is in use.
+  CPU reservations are not exported. Read them with `legion node usage`.
 
 - **`legion_node_pressure_actions_total{node,step}`** (counter): actions a
   node's memory pressure response reported, by `step` (`reclaim`, `suspend`,
@@ -389,12 +473,23 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   paused plus storing its memory. Buckets run from 25 ms to 60 s.
 - **`legion_instance_resume_seconds{kind}`** (histogram): how long each
   successful resume's restore took on its node, by `kind`. Placement time is
-  not included. The memory target is under 300 ms for a 1 GiB guest on local
-  NVMe.
+  not included. What a memory restore waits for depends on its
+  `memory_restore` mode (see
+  [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)).
+- **`legion_snapshot_capture_seconds{kind}`** (histogram): how long each
+  successful manual snapshot capture (`legion snapshot create`,
+  `CreateSnapshot`) took on its node, by `kind`. Suspends are
+  `legion_instance_suspend_seconds`, and fork captures are not observed.
+  Buckets run from 25 ms to 60 s.
+- **`legion_snapshot_restore_seconds{kind}`** (histogram): how long each
+  successful restore from a snapshot (`legion snapshot restore`, or an
+  instance [created from one](suspend-and-resume.md#create-from-a-snapshot))
+  took on its node, by the snapshot's `kind`. Resuming a suspended instance is
+  `legion_instance_resume_seconds`. Placement time is not included.
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
   by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
-  `pressure` (a node's `suspend` pressure step), or `make_room` (to make room
-  for a resume, see
+  `pressure` (a node's `suspend` pressure step), `park` (the workload
+  [parked](park.md) itself), or `make_room` (to make room for a resume, see
   [Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)).
 - **`legion_idle_sweep_suspends_total{outcome}`** (counter): suspends the
   idle sweep tried to start, by `outcome`: `started`, or `skipped` (the
@@ -412,8 +507,9 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   suspend reports 0, because its volume stays in place uncopied.
 - **`legion_checkpoint_publish_bytes{kind}`** (histogram): bytes a node
   uploaded to its `contentStore` to publish one checkpoint
-  (`durability = "store"`). 0 when the store already held every part, since
-  parts are keyed by digest.
+  (`durability = "store"`): only the chunks the store did not hold yet, so
+  a repeat checkpoint reports what changed. 0 when the store already held
+  every chunk ([How published parts are stored](suspend-and-resume.md#how-published-parts-are-stored)).
 - **`legion_checkpoint_publish_seconds{kind}`** (histogram): how long each
   successful publish took on its node, from 50 ms to 10 minutes.
 - **`legion_checkpoint_publish_total{outcome}`** (counter): publishes
@@ -434,18 +530,66 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
 Counted on the manager that served the request, so with several managers sum
 across them. See [session-mode.md](session-mode.md).
 
+- **`legion_session_runs_total{outcome}`** (counter):
+  [session runs](session-runs.md) this manager routed, by `outcome`: `ran`,
+  `deduplicated` (a node answered from a kept reply), `refused` (no node
+  took it: no envelope, or every one full), `failed` (the node it ran on
+  answered an error), and `runtime_disabled`.
 - **`legion_session_starts_total{outcome}`** (counter): session creates the
   session router answered, by `outcome`: `started`, `deduplicated` (an
   idempotent retry found the session running), `no_envelope` (no node holds
   an envelope for the task yet), `no_room` (every envelope was full by the
-  router's view), or `refused` (the nodes tried all refused). None of them
+  router's view), `refused` (the nodes tried all refused), or
+  `runtime_disabled` (the task's runtime is
+  [disabled](runtime-disable.md)). None of them
   writes the replicated store. A rising `no_room` or `refused` rate means
   the envelopes are too small for the arrival rate.
+- **`legion_sessions_envelope_free{job}`** (gauge): how many more sessions
+  of their task's size fit the job's envelopes right now: each envelope's
+  room less what its sessions hold, divided by one session's `resources`
+  (on the tightest key) and summed over the job's nodes and session tasks.
+  It is the burst a job can take before creates are refused with
+  `RESOURCE_EXHAUSTED`. Unlike the counters in this section it is a gauge
+  over the nodes whose heartbeats this manager holds, since that is where
+  their session reports land, so **sum it across managers**. Refreshed
+  every 10 seconds, from the sessions' last reports and this manager's own
+  starts since. An [elastic envelope](session-mode.md#elastic-envelopes)
+  counts at its current size, so the gauge can read low while the envelope
+  is about to grow. A job whose envelopes are gone (stopped, or not placed
+  yet) reads `0`. Alert on it falling toward the burst you need to absorb.
 - **`legion_session_stops_total{reason}`** (counter): sessions this manager
   ended on their nodes, by `reason`: `stop`, `destroy`, or `duplicate` (the
   later copy of a session id running on two nodes).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
+- **`legion_keyed_children_ended_total{end}`** (counter): keyed
+  [children](child-sessions.md#keyed-children) the scheduler lane's leader
+  ended because their owner ended some way other than an instance stop or
+  destroy (an allocation that completed or was lost, a job stop), by what
+  was applied: `stopped` or `destroyed`. An instance owner's own stop and
+  destroy end its children in the same entry and are not counted here.
+- **`legion_child_handoffs_total`** (counter, on workers): inbound
+  connections an owner handed to one of its children's ports
+  ([connection handoff](child-sessions.md#connection-handoff)).
+- **`legion_resizes_total{unit, outcome}`** (counter): in-place
+  [resizes](resize.md) this manager answered, by `unit` (`allocation`,
+  `instance`, `session`, or `task`) and `outcome`: `applied`, `deferred`,
+  `refused`, `needs_restart`, `not_supported`, `stale` (a shrink whose row
+  changed under it), or `error` (the unit's node did not answer). A task
+  resize counts once under `task` (`applied` or `reset`) and once per
+  allocation it touched under `allocation`. Dry runs are not counted. An applied allocation or instance resize is one scheduler-lane
+  write; a session resize writes nothing.
+- **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
+  envelope resizes nodes asked this manager for
+  ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`
+  (`grow` or `shrink`) and `outcome`: `applied`, `partial` (a grow that took
+  only the room the node had left), `refused` (a grow on a node with no free
+  room, or one that is draining or ineligible), `stale` (the node's view of
+  the size was out of date), `gone`, `invalid`, or `error` (the write did
+  not land; the node asks again). `applied` and `partial` are one
+  scheduler-lane raft entry each, and the rest write nothing. A steady
+  `refused` rate means envelopes want room their nodes do not have: add
+  nodes, or lower `stateful.envelope.max`.
 
 Two more are counted on the worker that holds the sessions, on its own
 listener ([Worker](#worker)):
@@ -532,6 +676,26 @@ status transitions are replicated. See
 - **`legion_liveness_checkpoint_seconds`** (histogram): wall-clock time of one
   replicated liveness checkpoint (the display-only batched write).
 
+### Scaling inputs
+
+Every manager rolls up the usage and service-graph samples its workers send,
+per (node, task), every 10 seconds, and ships them to the status-lane leader
+on the liveness digest RPC. The leader merges them and serves
+`GetScalingInputs`. See [autoscaling.md](autoscaling.md#scaling-inputs).
+
+- **`legion_scaling_rollup_syncs_total{outcome}`** (counter): rollup ticks.
+  `local` on the status-lane leader, which merges its own rollups with no
+  RPC. Elsewhere: `ok` (shipped and applied), `resync` (the leader held
+  nothing for this manager, usually after a takeover, and took a full set),
+  `error` (not delivered: no leader, unreachable, or a refused resync; the
+  next tick sends a full set). A manager whose `error` rate keeps rising
+  leaves its nodes' tasks reading `missing` on the leader.
+- **`legion_scaling_rollup_rows{kind}`** (gauge): rollups, one per (node,
+  task). `kind="local"` is what this manager built from its own workers at
+  the last tick; `kind="merged"` is what it holds from every manager while it
+  leads the status lane, and `0` elsewhere. `merged` grows with how widely
+  tasks spread across nodes, not with replica count or sample rate.
+
 ### Async runtime
 
 The manager's handlers run on a multi-threaded tokio runtime, and several of
@@ -541,12 +705,23 @@ CPU sits idle and no single operation is slow. These two families name that
 condition directly. Without them, everything just looks slow for no clear
 reason.
 
+- **`process_resident_memory_bytes`** (gauge): the manager process's
+  resident set size, read from `/proc/self/status` at each scrape. It keeps
+  the conventional Prometheus name (no `legion_` prefix) so stock process
+  dashboards pick it up. Linux only: it reads 0 on macOS.
+- **`legion_log_dropped_lines_total{sink}`** (counter): log lines this
+  manager process dropped because a sink's buffer was full. `sink` is
+  `console` (stdout), `file` (`./logs/events.log`), or `traces`
+  (`./traces/spans.json`). A server's log writers never block the thread
+  that logs, so a reader that falls behind (journald, a container runtime, a
+  slow disk) costs lines instead of stalling heartbeats. Anything above zero
+  means the log is incomplete for that period. Read at scrape time.
 - **`legion_runtime_worker_threads`** (gauge): worker threads in the
   runtime. Set once at startup. This is the ceiling on concurrent blocking
   handlers and the denominator for `legion_grpc_in_flight`.
-- **`legion_runtime_spawn_delay_seconds`** (histogram): a probe task is
-  spawned once a second and records how long it waited before its first
-  poll. Tens of microseconds is a healthy runtime. Milliseconds means no
+- **`legion_runtime_spawn_delay_seconds`** (histogram): once a second a
+  timer wakes the probe, which spawns a task and records how long after the
+  timer's deadline that task was first polled. Tens of microseconds is a healthy runtime. Milliseconds means no
   worker thread was free to pick up trivial work. That points to blocking
   handlers, not load: the delay lands on unrelated RPCs, so a do-nothing
   endpoint's p99 rises along with an expensive one's. Buckets start at 50µs,
@@ -671,8 +846,9 @@ these families can tell you which is the case.
   the lane, else `0`. Summed across managers, each lane should be exactly 1.
   A flapping series shows leadership churn.
 - **`legion_raft_capture_seconds{lane}`** (histogram): the local capture
-  phase of a replicated op: run the mutation, collect its changeset, roll
-  back. This is purely local store work.
+  phase of one raft entry: run every op of the batch, collect and combine
+  their changesets, and roll back (or, under `single`, commit locally with
+  an undo record). This is purely local store work.
 - **`legion_raft_propose_apply_seconds{lane}`** (histogram): the
   propose → quorum-commit → local-apply round-trip of a replicated op.
   Use it to find the bottleneck by comparing against
@@ -681,14 +857,17 @@ these families can tell you which is the case.
   replication pipeline (network, fsync, follower lag).
 - **`legion_raft_ops_total{lane,op,outcome}`** (counter): replicated store
   ops by outcome:
-  - `applied`.
-  - `empty`: the mutation touched no rows and skipped the raft entry.
+  - `applied`: the op's rows rode a committed raft entry.
+  - `empty`: the mutation touched no rows (its batch may still have
+    produced an entry for other ops).
   - `not_leader`: proposal rejected before capture. This is normal on
     followers under divergent lane leadership.
   - `error`.
 
-  `op` is the operation name, so you can see which ops keep a lane busy. A
-  lane's `applied` count is its quorum-round count, so
+  `op` is the operation name, so you can see which ops keep a lane busy.
+  Ops that queue together share one raft entry (group commit), so a lane's
+  quorum-round count is `legion_raft_entry_ops_count`, not the `applied`
+  count; still,
   `topk(10, sum by (lane, op) (rate(legion_raft_ops_total{outcome="applied"}[1m])))`
   is the list to shorten when a lane is the limit.
 
@@ -711,7 +890,48 @@ these families can tell you which is the case.
   constraint.
 - **`legion_raft_pipeline_depth{lane}`** (gauge): ops queued to a lane's
   pipeline thread and not yet started. Sustained depth above 1 means writes
-  on that lane are waiting in line behind each other.
+  on that lane are waiting in line behind each other (and will share the
+  next entry).
+- **`legion_raft_entry_ops{lane}`** (histogram): ops committed per raft
+  entry. The pipeline takes everything queued (up to 64 ops, or until the
+  changesets reach 128 KiB) into one entry, so ops waiting behind an
+  in-flight entry share its successor's capture, quorum round trip, log
+  fsync, and apply. Mostly 1 on a quiet lane; larger under bursts.
+  `_count` is the lane's raft-entry count.
+- **`legion_raft_speculation_total{lane,outcome}`** (counter, `single`
+  topology): batches the leader committed locally before their entry
+  applied (`committed`), resolved by their own entry without re-running
+  (`matched`), and reverted because the log went another way (`undone`:
+  leadership lost or the entry truncated). `undone` should be rare and
+  track leadership changes; see
+  [multi-raft.md](multi-raft.md#the-write-path-group-commit-and-single-execution).
+- **`legion_raft_state_syncs_total{lane,outcome}`** (counter): state-DB
+  fsyncs run as the purge barrier before a raft log purge, `ok` or
+  `error`. The state DB runs `synchronous=NORMAL`; this barrier is what keeps
+  its applied index durable past the log's purge horizon. An `error` fails
+  the purge (the log is kept) and is worth paging on: it usually means the
+  disk is failing.
+- **`legion_raft_log_retained_seconds{lane}`** (gauge): age of the oldest
+  entry still in the lane's raft log: how long a manager can be down and
+  still catch up by log replay rather than a full snapshot install. Sized
+  by `raft.logRetainBytes`; it shrinks as the write rate grows.
+- **`legion_leader_forwards_total{lane,op,outcome}`** (counter): store
+  writes this manager forwarded to the lane's leader because it does not
+  lead the lane, by `outcome`: `ok` (the leader executed it) or `failed` (no
+  leader known, unreachable, the target lost leadership too, or the op
+  failed there; the caller sees the original not-the-leader error). Only
+  writes that cannot wait for a leader forward: worker heartbeats and health
+  reports, failure and completion reports, and a follower's own config row.
+  A steady `ok` rate on a follower is normal (workers heartbeat to whichever
+  manager they dialed); a `failed` rate means those reports are not landing.
+  Recorded on the forwarding manager.
+- **`legion_plugin_panics_total{kind,name}`** (counter): dylib plugin calls
+  that panicked (`kind` is `scheduling`, `rollouts`, `node_checks`, or
+  `artifacts`). The panic was contained and the plugin quarantined until the
+  process restarts: a quarantined scheduling plugin places with `bin_pack`,
+  a rollout strategy fails its resolves, a fetcher fails its fetches, and a
+  node check shows as a failing health check. Any non-zero value needs the
+  plugin fixed or removed (docs/plugin-system.md, "Panics and quarantine").
 
 The gauge series refresh on the node-status-checker tick, on leaders and
 followers alike. The histograms and the op counter are recorded at the
@@ -761,6 +981,14 @@ root key is per-manager state ([kv-encryption.md](kv-encryption.md)).
   key provider calls (`describe` | `wrap` | `unwrap`) by outcome (`ok` |
   `error`). These never happen on a KV read or write path. A rising `error`
   series with an `exec` provider points to a KMS problem.
+- **`legion_cluster_ca_provider_calls_total{provider,op,outcome}`**
+  (counter): cluster CA provider calls ([The Cluster CA](cluster-ca.md)) by
+  provider (`builtin` | `file` | `exec`), operation (`load` for `file`,
+  `describe` for `exec`, `sign`), and outcome (`ok` | `error` | `refused`).
+  `refused` counts certificates a provider returned that Legion would not
+  hand out (wrong names, wrong key, too long, not chaining to the bundle):
+  alert on it. A rising `error` series with `exec` points to the external
+  CA or its helper.
 
 ### Worker
 
@@ -774,6 +1002,10 @@ and `/healthz`. A worker has no store or quorum to probe, so there is no
 `/readyz`. The manager's node health and heartbeat state is the cluster's view
 of worker readiness. Default: disabled.
 
+- **`legion_worker_log_dropped_lines_total{sink}`** (counter): the worker
+  process's own dropped log lines, by sink. See
+  `legion_log_dropped_lines_total` under [Async runtime](#async-runtime);
+  this is the same count for a worker.
 - **`legion_worker_heartbeats_total{outcome}`** (counter): heartbeat
   round-trips attempted, by outcome (`ok` | `error` | `unauthenticated`).
   A rising `error` rate is the worker-side view of manager unreachability.
@@ -795,6 +1027,16 @@ of worker readiness. Default: disabled.
   flow was handed off), `error` (timeout, bad reply, no endpoint).
 - **`legion_net_handler_seconds`** (histogram): wall-clock time of one `authz`
   webhook call. Cache hits are not observed.
+- **`legion_net_plugin_calls_total{plugin,stage,outcome}`** (counter): WASM
+  [network plugin](network-plugins.md) callbacks by stage (`connect`,
+  `request`, `body`, `response`, `done`) and outcome (`ok`, `error`: a trap,
+  exhausted fuel, a deadline, a memory limit).
+- **`legion_net_plugin_callback_seconds`** (histogram): wall-clock time of
+  one plugin callback.
+- **`legion_net_plugin_metric{plugin,scope,name}`** (gauge): the current value
+  of each metric a plugin module defines (`define_metric`), per scope
+  (`policy`, or `job:<id>` for a job's own reference). At most 64 per scope;
+  plugin authors choose the names, so keep them few.
 - **`legion_worker_heartbeat_duration_seconds`** (histogram): wall-clock
   time of one heartbeat round-trip (status report plus reconcile against the
   manager's reply). In a scale test, use it to show the workers are not the
@@ -803,6 +1045,13 @@ of worker readiness. Default: disabled.
   node's memory pressure response took, by `step` (`reclaim`,
   `evict-bursting`, `evict-reserved`). Counted when the worker acts, before
   the manager hears about it.
+- **`legion_worker_parks_total{outcome}`** (counter): what the
+  [park sockets](park.md) on this node did, by `outcome`: `parked` (a
+  `park` accepted), `unparked` (a pending park cancelled by `unpark` or
+  `busy`), `suspended` (a deadline passed and the suspend ran), `failed`
+  (the suspend did not, and the task keeps running). `parked` well above
+  `suspended` plus `unparked` means parks are being replaced before their
+  deadlines.
 - **`legion_worker_allocations_running`** (gauge): allocations this worker
   currently runs, as reported on its last heartbeat.
 - **`legion_worker_allocation_failures_reported_total`** (counter):
@@ -813,6 +1062,37 @@ that has never taken a provisional start.
 
 - **`legion_provisional_starts_total{origin,gate}`** (counter): provisional
   allocations admitted, by `origin` (`manager` | `edge`) and gate.
+- **`legion_derived_builds_total{kind,outcome}`** (counter):
+  [derived content](artifacts.md#derived-content) builds on this node, by
+  `kind` (`rootfs` today) and `outcome`: `built` (the entry was kept), or why
+  it was not (`oversized`, `below_min_free`, `no_room`, `duplicate`,
+  `disabled`, `error`). A build that is not kept still served the start that
+  needed it.
+- **`legion_derived_build_seconds{kind}`** (histogram): how long one build
+  took. For `rootfs` this is extracting the image and formatting the disk.
+- **`legion_derived_hits_total{kind}`** (counter): uses served by an entry
+  already on the node. Hits against builds is the class's hit rate.
+- **`legion_derived_bytes`** (gauge): disk the derived class holds, in
+  allocated blocks. Compare it with `content.budgets.derived`.
+- **`legion_content_store_bytes{class}`** (gauge): bytes the node
+  [content store](artifacts.md) holds, by `class`: `artifacts` (fetched
+  artifacts and image layers), `snapshots` (checkpoint parts, local
+  snapshots and suspends included), and `derived`. Refreshed on every
+  heartbeat, so it lags a write by at most one interval. For `derived` it
+  is the same number as `legion_derived_bytes` (allocated blocks), which is
+  updated on every change instead.
+- **`legion_content_store_pinned_bytes{class}`** (gauge): of those, the
+  bytes held by a pin (a snapshot's parts, content a task is using). Budget,
+  TTL, and `minFreeDisk` eviction cannot free them. A class whose pinned
+  bytes reach its budget refuses new content.
+- **`legion_content_store_budget_bytes{class}`** (gauge): each class's
+  budget (`content.budgets.<class>`). Alert on `bytes / budget` for
+  `snapshots` to see a node running out of room for checkpoints before
+  `legion node usage` reports it full.
+- **`legion_runtime_disabled_refusals_total{runtime}`** (counter): starts
+  this worker refused because their runtime is
+  [disabled](runtime-disable.md): placements, session starts, claims,
+  resumes, and restarts. Zero on a node that never held a disable.
 - **`legion_provisional_refused_total{reason}`** (counter): ratifications
   refused. A rising `instance_claimed` rate points to a routing problem (two
   edges racing for one sandbox) rather than a cluster problem. `no_capacity`
@@ -828,6 +1108,20 @@ that has never taken a provisional start.
   It makes started-but-unconfirmed capacity visible. A value that does not
   return to zero means claims are leaking.
 
+The node's claim window ([edge-boot.md](edge-boot.md#overload)) adds two:
+
+- **`legion_worker_claim_window`** (gauge): how many unratified edge claims
+  the node admits at once right now. It sits at
+  `edgeBoot.maxProvisionalPerNode` while ratifications come back within
+  `edgeBoot.overloadThreshold` of their lease. A value below it means the
+  node has seen slow ratifications and is shedding.
+- **`legion_worker_claim_overload_refusals_total`** (counter): edge starts
+  refused `OVERLOADED` because the window stayed full for
+  `edgeBoot.queueTimeout`. Each one held nothing and spent no ticket. A
+  rising rate with the window below its ceiling means the managers are
+  behind on ratification. Look at `legion_provisional_ratify_seconds` and
+  the scheduler lane before raising `maxProvisionalPerNode`.
+
 Session starts on the node ([session-mode.md](session-mode.md)) add two:
 
 - **`legion_worker_launch_refusals_total`** (counter): provisional starts
@@ -838,6 +1132,86 @@ Session starts on the node ([session-mode.md](session-mode.md)) add two:
 - **`legion_worker_edge_session_starts_total`** (counter): sessions this
   node started from a session ticket (`Worker.StartSession`), not counting
   deduplicated retries.
+- **`legion_worker_session_runs_total{outcome}`** (counter):
+  [session runs](session-runs.md) this node drove, by `outcome`: `ran` (the
+  command exited, with any status), `stopped` (`run.wall`, memory, or the
+  session ending stopped it), `failed` (the run could not start or finish).
+  A retry answered from a kept reply is not counted. Runs on
+  [isolate](task-runtime-isolate.md) tasks are counted here too, in either
+  tier.
+
+The [isolate runtime](task-runtime-isolate.md#observing) adds these
+families. None has a `job` or `task` label (per-task numbers are in
+`legion isolate stats`), and the CPU counter is in microseconds:
+
+- **`legion_isolate_instantiate_seconds{image}`** (histogram): time to a
+  ready instance for an invocation, by `image` (`python`, `js`, `module`).
+  Warm starts are not observed. Buckets run from 10 µs to 100 ms.
+- **`legion_isolate_turns_total`** (counter): isolate turns run on this node.
+- **`legion_isolate_cpu_microseconds_total`** (counter): CPU time isolates
+  used on this node, in microseconds.
+- **`legion_isolate_resident{tier}`** (gauge): isolates on this node by
+  `tier`: `hot`, `paged_out`, `hibernated`.
+- **`legion_isolate_wakes_total{from}`** (counter): isolate starts by kind:
+  `fresh`, `warm`, `paged`, `hibernated`.
+- **`legion_isolate_stopped_total{reason}`** (counter): invocations stopped
+  before they finished, by `reason`: `limits`, `unsupported`, `trap`,
+  `ended`.
+- **`legion_isolate_limit_total{limit}`** (counter): invocations stopped by
+  a limit, by `limit`: `cpu`, `wall`, `memory`. `limits.output` truncates
+  and never stops a run, so it has no value here.
+- **`legion_isolate_vm_runs_total{reason}`** (counter): runs of isolate
+  tasks sent to the VM tier, by `reason`: `requested`, `disabled`
+  (the runtime is disabled), `import` (the pre-flight scan), `memo`.
+- **`legion_isolate_child_vms`** (gauge): child VMs isolates own on this
+  node.
+- **`legion_isolate_compile_seconds`** (histogram): time to compile one
+  isolate module on this node.
+- **`legion_isolate_host_rss_bytes{cordon}`** (gauge): resident set of each
+  cordon's host processes, summed over its replicas. `cordon` is the
+  cordon's name: `ns:<namespace>`, `job:<job id>`, or `shared`.
+- **`legion_isolate_slots{cordon,state}`** (gauge): memory slots of a
+  cordon's host processes, by `state`: `used`, `free`.
+
+Every task start on the node adds one histogram:
+
+- **`legion_task_start_stage_seconds{runtime,stage}`** (histogram): wall-clock
+  time of each stage of a task start, from the moment the node has the work
+  to the moment the workload is healthy. It is the place to look when starts
+  are slow, because it says which stage is slow. Buckets run from 1 ms to
+  2 minutes.
+
+  | `stage` | What it times | Recorded for |
+  | --- | --- | --- |
+  | `staging` | Artifact staging, including a restore's snapshot fetch, on its own thread | Tasks with artifacts (every container image when `containerImageDesugar` is on) |
+  | `volumes` | Volume mounts, including a restore's volume rollback | Tasks with volumes |
+  | `prepare` | Artifact consumption and the runtime's `prepare` | Every start |
+  | `start` | The runtime's `start`. The process or VMM is spawned when it returns | Every start that is not a restore |
+  | `restore` | A restore from a checkpoint, in place of `start` | Restores |
+  | `register` | From `start` returning to the start being recorded: the wait for the worker's task lock, and the state-file write | Every start |
+  | `total` | From the node having the work to the start being recorded. Every stage above falls inside it | Every start |
+  | `health` | From the start being recorded to the first passing check | Tasks with `boot` or `health` checks |
+
+  The sandbox runtime also reports its own sub-stages of `start`, in order:
+  `network` (the guest's TAP device and address lease, TAP sandboxes only),
+  `image` (the kernel and the image's OCI layout and config), `root_disk`
+  (the root disk's fingerprint, then a reuse or a build), `vmm_config` (a
+  checkpoint launch's device links and identity disk, the balloon, and the
+  VMM's config), and `vmm_spawn` (spawning the VMM). The guest boots after
+  `vmm_spawn`, so the guest's own boot falls inside `health`.
+
+  Stages nest, so don't sum them across `stage`. A restart in place (a
+  failed health check under `onUnhealthy`) is timed as a start of its own,
+  with `start`, `register`, and `total`. For a claim held at the `stage` gate
+  ([edge-boot.md](edge-boot.md)), `total` includes the wait for its
+  ratification. The worker also logs one `Task allocation started` line per
+  start with the same breakdown in milliseconds, for a single slow start:
+
+  ```text
+  INFO Task allocation started allocation_id=4312 task_name=box task_runtime=sandbox
+    total_ms=2611 stages="staging=1204ms prepare=1ms image=2ms root_disk=1380ms
+    vmm_config=1ms vmm_spawn=3ms start=1389ms register=2ms"
+  ```
 
 #### Simulated fleets
 

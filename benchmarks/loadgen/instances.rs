@@ -25,8 +25,10 @@
 //!   control plane's share of a cold boot; the simulated node "boots" in
 //!   `--ready-after`).
 //! - `suspend`: `SuspendInstance` sent → `instance.suspended`. The capture
-//!   request and its report each ride a heartbeat, so this includes up to
-//!   two heartbeat intervals by design.
+//!   request is pushed on the node's work stream and its report goes out on
+//!   an immediate heartbeat, so this is two round trips plus the commits,
+//!   whatever the heartbeat cadence (the simulated capture itself is
+//!   instant).
 //! - `resume_dispatch`: `StartInstance` sent → the node holds the restore
 //!   payload.
 //! - `resume`: `StartInstance` sent → `instance.resumed`.
@@ -240,6 +242,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
         clients[0]
             .clone()
             .run_job(tonic::Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: spec.clone(),
                 submissions: vec![Submission {
                     path: format!("{}.json", opts.job),
@@ -249,6 +252,8 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await
             .context("submitting the instances job")?;
@@ -538,6 +543,7 @@ async fn session(
             instance_id: instance_id.clone(),
             idempotency_key: None,
             cold: false,
+            force_move: false,
         }))
         .await
         .context("StartInstance")?;

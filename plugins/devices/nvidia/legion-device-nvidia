@@ -1,0 +1,144 @@
+#!/bin/sh
+# legion-device-nvidia: the reference NVIDIA GPU device plugin for Legion
+# (protocol legion-device/1, docs/devices.md). It wraps `nvidia-smi`.
+#
+#   devices.plugins.nvidia = {
+#     command = ["/opt/legion/plugins/devices/nvidia/legion-device-nvidia"],
+#     # With a CDI spec from `nvidia-ctk cdi generate --format=json
+#     #   --output=/etc/cdi/nvidia.json`, containers also get the driver
+#     #   libraries and the ldcache hook:
+#     # command = [".../legion-device-nvidia", "--cdi=index"],   # or --cdi=uuid
+#   }
+#
+# fingerprint: one group per GPU model, one instance per GPU (id = GPU UUID)
+# with index, pciBusId, numaNode (from sysfs), and peerGroup (GPUs joined by
+# NVLink, from `nvidia-smi topo -m`). A GPU with uncorrected volatile ECC
+# errors is reported unhealthy; a GPU that falls off the bus is simply gone.
+#
+# allocate: NVIDIA_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES set to the UUIDs,
+# and the device nodes (/dev/nvidiaN, /dev/nvidiactl, /dev/nvidia-uvm,
+# /dev/nvidia-uvm-tools). With --cdi=..., it names the CDI devices instead
+# and Legion resolves them from the CDI spec, which also mounts the
+# user-space driver libraries.
+#
+# NOT YET RUN ON REAL GPU HARDWARE. The parsing follows nvidia-smi's
+# documented CSV and topology formats; treat it as a reference to adapt.
+set -eu
+
+cdi=""
+for arg in "$@"; do
+    case "$arg" in
+    --cdi=index | --cdi=uuid) cdi=${arg#--cdi=} ;;
+    *) echo "legion-device-nvidia: unknown argument $arg" >&2; exit 2 ;;
+    esac
+done
+
+request=$(cat)
+command -v nvidia-smi >/dev/null 2>&1 || {
+    echo "nvidia-smi is not installed on this node (install the NVIDIA driver)" >&2
+    exit 1
+}
+
+# index, uuid, name, memory MiB, driver, pci bus id, compute capability,
+# uncorrected volatile ECC errors.
+gpus() {
+    nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version,pci.bus_id,compute_cap,ecc.errors.uncorrected.volatile.total \
+        --format=csv,noheader,nounits | sed 's/, /,/g'
+}
+
+# "index root" for every GPU joined to another by NVLink: root is the lowest
+# index of its NVLink-connected set.
+peer_groups() {
+    nvidia-smi topo -m 2>/dev/null | awk '
+        function find(x) { while (parent[x] != x) x = parent[x]; return x }
+        /^GPU[0-9]+/ {
+            i = substr($1, 4) + 0
+            if (!(i in parent)) parent[i] = i
+            for (k = 2; k <= NF; k++) {
+                if ($k ~ /^NV[0-9]+$/) {
+                    j = k - 2
+                    if (!(j in parent)) parent[j] = j
+                    a = find(i); b = find(j)
+                    if (a != b) { if (a < b) parent[b] = a; else parent[a] = b }
+                    linked[i] = 1; linked[j] = 1
+                }
+            }
+        }
+        END { for (g in linked) print g, find(g) }'
+}
+
+numa_node() {
+    # nvidia-smi: 00000000:07:00.0; sysfs: 0000:07:00.0
+    bus=$(printf '%s' "$1" | tr 'A-F' 'a-f' | sed 's/^0000\(....:\)/\1/')
+    cat "/sys/bus/pci/devices/$bus/numa_node" 2>/dev/null || echo -1
+}
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+fingerprint() {
+    peers=$(peer_groups || true)
+    models=$(gpus | cut -d, -f3 | sort -u)
+    printf '{"devices":['
+    first_group=1
+    printf '%s\n' "$models" | while IFS= read -r model; do
+        [ -n "$model" ] || continue
+        model_id=$(printf '%s' "$model" | sed 's/^NVIDIA //; s/[ \/,=]/-/g')
+        [ $first_group -eq 1 ] || printf ','
+        first_group=0
+        memory=""; driver=""; cc=""
+        instances=""
+        while IFS=, read -r index uuid name mem drv bus capability ecc; do
+            [ "$name" = "$model" ] || continue
+            memory=$mem; driver=$drv; cc=$capability
+            healthy=true; detail=""
+            case "$ecc" in
+            '' | 0 | '[N/A]' | 'N/A') ;;
+            *) healthy=false; detail="uncorrected ECC errors: $ecc" ;;
+            esac
+            numa=$(numa_node "$bus")
+            peer=$(printf '%s\n' "$peers" | awk -v i="$index" '$1 == i { print "nvlink-" $2 }')
+            attrs="\"index\":$index,\"pciBusId\":\"$(json_escape "$bus")\""
+            [ "$numa" -ge 0 ] 2>/dev/null && attrs="$attrs,\"numaNode\":$numa"
+            [ -n "$peer" ] && attrs="$attrs,\"peerGroup\":\"$peer\""
+            instance="{\"id\":\"$(json_escape "$uuid")\",\"healthy\":$healthy"
+            [ -n "$detail" ] && instance="$instance,\"healthDetail\":\"$detail\""
+            instance="$instance,\"attributes\":{$attrs}}"
+            instances="${instances:+$instances,}$instance"
+        done <<EOF
+$(gpus)
+EOF
+        printf '{"vendor":"nvidia","type":"gpu","model":"%s",' "$(json_escape "$model_id")"
+        printf '"attributes":{"name":"%s","memoryMiB":%s,"driver":"%s","computeCapability":"%s"},' \
+            "$(json_escape "$model")" "${memory:-0}" "$(json_escape "$driver")" "$(json_escape "$cc")"
+        printf '"instances":[%s]}' "$instances"
+    done
+    printf ']}\n'
+}
+
+allocate() {
+    ids=$(printf '%s' "$request" | sed 's/.*"ids":\[\([^]]*\)\].*/\1/' | tr -d '" ')
+    nodes=""
+    cdi_devices=""
+    for uuid in $(printf '%s' "$ids" | tr ',' ' '); do
+        index=$(gpus | awk -F, -v u="$uuid" '$2 == u { print $1 }')
+        [ -n "$index" ] || { echo "GPU $uuid is not on this node" >&2; exit 1; }
+        nodes="${nodes:+$nodes,}{\"path\":\"/dev/nvidia$index\"}"
+        case "$cdi" in
+        index) cdi_devices="${cdi_devices:+$cdi_devices,}\"nvidia.com/gpu=$index\"" ;;
+        uuid) cdi_devices="${cdi_devices:+$cdi_devices,}\"nvidia.com/gpu=$uuid\"" ;;
+        esac
+    done
+    for shared in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools; do
+        [ -e "$shared" ] && nodes="$nodes,{\"path\":\"$shared\"}"
+    done
+    printf '{"containerEdits":{"env":["NVIDIA_VISIBLE_DEVICES=%s","CUDA_VISIBLE_DEVICES=%s"],"deviceNodes":[%s]}' \
+        "$ids" "$ids" "$nodes"
+    [ -n "$cdi_devices" ] && printf ',"cdiDevices":[%s]' "$cdi_devices"
+    printf '}\n'
+}
+
+case "$request" in
+*'"op":"fingerprint"'*) fingerprint ;;
+*'"op":"allocate"'*) allocate ;;
+*) echo "legion-device-nvidia: unsupported request" >&2; exit 2 ;;
+esac

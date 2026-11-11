@@ -80,7 +80,7 @@
       config = {
         command = ["sleep", "1"],
       },
-      on_unhealthy = {
+      onUnhealthy = {
         restartCount = 1,
         restartPeriod = "1m",
         restartDelay = "10s",

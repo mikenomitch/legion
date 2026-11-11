@@ -24,10 +24,10 @@ task". The word is spent.
 
 **It does not distinguish the axis.** `kind` is Legion's generic discriminator
 and appears on at least five unrelated things: health checks
-(`TaskCheckKind`, `src/structs/job.rs:480`), scheduler events
-(`src/storage/events.rs:29`), evals (`src/structs/eval.rs:31`), auth methods
-(`src/manager/auth_method.rs`), and the plugin manifest's category
-(`src/plugin_runtime.rs:10`, the `plugins/<kind>/<name>/` directory). Grepping
+(`TaskCheckKind`, `crates/common/src/structs/job.rs:480`), scheduler events
+(`crates/manager/src/storage/events.rs:29`), evals (`crates/manager/src/manager/eval.rs:31`), auth methods
+(`crates/manager/src/manager/auth_method.rs`), and the plugin manifest's category
+(`crates/worker/src/plugin_runtime.rs:10`, the `plugins/<kind>/<name>/` directory). Grepping
 `kind` to find the task-execution axis returns mostly noise, and a reader of
 `task.kind` next to `check.kind` has no signal that these are different concepts.
 
@@ -131,34 +131,34 @@ impl TaskPlugin for ContainerRuntime {
 
 ## 5. Background — what exists today
 
-**The jobspec field.** `TaskConfig.kind: String` (`src/structs/job.rs:1120`) and
-its deserialization twin `TaskConfigInput.kind` (`src/structs/job.rs:1557`).
-Constructed by `TaskConfig::new(name, kind)` (`src/structs/job.rs:1856`), used
+**The jobspec field.** `TaskConfig.kind: String` (`crates/common/src/structs/job.rs:1120`) and
+its deserialization twin `TaskConfigInput.kind` (`crates/common/src/structs/job.rs:1557`).
+Constructed by `TaskConfig::new(name, kind)` (`crates/common/src/structs/job.rs:1856`), used
 across the codebase as `task.kind`.
 
 **The wire field.** `string task_kind = 7` (`proto/legion.proto:3144`).
 
 **The DB column.** `task_config.kind STRING NOT NULL`
-(`src/storage/migrations.rs:82`), read positionally in three query sites
-(`src/storage/store.rs:521`, `:1212`, `:1500`) and bound as `":kind"` at
-`src/storage/store.rs:2527`.
+(`crates/manager/src/storage/migrations.rs:82`), read positionally in three query sites
+(`crates/manager/src/storage/store.rs:521`, `:1212`, `:1500`) and bound as `":kind"` at
+`crates/manager/src/storage/store.rs:2527`.
 
 **The plugin registry.** `TaskPluginRegistry::load_plugin(&mut self, kind: &str, …)`
-and `plugin(&self, kind: &str)` (`src/task_plugins/mod.rs:317`, `:330`), plus
+and `plugin(&self, kind: &str)` (`crates/worker/src/task_plugins/mod.rs:317`, `:330`), plus
 `kind_is_host_level(kind: &str)` (`:144`) which the manager calls to pick the
 `host` ACL flag before proxying an exec.
 
 **The collision.** Two existing uses of `runtime` stand in the way.
 
-1. **`TaskRuntime`** (`src/task_plugins/mod.rs:112`) is *per-task live execution
+1. **`TaskRuntime`** (`crates/worker/src/task_plugins/mod.rs:112`) is *per-task live execution
    state* — `child`, `pid`, `alloc_dir`, `task_dir`, `extra_env`,
    `staged_artifacts`, `log_dir`. It is public plugin API
    (`legion::task_plugins::TaskRuntime`), passed `&mut` to every `TaskPlugin`
    method, and held in `task_manager.rs`'s `runtimes` map (~66 uses in
-   `src/worker/task_manager.rs`, ~15 in `src/task_plugins/container.rs`).
+   `crates/worker/src/worker/task_manager.rs`, ~15 in `crates/worker/src/task_plugins/container.rs`).
    Post-rename it would read as `runtime: &mut TaskRuntime` for a task whose
    `runtime` is `"container"` — two meanings in one signature.
-2. **`ContainerRuntime`** (`src/task_plugins/container.rs:59`) is the *OCI
+2. **`ContainerRuntime`** (`crates/worker/src/task_plugins/container.rs:59`) is the *OCI
    runtime* — Apple `container` vs a `docker`/`podman` binary. Its local
    bindings are already spelled `runtime_kind` (`:285`, `:373`, `:452`), which a
    mechanical `kind` → `runtime` pass would turn into `runtime_runtime`.
@@ -234,13 +234,13 @@ Ordering within the single phase, chosen so the compiler drives correctness:
 - **Compiler as the primary check.** Renaming a struct field and a public type
   makes every stale reference a hard error; `cargo build --all` passing is most
   of the coverage.
-- **`tests/config_jobs.rs`** parses every `configs/jobs/*.jsonnet`, so it is the
+- **`tests/integration/config_jobs.rs`** parses every `configs/jobs/*.jsonnet`, so it is the
   regression net for the config surface.
-- **New unit test in `src/structs/job.rs`**: a jobspec using `kind:` is rejected,
+- **New unit test in `crates/common/src/structs/job.rs`**: a jobspec using `kind:` is rejected,
   and the error message names `runtime`.
 - **New migration test**: an existing DB with a populated `task_config.kind`
   migrates and the value is readable as `runtime`.
-- **`tests/acl_endpoints.rs`** re-run per AGENTS.md, since the proto is touched.
+- **`tests/integration/acl_endpoints.rs`** re-run per AGENTS.md, since the proto is touched.
 - **Full suite**: `cargo fmt --all`, `cargo clippy --all -- -D warnings`,
   `cargo test --all --locked`.
 

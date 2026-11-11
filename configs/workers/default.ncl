@@ -18,10 +18,12 @@
             parallelism = 4,
             # Per-artifact retries before the allocation fails.
             attempts = 3,
-            # Overall fetch deadline per artifact.
-            timeout = "10m",
-            # Per-artifact size cap; also bounds decompression.
-            maxArtifactSize = "50GiB",
+            # Overall fetch deadline per artifact. Generous by default so a
+            # model checkpoint of a few hundred GB fetches over a 1 Gbps link.
+            timeout = "2h",
+            # Per-artifact size cap; also bounds decompression. Lower it for
+            # nodes that fetch from sources you do not trust.
+            maxArtifactSize = "1TiB",
         },
     },
     # The node content store (docs/artifacts.md, "The node content store"):
@@ -40,8 +42,15 @@
         # same as leaving it unset. Shares, defaults included, must add up
         # to at most 100%.
         budgets = {
-            # Unset: 10% of the disk, clamped to 1GiB..20GiB.
-            # artifacts = "20GiB",
+            # Unset: 50% of the disk, at least 1GiB, no ceiling: room for
+            # model weights. Cap a share with an object:
+            # artifacts = { share = "50%", max = "2TiB", min = "10GiB" },
+            # or set a fixed size: artifacts = "200GiB",
+            # Unset: 10% of the disk, clamped to 1GiB..20GiB. Holds derived
+            # content: what Legion builds on the node and can rebuild, such
+            # as each sandbox image's base root disk (docs/artifacts.md,
+            # "Derived content"). "0" turns it off.
+            # derived = "40GiB",
             # Unset: 20% of the disk, clamped to 2GiB..200GiB. Holds memory
             # checkpoints: local ones pinned until resumed or deleted,
             # published ones (suspend.durability = "store") as evictable
@@ -58,11 +67,14 @@
     },
     # Where this worker publishes content (docs/artifacts.md, "Publishing
     # content"). Absent by default: the node publishes nothing. Every part
-    # is sealed (AES-256-GCM) with a key the manager sends, and lands at
-    # <url>/sealed/<name>, so the bucket never holds plaintext and
-    # publishing is idempotent. Any worker that can read the URL and is sent
-    # the key fetches it back through the ordinary s3:// or file:// artifact
-    # fetcher, opened and verified by digest. Point each
+    # is cut into chunks, and each distinct non-zero chunk is sealed
+    # (AES-256-GCM) and lands once at <url>/sealed/<name>, beside a sealed
+    # index per part, so the bucket never holds plaintext and a repeat
+    # checkpoint uploads only what changed (docs/suspend-and-resume.md, "How
+    # published parts are stored"). Any worker that can read the URL and is
+    # sent the part's key fetches it back, opened and verified by digest.
+    # Expire sealed/ with a bucket lifecycle rule older than your
+    # longest-lived checkpoint plus dedupWindow. Point each
     # region's workers at their own bucket for region locality. A worker
     # with a contentStore publishes durable checkpoints
     # (suspend.durability = "store", `legion snapshot create --publish`) and
@@ -74,6 +86,13 @@
     #     # variables, then the instance profile). Or read an AWS credential
     #     # object from KV, the same shape artifact auth.kv takes:
     #     # auth = { kv = "legion/content-store" },
+    #     # The size parts are cut into: 64KiB to 16MiB, a multiple of 4KiB.
+    #     # Smaller uploads fewer unchanged bytes per change, and makes more
+    #     # objects and requests.
+    #     # chunkSize = "1MiB",
+    #     # How long chunks are shared between publishes. A chunk is reused
+    #     # only in the window it was uploaded in. At least 1m.
+    #     # dedupWindow = "24h",
     # },
     # Sessions (docs/session-mode.md, "No split brain"). Only acts on
     # sessions whose task sets suspend.durability = "store", which need a
@@ -173,6 +192,17 @@
             # host network can then also read the node's traffic.
             # "NET_RAW",
         ],
+        # OCI runtimes a task can pick with config.runtimeClass
+        # (docs/task-runtime-container.md, "Runtime classes"). The worker
+        # runs `<path> --version` at start and advertises the classes that
+        # answer as container.runtimeClasses. isolatesRoot = true says the
+        # runtime keeps container root off host root itself (a user-space
+        # kernel, a VM), so floor parts it cannot apply are dropped instead
+        # of refusing the task.
+        # runtimeClasses = {
+        #     gvisor = { path = "/usr/local/bin/runsc", userNamespace = false, isolatesRoot = true },
+        #     kata = { path = "/usr/bin/kata-runtime", userNamespace = false, isolatesRoot = true },
+        # },
     },
     # Whether this node serves `Worker.StartClaim` — that is, whether it will
     # start work on a boot ticket at all (docs/edge-boot.md). Off by default
@@ -191,11 +221,67 @@
     #     launchConcurrency = 0,
     #     # How long a start waits for a launch slot before the node refuses
     #     # it with RESOURCE_EXHAUSTED (retryable), so the picker tries the
-    #     # next node.
+    #     # next node. An edge start also waits up to this long for room in
+    #     # the claim window below before it is refused OVERLOADED.
     #     queueTimeout = "1s",
+    #     # The most unratified edge claims this node holds at once, and the
+    #     # ceiling of its claim window (docs/edge-boot.md, "Overload").
+    #     maxProvisionalPerNode = 32,
+    #     # A ratification slower than this fraction of its claim's
+    #     # ratifyTimeout halves the claim window, and timely ones grow it back.
+    #     # 0 keeps maxProvisionalPerNode as a static cap.
+    #     overloadThreshold = 0.3,
     #     # How long a gracefully stopping worker spends checkpointing
     #     # sessions whose task sets suspend.onWorkerStop = "checkpoint".
     #     stopCheckpointTimeout = "60s",
+    # },
+    # `isolate` runtime settings (docs/task-runtime-isolate.md): where the
+    # `legion-isolate` binary and the built images are, and how each
+    # cordon's host process is sized and confined. A worker that finds the
+    # binary advertises the `isolates` capability, which isolate tasks'
+    # envelopes require. Absent: every default below.
+    # isolate = {
+    #     # The host binary. Default: `legion-isolate` beside this worker's
+    #     # executable, then LEGION_ISOLATE_BINARY. Absolute.
+    #     binary = "/usr/local/bin/legion-isolate",
+    #     # The largest resources.memoryMax an isolate may have here, and the
+    #     # size of one memory slot. Default "4GiB", at most "4GiB".
+    #     maxMemory = "4GiB",
+    #     # Memory slots per host process: the most isolates one process
+    #     # holds resident. Default 10000; at most 16000 with guard-pages
+    #     # (each slot reserves address space). A cordon that needs more runs
+    #     # another host process.
+    #     slotsPerHost = 10000,
+    #     # Shard threads per host process. 0 (the default) is one per CPU
+    #     # the host may run on.
+    #     shards = 0,
+    #     # How often the epoch ticker advances: how late a CPU limit or a
+    #     # slice can be noticed. Default "1ms".
+    #     epoch = "1ms",
+    #     # How long a turn runs before it yields its shard. Default "5ms",
+    #     # at least `epoch`.
+    #     slice = "5ms",
+    #     # Idle time before a resident isolate's private pages are paged
+    #     # out. Default "2s"; "0s" never pages out.
+    #     pageOutAfter = "2s",
+    #     # What separates cordons: "process" (the default and the only
+    #     # value available: a confined host process each). "vm" (a microVM
+    #     # per cordon) is not built yet and is refused at startup.
+    #     cordonBoundary = "process",
+    #     # How memory slots are laid out: "guard-pages" (default), "mpk"
+    #     # (x86-64 Linux with PKU; denser), or "small" (densest, slower).
+    #     layout = "guard-pages",
+    #     # How strictly a host confines itself before it serves: "enforce"
+    #     # (default; every layer applies or the host exits), "best-effort",
+    #     # or "off" (development only).
+    #     confine = "enforce",
+    #     # The directory of built image components and their manifest.
+    #     # Default: `isolate-images` beside this worker's executable, then
+    #     # LEGION_ISOLATE_IMAGES. Absolute.
+    #     images = "/var/lib/legion/isolate-images",
+    #     # The largest request or response body a host buffers. Default
+    #     # "16MiB".
+    #     maxBodyBytes = "16MiB",
     # },
     # The host guard (docs/network-handlers.md, "The host guard"): the fixed
     # floor of destinations no allocation on this node may reach through the
@@ -208,6 +294,9 @@
     #     allow = ["10.0.1.7:9100"],
     #     # Extra destinations to refuse like metadata: IPs or CIDRs.
     #     deny = ["10.0.0.2/32"],
+    #     # How often the nftables guard's drop counters are read for
+    #     # net.denied events (each read runs `nft -j list table`).
+    #     counterInterval = "10s",
     # },
     # Direct exec (docs/exec-and-actions.md, "Direct exec"): admit exec
     # tickets on this node's worker plane, so `legion exec --direct` and
@@ -215,4 +304,32 @@
     # Off by default: with it on, any client that can reach port 4848 and
     # holds a ticket for this node can open the session the ticket names.
     # exec = { direct = true },
+    # Devices (docs/devices.md): GPUs and other whole devices a task can ask
+    # for with resources.devices. Absent: this node has no devices.
+    # devices = {
+    #     # Device plugins (protocol legion-device/1): commands the worker
+    #     # runs at start and on every node-check pass (30s) to discover
+    #     # devices and their health, and at task start to allocate them.
+    #     plugins = {
+    #         nvidia = {
+    #             command = ["/opt/legion/plugins/devices/nvidia/legion-device-nvidia"],
+    #             # Passed to the plugin as `config` on every request.
+    #             # config = {},
+    #             # How long one call may run. Default 10s.
+    #             # timeout = "10s",
+    #         },
+    #     },
+    #     # Devices declared by hand, for hardware no plugin reports.
+    #     static = [
+    #         {
+    #             vendor = "xilinx", type = "fpga", model = "u250",
+    #             attributes = { memoryMiB = 65536 },
+    #             # `cdi` names the device in a CDI spec under cdiSpecDirs,
+    #             # whose container edits a container task then gets.
+    #             instances = [{ id = "0", cdi = "xilinx.com/fpga=0" }],
+    #         },
+    #     ],
+    #     # Where CDI spec files (JSON) are read. Default:
+    #     cdiSpecDirs = ["/etc/cdi", "/var/run/cdi"],
+    # },
 }

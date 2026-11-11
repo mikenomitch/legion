@@ -28,7 +28,8 @@ SC_MANAGERS=(sc-mgr-1 sc-mgr-2 sc-mgr-3)
 SC_WORKERS=(sc-wkr-1 sc-wkr-2)
 
 # Pinned versions of what the workers install.
-SC_YOUKI_VERSION="0.7.0"
+# runc runs the containers; the default user namespace needs 1.2 or newer.
+SC_RUNC_VERSION="v1.5.2"
 SC_CH_VERSION="v51.2"
 SC_KERNEL_RELEASE="ch-release-v6.16.9-20261001"
 

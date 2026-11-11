@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "workloads"))
 
 from driver import (  # noqa: E402
+    server_reports_complete,
+    follower_lag_summary,
     K8sAdapter,
     LegionAdapter,
     NomadAdapter,
@@ -58,7 +60,7 @@ def load_fixture_run(name):
 
 class PercentileMath(unittest.TestCase):
     def test_nearest_rank_matches_rust_pctl(self):
-        # Same convention as tests/benchmark_support/mod.rs::pctl —
+        # Same convention as tests/integration/benchmark_support/mod.rs::pctl —
         # round((len-1) * fraction) on the sorted list.
         values = [10.0, 20.0, 30.0, 40.0, 50.0]
         self.assertEqual(percentile(values, 0.50), 30.0)
@@ -221,7 +223,7 @@ class CountingCrossCheck(unittest.TestCase):
 class LegionEventParsing(unittest.TestCase):
     """The envelope contract: `legion events follow -j` NDJSON ->
     internal placement events. Fixture lines were captured from the
-    documented event shape (docs/event-stream.md, src/storage/events.rs)."""
+    documented event shape (docs/event-stream.md, crates/manager/src/storage/events.rs)."""
 
     def test_placed_event_with_count(self):
         line = json.dumps(
@@ -281,6 +283,17 @@ class TranslatorShapes(unittest.TestCase):
         total = sum(translate.expected_allocations(job_type) for _, job_type, _ in jobs)
         # api: 2 tasks x 4 = 8 each; cron: 1 x 2 = 2 each -> 20*8 + 10*2.
         self.assertEqual(total, 180)
+
+    def test_manifest_carries_the_scenarios_scheduling_policy(self):
+        # Legion's policy is a manager setting, so the manifest is the
+        # only place the translator can hand it on; web_fleet is spread.
+        with tempfile.TemporaryDirectory() as out:
+            manifest = translate.translate(self.scenario, "legion", out, 1.0)
+            self.assertEqual(manifest["scheduling_policy"], "spread")
+            with open(os.path.join(out, "manifest.json")) as f:
+                self.assertEqual(json.load(f)["scheduling_policy"], "spread")
+        with self.assertRaises(ValueError):
+            translate.scheduling_policy({"name": "x", "scheduling_policy": "binpack"})
 
     def test_count_multiplier_scales_jobs(self):
         jobs = list(translate.iter_jobs(self.scenario, 2.0))
@@ -527,3 +540,36 @@ class NativeSubmitterWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowerLagSummaryTest(unittest.TestCase):
+    def test_empty_is_none(self):
+        self.assertIsNone(follower_lag_summary([]))
+        self.assertIsNone(follower_lag_summary(None))
+
+    def test_percentiles(self):
+        summary = follower_lag_summary([5, 1, 3, 2, 4])
+        self.assertEqual(summary["samples"], 5)
+        self.assertEqual(summary["p50_ms"], 3.0)
+        self.assertEqual(summary["max_ms"], 5.0)
+
+
+class ParseLegionEventCamelCaseTest(unittest.TestCase):
+    def test_camel_case_envelope(self):
+        line = json.dumps({"ok": True, "data": {
+            "kind": "allocation.placed", "jobId": "bench-api-1",
+            "metadataJson": json.dumps({"count": 6})}})
+        self.assertEqual(parse_legion_event(line), {"job": "bench-api-1", "count": 6})
+
+
+class ServerReportsCompleteTest(unittest.TestCase):
+    def test_server_count_covers_expected(self):
+        self.assertTrue(server_reports_complete(
+            {"allocations": 10.0}, lambda: {"allocations": 110.0}, 100))
+
+    def test_short_or_unavailable(self):
+        self.assertFalse(server_reports_complete(
+            {"allocations": 10.0}, lambda: {"allocations": 100.0}, 100))
+        self.assertFalse(server_reports_complete(None, lambda: {"allocations": 1e9}, 100))
+        self.assertFalse(server_reports_complete(
+            {"allocations": 0.0}, lambda: {"error": "down"}, 100))

@@ -3,17 +3,22 @@ use std::vec;
 
 use clap::value_parser;
 
-use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
+use crate::cmd::helpers::{
+    active_namespace, allow_unknown_fields_flag, connect_manager_client, friendly_status, job_ref,
+    json_flag, list_namespace_flags, lists_many_namespaces, namespace_flag, namespace_selection,
+    print_table,
+};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
+use crate::structs::spec_fields::UnknownFieldMode;
 use crate::structs::{
     AdvanceRolloutRequest, DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest,
     GetJobScaleStatusRequest, GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobConfig,
-    JobPlanPrint, JobPrint, KvEntry, KvValueType, ListJobsRequest, ListRolloutEventsRequest,
-    ListRolloutsRequest, PlanJobRequest, RunJobRequest, ScaleTaskRequest, StopJobRequest,
-    Submission,
+    JobPlanPrint, JobPrint, JobPrintNamespaced, KvEntry, KvValueType, ListJobsRequest,
+    ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest, ScaleTaskRequest,
+    StopJobRequest, Submission,
 };
-use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
+use crate::task_plugins::validate_job_config;
 use serde::Serialize;
 use tabled::Tabled;
 use tempfile::TempDir;
@@ -40,7 +45,20 @@ pub fn config() -> Command {
         .arg(idempotency_arg())
         .arg(wait_flag())
         .arg(timeout_arg())
+        .arg(allow_unknown_fields_flag())
+        .arg(namespace_flag())
         .arg(json_flag())
+        .arg(
+            Arg::new("expected-version")
+                .long("expected-version")
+                .value_name("VERSION")
+                .value_parser(value_parser!(i64))
+                .help(
+                    "Submit only if the job is at this spec version (`version` in `job info \
+                     --json`); 0 means it must not exist. Fails, writing nothing, when another \
+                     submit landed first",
+                ),
+        )
         .args(config_var_args());
 
     let stop_cmd = Command::new("stop")
@@ -53,6 +71,7 @@ pub fn config() -> Command {
         .arg(priority_arg())
         .arg(asap_flag())
         .arg(idempotency_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let scale_cmd = Command::new("scale")
@@ -95,7 +114,39 @@ pub fn config() -> Command {
                 .value_name("REASON")
                 .help("Audit note recorded on the override and in the event stream"),
         )
+        .arg(Arg::new("for").long("for").value_name("DURATION").help(
+            "Pin the count (or --min/--max) on an autoscaled task for this long, e.g. \
+                     2h; required for --count on an autoscaled task",
+        ))
+        .arg(
+            Arg::new("min")
+                .long("min")
+                .value_name("COUNT")
+                .value_parser(value_parser!(u32))
+                .requires("for")
+                .conflicts_with_all(["count", "reset"])
+                .help("Pin a floor on an autoscaled task (with --for); still autoscaled above it"),
+        )
+        .arg(
+            Arg::new("max")
+                .long("max")
+                .value_name("COUNT")
+                .value_parser(value_parser!(u32))
+                .requires("for")
+                .conflicts_with_all(["count", "reset"])
+                .help("Pin a ceiling on an autoscaled task (with --for)"),
+        )
+        .arg(
+            Arg::new("release")
+                .long("release")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["count", "reset", "for", "min", "max"])
+                .help(
+                    "End an autoscaled task's pin now; autoscaling resumes from the current count",
+                ),
+        )
         .arg(idempotency_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let destroy_cmd = Command::new("destroy")
@@ -108,6 +159,7 @@ pub fn config() -> Command {
         .arg(priority_arg())
         .arg(asap_flag())
         .arg(idempotency_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let validate_cmd = Command::new("validate")
@@ -119,6 +171,7 @@ pub fn config() -> Command {
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
+        .arg(allow_unknown_fields_flag())
         .arg(json_flag())
         .args(config_var_args());
 
@@ -135,17 +188,20 @@ pub fn config() -> Command {
                 .required(true),
         )
         .arg(timeout_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let info_cmd = Command::new("info")
-        .about("Get job info")
+        .about("Get job info, with each task's measured usage against its reservation")
         .arg(
             Arg::new("name")
                 .value_name("NAME")
                 .help("Name of the job to inspect")
                 .required(true),
         )
-        .arg(json_flag());
+        .arg(namespace_flag())
+        .arg(json_flag())
+        .args(crate::cmd::watch::read_flags());
 
     let plan_cmd = Command::new("plan")
         .about("Preview which nodes allocations would land on")
@@ -156,6 +212,8 @@ pub fn config() -> Command {
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
+        .arg(allow_unknown_fields_flag())
+        .arg(namespace_flag())
         .arg(json_flag())
         .args(config_var_args());
 
@@ -166,6 +224,7 @@ pub fn config() -> Command {
                 .value_name("NAME")
                 .help("Name of the job to fetch the spec for"),
         )
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let list_cmd = Command::new("list")
@@ -176,6 +235,7 @@ pub fn config() -> Command {
                 .value_name("STATUS")
                 .help("Only jobs with this exact status: running, pending, failed, scheduled, complete, suspended, idle, or stopped"),
         )
+        .args(list_namespace_flags())
         .arg(json_flag());
 
     let logs_cmd = Command::new("logs")
@@ -229,6 +289,7 @@ pub fn config() -> Command {
                 )
                 .action(ArgAction::SetTrue),
         )
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let rollout_list_cmd = Command::new("list")
@@ -237,8 +298,9 @@ pub fn config() -> Command {
             Arg::new("job")
                 .long("job")
                 .value_name("JOB")
-                .help("Filter rollouts by job id"),
+                .help("Filter rollouts by job (`name` or `namespace/name`)"),
         )
+        .args(list_namespace_flags())
         .arg(
             Arg::new("active")
                 .long("active")
@@ -314,6 +376,7 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(run_cmd)
         .subcommand(info_cmd)
+        .subcommand(crate::cmd::watch::job_watch_cmd())
         .subcommand(plan_cmd)
         .subcommand(validate_cmd)
         .subcommand(schema_cmd)
@@ -321,10 +384,41 @@ pub fn config() -> Command {
         .subcommand(list_cmd)
         .subcommand(stop_cmd)
         .subcommand(scale_cmd)
+        .subcommand(crate::cmd::resize::job_resize_command())
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
         .subcommand(logs_cmd)
         .subcommand(rollout_cmd)
+}
+
+/// The namespace a spec-bearing request (`job run`, `job plan`) sends.
+///
+/// An explicit `-n` always goes, so the manager can reject it when the
+/// jobspec declares a different namespace. `LEGION_NAMESPACE` is a default,
+/// like kubectl's context namespace: it applies only when the jobspec names
+/// no namespace of its own, and never conflicts with one.
+pub(crate) fn spec_request_namespace(matches: &ArgMatches, rendered: &str) -> Option<String> {
+    if let Some(flag) = matches
+        .try_get_one::<String>("namespace")
+        .ok()
+        .flatten()
+        .map(|namespace| namespace.trim().to_string())
+        .filter(|namespace| !namespace.is_empty())
+    {
+        return Some(flag);
+    }
+    let declares = serde_json::from_str::<Value>(rendered).is_ok_and(|spec| {
+        spec.get("namespace").is_some()
+            || spec
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.contains('/'))
+    });
+    if declares {
+        None
+    } else {
+        active_namespace(matches)
+    }
 }
 
 /// Optional idempotency key for mutating job operations. When supplied, the
@@ -475,12 +569,15 @@ pub(crate) async fn wait_for_convergence(
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .context("missing job name")?;
+    let job_name = &job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .context("missing job name")?,
+    )?;
     let timeout = wait_timeout(arg_matches);
     let mut client = connect_manager_client().await?;
 
@@ -499,7 +596,7 @@ async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let path = arg_matches
@@ -519,16 +616,39 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
-    // Parse the rendered jobspec into a JobConfig.
-    let config: JobConfig = match serde_json::from_str(&rendered) {
-        Ok(config) => config,
+    // Parse the rendered jobspec into a JobConfig, with the same unknown-key
+    // rules the manager applies to the submit (`--allow-unknown-fields`).
+    // Keys installed apps add are checked against their schemas when a
+    // manager says which are installed; offline they are reported as not
+    // checked.
+    let mode = UnknownFieldMode::from_allow(arg_matches.get_flag("allow-unknown-fields"));
+    let cluster = cluster_job_schema().await;
+    let registry = cluster.as_ref().ok().map(|reply| {
+        crate::structs::extensions::ExtensionRegistry::from_keys(
+            reply
+                .extensions
+                .iter()
+                .filter_map(|key| crate::structs::extensions::InstalledKey::from_proto(key).ok())
+                .collect(),
+        )
+    });
+    let check = match registry.as_ref() {
+        Some(registry) => crate::structs::spec_fields::ExtensionCheck::Installed(registry),
+        None => crate::structs::spec_fields::ExtensionCheck::Offline,
+    };
+    let (config, unknown_fields) = match JobConfig::parse_submitted_str(&rendered, mode, check) {
+        Ok(parsed) => parsed,
         Err(err) => {
+            let text = format!("jobspec is not a valid job configuration: {err:#}");
+            let (message, hint) = crate::cmd::helpers::split_hint(&text);
             return Err(output::fail_local(
                 format,
                 CliError::local(
                     "InvalidArgument",
-                    format!("jobspec is not a valid job configuration: {err}"),
-                    Some("check field names and types against `legion job schema`"),
+                    message,
+                    hint.or(Some(
+                        "check field names and types against `legion job schema`",
+                    )),
                 ),
             ));
         }
@@ -559,7 +679,37 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     // `speculativeStart.mode` cannot be honored is capped at `stage` — never
     // silently, because the symptom otherwise is a speedup that quietly did
     // not happen.
-    let mut warnings = speculative_start_warnings(&config);
+    // Unknown keys the flag kept or dropped come first: a dropped key is
+    // intent the submit would lose.
+    let mut warnings = unknown_fields.warnings();
+    if let Some(registry) = registry.as_ref() {
+        // What only a submit checks: `requires` (as the submitter) and the
+        // apps' own validate calls.
+        let deferred: Vec<String> = config
+            .extensions
+            .iter()
+            .filter_map(|value| {
+                let installed = registry.for_value(&value.app, value.point)?;
+                let mut checks = Vec::new();
+                if let Some(requires) = &installed.decl.requires {
+                    checks.push(format!("that you hold {}", requires.label()));
+                }
+                if installed.decl.validate {
+                    checks.push(format!("the {} app's own check", value.app));
+                }
+                (!checks.is_empty()).then(|| {
+                    format!(
+                        "{}{}: {} are checked at submit",
+                        value.path.scope(value.point),
+                        value.key,
+                        checks.join(" and ")
+                    )
+                })
+            })
+            .collect();
+        warnings.extend(deferred);
+    }
+    warnings.extend(speculative_start_warnings(&config));
     // Valid settings that will not do what the author most likely expects
     // (an idle signal a microVM cannot see, an identity refresh that reboots
     // the guest). `job run` prints the same lines.
@@ -570,7 +720,36 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         &config,
         |_| false,
     ));
+    // The task's own chain only; `job plan` and `job run` add stored policies.
+    warnings.extend(crate::structs::network::tcp_upstream_http_chain_warnings(
+        &config,
+        |_| Vec::new(),
+    ));
     warnings.extend(crate::task_plugins::container_security_warnings(&config));
+    // Namespace policy job rules (docs/namespaces.md, "Job rules"), when this
+    // caller can read the policies that govern the job's namespace
+    // (`namespace:read` there, or `acl:read`). `job plan` and `job run`
+    // always check them, on the manager.
+    match job_rules_refusal(
+        crate::cmd::helpers::active_namespace(arg_matches),
+        &rendered,
+        &config,
+    )
+    .await
+    {
+        Ok(None) => {}
+        Ok(Some(refusal)) => {
+            let (message, hint) = crate::cmd::helpers::split_hint(&refusal);
+            return Err(output::fail_local(
+                format,
+                CliError::local("FailedPrecondition", message, hint),
+            ));
+        }
+        Err(why) => warnings.push(format!(
+            "namespace policy job rules were not checked ({why}); `legion job plan` checks \
+             them"
+        )),
+    }
 
     if format.is_json() {
         output::print_success(&json!({
@@ -579,6 +758,11 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
             "tasks": task_count,
             "groups": groups.iter().collect::<Vec<_>>(),
             "warnings": warnings,
+            "unknownFields": unknown_fields,
+            // `checked` when a manager said which keys apps add; `unchecked`
+            // offline, when keys at extension points could not be resolved.
+            "installedKeys": if registry.is_some() { "checked" } else { "unchecked" },
+            "extensions": config.extensions,
         }));
     } else {
         println!(
@@ -590,9 +774,194 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         for warning in &warnings {
             println!("warning: {warning}");
         }
+        if let Err(why) = &cluster {
+            println!(
+                "note: core fields only; keys installed apps add were not checked (no manager \
+                 answered: {why})"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// `job validate`'s check of namespace policy `jobRules` (PLG4): the
+/// refusal the manager would give, `None` when the job passes, or why the
+/// rules could not be read. `active_namespace` is `-n` (or the CLI's
+/// default namespace), used when the spec names none. The governing policies come from the job's
+/// namespace (`GetNamespace`, `namespace:read` there, which a tenant holds
+/// and which already shows every governing policy whole), else from the
+/// full list (`ListNamespacePolicies`, `acl:read`), which also covers a
+/// namespace that does not exist yet.
+pub(crate) async fn job_rules_refusal(
+    active_namespace: Option<String>,
+    rendered: &str,
+    config: &JobConfig,
+) -> Result<Option<String>, String> {
+    let mut client = connect_manager_client()
+        .await
+        .map_err(|err| format!("no manager: {err:#}"))?;
+    // The namespace the submit would use: the jobspec's own, else -n, else
+    // `default`.
+    let declared = serde_json::from_str::<Value>(rendered)
+        .ok()
+        .and_then(|spec| {
+            spec.get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    spec.get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|name| name.split_once('/'))
+                        .map(|(namespace, _)| namespace.to_string())
+                })
+        });
+    let namespace = declared
+        .or(active_namespace)
+        .unwrap_or_else(|| crate::structs::namespace::DEFAULT_NAMESPACE.to_string());
+    let decode = |policy: &crate::structs::NamespacePolicy| {
+        serde_json::from_str::<crate::structs::namespace_policy::NamespacePolicy>(
+            &policy.object_json,
+        )
+        .ok()
+    };
+    let policies: Vec<crate::structs::namespace_policy::NamespacePolicy> = match client
+        .get_namespace(crate::structs::GetNamespaceRequest {
+            name: namespace.clone(),
+        })
+        .await
+    {
+        Ok(reply) => reply
+            .into_inner()
+            .policies
+            .iter()
+            .filter_map(|status| status.policy.as_ref())
+            .filter_map(decode)
+            .collect(),
+        Err(by_namespace) => match client
+            .list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {})
+            .await
+        {
+            Ok(reply) => reply
+                .into_inner()
+                .policies
+                .iter()
+                .filter_map(decode)
+                .collect(),
+            Err(by_list) => {
+                return Err(format!(
+                    "reading them needs `namespace:read` on {namespace} or `acl:read`: {}; {}",
+                    by_namespace.message(),
+                    by_list.message()
+                ))
+            }
+        },
+    };
+    let mut job = config.clone();
+    job.name = crate::structs::namespace::job_id(
+        &namespace,
+        crate::structs::namespace::job_name(&config.name),
+    );
+    let governing = crate::structs::namespace_policy::governing(&policies, &namespace);
+    Ok(crate::structs::namespace_policy::check_job_rules(&governing, &job).err())
+}
+
+/// One extension value as `job info -j` shows it: the proto, with its JSON
+/// strings parsed.
+fn extension_value_json(value: &crate::structs::JobExtensionValue) -> Value {
+    let mut json = serde_json::to_value(value).unwrap_or(Value::Null);
+    if let Some(object) = json.as_object_mut() {
+        for (raw, parsed) in [("valueJson", "value"), ("effectiveJson", "effective")] {
+            let value = object
+                .remove(raw)
+                .and_then(|text| {
+                    text.as_str()
+                        .and_then(|text| serde_json::from_str(text).ok())
+                })
+                .unwrap_or(Value::Null);
+            object.insert(parsed.into(), value);
+        }
+    }
+    json
+}
+
+/// `volume data on task postgres: backup = {...} (backup app; valid)`.
+fn extension_value_line(value: &crate::structs::JobExtensionValue) -> String {
+    let path = value.path.clone().unwrap_or_default();
+    let mut place = Vec::new();
+    if value.point == "group" {
+        place.push(format!("group {} (on task {})", path.group, path.task));
+    } else if !path.task.is_empty() {
+        place.push(format!("task {}", path.task));
+    }
+    for (label, name) in [
+        ("volume", &path.volume),
+        ("port", &path.port),
+        ("service", &path.service),
+    ] {
+        if !name.is_empty() {
+            place.push(format!("{label} {name}"));
+        }
+    }
+    let place = if place.is_empty() {
+        "job".to_string()
+    } else {
+        place.join(": ")
+    };
+    let owner = if value.app.is_empty() {
+        value.state.clone()
+    } else {
+        format!("{} app; {}", value.app, value.state)
+    };
+    let detail = if value.detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", value.detail)
+    };
+    format!(
+        "{place}: {} = {} ({owner}{detail})",
+        value.key, value.effective_json
+    )
+}
+
+/// The cluster's jobspec schema and installed keys (`GetJobSchema`), when a
+/// manager answers within a few seconds; otherwise why not.
+pub(crate) async fn cluster_job_schema() -> Result<crate::structs::GetJobSchemaReply, String> {
+    let fetch = async {
+        let mut client = connect_manager_client()
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+        client
+            .get_job_schema(crate::structs::GetJobSchemaRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| status.message().to_string())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), fetch)
+        .await
+        .unwrap_or_else(|_| Err("the manager did not answer within 5s".to_string()))
+}
+
+/// The jobspec schema this CLI can see: the cluster's (with installed apps'
+/// keys) when a manager is reachable, else the compiled-in one, marked as
+/// such in `$comment`.
+pub(crate) async fn jobspec_schema_for_cli() -> (Value, Option<String>) {
+    match cluster_job_schema().await {
+        Ok(reply) => match serde_json::from_str::<Value>(&reply.schema_json) {
+            Ok(schema) => (schema, None),
+            Err(err) => offline_schema(format!("the manager's schema is not JSON: {err}")),
+        },
+        Err(why) => offline_schema(why),
+    }
+}
+
+fn offline_schema(why: String) -> (Value, Option<String>) {
+    let mut schema = build_jobspec_schema();
+    schema["$comment"] = json!(format!(
+        "The compiled-in jobspec schema: keys installed apps add are not included (no manager \
+         answered: {why})."
+    ));
+    (schema, Some(why))
 }
 
 /// Gate downgrades this jobspec would take at admission, as human-readable
@@ -615,10 +984,16 @@ fn speculative_start_warnings(config: &JobConfig) -> Vec<String> {
         .collect()
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let schema = build_jobspec_schema();
+    let (schema, offline) = jobspec_schema_for_cli().await;
+    if let Some(why) = offline {
+        eprintln!(
+            "note: the compiled-in schema; keys installed apps add are not included (no manager \
+             answered: {why})"
+        );
+    }
 
     if format.is_json() {
         output::print_success(&schema);
@@ -628,132 +1003,10 @@ async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-/// Assemble the jobspec JSON Schema: a documented top-level envelope plus the
-/// live, per-runtime task config schemas derived from the built-in plugins.
+/// The compiled-in jobspec JSON Schema (`crate::task_plugins::job_schema`):
+/// what `legion job schema` prints when no manager is reachable.
 pub(crate) fn build_jobspec_schema() -> Value {
-    let mut task_runtimes = serde_json::Map::new();
-    for plugin in builtin_task_plugin_schemas() {
-        task_runtimes.insert(plugin.name, plugin.schema);
-    }
-
-    json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Legion Jobspec",
-        "description": "A Legion job specification (the JSON a Nickel jobspec renders to). \
-            A job has a name and one or more tasks (use `task` for a single task or `tasks` for many). \
-            Each task's `config` object is validated against the schema for its `runtime` under `taskRuntimes`.",
-        "type": "object",
-        "required": ["name"],
-        "properties": {
-            "name": { "type": "string", "description": "Unique job name." },
-            "task": { "$ref": "#/$defs/task", "description": "A single task (shorthand for tasks: [task])." },
-            "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" }, "description": "List of tasks." },
-            "version": { "type": "integer", "description": "Optional jobspec version." },
-            "priority": {
-                "type": "string",
-                "enum": ["critical", "high", "elevated", "normal", "low", "background"],
-                "default": "normal",
-                "description": "Priority band, most important first. Orders the eval queue AND governs preemption: an allocation is only ever displaced by a job in a STRICTLY higher band, never a peer. Choosing a band below `normal` is the consent to be displaced. Claiming a band may require an ACL `bands` grant. See docs/preemption-and-eviction.md."
-            },
-            "rollout": { "$ref": "#/$defs/rollout", "description": "Default rollout strategy for the job." },
-            "rolloutByGroup": {
-                "type": "object",
-                "additionalProperties": { "$ref": "#/$defs/rollout" },
-                "description": "Per-group rollout overrides keyed by group name."
-            }
-        },
-        "$defs": {
-            "task": {
-                "type": "object",
-                "required": ["runtime"],
-                "properties": {
-                    "name": { "type": "string", "description": "Task name (unique within the job)." },
-                    "runtime": { "type": "string", "description": "Task runtime plugin that runs this task (e.g. exec, container, noop)." },
-                    "group": { "type": "string", "description": "Task group; tasks in a group are placed together." },
-                    "lifecycle": { "type": "string", "enum": ["service", "batch", "sidecar"], "description": "Task lifecycle." },
-                    "count": {
-                        "description": "Number of instances, or {num, per} for spread placement.",
-                        "oneOf": [
-                            { "type": "integer", "minimum": 0 },
-                            { "type": "object", "required": ["num", "per"], "properties": {
-                                "num": { "type": "integer" },
-                                "per": { "type": "string" }
-                            }}
-                        ]
-                    },
-                    "config": { "type": "object", "description": "Runtime-specific config; validated against taskRuntimes[runtime]." },
-                    "dependsOn": {
-                        "type": "array",
-                        "items": { "type": "object", "required": ["task"], "properties": {
-                            "task": { "type": "string" },
-                            "condition": { "type": "string", "enum": ["running", "healthy", "complete", "success"] }
-                        }},
-                        "description": "Task dependencies that gate start."
-                    },
-                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." },
-                    "stop": {
-                        "type": "object",
-                        "description": "How the platform terminates this task, for every cause (job stop, rollout replacement, drain, reschedule, scale-in, preemption). See docs/graceful-stop.md.",
-                        "properties": {
-                            "signal": {
-                                "type": "string",
-                                "enum": ["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2"],
-                                "default": "SIGTERM",
-                                "description": "Notice signal, sent to the task's process group. SIGKILL is deliberately not offered: it is the end of the ladder, not a notice."
-                            },
-                            "killAfter": {
-                                "type": "string",
-                                "default": "30s",
-                                "description": "Grace between the signal and SIGKILL, e.g. \"30s\". Capped at 5m — grace may slow a drain, never wedge one."
-                            }
-                        }
-                    },
-                    "disruption": {
-                        "type": "object",
-                        "description": "Floor on how many of this task's allocations VOLUNTARY disruption (preemption) may leave running. Does not bind drain, node loss or job stop. See docs/preemption-and-eviction.md.",
-                        "properties": {
-                            "minAvailable": {
-                                "description": "Absolute count (2) or percent of count (\"50%\", rounded up). Default 0.",
-                                "oneOf": [
-                                    { "type": "integer", "minimum": 0 },
-                                    { "type": "string" }
-                                ]
-                            }
-                        }
-                    },
-                    "speculativeStart": {
-                        "type": "object",
-                        "description": "How far a node may get on a start for this task BEFORE the placement is durable. Absent = off, today's behavior. A task declaring network ports, connect upstreams, or storage whose driver cannot fence a concurrent attach is downgraded to `stage` (reported by `job validate`). See docs/edge-boot.md.",
-                        "properties": {
-                            "mode": {
-                                "type": "string",
-                                "enum": ["off", "stage", "boot", "serve"],
-                                "description": "off (default) = no speculation. stage = fetch artifacts and build the root disk, do not start. boot = also boot, with the network held shut. serve = also open the network; the only mode where a workload that loses its race may already have had externally visible side effects."
-                            },
-                            "ratifyTimeout": {
-                                "type": "string",
-                                "description": "Lease: unratified work is killed at expiry, unconditionally. Default 5s, capped at 2m."
-                            },
-                            "onRefused": {
-                                "type": "string",
-                                "enum": ["kill", "stop"],
-                                "description": "What to do when ratification is refused. kill (default) is a hard destroy; stop runs the normal graceful-stop ladder."
-                            }
-                        }
-                    }
-                }
-            },
-            "rollout": {
-                "type": "object",
-                "properties": {
-                    "strategy": { "type": "string", "description": "Rollout strategy name (e.g. default)." },
-                    "maxParallel": { "type": "integer", "description": "Max allocations updated in parallel." },
-                    "autoPromote": { "type": "boolean", "description": "Advance automatically between steps." }
-                }
-            }
-        },
-        "taskRuntimes": task_runtimes
-    })
+    crate::task_plugins::job_schema::core_jobspec_schema()
 }
 
 pub(crate) fn priority_arg() -> Arg {
@@ -1112,10 +1365,12 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("run", matches)) => run_job(matches).await,
         Some(("stop", matches)) => stop_job(matches).await,
         Some(("scale", matches)) => scale_job(matches).await,
+        Some(("resize", matches)) => crate::cmd::resize::resize_job(matches).await,
         Some(("spec", matches)) => get_job_spec(matches).await,
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
+        Some(("watch", matches)) => crate::cmd::watch::job_watch(matches).await,
         Some(("plan", matches)) => plan_job(matches).await,
         Some(("validate", matches)) => validate_job(matches).await,
         Some(("schema", matches)) => job_schema(matches).await,
@@ -1138,10 +1393,13 @@ struct RolloutPrint {
     pub incomplete: bool,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let name = arg_matches.get_one::<String>("name").cloned();
+    let name = arg_matches
+        .get_one::<String>("name")
+        .map(|name| job_ref(arg_matches, name))
+        .transpose()?;
     let allocation_id = arg_matches.get_one::<i64>("allocation").copied();
     let stream = arg_matches
         .get_one::<String>("stream")
@@ -1377,6 +1635,36 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn job_info_lists_replacements_waiting_out_their_backoff() {
+        assert!(reschedule_backoff_lines(&[]).is_empty());
+        let backoff = |task: &str, instance: &str| crate::structs::RescheduleBackoff {
+            task: task.into(),
+            instance_id: instance.into(),
+            attempt: 4,
+            delay_seconds: 240,
+            summary: "attempt 4 failed (boom); next attempt at 2026-10-12T02:31:05Z (backoff 4m)"
+                .into(),
+            ..Default::default()
+        };
+        let lines = reschedule_backoff_lines(&[backoff("store", "sb-1"), backoff("web", "")]);
+        assert_eq!(
+            lines,
+            vec![
+                "Waiting out reschedule backoff:".to_string(),
+                "  task store (instance sb-1): attempt 4 failed (boom); next attempt at \
+                 2026-10-12T02:31:05Z (backoff 4m)"
+                    .to_string(),
+                "  task web: attempt 4 failed (boom); next attempt at 2026-10-12T02:31:05Z \
+                 (backoff 4m)"
+                    .to_string(),
+                "  `legion job run <spec> --force-reschedule` retries now (`legion instance \
+                 start <id>` for one instance)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn priority_conflicts_with_asap() {
         let cmd = config();
         let result =
@@ -1519,6 +1807,7 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             encrypted: false,
+            locked: false,
         }
     }
 
@@ -1694,18 +1983,21 @@ mod tests {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str),
+    )?;
     let priority = priority_from_matches(arg_matches);
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
 
     let request = tonic::Request::new(StopJobRequest {
-        name: job_name.to_owned(),
+        name: job_name,
         priority,
         idempotency_key,
     });
@@ -1728,18 +2020,32 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
 /// `legion job scale <NAME> [--count N | --reset]` (docs/autoscaling.md):
 /// with `--count`/`--reset` it calls ScaleTask; with neither it prints the
 /// job's scale status (spec vs override vs effective, per task).
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .context("job name is required")?
-        .clone();
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .context("job name is required")?,
+    )?;
     let count = arg_matches.get_one::<u32>("count").copied();
     let reset = arg_matches.get_flag("reset");
+    let release = arg_matches.get_flag("release");
+    let min = arg_matches.get_one::<u32>("min").copied();
+    let max = arg_matches.get_one::<u32>("max").copied();
+    let pin_for_seconds = match arg_matches.get_one::<String>("for") {
+        Some(text) => Some(
+            humantime::parse_duration(text.trim())
+                .map_err(|err| anyhow!("--for {text:?}: {err} (write it like 2h or 30m)"))?
+                .as_secs()
+                .max(1),
+        ),
+        None => None,
+    };
 
-    if count.is_none() && !reset {
+    if count.is_none() && !reset && !release && min.is_none() && max.is_none() {
         // Status mode.
         let request = tonic::Request::new(GetJobScaleStatusRequest {
             name: job_name.clone(),
@@ -1765,6 +2071,23 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
                         "source": task.source,
                         "reason": task.reason,
                         "updatedAt": task.updated_at,
+                        "autoscaled": task.autoscaled,
+                        "policy": task.policy_summary,
+                        "state": task.state,
+                        "pin": task.pin.as_ref().map(|pin| json!({
+                            "untilUnixMs": pin.until_unix_ms,
+                            "min": pin.min,
+                            "max": pin.max,
+                            "by": pin.by,
+                            "reason": pin.reason,
+                        })),
+                        "paused": task.pause.as_ref().map(|pause| json!({
+                            "scope": pause.scope,
+                            "untilUnixMs": pause.until_unix_ms,
+                            "by": pause.by,
+                            "reason": pause.reason,
+                        })),
+                        "version": task.version,
                     })
                 })
                 .collect::<Vec<_>>() }));
@@ -1785,6 +2108,27 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
                     line.push_str(&format!(", scale-in to {pending} pending"));
                 }
                 line.push(')');
+                if task.autoscaled {
+                    line.push_str(&format!("; autoscaled {}", task.policy_summary));
+                    if let Some(pin) = task.pin.as_ref() {
+                        line.push_str(&format!(
+                            "; pinned {} by {} until {}",
+                            match (pin.min, pin.max) {
+                                (Some(min), Some(max)) if min == max => format!("at {min}"),
+                                (min, max) => format!(
+                                    "to {}..{}",
+                                    min.map_or("-".to_string(), |n| n.to_string()),
+                                    max.map_or("-".to_string(), |n| n.to_string())
+                                ),
+                            },
+                            pin.by,
+                            crate::cmd::scaling::clock(pin.until_unix_ms)
+                        ));
+                    }
+                    if let Some(pause) = task.pause.as_ref() {
+                        line.push_str(&format!("; paused ({}) by {}", pause.scope, pause.by));
+                    }
+                }
                 println!("{line}");
             }
         }
@@ -1799,6 +2143,11 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
         reset,
         reason: arg_matches.get_one::<String>("reason").cloned(),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+        pin_for_seconds,
+        min,
+        max,
+        release,
+        ..Default::default()
     });
     let reply = output::resolve(
         format,
@@ -1812,6 +2161,8 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
             "message": reply.message,
             "deduplicated": reply.deduplicated,
             "deferred": reply.deferred,
+            "version": reply.version,
+            "pinnedUntilUnixMs": reply.pinned_until_unix_ms,
         }));
     } else {
         println!("{}", reply.message);
@@ -1820,18 +2171,19 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str),
+    )?;
 
-    let request = tonic::Request::new(GetJobSpecRequest {
-        name: job_name.to_owned(),
-    });
+    let request = tonic::Request::new(GetJobSpecRequest { name: job_name });
 
     let response = output::resolve(
         format,
@@ -1855,18 +2207,21 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str),
+    )?;
     let priority = priority_from_matches(arg_matches);
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
 
     let request = tonic::Request::new(DestroyJobRequest {
-        name: job_name.to_owned(),
+        name: job_name,
         priority,
         idempotency_key,
     });
@@ -1890,7 +2245,7 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1903,8 +2258,11 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
+    let namespace = spec_request_namespace(arg_matches, &rendered);
     let request = tonic::Request::new(PlanJobRequest {
         parsed_jobspec: rendered,
+        namespace,
+        allow_unknown_fields: arg_matches.get_flag("allow-unknown-fields"),
     });
 
     let response = output::resolve(format, "failed to plan job", client.plan_job(request).await)?;
@@ -1918,8 +2276,21 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         if !reply.message.is_empty() {
             println!("{}", reply.message);
         }
+        // What the submit would change, field by field.
+        if !reply.diff.is_empty() {
+            println!("Changes to the stored spec:");
+            for change in &reply.diff {
+                println!("  {}", plan_diff_line(change));
+            }
+        }
         for warning in &reply.warnings {
             println!("warning: {warning}");
+        }
+        if !reply.extensions.is_empty() {
+            println!("jobspec extensions:");
+            for value in &reply.extensions {
+                println!("  {}", extension_value_line(value));
+            }
         }
         // One line per placement that carries fallback candidates: the
         // ranked list the apply walk may bind instead of the first choice
@@ -2006,6 +2377,68 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                 println!("  {line}");
             }
         }
+        // Whether each gang reaches its quorum (docs/gang-scheduling.md). A
+        // gang that does not makes the whole plan place nothing: the submit
+        // would wait, blocked, until it fits.
+        if !reply.gang_reports.is_empty() {
+            println!("Gang:");
+            for report in &reply.gang_reports {
+                let together = report.min.saturating_sub(report.running);
+                let quorum = if report.min == report.desired {
+                    format!("all {} together", report.desired)
+                } else {
+                    format!("at least {} of {} together", report.min, report.desired)
+                };
+                let running = if report.running > 0 {
+                    format!("{} running, ", report.running)
+                } else {
+                    String::new()
+                };
+                let nodes = format!(
+                    "{} of {} nodes accept it",
+                    report.eligible_nodes, report.nodes
+                );
+                if report.would_place {
+                    println!(
+                        "  {}: places ({running}{} fit, needs {quorum}; {nodes})",
+                        report.task, report.placeable
+                    );
+                } else {
+                    println!(
+                        "  {}: would NOT place — {running}{} of the {together} it needs fit \
+                         ({quorum}; {nodes}); the job would wait, holding nothing",
+                        report.task, report.placeable
+                    );
+                }
+                if !report.topology_key.is_empty() && report.would_place {
+                    let key = &report.topology_key;
+                    let domains = report.topology_domains;
+                    if report.topology_domain.is_empty() {
+                        println!(
+                            "    across more than one {key}: none of the {domains} with eligible \
+                             nodes fits it alone (topology {})",
+                            report.topology_mode
+                        );
+                    } else {
+                        println!(
+                            "    in {key}={} ({domains} {key} domain(s) have eligible nodes)",
+                            report.topology_domain
+                        );
+                    }
+                }
+                if !report.reason.is_empty() && !report.would_place {
+                    println!("    {}", report.reason);
+                }
+                if report.placement_timeout_seconds > 0 && !report.would_place {
+                    println!(
+                        "    The job fails if the gang is still short after its placementTimeout ({})",
+                        humantime::format_duration(std::time::Duration::from_secs(
+                            report.placement_timeout_seconds
+                        ))
+                    );
+                }
+            }
+        }
         // Who this submit would displace. Printed last and unmissably,
         // because it is the one thing in a plan that costs somebody else
         // something (S3 in the preemption plan: the submit becomes a
@@ -2036,8 +2469,18 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             }
             for (node_id, victims) in by_node {
                 for victim in victims {
+                    // A victim still inside victimExemptAge: the submit
+                    // waits for it to age, then evicts it.
+                    let wait = if victim.eligible_in_seconds > 0 {
+                        format!(
+                            ", once past victimExemptAge in {}s",
+                            victim.eligible_in_seconds
+                        )
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued",
+                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued{wait}",
                         victim.job_id,
                         victim.task_name,
                         victim.allocation_id,
@@ -2052,7 +2495,32 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+/// One line of `legion job plan`'s diff: `~ tasks.web.count: 2 → 3`,
+/// `+ tasks.cron: {…}`, `- tasks.old.env.X: "y"`.
+fn plan_diff_line(change: &crate::structs::JobFieldChange) -> String {
+    let cut = |text: &str| {
+        if text.chars().count() > 80 {
+            format!("{}…", text.chars().take(79).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    if change.redacted {
+        return format!("~ {}: changed (from a KV key you cannot read)", change.path);
+    }
+    match change.change.as_str() {
+        "added" => format!("+ {}: {}", change.path, cut(&change.new_json)),
+        "removed" => format!("- {}: {}", change.path, cut(&change.old_json)),
+        _ => format!(
+            "~ {}: {} → {}",
+            change.path,
+            cut(&change.old_json),
+            cut(&change.new_json)
+        ),
+    }
+}
+
+#[instrument(skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -2068,10 +2536,20 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let resolved = resolve_jobspec_source_async(job_path).await?;
     let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
 
-    // Capture the job name so we can optionally wait for convergence below.
-    let job_name = serde_json::from_str::<JobConfig>(&rendered)
-        .map(|config| config.name)
-        .ok();
+    let namespace = spec_request_namespace(arg_matches, &rendered);
+    // Capture the job's canonical id so we can optionally wait for
+    // convergence below.
+    let job_name = JobConfig::parse_submitted_str(
+        &rendered,
+        UnknownFieldMode::Allow,
+        crate::structs::spec_fields::ExtensionCheck::Offline,
+    )
+    .map(|(config, _)| {
+        let (declared, name) = crate::structs::namespace::split_job_id(&config.name);
+        let namespace = namespace.as_deref().unwrap_or(declared);
+        crate::structs::namespace::job_id(namespace, name)
+    })
+    .ok();
 
     let request = tonic::Request::new(RunJobRequest {
         parsed_jobspec: rendered,
@@ -2079,6 +2557,9 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         priority,
         force_reschedule: arg_matches.get_flag("force-reschedule"),
         idempotency_key,
+        namespace,
+        allow_unknown_fields: arg_matches.get_flag("allow-unknown-fields"),
+        expected_version: arg_matches.get_one::<i64>("expected-version").copied(),
     });
 
     let reply =
@@ -2100,6 +2581,9 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         output::print_success(&json!({
             "message": reply.message,
             "deduplicated": reply.deduplicated,
+            "warnings": reply.warnings,
+            "version": reply.version,
+            "revision": reply.revision,
             "wait": wait_result,
         }));
     } else {
@@ -2112,13 +2596,15 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
+    let namespaces = namespace_selection(arg_matches);
     let request = tonic::Request::new(ListJobsRequest {
         status: arg_matches.get_one::<String>("status").cloned(),
+        namespaces: namespaces.clone(),
         ..Default::default()
     });
     let response = output::resolve(
@@ -2126,10 +2612,34 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
         "failed to list jobs",
         client.list_jobs(request).await,
     )?;
-    let jobs_list = response.into_inner().jobs;
+    let reply = response.into_inner();
+    let jobs_list = reply.jobs;
 
     if format.is_json() {
         print_json(&jobs_list);
+        return Ok(());
+    }
+    if jobs_list.is_empty() {
+        let selected = if namespaces.is_empty() {
+            "namespace 'default'".to_string()
+        } else {
+            format!("namespace {}", namespaces.join(","))
+        };
+        if reply.elsewhere_count > 0 {
+            // The jobs are not gone; they are somewhere this list did not
+            // look (Nomad's most-asked namespace question).
+            println!(
+                "No jobs in {selected}. {} job(s) in {} other namespace(s) you can read; use -A.",
+                reply.elsewhere_count, reply.elsewhere_namespaces
+            );
+        } else {
+            println!("No jobs in {selected}.");
+        }
+        return Ok(());
+    }
+    if lists_many_namespaces(arg_matches) {
+        let printable: Vec<JobPrintNamespaced> = jobs_list.into_iter().map(Into::into).collect();
+        print_table(printable);
     } else {
         let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
         print_table(printable_jobs);
@@ -2138,16 +2648,20 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let active_only = arg_matches.get_flag("active");
-    let job_id = arg_matches.get_one::<String>("job").cloned();
+    let job_id = arg_matches
+        .get_one::<String>("job")
+        .map(|job| job_ref(arg_matches, job))
+        .transpose()?;
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListRolloutsRequest {
         job_id,
         active_only,
+        namespaces: crate::cmd::helpers::namespace_selection(arg_matches),
         ..Default::default()
     });
     let response = output::resolve(
@@ -2182,7 +2696,7 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2254,7 +2768,7 @@ struct RolloutEventPrint {
     message: String,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2360,7 +2874,7 @@ async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2402,28 +2916,286 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+/// `job info`'s lines for replacements waiting out their reschedule backoff
+/// (`Job.reschedule_backoffs`, docs/jobs-tasks-and-scheduling.md):
+///
+/// ```text
+/// Waiting out reschedule backoff:
+///   task store (instance sb-1): attempt 4 failed (...); next attempt at ... (backoff 4m)
+///   `legion job run <spec> --force-reschedule` retries now
+/// ```
+fn reschedule_backoff_lines(backoffs: &[crate::structs::RescheduleBackoff]) -> Vec<String> {
+    if backoffs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Waiting out reschedule backoff:".to_string()];
+    for backoff in backoffs {
+        let subject = if backoff.instance_id.is_empty() {
+            format!("task {}", backoff.task)
+        } else {
+            format!("task {} (instance {})", backoff.task, backoff.instance_id)
+        };
+        lines.push(format!("  {subject}: {}", backoff.summary));
+    }
+    lines.push(
+        "  `legion job run <spec> --force-reschedule` retries now (`legion instance start <id>` \
+         for one instance)"
+            .to_string(),
+    );
+    lines
+}
+
+/// The job's scaling inputs (`GetScalingInputs`), or `None` when the call
+/// fails: no `scale:read`, or a manager that predates the RPC. Shared with
+/// the MCP server's `legion_job_info`, so both render the same reply.
+pub(crate) async fn scaling_inputs_for_job(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    job: &str,
+) -> Option<Vec<crate::structs::ScalingInputs>> {
+    let request = crate::structs::GetScalingInputsRequest {
+        targets: vec![crate::structs::ScalingTargetSelector {
+            job: job.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    match client.get_scaling_inputs(request).await {
+        Ok(reply) => Some(reply.into_inner().inputs),
+        Err(status) => {
+            debug!(code = ?status.code(), message = %status.message(), "Scaling inputs unavailable");
+            None
+        }
+    }
+}
+
+/// `job info -j`'s data: the `Job` object, plus `scalingInputs` (one entry
+/// per task) when the caller could read them.
+pub(crate) fn job_info_json(
+    job: Option<crate::structs::Job>,
+    usage: Option<&[crate::structs::ScalingInputs]>,
+) -> Value {
+    let mut value = serde_json::to_value(&job).unwrap_or(Value::Null);
+    if let (Some(object), Some(usage)) = (value.as_object_mut(), usage) {
+        object.insert(
+            "scalingInputs".to_string(),
+            serde_json::to_value(usage).unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+/// One `job info` usage row: a task's replicas, measured CPU and memory
+/// against its reservation, requests into its service, and how fresh the
+/// numbers are.
+#[derive(Tabled)]
+struct ScalingInputsPrint {
+    #[tabled(rename = "TASK")]
+    task: String,
+    #[tabled(rename = "REPLICAS")]
+    replicas: String,
+    #[tabled(rename = "CPU USED / RESERVED")]
+    cpu: String,
+    #[tabled(rename = "MEMORY USED / RESERVED")]
+    memory: String,
+    #[tabled(rename = "REQUESTS")]
+    requests: String,
+    #[tabled(rename = "DATA")]
+    data: String,
+}
+
+fn percent(ratio: f64) -> String {
+    format!("{:.0}%", ratio * 100.0)
+}
+
+impl From<&crate::structs::ScalingInputs> for ScalingInputsPrint {
+    fn from(inputs: &crate::structs::ScalingInputs) -> Self {
+        let task = format!("{}/{}", inputs.task_group, inputs.task_name);
+        if !inputs.error.is_empty() {
+            return Self {
+                task,
+                replicas: "-".into(),
+                cpu: "-".into(),
+                memory: "-".into(),
+                requests: "-".into(),
+                data: inputs.error.clone(),
+            };
+        }
+        let mut replicas = format!("{}/{} ready", inputs.ready_replicas, inputs.placed_replicas);
+        if inputs.unplaced_replicas > 0 {
+            replicas.push_str(&format!(", {} unplaced", inputs.unplaced_replicas));
+        }
+        if inputs.rollout_active {
+            replicas.push_str(", rollout");
+        }
+        let cpu = match inputs.cpu.as_ref().filter(|cpu| cpu.measured_replicas > 0) {
+            None => "-".to_string(),
+            Some(cpu) => {
+                let amount = if cpu.used_mhz > 0.0 || cpu.reserved_mhz > 0.0 {
+                    format!("{:.0} / {:.0} MHz", cpu.used_mhz, cpu.reserved_mhz)
+                } else {
+                    format!("{}m", cpu.used_millicores)
+                };
+                if cpu.unmeasurable_replicas < cpu.measured_replicas {
+                    format!(
+                        "{amount} ({}, max {})",
+                        percent(cpu.utilization),
+                        percent(cpu.max_utilization)
+                    )
+                } else {
+                    amount
+                }
+            }
+        };
+        let memory = match inputs
+            .memory
+            .as_ref()
+            .filter(|memory| memory.measured_replicas > 0)
+        {
+            None => "-".to_string(),
+            Some(memory) if memory.reserved_mib > 0.0 => format!(
+                "{:.0} / {:.0} MiB ({})",
+                memory.used_mib,
+                memory.reserved_mib,
+                percent(memory.utilization)
+            ),
+            Some(memory) => format!("{:.0} MiB", memory.used_mib),
+        };
+        let requests = match inputs.requests.as_ref() {
+            None => "-".to_string(),
+            Some(requests) => {
+                let mut line = format!(
+                    "{:.1} rps, {:.1}% err",
+                    requests.requests_per_second,
+                    requests.error_ratio * 100.0
+                );
+                if requests.latency_ms_mean > 0.0 {
+                    line.push_str(&format!(", {:.0}ms avg", requests.latency_ms_mean));
+                }
+                line
+            }
+        };
+        let data = match inputs.freshness.as_ref() {
+            None => "-".to_string(),
+            Some(freshness) if freshness.state == "current" => {
+                format!("current ({}s ago)", freshness.age_seconds)
+            }
+            Some(freshness) => freshness.state.clone(),
+        };
+        Self {
+            task,
+            replicas,
+            cpu,
+            memory,
+            requests,
+            data,
+        }
+    }
+}
+
+#[instrument(skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches.get_one::<String>("name").context("need name")?;
-    let request = tonic::Request::new(GetJobInfoRequest {
-        name: job_name.to_owned(),
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches.get_one::<String>("name").context("need name")?,
+    )?;
+    let mut request = tonic::Request::new(GetJobInfoRequest {
+        name: job_name.clone(),
     });
+    crate::cmd::watch::apply_read_flags(&mut request, arg_matches)?;
     let response = output::resolve(
         format,
         "failed to fetch job info",
         client.get_job_info(request).await,
     )?;
+    // Request vs usage (docs/autoscaling.md, "Scaling inputs"). Best effort:
+    // a caller without `scale:read`, or a manager that predates the RPC,
+    // still gets the job.
+    let usage = scaling_inputs_for_job(&mut client, &job_name).await;
 
+    let reply = response.into_inner();
     if format.is_json() {
-        print_json(&response.into_inner().job);
+        let mut value = job_info_json(reply.job, usage.as_deref());
+        if let Some(object) = value.as_object_mut() {
+            if let Some(managed_by) = &reply.managed_by {
+                let mut stamp = json!({ "app": managed_by.app });
+                if managed_by.object.is_empty() {
+                    stamp["digest"] = json!(managed_by.digest);
+                } else {
+                    stamp["object"] = json!(managed_by.object);
+                    stamp["label"] =
+                        json!(crate::structs::acl::object_stamp_label(&managed_by.object));
+                }
+                object.insert("managedBy".to_string(), stamp);
+            }
+            // `unknownFields` when the latest version was submitted with
+            // --allow-unknown-fields and that kept or dropped something.
+            if let Some(record) = reply.unknown_fields.as_ref() {
+                object.insert("unknownFields".into(), serde_json::to_value(record)?);
+            }
+            // `extensions` when the job sets installed apps' jobspec keys
+            // (or keeps pending ones), as they read now.
+            if !reply.extensions.is_empty() {
+                object.insert(
+                    "extensions".into(),
+                    Value::Array(reply.extensions.iter().map(extension_value_json).collect()),
+                );
+            }
+            // What `--index` takes to wait for the next change
+            // (docs/watches-and-blocking-queries.md).
+            object.insert("revision".into(), json!(reply.revision));
+        }
+        print_json(&value);
     } else {
-        let job = response.into_inner().job.context("no job found")?;
+        let job = reply.job.context("no job found")?;
         let blocked = job.blocked.clone();
+        let backoff_lines = reschedule_backoff_lines(&job.reschedule_backoffs);
         let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
+        // An app's job (docs/apps.md): the reconciler owns its spec. Or a
+        // job an app wrote for one of its objects (docs/app-objects.md,
+        // "Acting for an object"): the app will likely write it back.
+        if let Some(managed_by) = &reply.managed_by {
+            if managed_by.object.is_empty() {
+                let digest: String = managed_by.digest.chars().take(8).collect();
+                println!(
+                    "managed by app {} (digest {digest}…); direct edits are refused. Use `legion app`.",
+                    managed_by.app
+                );
+            } else {
+                println!(
+                    "managed by {}; {} will likely write back a version you submit",
+                    crate::structs::acl::object_stamp_label(&managed_by.object),
+                    managed_by.app
+                );
+            }
+        }
+        for line in backoff_lines {
+            println!("{line}");
+        }
+        // Kept so the escape hatch stays visible rather than habitual
+        // (docs/jobs-tasks-and-scheduling.md, "Unknown fields").
+        if let Some(record) = reply.unknown_fields.as_ref() {
+            let record = crate::structs::spec_fields::UnknownFieldsRecord::from(record);
+            println!(
+                "submitted with --allow-unknown-fields: {}",
+                record.summary()
+            );
+        }
+        // Installed apps' values (docs/apps.md, "Jobspec extensions"), under
+        // the key the author wrote, with their state now.
+        if !reply.extensions.is_empty() {
+            println!("jobspec extensions:");
+            for value in &reply.extensions {
+                println!("  {}", extension_value_line(value));
+            }
+        }
+        if let Some(usage) = usage.as_deref().filter(|usage| !usage.is_empty()) {
+            println!();
+            print_table(usage.iter().map(ScalingInputsPrint::from).collect());
+        }
         // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
         // "Blocked evals"): it places on its own when that capacity appears.
         if let Some(blocked) = blocked {
@@ -2433,19 +3205,56 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                 .map(|(resource, amount)| format!("{resource} {amount}"))
                 .collect();
             shortfall.sort();
-            println!(
-                "Blocked on {} since {}: task {} needs {} per placement",
-                blocked.key,
-                chrono::DateTime::from_timestamp(blocked.since, 0)
-                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-                    .unwrap_or_else(|| blocked.since.to_string()),
-                blocked.task,
-                if shortfall.is_empty() {
-                    "room".to_string()
-                } else {
-                    shortfall.join(", ")
+            let per_placement = if shortfall.is_empty() {
+                "room".to_string()
+            } else {
+                shortfall.join(", ")
+            };
+            let since = chrono::DateTime::from_timestamp(blocked.since, 0)
+                .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| blocked.since.to_string());
+            match blocked.gang.as_ref() {
+                // A gang waits for its whole quorum, not for one placement
+                // (docs/gang-scheduling.md).
+                Some(gang) => {
+                    println!(
+                        "Blocked on {} since {}: gang {} is short {} replica(s) of {} each \
+                         ({} running, {} more fit, needs {} together)",
+                        blocked.key,
+                        since,
+                        blocked.task,
+                        gang.min
+                            .saturating_sub(gang.running)
+                            .saturating_sub(gang.placeable),
+                        per_placement,
+                        gang.running,
+                        gang.placeable,
+                        gang.min
+                    );
+                    if let Some(deadline) = chrono::DateTime::from_timestamp(gang.deadline, 0)
+                        .filter(|_| gang.deadline > 0)
+                    {
+                        println!(
+                            "  Fails at {} if still short (placementTimeout)",
+                            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        );
+                    }
                 }
-            );
+                // Not short of room: the task's runtime is disabled
+                // (docs/runtime-disable.md), and only the enable helps.
+                None if crate::structs::runtime_state::blocked_key_runtime(&blocked.key)
+                    .is_some() =>
+                {
+                    println!(
+                        "Blocked on {} since {}: task {} waits for its runtime to be enabled",
+                        blocked.key, since, blocked.task
+                    )
+                }
+                None => println!(
+                    "Blocked on {} since {}: task {} needs {} per placement",
+                    blocked.key, since, blocked.task, per_placement
+                ),
+            }
             println!("  {}", blocked.message);
         }
     }

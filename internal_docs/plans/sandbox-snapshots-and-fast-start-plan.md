@@ -1,5 +1,7 @@
 # Plan: Sandbox Snapshots, Fast Start, and Forking
 
+> **Judgement calls:** [sandbox-snapshots-and-fast-start-plan_calls.md](../calls/sandbox-snapshots-and-fast-start-plan_calls.md)
+
 > **Superseded in part (2026-10-09) by
 > [`suspend-resume-and-oversubscription-plan.md`](suspend-resume-and-oversubscription-plan.md).**
 > That plan wins on scope, phasing, the warm-pool and idle-handling stance

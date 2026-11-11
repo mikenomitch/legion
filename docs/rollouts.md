@@ -43,7 +43,7 @@ See a full example in `configs/jobs/maximal.ncl`.
 | `onCapacityTimeout` | `rollback \| fail \| completeIncomplete` | `fail` | Action when `capacityBlockTimeout` expires. |
 | `rollbackOnFailure` | `bool` | `false` | If true, `fail` actions trigger rollback. |
 | `onHealthDeadline` | `rollback \| fail \| pause` | `rollback` | Action when `healthyDeadline` expires. |
-| `batchKillAfter` | `duration` | unset | For batch tasks, maximum wait before active old allocations are force-retired during rollout. |
+| `batchKillAfter` | `duration` | unset | For batch tasks, maximum wait before running old allocations are force-retired during rollout. Finished ones are retired at once regardless. |
 | `slots.order` | `parallel \| sequential` | `parallel` | Slot-mode stateful groups only. `sequential` replaces one slot per step, highest ordinal first, each step health-gated. |
 | `slots.updateFrom` | `u32` | unset | Slot-mode stateful groups only. Staged rollout floor: only slots `>= updateFrom` are updated, and lower slots keep their current allocations. Requires `slots.order = "sequential"` and must be `< count.num`. |
 
@@ -71,6 +71,7 @@ Legion validates rollout config when you submit the job.
 - `slots.order = "sequential"` cannot be combined with a step mode in the same scope.
 - `slots` is only valid for groups with a slot-mode stateful task.
 - `slots.updateFrom` requires `slots.order = "sequential"` and must be less than the slot task's `count.num`.
+- A group whose task sets [`gang`](gang-scheduling.md#rollouts) must roll out in one step: a step mode that resolves to more than one step (`percentSteps = [100]` is one), and `slots.order = "sequential"`, are rejected. The engine also runs a gang group in one step whatever a strategy plugin injects. With `destroyFirst` the update is a restart of the whole gang; with `createFirst` the new gang places whole beside the old one.
 
 ## Step semantics
 
@@ -165,8 +166,15 @@ rollout left behind instead of the latest config:
   new version first. If the previous version then cannot be placed back (no
   capacity, a lost conflict race), a `job_reschedule` for the previous
   version is queued 5 seconds out. An automatic rollback still ends the
-  rollout `failed`. A `StopRollout` with `revert` returns the error and
-  leaves the rollout in its current status, so retry the stop. Reconciliation tops up
+  rollout `failed`. A `StopRollout` with `revert` ends the rollout
+  `cancelled` and removes the new version in one write, before it re-places
+  the previous version, so no later tick can find the rollout live and place
+  the new version again. If the re-placement then fails, the stop still
+  succeeds: the rollout's message (and the reply's) reads `Rollout stopped
+  and reverted; the new version is removed, but re-placing the previous
+  version failed (<error>), so a job_reschedule retry is queued`, and the
+  same text is a `warn` rollout event. If the stop itself fails, nothing
+  changed and it can be retried. Reconciliation tops up
   the previous version, for example after a node loss. It never re-places the
   rolled-back version.
 - **Failed after replacing everything**: only the new version runs, and
@@ -216,6 +224,17 @@ version that has not exited) is not capacity blocked. The group waits with
 `Group <g> waiting for dependencies of <task> to finish`, the capacity
 timeout does not run, and the dependency's exit queues the next tick.
 
+A replacement of an allocation that failed, on this version or on the one
+being replaced, waits out that failure's reschedule backoff
+([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md), "Manager-side
+move logic"). It is not capacity blocked either: the group waits with
+`Group <g> waiting for <task> (<n>) to wait out a reschedule backoff`, the
+capacity timeout does not run, and the group looks again when the soonest
+hold lapses (at most every 30s). Time spent waiting still counts toward
+`healthyDeadline`, which is measured from the step's start, so a backoff
+longer than the deadline makes the step miss it once the replacement is
+placed.
+
 ### Static ports and surge
 
 A task with a static port (`network.ports[].static`) runs once per node, so
@@ -256,9 +275,23 @@ Reconcile loop:
 ## Lifecycle-specific behavior
 
 - `service` tasks: standard rollout behavior.
-- `batch` tasks: old batch allocations are not killed by default during rollout. The rollout waits for them to finish.
-- `batchKillAfter`: if set, old batch allocations are force-retired after that elapsed time in-step.
-- `sidecar` tasks: rollout follows the group progression and updates in lockstep with the group.
+- `batch` tasks: old batch allocations that are still running are not killed by default during rollout. The rollout waits for them to finish (the batch retire window), and the group's event reads `Group <name> waiting for batch retire window` meanwhile.
+- `batchKillAfter`: if set, running old batch allocations are force-retired after that elapsed time in-step.
+- Finished old allocations (`complete` or `failed`, of any lifecycle) run nothing, so the rollout retires them at once and before any live allocation of the same task. They never wait on the batch retire window.
+- `sidecar` tasks: rollout follows the group progression and updates in lockstep with the group. A sidecar on a node where the batch retire window keeps a running old batch step of its group waits with that step, so the step never runs on without it.
+- A `batch` task that another task waits on to exit (`dependsOn` with `complete` or `success`) is placed whole at every step, whatever the step's fraction. Its dependents need every replica to finish, so placing a fraction of it would hold them, and the step with them, forever.
+
+### Resubmitting a batch or DAG job
+
+A new version of a batch job runs from the top. Its tasks are new task configs with their own `pending` statuses, so the old version's results never satisfy the new version's `dependsOn`. A resubmit with a changed variable goes like this:
+
+1. The old version's finished steps are retired on the first tick. A step still running holds the group until it exits (or `batchKillAfter` passes).
+2. The rollout places the new version's DAG roots. Each later step is placed when its dependency's exit is reported, through a `rollout_tick` (see [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#task-lists-and-dependency-readiness)).
+3. A `service` that depends on a batch step is placed once that step succeeds, and the rollout completes when it is healthy.
+
+Releasing a held dependent is DAG progress inside the new version, not a step of replacing the old one, so every `rollout_tick` does it first, ahead of the rollout's gates. A dependent is placed even while the rollout is paused, waits for a manual advance or a step stagger, or waits on the batch retire window, and the rollout logs `Released N allocation(s) held behind a dependency's exit`. The release does not widen a step: a `batch` dependent is placed whole, but a `service` or `sidecar` dependent is placed only up to its group's active step target, and not while `destroyFirst` still has old allocations of it to retire. A paused rollout stays paused: the tick releases the dependents and runs no step.
+
+Once the new version lands, the old version is superseded: nothing more of it is placed. A service of the old version that was still waiting on its dependencies never starts, and the new version's service replaces it.
 
 ## Scheduler and eval loop integration
 
@@ -272,7 +305,13 @@ Core flow:
 6. Allocation dispatch and task status updates run after successful placement.
 7. Old allocations are retired according to replacement mode and lifecycle rules.
 8. Rollout status/events/runtime JSON are persisted.
-9. Next delayed `rollout_tick` is enqueued when rollout must continue.
+9. Next delayed `rollout_tick` is enqueued when rollout must continue. A
+   tick that only waited (for health, capacity, a dependency, or a backoff)
+   and changed nothing (status, message, and step state as it found them)
+   instead puts its own eval back to pending for the delay. Such a no-op tick
+   writes no `eval.completed` and no `eval.enqueued` event, so a rollout that
+   waits a long time does not fill the event stream with a pair per poll;
+   the rollout's own event log already records only changes.
 
 Eval handler paths:
 

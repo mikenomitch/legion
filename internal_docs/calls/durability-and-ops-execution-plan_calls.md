@@ -490,6 +490,18 @@ surface that is explicitly allowed to drop under real failure.
 leadership; `docs/event-stream.md` unchanged (the per-lane ordering caveat
 already covered it).
 
+**Revisited (spot check 2026-10-12).** "First led lane wins" still dropped
+every standalone event on a manager that leads *no* lane, which is every
+follower in the default `single` topology. Events raised in heartbeat
+handlers run on whichever manager a worker dials, so `legion events list
+--kind node.pressure` was empty on all three managers while the pressure
+response evicted work. A manager that leads no lane now forwards the event
+(`ForwardableLaneWrite::EmitEvent`, status lane). The original objection
+holds where it applied: a manager that leads any lane still never forwards,
+and a forward that fails (no leader, unreachable) is logged and dropped, so
+journal writes reach the network only from followers and only for events
+that would otherwise be lost.
+
 ## 16. Tests assert the real contract, and gained standing-split and forwarding cases
 
 **The call.** `lane_leadership_co_locates_on_the_control_anchor` still demands

@@ -16,7 +16,7 @@ entry contradicts an earlier one, it says so and gives the reason.
 status-lane leader and commits nothing. `node_health.last_heartbeat` and
 `.last_heartbeat_unix` stop being written per beat. The `active → lost` and
 `lost → active` transitions keep their existing replicated composites
-(`Store::mark_nodes_as_lost`, `src/storage/store.rs:4805`;
+(`Store::mark_nodes_as_lost`, `crates/manager/src/storage/store.rs:4805`;
 `Store::mark_node_ready`, `:4370`), so everything a scheduler, an operator,
 or a reconciler consumes stays durable.
 
@@ -40,7 +40,7 @@ replicated one. (c) **Gossip/SWIM**, Consul's model.
   word in an operator's vocabulary that was not there before.
 - Soft state is harder to reason about than replicated state. A bug in the
   liveness table is invisible to the content-hash convergence checks that
-  `tests/raft_lanes.rs` uses to prove everything else correct.
+  `tests/integration/raft_lanes.rs` uses to prove everything else correct.
 - Under a standing lane split, detection now depends on a digest RPC path
   (entry 12) that does not exist today, with its own partial-failure story.
 
@@ -48,7 +48,7 @@ replicated one. (c) **Gossip/SWIM**, Consul's model.
 *derived* (the worker never sends one; the manager stamps `now`), *worthless
 after a few seconds*, and — decisively — **already discarded by the code at
 the one moment durability would pay off**. The startup-grace comment at
-`src/manager/daemon.rs:956-964` says so outright: *"time the manager spent
+`crates/manager/src/manager/daemon.rs:956-964` says so outright: *"time the manager spent
 down must not count as missed heartbeats: right after a manager restart
 every persisted heartbeat looks stale."* Legion is paying an fsync per beat
 for a value it deliberately refuses to trust. Measured, that fsync dominates:
@@ -204,6 +204,10 @@ no longer 10% of margin from mass false loss — not the destination.
 
 ## 4. `liveness.batchWindow` ships inert, because the measurement it is contingent on has not been run
 
+> **Superseded 2026-11-10.** The inert field was deleted
+> ([todo-closeout calls #4](todo-closeout-2026-11-10_calls.md)); the reasoning
+> below is why it was never wired, and still holds if the window comes back.
+
 **Call.** *(Implementation.)* `liveness.batchWindow` exists in the config, is
 parsed and validated, and defaults to `"0ms"` — reproducing today's
 commit-while-you-can batching exactly — but **nothing consumes it**, and the
@@ -234,7 +238,7 @@ something.
 **Call.** Nothing in the scheduler, the eval loop, the dispatcher, or the
 rollout engine ever reads the liveness table. Placement continues to gate on
 `node.availability` — a **control-lane** column — exactly as it does today
-(`Store::available_node_arcs`, `src/storage/store.rs:2094`;
+(`Store::available_node_arcs`, `crates/manager/src/storage/store.rs:2094`;
 `available_node_ids`, `:2079`). Node loss reaches the scheduler the way it
 already does: the existing `mark_nodes_as_lost` composite flips
 `node.availability` on the control lane and enqueues a
@@ -258,7 +262,7 @@ deliberately preserved rather than fixed, so it belongs on the record.
 (`node.availability`, control lane) and liveness (`node_health`, status
 lane) in different places, and `set_node_availability`'s own doc comment
 names availability as *"the scheduler's single placement chokepoint"*
-(`src/storage/store.rs:4570-4573`). The lanes complication that looked like
+(`crates/manager/src/storage/store.rs:4570-4573`). The lanes complication that looked like
 the hardest part of this plan turns out to be already solved by a decision
 someone else made for other reasons. Adding a cross-lane liveness read would
 create the first place in Legion where a scheduling decision depends on
@@ -352,12 +356,12 @@ and let the status column carry the whole answer. (c) Gossip the timestamps.
 **Trade-off.** Two managers can print different values for the same node.
 Someone will file that as a bug, and the answer will be "working as
 intended", which is never a satisfying reply. Sorting by `last_heartbeat`
-(`src/manager/server.rs:5398`) also now sorts on whatever value *that*
+(`crates/manager/src/manager/server.rs:5398`) also now sorts on whatever value *that*
 manager holds, which is a subtly different ordering per manager.
 
 **Why (performance on a hot read path, and honesty).** `get_nodes` is a pure
 local read today, with ACL filtering, query matching, sorting, and pagination
-applied *after* the fetch (`src/manager/server.rs:5372-5395`). Option (a)
+applied *after* the fetch (`crates/manager/src/manager/server.rs:5372-5395`). Option (a)
 would forward the entire pre-filter node list on every `legion node list`
 and every UI poll — turning a display field into a hard dependency on the
 status leader being reachable, on a page an on-call responder opens
@@ -524,16 +528,16 @@ rather than the prose.
 ## 14. `ReportNodeLiveness` goes on `RaftTransport`, not on the `Manager` service
 
 **Call.** The digest RPC is added to the existing authenticated manager-plane
-`RaftTransport` service (`src/storage/raft/server.rs:70`), alongside
+`RaftTransport` service (`crates/manager/src/storage/raft/server.rs:70`), alongside
 `ForwardLaneWrite`. It takes no ACL resource/action/scope and no row in
-`tests/acl_endpoints.rs`.
+`tests/integration/acl_endpoints.rs`.
 
 **Alternative.** Put it on the `Manager` service with an ACL row
 (`AclResource::Node` / `AclAction::Write` / worker-plane-style enforcement),
 which is what `AGENTS.md`'s "every Manager gRPC endpoint must enforce ACLs"
 rule would produce if the message lived there.
 
-**Trade-off.** `tests/acl_endpoints.rs::every_manager_rpc_is_classified`
+**Trade-off.** `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified`
 parses `proto/legion.proto` for `Manager` RPCs and fails the build on an
 unclassified one. Putting the digest outside that service puts it outside
 that safety net, so a future mistake here — a second manager-plane RPC that
@@ -559,7 +563,7 @@ the right degradation story against an older peer, which entry 15 depends on.
 `protocol_version` bump, no worker behavior change. A manager that gets
 `unimplemented` from `ReportNodeLiveness` on a peer falls back to today's
 per-heartbeat `ForwardLaneWrite::NodeHeartbeat`
-(`src/storage/raft/forward.rs:54`), counting
+(`crates/manager/src/storage/raft/forward.rs:54`), counting
 `legion_liveness_digest_rpcs_total{outcome="unimplemented"}`.
 
 **Alternative.** Have workers help — for example, send a monotonic beat
@@ -653,12 +657,12 @@ phasing in the first place.
 
 ## 18. The liveness table lives on `Store`, not on the manager service
 
-**Call.** *(Implementation.)* `LivenessTable` (`src/storage/liveness.rs`) is
+**Call.** *(Implementation.)* `LivenessTable` (`crates/manager/src/storage/liveness.rs`) is
 an `Arc` field on `Store`, and `Store::update_node_heartbeat` remains the one
 entry point a heartbeat takes.
 
 **Alternatives.** (a) Put it on `ManagerDaemonService` — it is arguably
-manager state, not storage state, and `src/storage/` is where *persistence*
+manager state, not storage state, and `crates/manager/src/storage/` is where *persistence*
 lives. (b) A standalone service owned by `run_manager` and threaded into both
 the gRPC handler and the checker loop.
 
@@ -673,13 +677,13 @@ also already carries process-local soft state that is neither persisted nor
 replicated — the two coalescers, `node_health_orphan_candidates` — so this is
 the established shape rather than a new one. Options (a) and (b) both mean
 threading a second handle through code that has no manager service at all,
-including `tests/raft_lanes.rs` and every embedded use of `Store`.
+including `tests/integration/raft_lanes.rs` and every embedded use of `Store`.
 
 ---
 
 ## 19. The registry gained a float gauge rather than scaling the ratio into an integer
 
-**Call.** *(Implementation.)* `src/manager/telemetry.rs` gained a `FloatGauge`
+**Call.** *(Implementation.)* `crates/manager/src/manager/telemetry.rs` gained a `FloatGauge`
 family type and a `SampleValue::GaugeF64` variant, so
 `legion_heartbeat_freshness_ratio` reads `0.22`.
 
@@ -687,7 +691,7 @@ family type and a `SampleValue::GaugeF64` variant, so
 (`220`) — no new metric type, no new arm in the OTLP export.
 
 **Trade-off.** One more type in the registry and one more branch in
-`src/otel.rs`.
+`crates/common/src/otel.rs`.
 
 **Why (simplicity at 3am).** The whole point of the ratio is that it is in the
 same units as its danger threshold: false loss begins at

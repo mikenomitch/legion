@@ -9,10 +9,14 @@
 //! - any configured JWT method: pass the externally issued JWT with `--jwt`
 //!   or `--jwt-file` and the manager exchanges it for an ACL token.
 //!
-//! The minted secret is written to `~/.legion/token` (override with
-//! `LEGION_TOKEN_FILE`); `LEGION_TOKEN` always takes precedence when set.
+//! The minted secret is written to the token file for the manager's address,
+//! `~/.legion/tokens/<host>_<port>` (`LEGION_TOKEN_FILE` names one file for
+//! every address instead), so logins to two clusters never overwrite each
+//! other; `LEGION_TOKEN` always takes precedence when set.
 
-use crate::cmd::helpers::{cli_token_path, connect_manager_client, json_flag, save_cli_token};
+use crate::cmd::helpers::{
+    cli_token_path, connect_manager_client, json_flag, manager_address, save_cli_token,
+};
 use crate::cmd::oidc;
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
@@ -20,7 +24,7 @@ use crate::structs::{GetAuthMethodsRequest, LoginRequest};
 
 pub fn login_config() -> Command {
     Command::new("login")
-        .about("Log in to the manager and store the resulting ACL token")
+        .about("Log in to the manager at LEGION_ADDR and store the ACL token for that address")
         .arg(
             Arg::new("method")
                 .long("method")
@@ -85,11 +89,11 @@ pub fn login_config() -> Command {
 
 pub fn logout_config() -> Command {
     Command::new("logout")
-        .about("Remove the stored ACL token")
+        .about("Remove the stored ACL token for the manager at LEGION_ADDR")
         .arg(json_flag())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle_login(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let method = arg_matches
@@ -190,7 +194,7 @@ pub async fn handle_login(arg_matches: &ArgMatches) -> R<()> {
     let stored_path = if arg_matches.get_flag("no-store") {
         None
     } else {
-        Some(save_cli_token(&reply.secret)?)
+        Some(save_cli_token(&manager_address(), &reply.secret)?)
     };
 
     if format.is_json() {
@@ -255,10 +259,10 @@ async fn browser_login(
     .await
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle_logout(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let path = cli_token_path();
+    let path = cli_token_path(&manager_address());
     let removed = match std::fs::remove_file(&path) {
         Ok(()) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,

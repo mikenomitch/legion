@@ -22,18 +22,53 @@
   # exec = { enabled = true },
   # Direct exec tickets (`legion exec --direct`, `MintExecTicket`): how long a
   # ticket can be redeemed and how long its session may run. Signed with the
-  # workload-identity key, so `workloadIdentity.enabled` must be true to mint.
+  # workload-identity key (on by default; `workloadIdentity.enabled = false`
+  # turns tickets off with it).
   # exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
   # Telemetry: Prometheus /metrics plus /healthz + /readyz probes
   # (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
   # unless `port` is set. Set `enabled = false` to turn the listener off.
   # telemetry = { enabled = true, port = 4749 },
+  # The system worker (docs/architecture-managers-workers.md, "The system
+  # worker"): every manager runs one in-process worker for Legion's own jobs,
+  # the ones in the reserved legion-system namespace. These are the defaults:
+  # write nothing to get them, or `enabled = false` to keep this manager free
+  # of allocations. `legion start manager --run-worker` runs a worker for
+  # every namespace instead, in the default pool, and ignores this block.
+  systemWorker = {
+    enabled = true,
+    # Namespaces it accepts. Globs skip reserved `legion-*` names, so
+    # "everything" is ["*", "legion-*"].
+    namespaces = ["legion-system"],
+    # What this manager lends its system worker, in MHz and MiB: the node's
+    # whole capacity as the scheduler sees it and, on Linux with cgroup v2,
+    # the cpu.max / memory.max of its `legion-system` cgroup parent.
+    resources = { cpu = 1000, memory = 1024 },
+    # Its worker plane port. A standalone worker on this host keeps 4848.
+    port = 4849,
+  },
+  # Seed-time settings for the apps bundled with Legion (docs/apps.md,
+  # "Seeding"), by app name. Read ONLY when the first Control leader seeds an
+  # app's record on a new cluster; after that `legion app` is the interface,
+  # and a manager that finds this block for an existing app logs that it was
+  # not applied. Leave it out to seed every bundled app enabled, with its
+  # manifest's defaults.
+  #
+  # apps = {
+  #   autoscaler = {
+  #     enabled = false,          # seed it disabled (`legion app enable` later)
+  #     placement = "managers",   # managers | workers | any
+  #     replicas = 1,
+  #     config = { plugins = {} },  # validated against its config schema
+  #   },
+  # },
   # Edge boot (docs/edge-boot.md): boot tickets and edge-initiated starts.
   # OFF BY DEFAULT, and turning it on is an explicit security decision — it
   # grants nodes the ability to start work on a capability, growing a
   # compromised node's blast radius from "runs what it was given" to "runs
   # anything a live ticket names". Tickets are signed by the
-  # workload-identity issuer, so `workloadIdentity.enabled` must also be true.
+  # workload-identity issuer (on by default), so `workloadIdentity.enabled`
+  # must not be false.
   #
   # A job's own `speculativeStart` block does NOT need this switch: pre-commit
   # dispatch from the manager opens no new authorization surface.
@@ -45,8 +80,8 @@
   #   # Hard cap. Revocation is by TTL only, so this is the real bound on
   #   # how long a leaked ticket is dangerous.
   #   maxTicketTtl = "1h",
-  #   # Cap on concurrent unratified claims per node.
-  #   maxProvisionalPerNode = 32,
+  #   # The per-node cap on unratified edge claims is a worker setting
+  #   # (`edgeBoot.maxProvisionalPerNode` in the worker type's config).
   # },
   # Automatic suspend (docs/suspend-and-resume.md, "Idle policy"). The idle
   # sweep reads the usage reports workers send every 10s and suspends
@@ -143,8 +178,6 @@
     #
     # Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     # by default; the flags exist as escape hatches.
-    # lazy_version_sample: RETIRED (no effect, warns once). Plans now take
-    # their fence epochs from their own capacity snapshot.
     # plan_apply_coalescing = true, # false = one commit/raft propose per plan
     # plan_apply_batch_max = 16,    # max plans per group commit (1-128)
     # Job-intake group commit (docs/scheduler-and-eval-loop.md): concurrent
@@ -207,6 +240,24 @@
   #   # are re-encrypted under the new key in the background afterwards.
   #   dataKeyRotationAge = "720h",
   # },
+  # The cluster CA (docs/cluster-ca.md): what signs node, fleet, and manager
+  # certificates and what every join token pins. Omit the block for the
+  # built-in CA, generated on first use and kept in the replicated store.
+  # Every manager in a cluster needs the same block (and the same files).
+  # clusterCa = {
+  #   provider = "builtin",                      # "builtin" | "file" | "exec"
+  #   # file: an intermediate from your PKI; the key never enters the store.
+  #   # certPath = "/etc/legion/ca/cluster-ca.pem",   # signing CA, then intermediates
+  #   # keyPath = "/etc/legion/ca/cluster-ca.key",    # PKCS#8 ("BEGIN PRIVATE KEY")
+  #   # bundlePath = "/etc/legion/ca/trust.pem",      # default: the signing CA itself
+  #   # exec: an external signer over JSON on stdin/stdout
+  #   # (plugins/cluster_ca/vault-pki/legion-ca-vault for Vault PKI).
+  #   # command = ["legion-ca-vault", "--mount", "pki_legion", "--role", "legion"],
+  #   # timeout = "10s",                         # per call
+  #   # refreshInterval = "1m",                  # how often the trust bundle is re-read
+  # },
+  # Test a provider before using it: `legion net ca provider test -- <command…>`
+  # or `legion net ca provider test --cert-path … --key-path …`.
   # Cluster-level artifact settings (docs/artifacts.md). Everything here is
   # optional; the values below match the built-in defaults.
   artifacts = {
@@ -226,21 +277,28 @@
     containerImageDesugar = false,
   },
   # Workload identity (OIDC issuer; see docs/workload-identity.md).
-  # Off by default. When enabled the manager signs short-lived per-task JWTs
+  # On by default: apps (the bundled autoscaler) and API sockets authenticate
+  # with Legion's own `legion` identity. The manager signs short-lived per-task JWTs
   # and serves the OIDC discovery document + JWKS over plain HTTP on the main
   # listener. `issuer` is the externally-published URL relying parties trust
   # (it must be reachable by AWS/GCP/Vault — typically via an HTTPS proxy).
+  # It is one value for the whole cluster: set the same `issuer` on every
+  # manager, or leave it unset for the shared default (docs/workload-identity.md,
+  # "The issuer").
   # `nodeIdentities` declares identities issued to worker nodes rather than
   # tasks — referenced by artifact `auth.nodeIdentity` and cluster
   # artifact-auth matchers.
   # workloadIdentity = {
-  #   enabled = true,
+  #   enabled = true,          # the default; false turns workload identity off
   #   issuer = "https://manager.example.com:4747",
   #   jwksPath = "/.well-known/jwks.json",
   #   signingAlg = "ES256",
   #   defaultTtl = "15m",      # token TTL when an identity sets none
   #   rotationAge = "24h",     # rotate the signing key past this age
-  #   subTemplate = "{region}:{job}:{group}:{task}",
+  #   subTemplate = "{region}:{namespace}:{job}:{group}:{task}",
+  #   # Other subject shapes a job's identity may name in its own
+  #   # `subTemplate` (default: none, only the one above).
+  #   allowedSubTemplates = ["{region}:{namespace}:{job}:{group}:{task}:{instance}"],
   #   nodeIdentities = [
   #     {
   #       name = "artifact-pull",
@@ -318,8 +376,10 @@
 
     # Floor and ceiling on a served interval. Past the ceiling the manager
     # stops backing off and warns instead: the answer is more control plane.
+    # The ceiling stays under the stateful self-fence (selfTerminateAfter,
+    # 90s by default); a ceiling at or past 90s starts with a warning.
     minInterval = "2s",
-    maxInterval = "120s",
+    maxInterval = "55s",
 
     # Headroom in the sizing formula `heartbeatSeconds >= H x N / R`.
     # 2 runs the control plane at half its measured ceiling.
@@ -349,26 +409,24 @@
     # ONLY — never read back as liveness. "0s" disables it entirely, and
     # non-leaders then show no time rather than an approximate one.
     checkpointInterval = "30s",
-
-    # Accumulation window for the heartbeat group commit. "0ms" (the
-    # default) is commit-while-you-can batching. A steady-state heartbeat
-    # does not commit at all, so this applies only to the checkpoint and to
-    # the mixed-version forwarding fallback.
-    # batchWindow = "0ms",
   },
   # Auth & ACLs (on by default; see docs/auth-and-acls.md). At first start
   # the manager mints the initial management token itself and writes it to
-  # <dataDir>/bootstrap-token and, when absent, ~/.legion/token (mode 0600),
+  # <dataDir>/bootstrap-token and ~/.legion/tokens/<host>_<port> (mode 0600),
   # so the CLI on this machine works with nothing to set up. Create
   # policies/tokens with `legion acl ...` and introduce workers with
   # `legion join-token create`. `enabled = false` is for throwaway clusters
   # only: every caller, including any task, then controls the cluster.
+  # `legion start manager --no-acl` does the same without editing this file.
   acl = {
     enabled = true,
     # bootstrapSecretFile = "/etc/legion/bootstrap-secret",  # IaC pre-seed (>= 24 chars), read at first start
     # auditOnly = true,        # log denials without enforcing (migration mode)
     # loginTtl = "24h",        # lifetime of tokens minted via `legion login`
-    # tokenMaxTtl = "720h",    # upper bound for client-token lifetimes
+    # tokenDefaultTtl = "720h",      # lifetime of a token created without --ttl (default 30 days)
+    # tokenMaxTtl = "2160h",         # upper bound for client tokens (default 90 days; "none" lifts it)
+    # childTokenDefaultTtl = "1h",   # `legion acl token create --child` default lifetime
+    # childTokenMaxTtl = "24h",      # and its bound (also bounded by the parent's expiry)
     # jwksRefreshInterval = "5m",
     # authMethods = [
     #   {
@@ -393,4 +451,25 @@
     #   },
     # ],
   },
+
+  # Agent governance: the audit journal, approval gates, per-token write rate
+  # limits, and usage accounting (docs/audit-journal.md,
+  # docs/approvals-and-rate-limits.md, docs/usage-accounting.md). Everything
+  # below is the default except the approval rules, of which there are none
+  # by default.
+  # governance = {
+  #   audit = { enabled = true, retainEvents = 200000, retainAge = "90d", flushInterval = "250ms" },
+  #   approvals = {
+  #     ttl = "1h",
+  #     rules = [
+  #       { name = "prod-destroys", operations = ["DestroyJob", "StopJob"], namespaces = ["prod"] },
+  #       { name = "acl-writes", permissions = ["acl:write"] },
+  #     ],
+  #   },
+  #   rateLimit = {
+  #     writesPerSecond = 20, burst = 100, exemptManagement = true,
+  #     overrides = [ { policies = ["ci-agent"], writesPerSecond = 2, burst = 10 } ],
+  #   },
+  #   usage = { enabled = true, interval = "60s", retention = "90d" },
+  # },
 }

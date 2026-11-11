@@ -11,7 +11,8 @@
 //! ```
 //!
 //! The host resolves unknown schemes to `plugins/artifacts/<scheme>/` and
-//! calls the exported `get()`; everything else (auth, checksums, unpack,
+//! calls the contained constructor `legion::export_artifact_fetcher!` exports;
+//! everything else (auth, checksums, unpack,
 //! status reporting) is shared pipeline code in the worker core.
 
 use std::io::Write;
@@ -54,11 +55,6 @@ impl ArtifactFetcher for DemoFetcher {
     }
 }
 
-// Lets the host refuse this dylib if it was built with a different rustc or
-// legion version (Rust has no stable ABI).
-legion::declare_plugin_abi!();
-
-#[no_mangle]
-pub extern "C" fn get() -> Box<dyn ArtifactFetcher> {
-    Box::new(DemoFetcher)
-}
+// Exports the ABI fingerprint, the panic probe, and the contained
+// constructor (docs/plugin-system.md, "Panics and quarantine").
+legion::export_artifact_fetcher!(DemoFetcher);

@@ -60,7 +60,7 @@ rules. It sits alongside the existing `namespaces` / `names` / `pools` /
 `templates` selectors:
 
 ```json
-{"resources": ["job"], "actions": ["write"], "names": ["prod-*"],
+{"resources": ["job"], "actions": ["write"], "namespaces": ["default"], "names": ["prod-*"],
  "bands": ["critical", "high"]}
 ```
 
@@ -90,7 +90,8 @@ An allocation on a candidate node is a possible victim only if all of these
 hold:
 
 - Its job's band is strictly below the preemptor's.
-- It is older than `preemption.victimExemptAge` (default `60s`).
+- It is older than `preemption.victimExemptAge` (default `60s`). The one
+  exception is described in [Which of them are taken](#which-of-them-are-taken).
 - It does not hold node-local storage (see
   [Stateful workloads](#stateful-workloads)).
 - Evicting it would not take its task below its `disruption.minAvailable`
@@ -106,6 +107,30 @@ out not to need.
 
 Size matching means Legion won't kill a 32 GiB allocation to free 1 GiB when a
 right-sized victim exists.
+
+The age guard never pushes a placement up the band ladder. Suppose the only
+old-enough victims on a node are in a more important band than younger work
+that would also make room, such as a `normal` service next to a `low` job
+placed 30 seconds ago. Then the younger, lower-band work is taken instead.
+Otherwise the displaced `normal` job would requeue and, once the `low` work
+aged past the guard, preempt it to come back: two evictions where one does.
+The guard never makes a preemption possible that otherwise isn't. When only
+young work could make room, it stays protected and the placement waits.
+
+The wait is on the clock, not on the cluster. A victim getting older is not a
+capacity change, so nothing would wake a blocked eval for it. When the guard
+is the only thing in the way, the eval retries once the youngest victim it
+needs is old enough, and preempts then. The `eval.blocked` event says when:
+
+```text
+Failed to place task vm: no available nodes matching constraints, permit, or
+resources; preemption found no eligible victims yet (4 below victimExemptAge).
+The victims it would take age past victimExemptAge in 23s, and placement
+retries then
+```
+
+A plan that places some replicas and leaves one waiting this way queues a
+delayed `job_reschedule` for the same moment.
 
 Across nodes, the plan with the fewest victims wins. Ties go to the plan that
 takes the least important work. Remaining ties go to the normal scoring policy,
@@ -171,7 +196,9 @@ The floor has two properties:
   violated in practice, including by Nomad's own drainer.
 
 Percentages round up: `minAvailable = "50%"` of 5 protects 3. The floor is
-measured against the task's live allocation count, and it holds across a whole
+measured against the task's allocation count across the whole fleet,
+including nodes the preemption pass is not considering (cordoned nodes, nodes
+outside the preemptor's constraints), and it holds across a whole
 plan. Eight placements cannot each take one allocation below the floor and
 together take eight.
 
@@ -182,6 +209,13 @@ example, a `high` job that wants 2 replicas on a node full of a 2-allocation
 `low` task with `minAvailable = "50%"` evicts one `low` allocation, places one
 replica, and leaves the other unplaced with `preemption found no eligible
 victims (1 protected by disruption.minAvailable)`.
+
+A [gang](gang-scheduling.md)'s quorum is a floor of the same kind: preemption
+never leaves fewer than `gang.min` members running (all of them for `gang =
+true`), because taking one member idles the rest. The stricter of the two
+floors binds, and the placement error names `disruption.minAvailable` either
+way. A gang that preempts does so as a unit: if every replica cannot fit with
+the victims it may take, the plan evicts nothing.
 
 **What this does not protect you from:** an operator draining half the
 cluster can take your service below `minAvailable`. A Kubernetes
@@ -217,7 +251,9 @@ pool whose jobs each hold hours of un-checkpointed state.
 `victimExemptAge` is a cheap guard against thrashing. Without it, one plan
 could undo the placement a previous plan made seconds earlier, and the
 follow-up eval could undo that. An allocation with no recorded placement time
-(written before this feature existed) counts as old enough.
+(written before this feature existed) counts as old enough. The guard yields
+when honoring it would mean evicting a more important band instead (see
+[Which of them are taken](#which-of-them-are-taken)).
 
 A misspelled `mode` is a startup error. Legion does not fall back to
 `enforce`, because a typo should not evict work you meant to protect.
@@ -241,6 +277,20 @@ Preemption: would preempt
 In `observe` mode, the same command reports what `enforce` would do and labels
 it that way. When preemption is off, the output says so, instead of showing an
 empty list that looks like "nothing would be displaced".
+
+When the victims are younger than `victimExemptAge` and the guard is all that
+stands in the way, the plan still shows the placement and the victims, with
+how long the submit will wait before taking them:
+
+```console
+Preemption: would preempt
+  node-b: band-fill/vm (alloc 88, priority low) — 30s grace, requeued, once past victimExemptAge in 23s
+```
+
+`job plan -j` carries the same wait as `eligibleInSeconds` on each entry of
+`preemptions` (0 for a victim the submit takes right away). Before this, the
+plan failed with "no available nodes" in that window while the submit went on
+to preempt a minute later.
 
 The plan runs against a snapshot and reserves nothing. The real submit plans
 again, so it may take different victims if the cluster changed in between.
@@ -309,7 +359,8 @@ The event links each victim to its preemptor and back. A user who only sees
 
 **Metrics** ([metrics.md](metrics.md)):
 
-- `legion_preemptions_total{pool,band}`: victims evicted, by pool and band.
+- `legion_preemptions_total{pool,band,namespace}`: victims evicted, by pool,
+  band, and the victim's [namespace](namespaces.md).
 - `legion_preemption_plans_total{outcome}`: preemption passes that reached a
   decision. Outcomes are `placed` (victims evicted, preemptor placed),
   `observe` (the pass ran under `observe` mode and committed nothing), or

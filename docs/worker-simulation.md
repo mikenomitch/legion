@@ -114,6 +114,26 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   manager verifies the fleet's name for them. The listener starts once that
   certificate is issued, a moment after the first registration; a push
   before then waits for the next heartbeat.
+
+  A fleet certificate names every node of the fleet, so the fleet has to
+  come from the operator, not from the nodes: with ACLs on, the join
+  token's worker type must grant it in its `workerFleet` attribute, either
+  the exact prefix or a `*` glob. Otherwise every registration is refused
+  with `PERMISSION_DENIED` (`... registers as part of fleet "sim-a", which
+  its worker type "sim" does not grant`). A worker type for simulator
+  processes started with `--name-prefix sim-0`, `sim-1`, and so on:
+
+  ```nickel
+  {
+    workerType = "sim",
+    pool = "sim",
+    attributes = { workerFleet = "sim-*" },
+  }
+  ```
+
+  Give simulators their own worker type: a type that grants a fleet lets
+  any node joined with it serve that fleet's name. A management token (or
+  ACLs off) registers any fleet.
 - **Allocation health, as a real worker reports it.** Every acknowledged
   allocation reports healthy (`running`). Off the stream that is every
   allocation on every beat, which is what a dense real node costs; on the

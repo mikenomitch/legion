@@ -263,7 +263,7 @@ cells with a background publisher at 5k and 10k.
 
 **Alternatives.** Add a node axis to `plan_under_fill` (uniform nodes,
 unconstrained job), or drive the macro matrix
-(`tests/scheduler_scale_benchmark.rs` with `LEGION_BENCH_CONCURRENCY`).
+(`tests/integration/scheduler_scale_benchmark.rs` with `LEGION_BENCH_CONCURRENCY`).
 
 **Trade-off.** Another bench group to maintain, with a slow setup at
 10k nodes and 50k allocations.

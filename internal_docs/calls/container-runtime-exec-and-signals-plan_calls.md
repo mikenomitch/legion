@@ -240,7 +240,9 @@ principle for exotic runtimes.
 immediately surfaces the binary's usage error.
 
 **Why.** Performance and simplicity over a hypothetical: youki, runc, and
-crun — the three runtimes Legion documents — all implement `exec`, the
+crun — the three runtimes Legion documents — all implement `exec` (youki has
+since been dropped; runc and crun are the only runtimes Legion runs, see
+[worker-plane-auth calls](worker-plane-auth-plan_calls.md) entry 40), the
 failure remains clearly attributed when it happens, and a startup probe adds a
 subprocess launch on every worker for a case no supported configuration hits.
 Kept as open question Q1 in the plan so implementation can flip if the e2e
@@ -606,3 +608,43 @@ A consequence worth stating: "undeclared" has to survive the trip as a state
 distinct from "declared `SIGTERM`", because the Linux container chain consults
 the image's own `STOPSIGNAL` only when the jobspec was silent. That is why the
 field is an empty string rather than a serialized default.
+
+## Spot-check fixes (2026-10-12)
+
+## 21. The `--` before an exec command is youki's dialect, not every OCI runtime's
+
+> **Superseded (2026-10-12).** Legion dropped youki: it supports runc and
+> crun only and refuses any other runtime at start
+> ([worker-plane-auth calls](worker-plane-auth-plan_calls.md), entry 40). The
+> youki branch is gone, and runc's dialect below is the only OCI form. The
+> entry stays as the record of why a `--` must never come back.
+
+**The call.** `build_exec_command` puts `--` between the container id and the
+command only when the runtime binary is youki. runc, crun, and any runtime
+Legion does not recognize get runc's dialect:
+
+```text
+runc exec [--tty] [--env K=V]… legion-<alloc> CMD…
+youki exec [--tty] [--env K=V]… legion-<alloc> -- CMD…
+```
+
+Phase 1 used `--` for every OCI runtime. On runc 1.5.2 (AWS spot check),
+`legion exec` and every action failed with `exec: "--": executable file not
+found in $PATH`. runc stops parsing flags at the container id, so the `--`
+became the command.
+
+**The alternatives.** (a) Use `exec --process <file>` everywhere, which all
+three runtimes accept, so argv parsing stops mattering. (b) Drop `--` for
+every runtime.
+
+**The trade-off.** The dialect is picked by binary name, so a youki renamed
+or wrapped under another name gets runc's dialect. A remote argv starting
+with `-` would then reach youki's flag parser.
+
+**Why.** (a) replaces the inherited process spec: runc does not merge
+`--process` with the bundle's `config.json`, so Legion would have to rebuild
+env, cwd, user, capabilities, and rlimits for every session and keep them in
+step with the bundle. (b) re-opens the flag-injection hole on youki, whose
+clap parser keeps reading flags after the id. runc's CLI is the one OCI
+runtimes copy, so it is the right default for an unknown runtime. **The
+reference runtime's behavior won.**

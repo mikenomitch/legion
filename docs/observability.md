@@ -6,26 +6,54 @@ depth.
 
 ## Logging and Tracing Setup
 
-`init_tracing()` / `init_tracing_with_options()` (`src/tracing_util.rs`)
+`init_tracing()` / `init_tracing_with_options()` (`crates/common/src/tracing_util.rs`)
 configure the `tracing_subscriber` stack:
 
-- Pretty console logs (stdout, or stderr for stdio protocol servers like
-  `legion mcp serve`).
-- JSON file logs, daily rolling under `./logs/events.log.<date>`.
+- Pretty console logs. Servers (every `legion start` subcommand, and
+  `legion join`) write them to stdout. Every other command, `legion mcp
+  serve` included, writes them to stderr, so stdout carries only the
+  command's output: a `--json` envelope parses as-is, and the MCP stream
+  stays clean.
+- JSON file logs, daily rolling under `./logs/events.log.<date>`, for
+  servers only. A one-shot command writes no files.
 - `EnvFilter` from the environment (default `info`). You control log verbosity
   with standard `RUST_LOG`-style tracing filters.
 - With `--o11y`, an extra JSON span layer (span new/close events) writes
   daily-rolling files under `./traces/spans.json.<date>`.
 
-Old files are pruned at startup: Legion keeps 7 days of `./logs` and 3 days of
+`./logs` and `./traces` are relative to the server's working directory. Old
+files are pruned at startup: Legion keeps 7 days of `./logs` and 3 days of
 `./traces`.
+
+**A server never waits on its log readers.** On `legion start manager` and
+`legion start worker`, console lines go to an in-memory buffer of up to
+16,384 lines, and one background thread writes them to stdout. When the
+reader falls behind (journald or a container runtime under load) and the
+buffer fills, new lines are dropped. The JSON file log under `./logs` and
+the span file under `./traces` work the same way, each with its own
+16,384-line buffer. (The logging library's default is 128,000 lines per
+writer; the smaller bound keeps a stuck reader from holding megabytes of
+queued lines per writer, and still absorbs a burst like the one below.)
+Dropped lines are counted per sink: `legion_log_dropped_lines_total{sink}`
+on a manager and `legion_worker_log_dropped_lines_total{sink}` on a worker
+([metrics.md](metrics.md#async-runtime)).
+
+The console used to be a blocking write. On a c5.metal worker starting a
+burst of 1,200 sandboxes, journald fell behind, and every thread that
+logged waited on stdout, heartbeats included. The worker sent no heartbeat
+for about 57 seconds and was marked lost, and the burst fell to 8 starts a
+second. With the buffer, the same burst ran at 293 starts a second and the
+worker stayed up. Under backpressure a server keeps its heartbeats and
+loses log lines instead. Neither the console nor the file log guarantees
+every line. Short CLI commands still write to the console (stderr)
+directly.
 
 ## OTLP Trace Export (OpenTelemetry)
 
 Legion can export its own control-plane spans over **OTLP/HTTP** to any
 OpenTelemetry backend (Tempo, Jaeger, Honeycomb, an OTel Collector, and so on).
-The exporter lives in `src/otel.rs` and is wired into the subscriber stack in
-`src/tracing_util.rs`.
+The exporter lives in `crates/common/src/otel.rs` and is wired into the subscriber stack in
+`crates/common/src/tracing_util.rs`.
 
 Export is opt-in. Turn it on with the standard OpenTelemetry env vars:
 
@@ -43,7 +71,7 @@ itself" section of [docs/logging.md](logging.md).
 ## Metrics and Health Probes
 
 The manager serves a separate telemetry HTTP listener
-(`src/manager/telemetry.rs`, default port `server.port + 2`):
+(`crates/manager/src/manager/telemetry.rs`, default port `server.port + 2`):
 
 - `GET /metrics`: Prometheus text exposition (`legion_*` families such as gRPC
   request counts and latency, evals, plan applies, heartbeats, nodes, and
@@ -74,6 +102,16 @@ The system records operational health in these places:
 - Rollout event stream (`rollout_event` table) with structured metadata.
 
 The UI rollout and node views read from these.
+
+### Slow task starts
+
+When a start is slow, the worker says where the time went. Each start logs one
+`Task allocation started` line with the time each stage took (artifact
+staging, volume mounts, `prepare`, the runtime's `start` and its own steps,
+registration), and the worker's opt-in `/metrics` listener exports the same
+stages as `legion_task_start_stage_seconds{runtime,stage}`, plus `health`, the
+time to the first passing check. See [metrics.md](metrics.md) for the stage
+table.
 
 ## What Exists in the UI
 

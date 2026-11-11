@@ -2,7 +2,7 @@
 
 `exec` is a built-in task runtime that runs a process directly on the host.
 Use it when your workload is a binary or script that doesn't need a container
-image. It is implemented in `src/task_plugins/exec.rs`.
+image. It is implemented in `crates/worker/src/task_plugins/exec.rs`.
 
 ## Purpose
 
@@ -39,10 +39,22 @@ runs a manager, the cluster's. Run untrusted code in `container` or
 Required:
 
 - `command`: array of strings, first element is program, remainder are args.
+  A first element of `legion:self` runs the worker's own executable
+  (`command = ["legion:self", "app", "run", "autoscaler"]`), so the task runs
+  the same build as the node, with nothing to download. Legion's bundled
+  [apps](apps.md) run this way.
 
 Optional:
 
-- `env`: map of string env vars.
+- `env`: map of string env vars. The task does **not** inherit the
+  worker's environment, which may hold a `LEGION_TOKEN` or cloud
+  credentials. It starts from `PATH` (a standard one when the worker has
+  none), `LANG`, `LANGUAGE`, `TZ`, and every `LC_*` from the worker, plus
+  `HOME`, `USER`, `LOGNAME`, and `SHELL` for the user it runs as (the
+  worker's own without a `user`). Legion's allocation env and this map are
+  layered on top. A variable the task needs from the host (`http_proxy`,
+  `SSL_CERT_FILE`) goes in `env`. An exec session into the task starts from
+  the same allowlist.
 - `cwd`: working directory. Defaults to the allocation's private task
   directory when unset (see Artifacts Support below).
 - `user` (unix): run as the given user (resolved to uid/gid). At start, the
@@ -50,6 +62,13 @@ Optional:
   symlinks. The worker creates alloc and task directories as owner-only to
   isolate allocations on a node from each other. The tree has to be handed
   over so the lower-privilege process can use its own cwd and artifacts.
+  Each `local-dir` volume the task mounts is handed over the same way: its
+  per-volume directory (`<state dir>/local-volumes/<volume_id>/`, owner-only)
+  and the data inside it (`$LEGION_VOLUME_<NAME>`). The data tree is walked
+  only when its top directory is not the user's already, so a restart on a
+  large volume costs one `stat`. A `host`, `nfs`, or `tmpfs` volume is never
+  chowned: its owner is the operator's to set. A `local-dir` volume used by
+  `exec` tasks with different `user`s belongs to whichever started last.
   The worker needs the privileges to chown to another user, and to set
   uid/gid at all.
 - `oom_adj` / `oom_score_adj` (linux): one of these, range `-1000..1000`.
@@ -58,7 +77,10 @@ Optional:
   - `read_only_paths`
   - `read_write_paths`
 - `hardening` (linux): `noNewPrivileges`, `privateTmp`,
-  `capabilities = { drop = [...] }`, `umask`, `nice`. See
+  `capabilities = { drop = [...], add = ["net_bind_service"] }`, `umask`,
+  `nice`. `add` keeps `CAP_NET_BIND_SERVICE` across the switch to `user`, so
+  a task that is not root can bind ports below 1024; it is the only
+  capability `add` takes. See
   [Task Supervision](task-supervision.md#process-hardening).
 
 ## Runtime Behavior
@@ -137,8 +159,14 @@ itself, link-local (the cloud metadata service), and other allocations'
 listeners are refused whatever the job's policy says. A task running as root
 can leave the namespace with `setns`, so `gated` contains non-root tasks
 only. The full model, the fail-closed rules, and the limits (no raw UDP, no
-ICMP, no inbound to undeclared ports, Linux only) are in
+ICMP, no inbound to undeclared ports) are in
 [Network Handlers](network-handlers.md#gated-mode).
+
+On macOS, which has no namespaces, a gated `exec` task runs under Seatbelt
+instead: `/usr/bin/sandbox-exec` with a profile that lets it connect only to
+its own egress proxy and upstream ports on `localhost`, with no DNS of its
+own ([Gated mode on macOS](network-handlers.md#gated-mode-on-macos); not yet
+verified on macOS hardware).
 
 ## Capability Summary
 
@@ -150,9 +178,11 @@ ICMP, no inbound to undeclared ports, Linux only) are in
 | Signal delivery | ✅ |
 | Graceful stop (`stop { signal, killAfter }`) | ✅ |
 | Memory / CPU limits, exclusive cores | ✅ Linux with `resourceEnforcement.enabled` (see [docs/resource-enforcement.md](resource-enforcement.md)) |
+| Resize in place (`memory`, `memoryMax`, `cpu`) | ✅ live, with `resourceEnforcement.enabled`: `memory.low`, `memory.max`, and `cpu.weight` are rewritten on the task's cgroup. A ceiling below current use is refused unless `--force`. See [docs/resize.md](resize.md) |
 | Exit reporting / restart policy | ✅ (see [Task Supervision](task-supervision.md)) |
 | Artifacts | ✅ (File/Tree + interpolation + env) |
 | Exec / interactive PTY | ✅ / ✅, host-level (see [docs/exec-and-actions.md](exec-and-actions.md)) |
+| Devices (`resources.devices`) | ✅ env only: `LEGION_DEVICE_<NAME>_IDS` and the device plugin's env (`CUDA_VISIBLE_DEVICES`). No device cgroup: the process can open any device node, and the ids say which to use (see [docs/devices.md](devices.md)) |
 
 Exec runs a sibling host process with the task's env and working directory.
 Because that is a process on the host (even under landlock), it carries the

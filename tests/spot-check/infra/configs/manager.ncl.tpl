@@ -15,8 +15,11 @@
   acl = { enabled = true },
   # Session tickets and direct exec tickets are signed by the workload-identity
   # issuer, and edge starts need the manager's switch (RUNBOOK 12.0, 12.10;
-  # docs/edge-boot.md). The default issuer is the same on all three managers,
-  # so a ticket minted on one verifies against any of them.
+  # docs/edge-boot.md). With `issuer` unset, every raft manager defaults to
+  # the one cluster issuer `https://manager.legion` (docs/workload-identity.md,
+  # "The issuer"), and workers learn it from the managers, so a ticket minted
+  # on any manager verifies on any worker. Setting `issuer` here means setting
+  # the same value on all three.
   workloadIdentity = { enabled = true },
   edgeBoot = { enabled = true },
   artifacts = {

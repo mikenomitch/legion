@@ -1,7 +1,8 @@
 # Legion A: 3-voter raft, lanes topology, the HA deployment shape from
 # docs/multi-raft.md. Rendered per manager by scripts/install-legion-a.sh
 # with envsubst: NODE_ID (cp-0|cp-1|cp-2), BOOTSTRAP (true|false),
-# PRIVATE_IP, CP0_IP/CP1_IP/CP2_IP, EVAL_THREADS, and JOIN_TOKEN_LINE
+# PRIVATE_IP, CP0_IP/CP1_IP/CP2_IP, EVAL_THREADS, SCHEDULING_POLICY, and
+# JOIN_TOKEN_LINE
 # (empty on the bootstrap node, `joinToken = "lgnraft_..."` on joiners).
 {
   server = {
@@ -31,8 +32,17 @@
   # rendered rather than hardcoded: sweep it with run-campaign.sh's
   # --eval-threads and compare against the table above.
   evalThreads = ${EVAL_THREADS},
-  schedulingPolicy = "bin_pack",
+  # The scenario's own `scheduling_policy` (bin_pack|spread), rendered by
+  # the installer from LEGION_SCHEDULING_POLICY, which run-campaign.sh
+  # sets from the scenario (or --scheduling-policy). It is a manager
+  # setting, not a jobspec field, so a campaign runs one policy and
+  # run-step.sh refuses a cell whose scenario asks for the other.
+  schedulingPolicy = "${SCHEDULING_POLICY}",
   defaultPriority = 50,
+  # Empty unless LEGION_HEARTBEAT_FIXED=1 (install-legion-a.sh): no
+  # heartbeat block means adaptive cadence, the default every comparative
+  # cell runs.
+  ${HEARTBEAT_LINE}
   artifacts = {},
 
   # Scraped by the loadgen Prometheus: the per-phase scheduler histogram

@@ -116,24 +116,24 @@ ACL story, and extracts its manifest with a regex over comments.
 ## 5. Background — what exists today
 
 - Jsonnet renders client-side only; the manager receives JSON
-  (`src/cmd/job.rs:898` `render_jobspec`; nothing under `src/manager/`
+  (`src/cmd/job.rs:898` `render_jobspec`; nothing under `crates/manager/src/manager/`
   constructs a `JsonnetVm`). The `jsonnet-rs` crate is already a dependency
   (`Cargo.toml:11`).
-- `RunJob` handler (`src/manager/server.rs:1657`): coarse
+- `RunJob` handler (`crates/manager/src/manager/server.rs:1657`): coarse
   `check_acl(job, write, any())`, idempotency replay, KV-ref resolution,
   precise enforce on `AclScope::job(name)`, `validate_job_config`,
   `handle_job_submit`, rollout/eval enqueue. `RunJobRequest` carries
   `parsed_jobspec`, `submissions`, `priority`, `force_reschedule`,
   `idempotency_key` (`proto/legion.proto:734`).
-- ACL engine (`src/structs/acl.rs`): resources
+- ACL engine (`crates/common/src/structs/acl.rs`): resources
   `job|node|kv|state|operator|acl|exec|action`, actions `read|write`,
   glob selectors `namespaces|names|pools|paths|action_names` + `host` flag.
   `selector_matches` returns false for `(Some(_), None)` — a rule with a
   selector never matches a request lacking that attribute (`acl.rs:255-261`).
   `AclScope` carries the request attributes (`acl.rs:134`). Enforcement via
   `check_acl` / `authenticate_acl` + `acl::enforce`
-  (`src/manager/server.rs:877-893`, `src/manager/acl.rs:616`).
-- `WhoAmI` (`proto/legion.proto:521`, handler `src/manager/server.rs:4650`)
+  (`crates/manager/src/manager/server.rs:877-893`, `crates/manager/src/manager/acl.rs:616`).
+- `WhoAmI` (`proto/legion.proto:521`, handler `crates/manager/src/manager/server.rs:4650`)
   returns identity metadata and policy *names* only. A scoped token cannot
   read its own rules (`GetAclPolicy` needs `acl:read`), so the UI cannot
   derive capabilities today.
@@ -143,9 +143,9 @@ ACL story, and extracts its manifest with a regex over comments.
   except the o11y nav item. Schema-driven form prior art:
   `ActionForm` (`ui/src/components/AllocationExecPanel.tsx:141`).
 - Store: SQLite + append-only migrations; named-entity CRUD pattern =
-  `saved_state_query` (`src/storage/store.rs:6334-6460`); idempotency via
+  `saved_state_query` (`crates/manager/src/storage/store.rs:6334-6460`); idempotency via
   `idempotency_lookup`/`idempotency_record`.
-- `tests/acl_endpoints.rs` parses the proto service block and fails unless
+- `tests/integration/acl_endpoints.rs` parses the proto service block and fails unless
   every RPC is classified.
 
 ## 6. Proposed design
@@ -302,13 +302,13 @@ MCP tools: `legion_template_list`, `legion_template_get`,
   `JobTemplateProvenance` referenced from `JobSpecHistoryItem` and
   `GetJobInfoReply`, `WhoAmIReply.rules_json`, updated `AclPolicy` rule
   schema comment (`templates` selector, `template` resource).
-- `src/structs/acl.rs`: `AclResource::Template` (+ `as_str`, `all()`),
+- `crates/common/src/structs/acl.rs`: `AclResource::Template` (+ `as_str`, `all()`),
   `AclRule.templates`, `AclScope.template` + `with_template(..)`,
   `has_scope_selectors`, `rule_matches`, parse validation, tests.
 - Migrations (append-only): `job_template` (name PK, latest_version,
   timestamps) and `job_template_version` (name+version PK, description,
   source, variables JSONB, created_by, created_at).
-- `src/storage/store.rs`: records + CRUD following `saved_state_query`;
+- `crates/manager/src/storage/store.rs`: records + CRUD following `saved_state_query`;
   provenance plumbed through job submit (private inner fn; public
   `handle_job_submit` signature unchanged); `job_template_provenance(name)`
   and a batch map for list filtering.
@@ -343,7 +343,7 @@ MCP tools: `legion_template_list`, `legion_template_get`,
   errors, typed variable validation and coercion, import rejection, render
   timeout config, run happy path, collision guard (reject + plain-job:write
   override), provenance in spec history, idempotent re-run.
-- **`tests/acl_endpoints.rs`:** six new classified rows + builders + seeded
+- **`tests/integration/acl_endpoints.rs`:** six new classified rows + builders + seeded
   fixture template; scenario test: template-scoped token can run its
   template but not raw `RunJob`, sees only its jobs.
 - **UI:** `npm run build` (tsc) green; manual smoke via seeded data.

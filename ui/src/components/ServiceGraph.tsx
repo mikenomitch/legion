@@ -2,6 +2,7 @@ import { A, useNavigate } from '@solidjs/router'
 import { For, Show, createMemo, createSignal } from 'solid-js'
 import type { ServiceEdge } from '../gen/legion_pb'
 import { Badge, EmptyState, MonoBadge, TableShell, cx, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { jobPath, serviceRefPath } from '../utils/namespaces'
 
 // The service graph (docs/network-handlers.md, "Service graph"): nodes are
 // services and the jobs that call them, edges are what every node's datapath
@@ -49,11 +50,11 @@ type Node = { id: string; label: string; kind: 'service' | 'caller'; x: number; 
 export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string; onSelect?: (key: string) => void }) {
   const navigate = useNavigate()
   const nodeHref = (node: Node) =>
-    node.kind === 'service' ? `/services/${encodeURIComponent(node.id)}` : `/jobs/${encodeURIComponent(node.id)}`
+    node.kind === 'service' ? serviceRefPath(node.id) : jobPath(node.id)
   const layout = createMemo(() => {
     const services = new Set<string>()
     const callers = new Set<string>()
-    for (const edge of props.edges) services.add(edge.service)
+    for (const edge of props.edges) services.add(edge.target || edge.service)
     for (const edge of props.edges) {
       const caller = edge.callerJob
       if (!services.has(caller)) callers.add(caller)
@@ -92,7 +93,7 @@ export function ServiceGraphSvg(props: { edges: ServiceEdge[]; selected?: string
         <For each={props.edges}>
           {(edge) => {
             const from = () => layout().byId.get(edge.callerJob)
-            const to = () => layout().byId.get(edge.service)
+            const to = () => layout().byId.get(edge.target || edge.service)
             const tone = () => edgeTone(edge)
             const key = edgeKey(edge)
             const selected = () => props.selected === key
@@ -221,14 +222,14 @@ export function ServiceEdgesTable(props: {
                     onClick={() => props.onSelect?.(key)}
                   >
                     <td class={tdClass}>
-                      <A class={linkClass} href={`/jobs/${encodeURIComponent(edge.callerJob)}/tasks/${encodeURIComponent(edge.callerTask)}`}>
+                      <A class={linkClass} href={`${jobPath(edge.callerJob)}/tasks/${encodeURIComponent(edge.callerTask)}`}>
                         {edge.callerJob}/{edge.callerTask}
                       </A>
                     </td>
                     <Show when={!props.hideService}>
                       <td class={tdClass}>
-                        <A class={linkClass} href={`/services/${encodeURIComponent(edge.service)}`}>
-                          {edge.service}
+                        <A class={linkClass} href={serviceRefPath(edge.target || edge.service)}>
+                          {edge.target || edge.service}
                         </A>
                       </td>
                     </Show>

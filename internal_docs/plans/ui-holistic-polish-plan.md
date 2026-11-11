@@ -138,7 +138,7 @@ the client." The `ui-build` job with the generated-client drift check,
   re-checked afterwards.
 - `ui/src/App.tsx` owned the palette, the jump hints, and `u`; the `*` route
   rendered `Homepage`.
-- `src/manager/server.rs` `list_jobs` filtered in memory (ACL, then free
+- `crates/manager/src/manager/server.rs` `list_jobs` filtered in memory (ACL, then free
   text) before paging, with no status filter and no counts.
 - `.github/workflows/ci.yml` had no UI job. `ui/src/gen` had been
   regenerated recently (the drift TODO was stale) but nothing enforced it.

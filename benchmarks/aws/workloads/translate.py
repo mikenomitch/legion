@@ -2,7 +2,7 @@
 """Translate a benchmark scenario into per-system workload artifacts.
 
 One scenario file (benchmarks/scheduler/scenarios/*.json — the schema in
-tests/benchmark_support/mod.rs) becomes:
+tests/integration/benchmark_support/mod.rs) becomes:
 
   legion : one Nickel jobspec per job (.ncl, submitted with
            `legion job run <file>`)
@@ -18,7 +18,7 @@ allocation count, so completeness is asserted, never assumed.
 Resource units: scenario `cpu` is MHz and `memory` MiB (Legion pool
 units). Nomad uses the same units natively. K8s requests are converted
 at the fleet's fingerprinted 3000 MHz/core (see fingerprint_for in
-src/worker/simulate.rs): cpu_millicores = MHz / 3. That keeps the
+crates/worker/src/worker/simulate.rs): cpu_millicores = MHz / 3. That keeps the
 *bin-packing pressure* — task share of a node — identical across
 systems, which is the property that matters for a scheduler benchmark.
 
@@ -28,6 +28,14 @@ Constraint mapping (scenario constraints are attr-equality):
            (nodesim node templates set class + meta accordingly)
   k8s    : nodeSelector labels (KWOK nodes are labeled from the same
            node_profiles file)
+
+Scheduling policy: the scenario's `scheduling_policy` (bin_pack|spread)
+is a manager setting in Legion (`schedulingPolicy`), not a jobspec field,
+so no artifact carries it. The manifest records it, run-campaign.sh
+renders it into the manager config at install time, and run-step.sh
+refuses a Legion cell whose running manager disagrees. Nomad and K8s run
+their own default placement policy (binpack and LeastAllocated); the
+fairness record names it rather than tuning them toward the scenario.
 
 Usage:
   translate.py --scenario ../scheduler/scenarios/web_fleet.json \
@@ -48,6 +56,20 @@ def load_scenario(path):
     with open(path) as f:
         scenario = json.load(f)
     return scenario
+
+
+SCHEDULING_POLICIES = ("bin_pack", "spread")
+
+
+def scheduling_policy(scenario):
+    """The scenario's placement policy, as Legion's `schedulingPolicy` spells it."""
+    policy = scenario.get("scheduling_policy")
+    if policy not in SCHEDULING_POLICIES:
+        raise ValueError(
+            f"scenario {scenario.get('name')}: scheduling_policy must be one of "
+            f"{', '.join(SCHEDULING_POLICIES)}, got {policy!r}"
+        )
+    return policy
 
 
 def effective_job_types(scenario):
@@ -350,6 +372,7 @@ def translate(scenario, system, out_dir, multiplier, jobspec_format="json"):
     manifest = {
         "scenario": scenario.get("name"),
         "system": system,
+        "scheduling_policy": scheduling_policy(scenario),
         "count_multiplier": multiplier,
         "jobs": [],
     }

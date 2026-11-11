@@ -174,7 +174,7 @@ Each of these has a TODO entry with the evidence.
 **Legion, observability and reporting**
 - ~~264 evals ended `status: failed` while
   `evals_processed_total{status="error"}` never moved.~~ **Retracted.**
-  `src/manager/daemon.rs:2267` increments that counter on both the ok and
+  `crates/manager/src/manager/daemon.rs:2267` increments that counter on both the ok and
   error paths, and re-reading the transcript the "unchanged" value came
   from a metrics scrape taken *before* those failures, compared against
   an eval-table query taken after. Same mistake phase 1 warned about:

@@ -79,8 +79,9 @@ pub fn config() -> Command {
                 .long_about(
                     "List volumes.\n\n\
                      A `*` after the node id marks a NODE-LOCAL volume: its instance can only \
-                     be replaced on that node. Destroyed volumes are retained as tombstones \
-                     so you can still see where a job's storage went.",
+                     be replaced on that node. Destroyed volumes are hidden: --all (or \
+                     --state destroyed) shows their tombstones, so you can still see where a \
+                     job's storage went.",
                 )
                 .arg(Arg::new("job").long("job").short('J').help("Filter by job"))
                 .arg(Arg::new("node").long("node").help("Filter by node"))
@@ -95,6 +96,14 @@ pub fn config() -> Command {
                         .long("state")
                         .help("Filter by state: pending, created, destroying, destroyed"),
                 )
+                .arg(
+                    Arg::new("all")
+                        .long("all")
+                        .short('a')
+                        .action(ArgAction::SetTrue)
+                        .help("Include destroyed volumes (tombstones of reclaimed storage)"),
+                )
+                .args(crate::cmd::helpers::list_namespace_flags())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -180,7 +189,7 @@ pub fn config() -> Command {
         )
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     match matches.subcommand() {
         Some(("list", sub)) => list(sub).await,
@@ -198,11 +207,13 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 async fn list(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let request = tonic::Request::new(ListVolumesRequest {
-        job_id: matches.get_one::<String>("job").cloned(),
+        namespaces: crate::cmd::helpers::namespace_selection(matches),
+        job_id: crate::cmd::helpers::job_arg(matches, "job")?,
         node_id: matches.get_one::<String>("node").cloned(),
         driver: matches.get_one::<String>("driver").cloned(),
-        instance_id: matches.get_one::<String>("instance").cloned(),
+        instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
         state: matches.get_one::<String>("state").cloned(),
+        include_destroyed: matches.get_flag("all"),
     });
 
     let mut client = connect_manager_client().await?;
@@ -221,7 +232,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
     if reply.volumes.is_empty() {
         println!(
             "No volumes. Declare storage with `stateful: {{ storage: {{ path: '/data' }} }}` \
-             on a task."
+             on a task. Destroyed volumes are hidden; --all shows them."
         );
         return Ok(());
     }

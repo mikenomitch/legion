@@ -51,3 +51,7 @@ committed files differ, so a proto change cannot merge without its client.
 - `npm run build` – type-check and produce a production build
 - `npm run gen` – regenerate `src/gen` from the proto
 - `npm run preview` – preview the production build locally
+- `npm run test:smoke` – after `npm run build`, drive the built UI in
+  Playwright's Chromium against a fake manager (`tests/smoke/`; needs the
+  `playwright` package and its Chromium installed globally; see
+  `docs/testing-and-benchmarks.md`, "UI smoke tests")

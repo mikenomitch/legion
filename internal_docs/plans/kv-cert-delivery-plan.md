@@ -31,8 +31,8 @@ which makes it a natural place to keep a TLS certificate. Getting that
 certificate to a running workload is where it falls down.
 
 - **KV `files` injections are written once, at task start.**
-  `materialize_task_files` (`src/task_plugins/container.rs:226`) and the
-  exec start path (`src/task_plugins/exec.rs:474`) are the only writers. A
+  `materialize_task_files` (`crates/worker/src/task_plugins/container.rs:226`) and the
+  exec start path (`crates/worker/src/task_plugins/exec.rs:474`) are the only writers. A
   renewed certificate reaches the task only through `onChange = "restart"`
   (every allocation of the job is replaced at once) or `"rollout"`. Neither
   is what nginx or HAProxy want: rewrite the file, send `SIGHUP`.
@@ -112,29 +112,29 @@ Non-goals:
 ## Background: what exists today
 
 - **KV injection specs:** `TaskKvFileInjection`
-  (`src/structs/job.rs:1980`), policy resolution `resolve_with_defaults`
+  (`crates/common/src/structs/job.rs:1980`), policy resolution `resolve_with_defaults`
   (`:1947`), `KvInjectionAction` (`:1909`).
 - **Manager reconcile:** `reconcile_kv_changes`
-  (`src/manager/server.rs:2727`) re-renders into a new job config, then
+  (`crates/manager/src/manager/server.rs:2727`) re-renders into a new job config, then
   acts. Rendered files land in `task.config.files` as
   `{ path, mode, content }` (`apply_task_kv_injections`, `:1041`).
 - **Allocations on a superseded config:** `migrate_allocations_to_job_config`
-  (`src/storage/store.rs:11372`) repoints allocations at a new config
+  (`crates/manager/src/storage/store.rs:11372`) repoints allocations at a new config
   without stopping them when `job_configs_schedule_equivalent` holds.
   `task_schedule_equivalent` (`:19001`) ignores `config`, so a files-only
   change qualifies.
-- **Worker:** `reconcile_allocations` (`src/worker/task_manager.rs:1139`)
+- **Worker:** `reconcile_allocations` (`crates/worker/src/worker/task_manager.rs:1139`)
   ignores `task_config` changes for running allocations.
-  `connect.templates` (`src/worker/templates.rs`, driven by `apply_templates`
-  in `src/worker/daemon.rs`) is the existing live-rewrite engine with
+  `connect.templates` (`crates/worker/src/worker/templates.rs`, driven by `apply_templates`
+  in `crates/worker/src/worker/daemon.rs`) is the existing live-rewrite engine with
   `changeMode`, `splay`, and `coalesce`.
-- **Ingress TLS:** `TlsConfig` (`src/structs/netpolicy.rs:413`),
+- **Ingress TLS:** `TlsConfig` (`crates/common/src/structs/netpolicy.rs:413`),
   validation at `:575`. The datapath builds a `rustls::ServerConfig` per
   (allocation, port) in `ForwarderContext::ingress_server_config`
-  (`src/worker/forwarder.rs:429`), cached by a fingerprint. A new
+  (`crates/worker/src/worker/forwarder.rs:429`), cached by a fingerprint. A new
   connection re-checks the fingerprint, so changing it is a hot swap.
 - **Worker KV reads:** only `GetArtifactCredential`
-  (`src/manager/server.rs:7661`), which serves any path to any worker (the
+  (`crates/manager/src/manager/server.rs:7661`), which serves any path to any worker (the
   "KV ACL caveat" in `docs/artifacts.md`).
 - **The failover rollout pass:** `reconcile_missing_rollouts` creates a
   rollout for any job whose newest config has no allocations, no rollout,
@@ -224,7 +224,7 @@ network = {
 - `TlsConfig.cert_from` becomes `CertFrom` (`"legion"` or `{ kv }`). The
   string form serializes identically, so existing policy hashes are stable.
 - New RPC `GetIngressCertificates` with request and reply messages,
-  classified `Plane::Worker` in `tests/acl_endpoints.rs`.
+  classified `Plane::Worker` in `tests/integration/acl_endpoints.rs`.
 - `configs/jobs/maximal.ncl`: both surfaces.
 - No storage migration.
 

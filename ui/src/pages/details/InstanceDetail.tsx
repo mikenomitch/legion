@@ -5,6 +5,7 @@ import { AccessGate } from '../../components/AccessGate'
 import { EventTimeline, createEventFeed, eventCategory } from '../../components/EventTimeline'
 import { InstanceActionButtons, createInstanceActions } from '../../components/InstanceActions'
 import { CheckpointCell, IdleCell, InstanceStateCell, instanceMemory, type InstanceRow } from '../../components/InstancesTable'
+import { resizeOverrideNote } from '../../lib/resize'
 import { SnapshotsTable } from '../../components/SnapshotsPanel'
 import {
   Badge,
@@ -45,6 +46,7 @@ import { LARGE_LISTING, SESSION_COPY, isSession, jobInstancesHref } from '../../
 import { mayReadSnapshots, restoreBlocker } from '../../utils/snapshots'
 import { statusTone } from '../../utils/status'
 import { fetchNodeUsage, formatCores, formatIdle, formatMiB, heldLabel, percentOf, reservationLabel } from '../../utils/usage'
+import { jobIdFromParams, jobPath } from '../../utils/namespaces'
 
 /*
  * One stateful instance (docs/stateful-workloads.md,
@@ -120,7 +122,7 @@ function InstanceDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
   const instanceId = createMemo(() => decodeURIComponent(params.instanceId))
-  const routeJob = createMemo(() => decodeURIComponent(params.id))
+  const routeJob = createMemo(() => jobIdFromParams({ namespace: decodeURIComponent(params.namespace), name: decodeURIComponent(params.name) }))
   const tick = usePoll()
   const slowTick = usePoll(INDEX_POLL_INTERVAL_MS)
 
@@ -359,13 +361,13 @@ function InstanceDetailContent() {
                   ],
                   [
                     'Task',
-                    <A href={`/jobs/${encodeURIComponent(jobId())}/tasks/${encodeURIComponent(instance()!.task)}`} class={linkClass}>
+                    <A href={`${jobPath(jobId())}/tasks/${encodeURIComponent(instance()!.task)}`} class={linkClass}>
                       {instance()!.task}
                     </A>,
                   ],
                   [
                     'Job',
-                    <A href={`/jobs/${encodeURIComponent(jobId())}`} class={linkClass}>
+                    <A href={`${jobPath(jobId())}`} class={linkClass}>
                       {jobId()}
                     </A>,
                   ],
@@ -478,7 +480,7 @@ function InstanceDetailContent() {
                       <Show when={stop().preemptorJob}>
                         <span class="text-xs text-faint">
                           for{' '}
-                          <A href={`/jobs/${encodeURIComponent(stop().preemptorJob)}`} class="text-muted hover:text-brass-strong">
+                          <A href={`${jobPath(stop().preemptorJob)}`} class="text-muted hover:text-brass-strong">
                             {stop().preemptorJob}
                           </A>
                         </span>
@@ -574,7 +576,7 @@ function InstanceDetailContent() {
                 </Show>
                 <p class="border-t border-line px-4 py-2.5 text-xs text-faint">
                   Take, name, warm, and delete snapshots in the{' '}
-                  <A href={`/jobs/${encodeURIComponent(jobId())}`} class={linkClass}>
+                  <A href={`${jobPath(jobId())}`} class={linkClass}>
                     job's Snapshots card
                   </A>{' '}
                   or with <code class="rounded bg-surface2 px-1 font-mono">legion snapshot</code>.
@@ -648,11 +650,11 @@ function Header(props: { instance: InstanceInfo; row: () => InstanceRow; actions
       subtitle={
         <>
           Task{' '}
-          <A href={`/jobs/${encodeURIComponent(props.instance.jobId)}/tasks/${encodeURIComponent(props.instance.task)}`} class={linkClass}>
+          <A href={`${jobPath(props.instance.jobId)}/tasks/${encodeURIComponent(props.instance.task)}`} class={linkClass}>
             {props.instance.task}
           </A>{' '}
           of job{' '}
-          <A href={`/jobs/${encodeURIComponent(props.instance.jobId)}`} class={linkClass}>
+          <A href={`${jobPath(props.instance.jobId)}`} class={linkClass}>
             {props.instance.jobId}
           </A>
           <Show when={props.instance.group}>
@@ -690,6 +692,46 @@ function Callouts(props: { instance: InstanceInfo; routeJob: string; provisional
           the managers list it from an in-memory index that can lag the node by a heartbeat. It ends when it exits, when you end it, or when its
           node is lost, and is not rescheduled. Promote it to give it a row in place, without a restart: it then reschedules on node loss and
           can be suspended, forked, and snapshotted.
+        </Note>
+      </Show>
+      <Show when={props.instance.owner}>
+        {(owner) => (
+          <Note tone="neutral">
+            <span class="font-medium">{props.instance.durable ? 'A keyed child.' : 'A child session.'}</span> It is owned by{' '}
+            {owner().kind}{' '}
+            <Show when={owner().kind !== 'allocation'} fallback={<span class="font-mono text-xs">{owner().id}</span>}>
+              <A href={instanceHref(props.instance.jobId, owner().id)} class={cx(linkClass, 'font-mono text-xs')}>
+                {owner().id}
+              </A>
+            </Show>{' '}
+            <Show
+              when={props.instance.durable}
+              fallback={<>and ends when its owner is stopped, destroyed, or lost. Suspending the owner does not end it.</>}
+            >
+              and is stopped when its owner is stopped and destroyed when it is destroyed. Suspending the owner does not end it.
+            </Show>
+          </Note>
+        )}
+      </Show>
+      <Show when={props.instance.children.length > 0}>
+        <Note tone="neutral">
+          <span class="font-medium">Owns {props.instance.children.length} {props.instance.children.length === 1 ? 'child' : 'children'}:</span>{' '}
+          <For each={props.instance.children}>
+            {(child, index) => (
+              <>
+                <Show when={index() > 0}>, </Show>
+                <A href={instanceHref(props.instance.jobId, child.sessionId)} class={cx(linkClass, 'font-mono text-xs')}>
+                  {child.sessionId}
+                </A>{' '}
+                <span class="text-xs">
+                  ({child.kind === 'instance' ? 'keyed, ' : ''}
+                  {child.taskName}
+                  {child.nodeId ? ` on ${child.nodeId}` : ''}, {child.state})
+                </span>
+              </>
+            )}
+          </For>
+          . They end when this unit does.
         </Note>
       </Show>
       <Show when={props.instance.promotedFrom}>
@@ -898,6 +940,13 @@ function ResourcesCard(props: { row: InstanceRow }) {
             Not measured: its worker sends no usage reports (resourceEnforcement off, always so on macOS), or none since it started.
           </p>
         </Show>
+      </Show>
+      <Show when={resizeOverrideNote(instance().resourcesOverride)}>
+        {(note) => (
+          <p class="mt-3 text-xs text-muted" title="legion instance resize set these in place of the spec's amounts; the override ends with the allocation">
+            {note()}
+          </p>
+        )}
       </Show>
     </SectionCard>
   )
@@ -1109,7 +1158,7 @@ function NotLoaded(props: { state: Loading; job: string; feed: ReturnType<typeof
                 : 'It may have been destroyed along with its job, or the id is mistyped. Keyed ids are never reused while their job exists.'
             }
           >
-            <A href={`/jobs/${encodeURIComponent(props.job)}`} class={cx(linkClass, 'mt-2 text-sm')}>
+            <A href={`${jobPath(props.job)}`} class={cx(linkClass, 'mt-2 text-sm')}>
               Back to {props.job}
             </A>
           </EmptyState>

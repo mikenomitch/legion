@@ -17,6 +17,7 @@ import {
 import { managerClient } from '../../grpcClient'
 import { retainOnError, usePoll } from '../../utils/polling'
 import { parseJsonMap, volumePinsPlacement, volumeScope, volumeScopeHint, volumeStateTone } from '../../utils/volumes'
+import { jobPath } from '../../utils/namespaces'
 
 // One line per state, so the page answers "what is happening to my data right
 // now" without sending the reader to the docs.
@@ -144,7 +145,7 @@ function VolumeDetailContent() {
                     [
                       'Job',
                       vol().jobId ? (
-                        <A href={`/jobs/${encodeURIComponent(vol().jobId!)}`} class={linkClass}>
+                        <A href={`${jobPath(vol().jobId!)}`} class={linkClass}>
                           {vol().jobId}
                         </A>
                       ) : (
@@ -155,7 +156,7 @@ function VolumeDetailContent() {
                       'Task',
                       vol().taskName && vol().jobId ? (
                         <A
-                          href={`/jobs/${encodeURIComponent(vol().jobId!)}/tasks/${encodeURIComponent(vol().taskName!)}`}
+                          href={`${jobPath(vol().jobId!)}/tasks/${encodeURIComponent(vol().taskName!)}`}
                           class={linkClass}
                         >
                           {vol().taskName}
@@ -169,7 +170,7 @@ function VolumeDetailContent() {
                       vol().instanceId ? (
                         vol().jobId ? (
                           <A
-                            href={`/jobs/${encodeURIComponent(vol().jobId!)}/instances/${encodeURIComponent(vol().instanceId!)}`}
+                            href={`${jobPath(vol().jobId!)}/instances/${encodeURIComponent(vol().instanceId!)}`}
                             class={cx(linkClass, 'font-mono text-xs')}
                           >
                             {vol().instanceId}

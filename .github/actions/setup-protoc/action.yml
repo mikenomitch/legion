@@ -1,0 +1,48 @@
+name: Set up protoc
+description: >-
+  Install a pinned protoc release (binary plus well-known-type includes) into
+  /usr/local. Replaces `apt-get update && apt-get install protobuf-compiler`,
+  which spent 20-40s per job refreshing package lists for one binary.
+
+runs:
+  using: composite
+  steps:
+    # 21.12 is protoc 3.21.12, the version Ubuntu 24.04's protobuf-compiler
+    # package ships, so the generated code matches what contributors get from
+    # their distro. Verified against the checksum below.
+    - name: Install protoc
+      shell: bash
+      env:
+        PROTOC_VERSION: "21.12"
+        PROTOC_SHA256: 3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8
+      # A release download now and then fails (github.com answering 504, or
+      # an error page saved as the zip): fail on HTTP errors and retry the
+      # download until it matches the pinned checksum, three tries at most.
+      # When GitHub's release downloads stay down, fall back to the distro
+      # package, which on ubuntu-24.04 is this same protoc, and refuse any
+      # other version rather than generate code with it.
+      run: |
+        downloaded=false
+        for attempt in 1 2 3; do
+          if curl -fsSL --retry 2 -o "$RUNNER_TEMP/protoc.zip" \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+            && echo "${PROTOC_SHA256}  $RUNNER_TEMP/protoc.zip" | sha256sum -c -; then
+            downloaded=true
+            break
+          fi
+          if [ "$attempt" != 3 ]; then sleep $((attempt * 5)); fi
+        done
+        if [ "$downloaded" = true ]; then
+          sudo unzip -q -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+        else
+          echo "::warning::protoc ${PROTOC_VERSION} release download failed; installing the distro package"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+        fi
+        installed="$(protoc --version)"
+        echo "$installed"
+        if [ "$installed" != "libprotoc 3.${PROTOC_VERSION}" ]; then
+          echo "::error::expected libprotoc 3.${PROTOC_VERSION}, got: $installed"
+          exit 1
+        fi

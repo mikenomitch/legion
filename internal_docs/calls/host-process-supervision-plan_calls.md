@@ -8,7 +8,7 @@ hardening).
 ## 1. A batch task's `Success` now comes from an exit code, gated per node on the worker's protocol version
 
 `task_status_for_lifecycle` used to stamp `Batch => Success` at *placement*
-(`src/storage/store.rs`), so `dependsOn: { condition: "success" }` meant "was
+(`crates/manager/src/storage/store.rs`), so `dependsOn: { condition: "success" }` meant "was
 placed". It now stamps `Running`, and only a worker's exit report promotes it to
 `Success` or `Failed` — except on nodes whose advertised `protocolVersion` is
 below 2, which keep the old optimistic answer.

@@ -105,6 +105,8 @@ fn make_jobs(total_allocations: usize) -> Vec<JobConfig> {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         });
     }
     jobs
@@ -219,6 +221,8 @@ fn make_constrained_job(task_count: usize, per_task: u32) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -315,6 +319,8 @@ fn fill_fleet(store: &Store, node_count: usize, per_node: usize) -> anyhow::Resu
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
             .pop()
@@ -348,6 +354,8 @@ fn make_fill_job(name: &str) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -496,6 +504,8 @@ fn make_api_job(name: &str) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -599,8 +609,6 @@ fn concurrent_scaling_cell(store: &Store, cell: &str) {
         .expect("task")[0]
         .0;
 
-    let metrics = legion::manager::telemetry::metrics();
-    let fallback_before = metrics.scheduler_lazy_sample_fallback_total.get();
     let stop = Arc::new(AtomicBool::new(false));
     let planned = Arc::new(AtomicUsize::new(0));
     let samples: Arc<Mutex<Vec<PlanTimings>>> = Arc::new(Mutex::new(Vec::new()));
@@ -654,17 +662,11 @@ fn concurrent_scaling_cell(store: &Store, cell: &str) {
     });
 
     let samples = samples.lock().unwrap();
-    let fallbacks = metrics.scheduler_lazy_sample_fallback_total.get() - fallback_before;
     let plans = planned.load(Ordering::Relaxed);
     eprintln!(
         "plan_fleet_scaling/concurrent/{cell}: {plans} plans in {SCALING_CONCURRENT_SECS}s \
-         ({:.1}/s), {fallbacks} lazy-sample fallbacks ({:.0}%)",
+         ({:.1}/s)",
         plans as f64 / SCALING_CONCURRENT_SECS as f64,
-        if plans > 0 {
-            100.0 * fallbacks as f64 / plans as f64
-        } else {
-            0.0
-        },
     );
     print_phase_means(&format!("plan_fleet_scaling/concurrent/{cell}"), &samples);
 }
@@ -750,13 +752,16 @@ fn eval_cycle_cell(store: &Store, cell: &str) {
         let started = std::time::Instant::now();
         let completion = resolve_claimed_eval(store, 0, eval);
         handle_us += started.elapsed().as_micros();
+        // A first submit whose plan places everything settles inside that
+        // plan's entry (`arm_eval_settle`), so `Settled` is the usual answer.
         assert!(
             matches!(
                 completion,
-                EvalCompletion::Finished {
-                    succeeded: true,
-                    ..
-                }
+                EvalCompletion::Settled
+                    | EvalCompletion::Finished {
+                        succeeded: true,
+                        ..
+                    }
             ),
             "eval failed: {completion:?}"
         );
@@ -885,6 +890,8 @@ fn make_locality_job(with_content: bool) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -913,6 +920,7 @@ fn seed_locality_index(store: &Store, node_count: usize) {
                 added,
                 removed: Vec::new(),
                 snapshot_budget: None,
+                derived: None,
             },
             now,
         );
@@ -1026,6 +1034,8 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
         .pop()
@@ -1076,6 +1086,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
             total_bytes: 512 * 1024 * 1024,
             allocation_id,
             local_suspension: false,
+            local_suspension_reason: String::new(),
             pause_ms: 0,
             manifest_url: String::new(),
         };
@@ -1100,6 +1111,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
                     }],
                     removed: Vec::new(),
                     snapshot_budget: None,
+                    derived: None,
                 },
                 now,
             );
@@ -1169,6 +1181,8 @@ fn setup_budget_placements(
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
         .pop()
@@ -1203,6 +1217,7 @@ fn setup_budget_placements(
                         min_free_disk_bytes: 5 * GIB,
                         reclaimable_bytes: 0,
                     }),
+                    derived: None,
                 },
                 now,
             );
@@ -1236,6 +1251,119 @@ fn snapshot_budget_benchmark(c: &mut Criterion) {
                 },
             );
         }
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Keyed binding (scheduler-lane entry cost)
+// ---------------------------------------------------------------------------
+//
+// The cost of placing ONE new keyed instance of a task that already has
+// `resident` placed instances and as many parked (stopped) ones, which is a
+// sandbox platform's steady state. Every keyed placement binds the oldest
+// unbound live instance inside the plan apply, so this is serial
+// scheduler-lane time, and the `apply` phase mean printed after each cell
+// is the number to watch: it should stay flat as the population grows.
+
+const KEYED_BIND_RESIDENT: &[usize] = &[1_000, 5_000];
+const KEYED_BIND_NODES: usize = 200;
+/// Instances placed per `plan_and_apply` while filling.
+const KEYED_BIND_FILL_CHUNK: usize = 500;
+
+fn setup_keyed_population(store: &Store, resident: usize) -> anyhow::Result<String> {
+    insert_uniform_nodes(store, KEYED_BIND_NODES)?;
+    let job = JobConfig {
+        priority: Default::default(),
+        name: "bench-keyed".into(),
+        tasks: vec![TaskConfig {
+            stateful: Some(serde_json::from_value(json!({ "mode": "keyed" }))?),
+            ..TaskConfig::new("workspace", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
+    };
+    let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
+        .pop()
+        .expect("one id");
+    let mut created = 0;
+    while created < resident {
+        let chunk = KEYED_BIND_FILL_CHUNK.min(resident - created);
+        for idx in created..created + chunk {
+            store.create_keyed_instance(
+                "bench-keyed",
+                "default",
+                "workspace",
+                Some(&format!("live-{idx}")),
+            )?;
+        }
+        // Reschedule, as a create's `job_reschedule` eval plans: only the
+        // instances with no allocation yet. A `Fresh` plan wants one
+        // placement per live instance and fails once some are bound.
+        let outcome =
+            Scheduler::new(store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        anyhow::ensure!(
+            outcome.allocations.len() == chunk,
+            "placed {} of {chunk} keyed instances",
+            outcome.allocations.len()
+        );
+        created += chunk;
+    }
+    for idx in 0..resident {
+        let id = format!("parked-{idx}");
+        store.create_keyed_instance("bench-keyed", "default", "workspace", Some(&id))?;
+        store.stop_keyed_instance(&id)?;
+    }
+    Ok(job_config_id)
+}
+
+fn keyed_bind_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("keyed_bind");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &resident in KEYED_BIND_RESIDENT {
+        let (store, _dir) = setup_store("bin_pack").expect("store");
+        let job_config_id = setup_keyed_population(&store, resident).expect("population");
+        let mut next = 0usize;
+        let timings: RefCell<Vec<PlanTimings>> = RefCell::new(Vec::new());
+        group.bench_function(
+            BenchmarkId::new("plan_and_apply", format!("resident_{resident}")),
+            |b| {
+                b.iter_batched(
+                    || {
+                        next += 1;
+                        store
+                            .create_keyed_instance(
+                                "bench-keyed",
+                                "default",
+                                "workspace",
+                                Some(&format!("new-{next}")),
+                            )
+                            .expect("instance");
+                    },
+                    |()| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let outcome = scheduler
+                            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
+                            .expect("plan");
+                        assert_eq!(outcome.allocations.len(), 1);
+                        timings.borrow_mut().push(outcome.timings.clone());
+                        outcome
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            },
+        );
+        print_phase_means(
+            &format!("keyed_bind/plan_and_apply/resident_{resident}"),
+            &timings.borrow(),
+        );
     }
 
     group.finish();
@@ -1276,6 +1404,7 @@ criterion_group!(
     plan_fleet_scaling_benchmark,
     locality_benchmark,
     restore_benchmark,
-    snapshot_budget_benchmark
+    snapshot_budget_benchmark,
+    keyed_bind_benchmark
 );
 criterion_main!(benches);

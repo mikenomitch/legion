@@ -33,15 +33,22 @@ import {
   volumePinsPlacement,
   volumeStateTone,
 } from '../utils/volumes'
+import { jobPath } from '../utils/namespaces'
+import { useNamespaceSelection } from '../components/NamespaceSwitcher'
 
 function VolumesContent() {
   const [search, setSearch] = createSignal('')
   const [stateFilter, setStateFilter] = createSignal('live')
   const tick = usePoll()
 
+  const selection = useNamespaceSelection()
   const [volumes] = createResource(
-    () => tick() + 1,
-    retainOnError(async () => (await managerClient.listVolumes({})).volumes, () => 'volumes'),
+    () => [tick(), selection().join(',')] as const,
+    // Tombstones too: the page filters them client-side ("All", "Destroyed").
+    retainOnError(
+      async () => (await managerClient.listVolumes({ includeDestroyed: true, namespaces: selection() })).volumes,
+      () => `volumes|${selection().join(',')}`,
+    ),
   )
   const [drivers] = createResource(
     () => tick() + 1,
@@ -225,7 +232,7 @@ function VolumesContent() {
                         </td>
                         <td class={tdClass}>
                           <Show when={volume.jobId} fallback={<span class="text-faint">—</span>}>
-                            <A href={`/jobs/${encodeURIComponent(volume.jobId!)}`} class="text-muted hover:text-brass-strong">
+                            <A href={`${jobPath(volume.jobId!)}`} class="text-muted hover:text-brass-strong">
                               {volume.jobId}
                             </A>
                           </Show>

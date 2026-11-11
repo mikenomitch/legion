@@ -27,6 +27,7 @@ import {
   type TabItem,
 } from '../../components/ui'
 import LogViewer from '../../components/LogViewer'
+import { AppPanels } from '../../components/apps/AppSlot'
 import { managerClient } from '../../grpcClient'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { EffectivePolicyView, parseEffectivePolicy } from '../../components/NetPolicyView'
@@ -60,6 +61,7 @@ import { instanceHref } from '../../utils/instances'
 import { envelopeServes, envelopeTaskName, isSessionTask, jobInstancesHref } from '../../utils/sessions'
 import { nodePublicAddress } from '../../utils/services'
 import { AllocationLink } from '../../components/AllocationLink'
+import { jobIdFromParams, jobIdOf, jobNamespace, jobPath, qualifiedDisplay, servicePath } from '../../utils/namespaces'
 
 // Checksum column value: pinned sources carry their digest in the source
 // (`…@sha256:…`); otherwise fall back to the declared checksum.
@@ -260,7 +262,7 @@ function ArtifactSummary(props: { rows: readonly ArtifactStateRow[] }) {
 
 function TaskDetailContent() {
   const params = useParams()
-  const jobName = createMemo(() => decodeURIComponent(params.id))
+  const jobName = createMemo(() => jobIdFromParams({ namespace: decodeURIComponent(params.namespace), name: decodeURIComponent(params.name) }))
   const taskName = createMemo(() => decodeURIComponent(params.taskName))
 
   // Tabs live in the URL so a link can land on one (`?tab=logs`), `?alloc=`
@@ -341,7 +343,7 @@ function TaskDetailContent() {
     const serviceName = taskSpec?.service ? (taskSpec.service.name ?? task) : undefined
     const endpoints = serviceName
       ? await managerClient
-          .resolveService({ service: serviceName, includeUnhealthy: true })
+          .resolveService({ service: jobIdOf(jobNamespace(job), serviceName), includeUnhealthy: true })
           .then((reply) => reply.endpoints.filter((endpoint) => endpoint.taskName === task))
           .catch(() => [])
       : []
@@ -560,8 +562,8 @@ function TaskDetailContent() {
             subtitle={
               <>
                 In job{' '}
-                <A class={linkClass} href={`/jobs/${encodeURIComponent(jobName())}`}>
-                  {data()!.job?.name ?? jobName()}
+                <A class={linkClass} href={jobPath(jobName())}>
+                  {qualifiedDisplay(jobName())}
                 </A>
                 <Show when={data()!.taskSpec}>
                   {(spec) => (
@@ -604,6 +606,7 @@ function TaskDetailContent() {
           <Switch>
             <Match when={activeTab() === 'overview'}>
               <div class="space-y-4" role="tabpanel" aria-label="Overview">
+                <AppPanels slot="task" job={jobName()} task={taskName()} group={data()!.taskSpec?.group} />
                 {/* Session mode (docs/session-mode.md): the task's sessions are
                     not allocations, and its envelope task's allocations run
                     nothing. Say so before the allocation cards below. */}
@@ -611,7 +614,7 @@ function TaskDetailContent() {
                   <Note tone="info">
                     <span class="font-medium">A session task.</span> Its sessions are not allocations, so they are not listed below: each runs
                     inside its node's envelope (task{' '}
-                    <A class={linkClass} href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(envelopeTaskName(taskName()))}`}>
+                    <A class={linkClass} href={`${jobPath(jobName())}/tasks/${encodeURIComponent(envelopeTaskName(taskName()))}`}>
                       {envelopeTaskName(taskName())}
                     </A>
                     ), which reserves the room.{' '}
@@ -625,7 +628,7 @@ function TaskDetailContent() {
                   {(served) => (
                     <Note tone="info">
                       <span class="font-medium">A session envelope.</span> Legion generated this task for{' '}
-                      <A class={linkClass} href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(served())}`}>
+                      <A class={linkClass} href={`${jobPath(jobName())}/tasks/${encodeURIComponent(served())}`}>
                         {served()}
                       </A>
                       : one allocation per eligible node, each reserving room for that task's sessions. Envelopes run nothing, so they report no
@@ -674,7 +677,7 @@ function TaskDetailContent() {
                     <StatCard
                       label="Endpoints"
                       icon="radio"
-                      href={data()!.serviceName ? `/services/${encodeURIComponent(data()!.serviceName!)}` : undefined}
+                      href={data()!.serviceName ? servicePath(jobNamespace(jobName()), data()!.serviceName!) : undefined}
                       value={`${data()!.endpoints.filter((endpoint) => endpoint.healthy).length} / ${data()!.endpoints.length}`}
                       tone={(() => {
                         const total = data()!.endpoints.length
@@ -964,7 +967,7 @@ function TaskDetailContent() {
                             <span class="inline-flex flex-wrap gap-x-2 gap-y-1">
                               <For each={data()!.taskSpec!.dependsOn}>
                                 {(dependency) => (
-                                  <A class={linkClass} href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(dependency.task)}`}>
+                                  <A class={linkClass} href={`${jobPath(jobName())}/tasks/${encodeURIComponent(dependency.task)}`}>
                                     {dependency.task}
                                     <Show when={dependency.condition}>
                                       <span class="text-faint"> ({dependency.condition})</span>
@@ -989,7 +992,7 @@ function TaskDetailContent() {
                       description="What this task advertises to discovery, and the ports it declares."
                       actions={
                         <Show when={data()!.serviceName}>
-                          <A class={linkClass + ' text-sm'} href={`/services/${encodeURIComponent(data()!.serviceName!)}`}>
+                          <A class={linkClass + ' text-sm'} href={servicePath(jobNamespace(jobName()), data()!.serviceName!)}>
                             Open service
                           </A>
                         </Show>

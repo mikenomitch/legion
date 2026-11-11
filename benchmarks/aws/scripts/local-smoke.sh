@@ -81,7 +81,7 @@ EOF
 # must kill the real process or failed runs leak a manager on :4747.
 # ACLs are on by default: the manager mints its management token into
 # $LEGION_DATA_DIR/bootstrap-token at first start. LEGION_TOKEN_FILE keeps it
-# from also landing in the developer's ~/.legion/token.
+# from also landing in the developer's ~/.legion/tokens/127.0.0.1_4747.
 (cd "$WORK/manager" && LEGION_DATA_DIR="$WORK/manager" LEGION_TOKEN_FILE="$WORK/cli-token" \
     exec "$LEGION" start manager -c config.ncl) >"$WORK/manager.log" 2>&1 &
 MANAGER_PID=$!

@@ -209,7 +209,10 @@ stale job-config epoch, a node whose epoch moved under a concurrent apply, a
 cordon, a shrunken node, and a static-port collision all land in the same
 `rejected` counter. Only the free-text rejection string on the
 `plan_submission` row tells them apart. Until there is a counter labelled by
-reason, read the strings.
+reason, read the strings. The table keeps about the last 1,000 rejected
+plans (applied plans leave no row; see
+[plan records](scheduler-and-eval-loop.md#plan-records)), so classify while
+the storm is recent.
 
 The strings include node and task ids, so grouping on the raw column gives one
 group per row. Classify them instead:
@@ -231,7 +234,7 @@ Each reason has a different remedy, so classify before you act:
 
 | Reason | Cause | Remedy |
 | --- | --- | --- |
-| `node_epoch_moved` | A concurrent apply took the node and the placement couldn't be revalidated onto it. Only an edge-boot ratification (`target_instance`) rejects on epoch alone. | Rare. If you see many of these, look at `speculativeStart` jobs instead of `evalThreads`. |
+| `node_epoch_moved` | A concurrent apply took the node and the placement couldn't be revalidated onto it. | Rare, since pass 2 revalidates a moved node. Edge-boot ratifications never compare epochs, so they never produce this. |
 | `job_epoch_stale` | Two plans raced on one job config | Reduce concurrency. Job-config epochs are a strict all-or-nothing fence. |
 | `node_unavailable` | Cordoned, draining, or lost since the plan snapshot | This is fleet churn. Reducing `evalThreads` won't help. Find what is cordoning or losing nodes. |
 | `capacity_shrank` | A worker re-registered with smaller totals | Check worker configs and re-registrations. |
@@ -414,11 +417,14 @@ submit can never overtake an older backlog.
 **Known limitation, and the workaround**
 
 `legion_eval_queue_depth` is a single unlabelled gauge. It tells you the queue
-is 764 deep but not what is in it, which is what you need here. Until it has a
+is 764 deep but not what is in it, which is what you need here. On a queue
+deeper than `evalThreads × 16` it is refreshed from a full count at most once
+a second, so it can lag by that much
+([claims](scheduler-and-eval-loop.md#eval-queue-semantics)). Until it has a
 `kind` label, read the queue contents from the store directly:
 
 ```console
-$ legion state query "SELECT kind, status, COUNT(*) FROM eval \
+$ legion state query "SELECT type, status, COUNT(*) FROM eval \
     WHERE status IN ('pending','blocked') GROUP BY 1,2 ORDER BY 3 DESC;"
 ```
 
@@ -579,9 +585,9 @@ $ legion state query "SELECT j.id AS job, j.status, COUNT(a.id) AS allocations \
     GROUP BY 1,2 ORDER BY 3 ASC;"
 
 # What failed, and why?
-$ legion state query "SELECT kind, COUNT(*) FROM eval WHERE status = 'failed' \
+$ legion state query "SELECT type, COUNT(*) FROM eval WHERE status = 'failed' \
     GROUP BY 1 ORDER BY 2 DESC;"
-$ legion state query "SELECT id, kind, job_id, node_name FROM eval \
+$ legion state query "SELECT id, type, job_id, node_id FROM eval \
     WHERE status = 'failed' ORDER BY id DESC LIMIT 20;"
 
 # The narrative version, with reasons attached.
@@ -643,7 +649,7 @@ answer that isn't there.
   concurrent apply, a cordon, a shrunken node, a late constraint failure, and
   a static-port collision are six different problems with six different
   remedies, and they share one counter. Workaround: group
-  `plan_submission.rejection_reason`.
+  `plan_submission.rejection_reason` (the last ~1,000 rejections).
 - **What is in the eval queue.** `legion_eval_queue_depth` is one unlabelled
   gauge. Workaround: `GROUP BY kind` on the eval table.
 - **How long work has been queued.** There is no queue-age metric, so you

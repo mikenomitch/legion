@@ -1,7 +1,7 @@
 //! Integration coverage for adaptive scheduler concurrency
 //! (docs/adaptive-scheduler-concurrency.md, plan Phase 3).
 //!
-//! The unit suite in `src/manager/concurrency.rs` proves the decision RULE.
+//! The unit suite in `crates/manager/src/manager/concurrency.rs` proves the decision RULE.
 //! This suite proves the two things a pure function cannot:
 //!
 //! 1. The gate is invisible to correctness. A burst pinned to one planner
@@ -18,6 +18,11 @@
 //! The gate, the mode and the window are process-global (one manager, one
 //! controller), so every test here takes `SERIAL` — they share the same
 //! statics and would otherwise read each other's state.
+
+// Only `scratch_root` is used here; the cluster gate is for the raft tests.
+#[allow(dead_code)]
+#[path = "integration/support.rs"]
+mod support;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +54,7 @@ fn serial() -> MutexGuard<'static, ()> {
 fn setup_store() -> R<Store> {
     let store_dir = Builder::new()
         .prefix("legion-adaptive-concurrency-")
-        .tempdir()
+        .tempdir_in(support::scratch_root())
         .context("error creating temp store directory")?
         .keep();
     let store_config = ManagerConfigFull {
@@ -106,6 +111,8 @@ fn submit_job(store: &Store, name: &str) -> R<String> {
         }],
         priority: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     store.handle_job_submit(
         &job,

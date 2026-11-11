@@ -39,7 +39,6 @@ let images = (import "lib/images.ncl") vars in
         "%,
       ],
       vcpus = 1,
-      memory_mib = 512,
       hypervisor = "cloud-hypervisor",
       network = { mode = "tap", bridge = "br0" },
     },

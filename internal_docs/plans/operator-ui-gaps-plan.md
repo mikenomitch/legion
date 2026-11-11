@@ -91,7 +91,7 @@ public addresses from cloud metadata; an allocations index page; a
   `extractJobSpecData` in `ui/src/utils/jobspec.ts` JSON-parsed them.
 - `LedgerAllocation` carried `task_config_id` but no task name; the UI joined
   through `queryStateStore` SQL (needs `state:read`).
-- `SchedulerEventFilter` (`src/storage/events.rs`) filtered by kind, job,
+- `SchedulerEventFilter` (`crates/manager/src/storage/events.rs`) filtered by kind, job,
   node, level. Instance events carry `instanceId` in metadata
   (`instanceId`/`instance_id` in `node.pressure`); allocation events carry
   `allocation_id`; allocation rows carry `instance_id`.
@@ -100,9 +100,9 @@ public addresses from cloud metadata; an allocations index page; a
   (`Store::replace_job_kv_references`).
 - Workers register `workerAddress` (always the private bind address); service
   endpoints derive `address` from it.
-- `handle_rollout_tick` (`src/manager/rollout.rs`) never checked that its
+- `handle_rollout_tick` (`crates/manager/src/manager/rollout.rs`) never checked that its
   target was still the job's latest config; `reconcile_kv_changes`
-  (`src/manager/server.rs`) creates new configs on KV restart/update without
+  (`crates/manager/src/manager/server.rs`) creates new configs on KV restart/update without
   cancelling an active rollout.
 
 ## 6. Design
@@ -221,7 +221,7 @@ asked. New fields: `GetJobSpecReply.rendered_jobspec`,
   (SQL and the stream's `matches_with` agree)
 - `storage::store::tests::list_kv_keys_omits_values`
 - `storage::store::tests::service_endpoints_carry_the_node_public_address`
-- `tests/acl_endpoints.rs` covers the changed KV requests.
+- `tests/integration/acl_endpoints.rs` covers the changed KV requests.
 - UI: `tsc`, and Playwright renders against mocked RPCs for the new pages.
 
 ## 9. Rollout

@@ -152,7 +152,7 @@ file is always there.
 | --- | --- |
 | `exec` | Signals the task's process group directly. Full support. |
 | `container` | Signals the container's init, not the launching CLI. On Linux (OCI runtimes), `stop.signal` is delivered as configured. When the jobspec has no `stop` block, the image's own `STOPSIGNAL` is used before falling back to `SIGTERM`, matching Docker's behavior (see [task-runtime-container.md](task-runtime-container.md#graceful-stop)). On macOS, the Apple `container` runtime runs its own ladder and may SIGKILL on its own schedule if `killAfter` exceeds what it accepts. |
-| `sandbox` | **No graceful stop.** A sandbox is a guest OS behind a VMM. Signaling the VMM terminates the hypervisor instead of asking the workload inside to shut down, and Legion has no in-guest agent to pass a notice to. `stop { signal, killAfter }` has no effect, and these allocations are torn down immediately. |
+| `sandbox` | On a microVM, the guest agent signals the guest's init with `stop.signal`. Init flushes the guest's disks, passes the signal to the command, waits for it, unmounts the volumes, and powers off. The VMM is killed at `killAfter` only if the guest is still up, after one more flush. `SIGINT` and `SIGQUIT` reach the command ignored, so a shell-script command cannot act on them. See [task-runtime-sandbox.md](task-runtime-sandbox.md#stopping-a-sandbox). The dev-mode backends (Apple `container`, an OCI runtime) are torn down immediately. |
 | Out-of-tree plugins | A runtime that tracks a host process gets the default (signal the process group). A runtime that does not declines the notice, and the worker tears the allocation down immediately, as it did before graceful stop existed. |
 
 ## Why this exists
@@ -180,12 +180,15 @@ the allocation.
 | `node_lost` | The node was removed or declared lost, clearing its allocations. |
 | `scale_in` | Surplus after `legion job scale` lowered the task's count ([autoscaling.md](autoscaling.md)). Unlike `update`, no new job config version is involved. |
 | `preempted` | Displaced to make room for higher-priority work ([preemption-and-eviction.md](preemption-and-eviction.md)). Includes a `preemptor` in the stop notice. |
+| `gang` | A member of the task's [gang](gang-scheduling.md) was lost and the gang restarts whole (`onMemberLoss = "restart"`), or the gang's job failed (`onMemberLoss = "fail"`, a spent move budget, or a `placementTimeout`). The survivors stop so the gang never runs short of its quorum. |
 | `node_pressure` | The node ran short of memory and its memory pressure response stopped this task, because it was bursting above its reservation (`evict-bursting`) or the node oversubscribes memory (`evict-reserved`). The worker writes this cause into the stop notice itself. See [resource-enforcement.md](resource-enforcement.md#memory-pressure). |
+| `runtime_disabled` | The task's runtime was disabled with a drain (`legion operator runtime disable --drain`). Nothing replaces the allocation until the runtime is enabled. See [runtime-disable.md](runtime-disable.md#draining). |
+| `failed` | The task exited unsuccessfully or failed its health checks, its worker reported it, and the manager removed the allocation to replace it (or, with the `onUnhealthy` move budget spent, to fail the job). A stateful instance's `last_stop` carries the worker's failure reason. |
 | `unknown` | No cause was recorded. See [Delivery guarantees](#delivery-guarantees). |
 
-`unknown` is a normal value, not just an error case. It most often comes from
-the worker failure-report path. A task that died on its own was never stopped
-by the platform, so there is no platform stop to explain.
+`unknown` is a normal value, not just an error case: a worker that reconciles
+before the notice reaches it, or a manager older than the cause it would
+send, stops with `unknown` rather than waiting.
 
 ## Where you can see it
 
@@ -325,9 +328,10 @@ lost. A stop whose notice has not arrived is still graceful. It just reports
 
 ## Known limitations
 
-- **`sandbox` tasks get no grace period.** See
-  [Runtime support](#runtime-support). This follows from the design (there
-  is no in-guest agent).
+- **Dev-mode `sandbox` tasks get no grace period.** Only a microVM has a
+  guest to ask. A microVM whose guest agent cannot be reached is also
+  stopped at once, after a flush attempt. See
+  [Runtime support](#runtime-support).
 - **The Apple `container` runtime runs its own ladder.** `stop.signal` is
   passed through, but the runtime's own timeout may fire before Legion's
   `killAfter`. Linux/OCI workers follow `killAfter` exactly.

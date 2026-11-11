@@ -81,7 +81,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 }
 
 async fn list(matches: &ArgMatches) -> R<()> {
-    let job = matches.get_one::<String>("job").expect("required");
+    let job = &crate::cmd::helpers::required_job_arg(matches, "job")?;
     let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -136,7 +136,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
 }
 
 async fn run(matches: &ArgMatches) -> R<()> {
-    let job = matches.get_one::<String>("job").expect("required").clone();
+    let job = crate::cmd::helpers::required_job_arg(matches, "job")?;
     let action = matches
         .get_one::<String>("action")
         .expect("required")
@@ -161,10 +161,7 @@ async fn run(matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
 
-    let instance_id = matches
-        .get_one::<String>("instance")
-        .cloned()
-        .unwrap_or_default();
+    let instance_id = crate::cmd::helpers::instance_arg(matches, "instance")?.unwrap_or_default();
     let allocation_id = match matches.get_one::<String>("alloc") {
         Some(raw) => raw
             .parse::<i64>()

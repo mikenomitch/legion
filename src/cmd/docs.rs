@@ -23,7 +23,7 @@ pub fn config() -> Command {
         .subcommand(task_schema_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("task-schemas", args)) => generate_task_schema_docs(args),

@@ -55,8 +55,8 @@ legion net policy test agent --to https://api.github.com/user   # would this be 
 ## What the datapath does today
 
 Every connection a task makes through an upstream (`LEGION_UPSTREAM_<KEY>`,
-a loopback port the node owns) passes through the node's forwarder. The
-forwarder runs in one of two modes.
+an address the node owns) passes through the node's forwarder. The forwarder
+runs in one of two modes, and the upstream's `to` scheme alone decides which.
 
 **L4 (the default).** Before dialing, the forwarder evaluates the task's
 **effective egress policy** using what is known at connect time: the
@@ -68,9 +68,37 @@ rule. An allowed connection is spliced through without parsing. The only
 per-connection cost of a connect-time policy is one pass over the rules. No
 bytes are inspected.
 
-**HTTP mode.** An upstream is parsed as HTTP/1.1 when it declares HTTP (an
-`http://`/`https://` target, an `http` block, or a `dlp` handler), or when
-the effective egress policy is `protocol = "http"`. For each request:
+On Linux, when both ends of a flow are plain sockets, bulk transfers move
+with `splice(2)` and never enter the worker's memory. Each direction starts
+as an ordinary copy and switches to `splice` once it is clearly carrying
+bulk data (a read fills the 16 KiB copy buffer), because for small requests
+and replies a copy is cheaper. That covers upstream and ingress flows over
+TCP, and a sandbox's flows over its vsock relay. A flow that has to be
+decrypted or framed (TLS, a mesh hop, a PROXY header read off the
+connection) is copied in user space, as is every flow on macOS. A kernel
+that refuses `splice` (some sandboxed kernels) is detected once at first
+use, and every flow is then copied. The behavior is the same either way.
+Only the CPU cost differs.
+
+**A policy never changes how a stream is parsed.** A chain's `protocol =
+"http"` says which rules it may hold (path, method, header); it does not put
+an upstream in HTTP mode. Under an HTTP chain, an upstream whose `to` does not
+speak HTTP (`db`, `tcp://…`, `tls://…`) is judged with the connect-time facts.
+When the first rule that could match it needs the request head, the
+connection is refused, and the `net.denied` event names both:
+
+```
+net.denied  policy/prod-web#1  upstream 'db' is tcp://, and the first rule that
+could match it needs a path, method, or header. Hint: allow 'db' by host ahead
+of path rules, or write to = "http://db" if it speaks HTTP
+```
+
+`legion job validate`, `job plan`, and `job run` warn about such an upstream
+before it is placed, and `legion net policy apply --dry-run` warns about the
+running tasks a new policy would do it to.
+
+**HTTP mode.** An upstream is parsed as HTTP/1.1 when its `to` is `http://` or
+`https://`. For each request:
 
 1. The chain is evaluated with the request head (method, path, headers) in
    addition to the connect-time facts. A denial returns a `403`. Its body and
@@ -78,17 +106,22 @@ the effective egress policy is `protocol = "http"`. For each request:
    a client (such as an agent in a sandbox) can read why it was denied
    instead of retrying.
 2. `dlp` handlers buffer the body up to `maxBytes` and reject a match.
+   Otherwise the body is streamed, or kept only as far as a retry needs it
+   ([Request bodies](#request-bodies)).
 3. The upstream's `http` block applies traffic management:
    - a per-request `timeout`
    - `retries` on connect failures and 5xx, for idempotent methods only (by
      default), under a `budget` (default 20% of requests per minute)
    - a weighted `split` by service tag
-   - `outlier` ejection of an endpoint after `consecutive5xx` failures, for
-     `ejectFor`
-4. Each request gets one upstream connection. TLS is opened for `https://`,
-   and the `Host` header is rewritten to an external target's host.
+   - outlier ejection, which has no setting: an endpoint that answers 5xx five
+     times in a row is skipped for 30 seconds, whatever the balancer
+4. Upstream connections are pooled per listener and reused across
+   requests, so a task's calls pay the TCP, TLS, and mesh handshakes once
+   rather than per request. TLS is opened for `https://`, and the `Host`
+   header is rewritten to an external target's host. See
+   [Connection pooling](#connection-pooling).
 
-`accessLog = true` on the chain (or a `log` handler) writes one NDJSON line
+`accessLog = true` on the chain writes one NDJSON line
 per request to `<worker logs>/<allocation>/net-access.log`. Each line has
 the task's labels, the verdict, the deciding rule, status, bytes, and
 duration.
@@ -96,6 +129,115 @@ duration.
 HTTP mode supports HTTP/1.1 only, with no HTTP/2 and no WebSocket upgrades.
 A task that needs those should use a `tcp://`/`tls://` upstream and an L4
 policy.
+
+### Connection pooling
+
+In HTTP mode, the datapath keeps idle upstream connections and reuses them.
+This applies to service endpoints, external targets, mesh endpoints, and the
+task behind an HTTP-mode ingress chain.
+
+- **Per listener.** Each upstream of each allocation has its own pool. Two
+  allocations never share a connection, so a mesh connection's PROXY header,
+  sent once when it opens, always names the workload making the request.
+- **When a connection comes back.** After the response body has been read,
+  if the upstream kept the connection alive. A response with
+  `Connection: close` ends the connection instead.
+- **Limits.** A connection is closed after 30 seconds idle, and each
+  destination keeps at most 32 idle connections.
+- **A connection the upstream closed.** It is skipped when picked from the
+  pool. If the upstream closes it just as a request goes out, the request is
+  sent again on a new connection when it never left the node, or when its
+  method is idempotent (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`).
+  Otherwise the task gets a `502`. This retry is separate from the `retries`
+  policy and does not count against its budget.
+- **Not pooled.** A request handed to a [`proxy` handler](#proxy--bring-your-own-proxy).
+
+L4 flows are not pooled. Each connection the task opens is one connection
+upstream, and on a mesh endpoint, one mTLS handshake, which resumes a TLS
+session when the node has one for that peer ([Sessions](#sessions)).
+
+### Request bodies
+
+HTTP mode never holds an unbounded request body in memory. What happens to a
+body depends on whether something has to read it whole or send it twice:
+
+| The request | Its body |
+| --- | --- |
+| A body hop applies (`dlp`, a plugin's `body` stage) | Read whole, up to the largest `maxBytes` of the route's body hops. Over it, the request is denied with `403` if any body hop fails closed (the default). If every body hop sets `onError = "allow"`, the body goes on **unread**: what was read and the rest are streamed to the upstream once, no body hop sees it, and the request is not retried |
+| The method may be retried (`http.retries`) | Kept up to `retries.maxBodyBytes` (default `1Mi`, at most `64Mi`) so a retry can send it again. A larger body is streamed to the upstream as it arrives and the request is **not retried** |
+| Anything else | Streamed to the upstream as it arrives |
+
+```nickel
+connect.upstreams = [{
+    name = "storage",
+    to = "https://storage.internal",
+    http = { retries = { attempts = 2, methods = ["PUT"], maxBodyBytes = "8Mi" } },
+}]
+```
+
+A streamed upload is not delayed until it is complete, and the worker's
+memory stays flat however large it is. The pooled-connection resend above
+still applies to a streamed request that never left the node. Access logs
+and the service graph count a streamed body's bytes as they pass, so a line
+written before the upload ends reports what had arrived.
+
+### What the datapath costs
+
+These numbers come from `net_bench`
+([Testing and Benchmarks](testing-and-benchmarks.md)), which runs the real
+forwarder against backends on loopback. That isolates the cost of the hop
+itself: there is no NIC, no network round trip, and no TLS. The runs used
+Linux 7.0 in a 10-vCPU VM on an Apple M5, on a host shared with other work.
+Each figure is the range across runs, not a single best case.
+
+| One hop through the forwarder (L4) | Direct | Through the forwarder | The hop adds |
+| --- | --- | --- | --- |
+| Request and reply, 100 bytes, kept-open connection | 4–7 µs | 8–13 µs | 4–7 µs |
+| New connection, one request and reply | 19–37 µs | 63–120 µs | 45–80 µs |
+| Bulk transfer, one stream | 5.3–6.0 GiB/s | 4.1–4.9 GiB/s | |
+| CPU per GiB moved, the hop alone | | 0.09–0.11 CPU-s | |
+
+For comparison, a bare userspace proxy (accept, dial, copy) in the same
+harness moved about 2 GiB/s at 0.27–0.37 CPU-seconds per GiB. The forwarder
+beats it on bulk transfers because it splices them in the kernel on Linux.
+On macOS every flow is copied, so expect numbers closer to that baseline.
+
+What this means in practice:
+
+- **Kept-open connections pay a few microseconds per round trip.** A
+  request between two nodes in one datacenter usually takes a few hundred
+  microseconds on the network, so one hop is a small share of it. A call
+  through `connect` to a port another node fronts crosses two hops, one on
+  each node.
+- **New connections pay the most.** The forwarder accepts one connection and
+  dials another, which roughly doubles the setup cost on loopback. A client
+  that keeps its connections open avoids this.
+- **Mesh mTLS adds a handshake per new L4 connection.** That is one extra
+  network round trip plus the handshake's CPU, and it is not in the table.
+  Most of those handshakes resume a TLS session instead of verifying
+  certificates again ([Sessions](#sessions)), including across the 8-hour
+  certificate refresh. HTTP mode pools its upstream connections, so a task
+  making many requests pays the handshake once per pooled connection, not
+  once per request.
+- **HTTP mode parses every request and response.** On loopback, a request
+  through HTTP mode on a reused upstream connection measured within about
+  20 µs of a direct one. That figure is noisy: a direct HTTP request in the
+  same harness averaged anywhere from about 30 to over 100 µs across runs.
+
+Balancing matters more than the hop when a backend is slow. With three
+backends and one of them deliberately slow, strategies that spread traffic
+evenly averaged 1.8–1.9 ms per request. `least_latency` averaged 62–73 µs in
+HTTP mode, and 98–114 µs over L4 with a new connection per request, close to
+the fast backends alone
+([Balancing strategies](service-discovery.md#balancing-strategies)). A pick
+costs 90–145 ns across 16 endpoints, against 2–5 ns for `round_robin` and
+110–180 ns for `least_conn`.
+
+To reproduce these on your own hardware:
+
+```console
+$ cargo bench --bench net_bench
+```
 
 ## Policy
 
@@ -110,7 +252,6 @@ network = {
     egress = {
         protocol = "tcp",       # tcp (default) | http — never inferred from the rules
         policy = "deny",        # fallthrough: allow | deny (deny when `allow` is used)
-        onError = "deny",       # what a failed handler means: deny | allow
         accessLog = false,
         allow = ["*.pypi.org", "api.github.com:443", "10.0.0.0/8:5432"],
         rules = [
@@ -165,9 +306,9 @@ task's next heartbeat, with no restart, rollout, or job edit.
     "priority" = 100,
     selector = {
         nodePools = ["untrusted"],       # node.pool globs
-        namespaces = ["default"],        # every job is in `default` (no user namespaces)
+        namespaces = ["agents-*"],       # namespace globs (docs/namespaces.md)
         runtimes = ["sandbox"],
-        jobs = ["agent-*"],              # job id globs
+        jobs = ["agent-*"],              # globs over the job's bare name
         labels = { tier = "free" },      # task network.labels that must all match
     },
     enforcement = "require",             # require | default
@@ -207,21 +348,24 @@ stored policy and no task that declares one pays nothing extra per heartbeat.
 
 ## Upstreams
 
-Each `connect.upstreams` entry is either a catalog **service** or an
-**external destination**:
+Each `connect.upstreams` entry names its destination with `to`: a catalog
+**service** by its bare name, or an **external destination** by URL
+([Service Discovery](service-discovery.md#connecting-to-services-the-connect-block)
+has the full rule):
 
 ```nickel
 connect = {
     upstreams = [
-        { service = "db" },                                   # as before
+        { to = "db" },                                       # a catalog service, L4
+        { to = "http://search" },                            # a catalog service, HTTP
         { name = "openai", to = "https://api.openai.com" },  # external
     ],
 },
 ```
 
 An external upstream has a `name` and a `to`. The task gets
-`LEGION_UPSTREAM_<NAME>` (`127.0.0.1:<port>`), the same as for a service
-upstream. The scheme of `to` decides two things:
+`LEGION_UPSTREAM_<NAME>`, the same as for a service upstream. The scheme of
+`to` decides two things:
 
 | `to` | Legion originates TLS | HTTP framing |
 | --- | --- | --- |
@@ -230,9 +374,13 @@ upstream. The scheme of `to` decides two things:
 | `http://host[:port]` | no | yes |
 | `https://host[:port]` | yes | yes |
 
-With `https://`, the task speaks **plaintext HTTP to loopback**, and the
+A dotless external host carries its port (`http://wiki:80`); without one, a
+bare name is a catalog service.
+
+With `https://`, the task speaks **plaintext HTTP to its upstream address**, and the
 node's forwarder dials the destination over TLS (verified against the Mozilla
-roots). This lets policy and handlers see an LLM API call's body **without
+roots, or against the bundle the upstream's `ca` pins,
+[TLS on ports](#tls-on-ports)). This lets policy and handlers see an LLM API call's body **without
 intercepting anyone's TLS**. Point the client at the upstream:
 
 ```sh
@@ -242,8 +390,8 @@ export OPENAI_BASE_URL="http://$LEGION_UPSTREAM_OPENAI/v1"
 Legion never holds a certificate authority that can impersonate the public
 internet. `to` must not include a path or query. The task chooses paths.
 
-The `http` block on an upstream (`timeout`, `retries`, `split`, `outlier`)
-turns on HTTP mode with traffic management. Per-upstream `handlers` run
+The `http` block on an upstream (`timeout`, `retries`, `split`) adds traffic
+management to an upstream that speaks HTTP. Per-upstream `handlers` run
 there too. See [What the datapath does today](#what-the-datapath-does-today).
 
 ### Credential injection
@@ -341,10 +489,10 @@ its first heartbeat, and until then requests on that upstream get a `503`.
 - **Every request.** The value is read once per request and sent on every
   attempt of it: retries, and a [`proxy` handler](#proxy--bring-your-own-proxy)
   hand-off. A proxy hop sees the credential, because it has to reach the
-  origin with it. The hand-off is plain HTTP to the proxy (it opens TLS to
-  the origin), so a proxy on another node receives the key over the network
-  unencrypted: prefer a `node`- or `port`-local proxy target, and run only
-  proxies you would trust with the key.
+  origin with it, so run only proxies you would trust with the key. The
+  hand-off never crosses the network in plaintext: a proxy on another node
+  is reached only over the [mesh](#the-mesh), so its service needs
+  `mesh = true` ([`proxy` targets](#proxy--bring-your-own-proxy)).
 - **`authz` hops never see it.** They run before injection, and they receive
   the task's own headers (minus `authorization`, `cookie`, and
   `proxy-authorization`, as always), so a placeholder at most.
@@ -363,7 +511,7 @@ its first heartbeat, and until then requests on that upstream get a `503`.
   into a burst of `401`s, or into requests that succeed against an origin
   that allows anonymous access.
 - **Rotation.** `legion kv put secrets/openai ...` reaches every node on its
-  next heartbeat (`GetUpstreamCredentials`, asked only for versions newer
+  next heartbeat (`FetchDatapathMaterial`, asked only for versions newer
   than the one held). Requests already in flight keep the old value. Nothing
   restarts. Deleting the key revokes it on the next heartbeat. An identity
   token is replaced on the first heartbeat after half its TTL has passed.
@@ -438,13 +586,20 @@ memory, so never in its memory checkpoints, forks, or published snapshots.
 
 ## Name-is-config: `<key>.svc.legion`
 
-On Linux, every allocation that declares upstreams gets its own loopback /24
-at placement (`127.42.<b>`, unique per node). All of 127/8 is loopback on
-Linux with no configuration. In that block:
+On a Linux node, every allocation that declares upstreams gets its own
+loopback /24 at placement, from `127.64.0.0/10`: the first is `127.64.0`,
+the 257th `127.65.0`, and the last `127.127.255`, so a node holds 16,384 of
+them. Blocks are handed out lowest first and are unique per node. All of
+127/8 is loopback on Linux with no configuration. Placement goes by the node's `os`
+fingerprint, so a manager on macOS assigns blocks to its Linux nodes and none
+to its macOS ones. In that block:
 
 - **`.1` is the allocation's resolver**, exported as `LEGION_DNS`. It answers
   `<key>.svc.legion` (and bare `<key>`, through the `svc.legion` search
-  domain) with that allocation's upstream VIP. SRV records carry the port.
+  domain) with that allocation's upstream VIP. An upstream that crosses into
+  another [namespace](namespaces.md#services-and-the-mesh) is keyed
+  `<service>.<namespace>`, so it answers `auth.shared.svc.legion` (and the SRV
+  form `_auth._tcp.shared.svc.legion`). SRV records carry the port.
   Other names are forwarded to the host's resolvers after the egress policy
   has checked the name. A host the policy would deny gets `NXDOMAIN` in one
   round trip and a `net.denied` event (`protocol: dns`), instead of a
@@ -452,20 +607,29 @@ Linux with no configuration. In that block:
   because the rule needs the address.
 - **`.2` onward are the upstream VIPs**, one per `connect.upstreams` entry in
   declaration order. Each listens on the upstream's **canonical port**,
-  which is the first of these that applies: a pinned `localPort`, the port
-  the service declared on its own task (`network.ports[].to`, or its static
-  port), an external target's port, or the dynamic loopback port.
+  which is the first of these that applies: a pinned `port`, the port the
+  service declared on its own task (`network.ports[].to`, or its static
+  port), an external target's port, or a port from the datapath's range
+  (`61000–65535`).
   `db.svc.legion:5432` works because the `db` service declared 5432.
 
-Both addresses reach the same listener, so policy, HTTP mode, and endpoints
-behave the same whichever one the task dials. The loopback port and
-`LEGION_UPSTREAM_<KEY>` still work. The name is an addition.
+The VIP is the upstream's address: `LEGION_UPSTREAM_<KEY>` is
+`<vip>:<canonical port>`, and the upstream takes no port from the node's
+port ranges. A pinned `port` also binds `127.0.0.1:<port>` (the same
+listener), for a config file that wants a literal loopback address. A
+sandbox's upstreams keep a loopback port too, because the guest's relay is
+keyed by it.
 
 | Env var | Value |
 | --- | --- |
-| `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
-| `LEGION_UPSTREAM_HOST_<KEY>` | `<key>.svc.legion` |
-| `LEGION_UPSTREAM_VIP_<KEY>` | `<vip>:<canonical port>` |
+| `LEGION_DNS` | `127.<a>.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
+| `LEGION_UPSTREAM_<KEY>` | `<vip>:<canonical port>` |
+| `LEGION_UPSTREAM_HOST_<KEY>` | `<vip>` |
+| `LEGION_UPSTREAM_PORT_<KEY>` | `<canonical port>` |
+
+The variables carry the address rather than the name because an `exec` task
+keeps the host's `/etc/resolv.conf` (below), where `<key>.svc.legion` does
+not resolve.
 
 **Who gets the resolver automatically.** Every allocation with upstreams,
 and every gated `container` or `exec` allocation, upstreams or not. A gated
@@ -481,9 +645,21 @@ agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
 `resolv.conf`), and the agent also listens on each upstream's VIP in the
 guest, so `<key>.svc.legion` works there too (see "Sandboxes").
 
+**Forwarding.** The host's resolvers are the `nameserver` lines of the
+node's `/etc/resolv.conf`, read when the worker starts. A forwarded query
+goes to them over UDP, first answer wins. When a client asked over TCP and
+the answer came back truncated, the resolver asks the same nameserver again
+over TCP and returns the full answer. A UDP client gets the truncated answer
+and asks again over TCP itself; the resolver serves TCP on the same address.
+A node whose `resolv.conf` names no nameserver answers every name outside
+`svc.legion` with `SERVFAIL` at once, and the worker logs a warning when it
+starts. No query goes to a public resolver the operator did not name.
+
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
-there. Upstreams keep their loopback ports and env vars, and there is no
-per-allocation resolver.
+there. Each upstream gets a loopback port from the datapath's range
+(`61000–65535`), which is
+what `LEGION_UPSTREAM_<KEY>` names, and there is no per-allocation resolver.
+The same applies on a Linux node that has run out of VIP blocks.
 
 ## Handlers
 
@@ -491,30 +667,71 @@ Handlers are code on the path. They only run when declared, either on a
 chain (`egress.handlers`, `ingress.handlers`, on a task or a policy object)
 or on one upstream (`connect.upstreams[].handlers`). They run in order after
 the rules have allowed the flow, with the chain's handlers first, then the
-upstream's.
+upstream's. Every path runs the same list: an L4 upstream, an HTTP-mode
+upstream, the gated proxy (`CONNECT` and absolute-URI requests), and
+ingress.
 
-| `handler` | What it does | Sees bytes |
-| --- | --- | --- |
-| `authz` | POSTs the flow's facts to `url` and reads back a verdict, cached per (hop, identity, destination[, method, path]) for `cache` (default `10s`, at most `5m`) | no |
-| `proxy` | hands the flow to any proxy (a catalog `service`, its `node`-local endpoints, or a sidecar's `port` label in the same job) with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | yes |
-| `log` | access log for this hop | as declared |
-| `dlp` | rejects HTTP bodies matching `config.patterns` up to `config.maxBytes` (needs `protocol = "http"`) | yes |
+A handler is written as its kind, with the kind's settings inside it:
+
+| Kind | What it does | Stage | Runs |
+| --- | --- | --- | --- |
+| `authz` | POSTs the flow's facts to `url` and reads back a verdict, cached per (hop, identity, destination[, method, path]) for `cache` (default `10s`, at most `5m`) | connect, request | external |
+| `proxy` | hands the flow to any proxy (a catalog `service`, with `local = true` for its endpoints on this node only, or a sidecar's `port` label in the same job) with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | connect, request | external |
+| `dlp` | rejects HTTP request bodies matching `patterns`, buffering up to `maxBytes` (default 1 MiB) | body | netd |
+| `plugin` | runs a stored [network plugin](network-plugins.md) object's WASM module (proxy-wasm ABI) with this reference's `config`: it may answer, rewrite, meter, or sign | the stages its object declares: connect, request, body, response, done | netd (wasm) |
+
+**Stage** is where in a flow the kind acts. An L4 path runs a hop at
+`connect`, with the connect-time facts; an HTTP path runs it at `request`,
+with the request head, and then at `body`. A kind whose stages all need
+HTTP, such as `dlp`, is refused at submit on a chain whose `protocol` is
+`tcp` or on an upstream that does not parse HTTP:
+
+```
+network.egress.handlers[0] dlp acts at stage "body", which needs HTTP, but
+network.egress.protocol is "tcp". Set protocol = "http", or put it on an
+upstream whose `to` is http:// or https://
+```
+
+**Runs** is where the work happens: in the node's datapath (`netd`), in
+the datapath inside a WASM sandbox (`netd (wasm)`), or outside it
+(`external`, a webhook or another proxy). `legion net policy
+show` prints both for every hop.
 
 Every hop has a `timeout` (default `2s`) and an `onError` (default `deny`).
-You cannot declare a handler without a timeout. If a hop cannot be reached
-(a webhook that times out, a proxy with no endpoint), the chain fails
-**closed** unless the hop sets `onError = "allow"`.
+If a hop cannot be reached (a webhook that times out, a proxy with no
+endpoint), the flow fails **closed** unless the hop sets `onError =
+"allow"`. A request body larger than the body hops' `maxBytes` cannot be
+read, which is a hop error like any other: the request is denied (`403`)
+unless every body hop sets `onError = "allow"`, in which case the body is
+streamed through **unread** ([Request bodies](#request-bodies)). Keep a
+`dlp` hop that must see every byte on the default `onError = "deny"`. `onError` belongs to the
+hop: a chain has no `onError` of its own, and a chain that sets one is
+refused at submit.
 
 ```nickel
 egress = {
     protocol = "http",
     allow = ["api.github.com/**"],
+    accessLog = true,
     handlers = [
-        { handler = "authz", url = "http://policy.internal:8080/check", cache = "30s" },
-        { handler = "proxy", service = "egress-filter", onError = "deny" },
+        { authz = { url = "http://policy.internal:8080/check", cache = "30s" } },
+        { proxy = { service = "egress-filter" }, onError = "deny" },
+        { dlp = { patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"], maxBytes = "1Mi" } },
     ],
 },
 ```
+
+A setting in the wrong place is an error that names the kind:
+
+```
+handler 'proxy' has an unexpected field 'url' beside it; a handler is one
+kind (authz, proxy, dlp, plugin) plus timeout and onError, with the kind's
+settings inside it
+```
+
+There is no `log` handler. The chain's `accessLog = true` writes the access
+log for every HTTP request the chain governs, upstreams and the gated proxy
+alike.
 
 ### `authz` — ask your service
 
@@ -549,7 +766,7 @@ The connection closes (or the request gets a `403` that names the hop in
 `legion net policy show` names the hop.
 
 **Where it runs.** On L4 paths (an upstream splice, the gated egress proxy's
-`CONNECT`/SOCKS, an ingress splice), the webhook is called at connect time
+`CONNECT`, an ingress splice), the webhook is called at connect time
 with the connect-time facts. In HTTP mode it is called per request with the
 request head: once per new (identity, destination, method, path), then from
 the cache.
@@ -560,7 +777,7 @@ A `proxy` hop takes over the flow. Legion dials the proxy, hands it the
 connection along with everything it needs to decide or filter, and then
 splices:
 
-- **TCP** (an L4 upstream, `CONNECT`, SOCKS5, an ingress splice): the
+- **TCP** (an L4 upstream, `CONNECT`, an ingress splice): the
   connection starts with a **PROXY protocol v2** header. It carries the
   source and destination addresses, plus these Legion TLVs: `0xE0`
   identity, `0xE1` the original destination as `host:port` (or the task's
@@ -579,11 +796,37 @@ splices:
 
 Targets:
 
-- `service = "x"`: any healthy endpoint of catalog service `x`, round-robin.
-- `node = "x"`: only endpoints of `x` on the same node, such as a per-node
-  filter run as a system job.
-- `port = "filter"`: a sidecar task in the same job with a port of that
-  label, on this node.
+- `{ proxy = { service = "x" } }`: any healthy endpoint of catalog service
+  `x`, round-robin.
+- `{ proxy = { service = "x", local = true } }`: only endpoints of `x` on the
+  same node, such as a per-node filter run as a system job.
+- `{ proxy = { port = "filter" } }`: a sidecar task in the same job with a
+  port of that label, on this node.
+
+Exactly one of `service` and `port` is set. `proxyProtocol = false` leaves
+out the PROXY v2 header.
+
+**How an HTTP hand-off travels.** The request handed to the proxy carries
+everything the task sent, any [injected credential](#credential-injection),
+and, for an `https://` target, what the task trusted the node to encrypt.
+So on an HTTP-mode upstream it never leaves the node in plaintext:
+
+| The picked endpoint | The hand-off |
+| --- | --- |
+| A mesh endpoint (the proxy's service has `mesh = true`), on any node | Over mesh mTLS with this node's certificate, the consuming workload named in a PROXY v2 TLV, as for any mesh hop; the request inside is in absolute form |
+| A plain endpoint on this node, or a sidecar `port` | Plain HTTP on the host |
+| A plain endpoint on another node | Not sent: `502`, `proxy handler <source>: ... is on another node and not on the mesh`, and a handler error on the heartbeat |
+
+Run a shared proxy as a `mesh = true` service, or use `local = true` to
+keep to the copy on each node. Keep the proxy's mesh port in L4 mode (no
+`ingress` chain with `protocol = "http"`): an HTTP ingress chain
+re-issues the request to the proxy in origin form, which a forward proxy
+cannot route. Hand-offs on the other paths (TCP: an L4 upstream,
+`CONNECT`, an ingress splice; and an absolute-URI `http://` request through
+the gated egress proxy) are not carried over the mesh yet: they dial the
+endpoint directly, so they cannot reach a proxy on a mesh port, and they
+cross the network as the task's own bytes, encrypted only if the task
+encrypted them. No credential is injected on those paths.
 
 The manager sends the endpoints on the heartbeat, as it does for an
 upstream. A target with no endpoint is a handler error (`onError`).
@@ -610,129 +853,210 @@ each check (`reachable`, `status_2xx`, `verdict`, `ttl`, or
 `proxy_protocol`) with a fix, and exits non-zero when a check fails. It is
 also available as an MCP tool (`legion_net_handler_test`).
 
-## mTLS
+## The mesh
 
-Legion terminates and originates TLS, so a handler never sees it. You choose
-one of three kinds of certificate material per chain: the mesh certificate,
-a certificate held in KV, or files on the node.
+One switch puts a service on the mesh:
 
 ```nickel
-ingress = {
-    tls = {
-        mode = "mutual",                      # off | server | mutual
-        certFrom = "legion",                  # the mesh: this node's certificate
-        clientCa = "legion",                  # verify peers against the mesh CA
-        requireIdentity = ["auto:web:*"],     # workload globs a peer must match
-    },
+service = { port = "http", mesh = true, allow = ["web", "agent-*"] },
+```
+
+With `mesh = true`:
+
+- **The service's port terminates node-to-node mTLS** with the node's
+  certificate, and verifies peers against the cluster CA. The datapath owns
+  the advertised port and the task binds a private twin, as with any
+  [ingress](#ingress) chain, so the task never holds a certificate.
+- **The catalog marks the endpoints mesh** (`ServiceEndpoint.mesh_tls`).
+  Each consumer's datapath dials them with its own node certificate,
+  verifies the peer node, and names the consuming **workload**
+  (`<region>:<job>:<group>:<task>`) in a PROXY v2 TLV inside the session.
+  The receiving node trusts that attribution because the peer proved it is a
+  node, and passes the identity to `identity` rules and `authz`.
+- **`service.allow` is enforced on the wire.** Its entries compile into the
+  service's ingress chain as a check that runs before any rule, with the
+  source `service/allow`. A verified caller outside the list is refused, and
+  a `net.denied` event names it. `legion net policy show` prints the check
+  as rule `0.` Without the mesh, `allow` is enforced by the endpoint feed
+  only ([Service Discovery](service-discovery.md#intentions-serviceallow)).
+- **A plain client that dials the port directly is refused at the
+  handshake.** A non-Legion client that must reach the port has two options:
+  present a certificate from the cluster CA (`legion net ca show` prints its
+  trust bundle, but Legion does not issue certificates for outside clients),
+  or go through a Legion task. With a `file` or `exec` CA, remember that
+  anything your PKI signs under that CA with a `legion://` URI SAN is a node
+  or a manager to every peer: keep that intermediate (or Vault role) for
+  Legion alone.
+- **Workloads never hold certificates.** The node attributes identity,
+  which keeps a per-user sandbox's identity out of the sandbox.
+
+`mesh` is resolved **at placement**, like [`network.mode`](#networkmode),
+because the catalog's flag and the listener must agree. A policy object can
+set it for the tasks it matches:
+
+```nickel
+{ name = "mesh-prod", enforcement = "require", selector = { nodePools = ["prod"] }, mesh = true }
+```
+
+Under `require` it wins over the task; under `default` it applies only to a
+task that does not set `mesh` itself, so a task's own `mesh = false` beats a
+default. A port that carries its own `tls` (below) is never made the mesh
+port by a policy, and a task that sets both on one port is rejected at
+submit. A policy change reaches an allocation at its next placement.
+
+**The node certificate.** The mesh uses the **cluster CA**. By default that
+is a CA the manager creates on first use and replicates with the control
+lane; it can instead be an intermediate from your own PKI or an external
+signer such as Vault PKI ([The Cluster CA](cluster-ca.md)). Every worker
+node holds a short-lived **node certificate** from it: the worker generates
+its own key, sends a CSR (`IssueNodeCertificate`, authorized by its node
+token) right after registration, and the manager has it signed with the SANs
+`<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
+manager picks those names itself and checks what an external CA returns
+before handing it out. The worker refreshes it after 8 hours, or when the
+cluster's trust bundle changes, after its rotation splay
+([The Cluster CA](cluster-ca.md#how-workers-learn)). The same certificate
+serves the node's worker plane
+([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key and
+certificate persist under `<state-dir>/identity/` (mode `0600`) so a
+restarted node has its mesh identity before it reaches a manager. The
+private key never leaves the node.
+
+`legion net ca show` prints the CA trust bundle (never a key), its pin, which
+provider supplies it, and where a rotation stands. `legion net ca rotate`
+rotates the built-in CA in two steps that break no mesh connection: the new
+CA, cross-signed by the old one, signs at once, and the old one stays in
+every trust bundle for one certificate lifetime (24 hours). Every node
+re-issues within its rotation splay, at most 10 minutes. A `file` or `exec` CA rotates outside
+Legion with the same add-switch-remove steps
+([The Cluster CA](cluster-ca.md#rotation)). Peers never fall back to
+plaintext ([Rotating the cluster
+CA](auth-and-acls.md#rotating-the-cluster-ca)).
+
+### Sessions
+
+Mesh hops are TLS 1.3, and both ends keep sessions so a new connection to a
+peer the node has talked to recently resumes instead of doing a full
+handshake.
+
+- **One client and one server configuration per trust bundle.** The node's
+  certificate is swapped into them in place when it is re-issued, so the
+  8-hour refresh keeps every session. The server keeps sessions in one
+  node-wide store (4,096 sessions, stateful single-use tickets) shared by
+  every mesh port; the client keeps up to 8 tickets per peer node.
+- **A trust-bundle change drops every session.** A CA rotation, or a CA
+  added to or removed from the bundle, builds new configurations with empty
+  stores on both ends, so nothing established under the old bundle resumes.
+  The first connection to each peer after it is a full handshake.
+- **A resumed session is only as good as the certificates that started
+  it.** Resuming reuses the original handshake's authentication, and each
+  resumption issues new tickets with the same identity. The client drops a
+  ticket whose chain may carry one of its own certificates that expires
+  within 30 minutes, and both ends refuse a resumed session whose peer
+  certificate has expired. A node that stops being re-issued therefore
+  loses mesh access when its certificate expires, as it would without
+  resumption.
+
+Each L4 connection is still its own TLS connection: there are no pooled,
+multiplexed tunnels between nodes yet (see
+[Current scope and limitations](#current-scope-and-limitations)).
+
+## TLS on ports
+
+TLS that is not the mesh goes on the port that serves it. The node
+terminates it, and the task speaks plaintext on its private port:
+
+```nickel
+network = {
+    ports = [
+        { name = "https", static = 443, tls = { cert = { kv = "certs/app.example.com" } } },
+        { name = "admin", to = 9443,
+          tls = { cert = { file = { cert = "/etc/app/tls.crt", key = "/etc/app/tls.key" } },
+                  clients = { ca = { kv = "certs/admin-clients" } } } },   # present = mutual
+    ],
 },
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `mode` | `server` presents a certificate. `mutual` also verifies the client's. Egress: `passthrough` (default, opaque) or `originate` (external upstreams, with TLS from the node and plaintext from the task). |
-| `certFrom = "legion"` | the node's mesh certificate (below). Omit it and give `certPath`/`keyPath` for bring-your-own files on the node (or staged artifacts). |
-| `certFrom = { kv = "<path>" }` | a certificate held in KV, swapped live when the key changes. Ingress only. See [Certificates from KV](#certificates-from-kv). |
-| `clientCa` | `"legion"` (the mesh CA) or a CA bundle path. Required for `mutual`. |
-| `requireIdentity` | identity globs. A verified peer outside them is refused with `Legion-Denied-By: tls/requireIdentity` and a `net.denied` event. Empty = any verified peer. |
-| `caPath` | egress `originate`: verify the destination against this bundle instead of the system roots. |
+| `tls.cert` | The certificate chain and its private key. `{ kv = "<path>" }`: one PEM bundle held in KV, swapped live when the key changes ([below](#certificates-and-cas-from-kv)). `{ file = { cert, key } }`: two files on the node (or staged artifacts); `{ file = "<path>" }`: one file holding both. |
+| `tls.clients.ca` | Present: the port is **mutual**, and a client must present a certificate that verifies against this CA bundle, `{ kv = "<path>" }` or `{ file = "<path>" }`. |
 
-**Bring-your-own PKI.** With `certPath`/`keyPath` (and `clientCa` for
-`mutual`), the advertised port terminates TLS with your certificate. A
-`mutual` peer's identity is its certificate's first URI SAN, or else its
-first DNS SAN, or else its CN. `identity` rules and `requireIdentity` match
-against that string.
+- **A mutual port's peer identity** is its certificate's first URI SAN, or
+  else its first DNS SAN, or else its CN. `identity` rules and `authz` see
+  that string. A port's own CA vouches only for names: a `legion://node/…`
+  SAN it verifies is just a name, never a node whose PROXY v2 attribution is
+  trusted. Only the mesh CA vouches for nodes.
+- **A port is either the service's mesh port or carries its own `tls`,
+  never both.** Submit says so.
+- **An identity is not a certificate.** `cert = { identity = … }` is a
+  submit error, and so is a relative file path.
+- **Chains carry policy only.** An ingress chain or policy object has no
+  `tls`; a policy object can impose `mesh = true` but cannot push
+  certificate material onto the tasks it matches.
 
-**The mesh (`certFrom = "legion"`).** The manager keeps one cluster **mesh
-CA**, created on first use and replicated with the control lane. Every
-worker node holds a short-lived **node certificate** from it: the worker
-generates its own key, sends a CSR (`IssueNodeCertificate`, authorized by its
-node token) right after registration, and the manager signs it with the SANs
-`<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
-worker refreshes it after 8. The same certificate serves the node's worker
-plane ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key
-and certificate persist under `<state-dir>/identity/` (mode `0600`) so a
-restarted node has its mesh identity before it reaches a manager. The
-private key never leaves the node. Then:
-
-- A task whose ingress chain sets `mode = "mutual", certFrom = "legion"` has
-  its advertised port terminate **node-to-node mTLS**. The catalog marks the
-  endpoint `mesh_tls`. Each consumer's datapath dials it with its own node
-  certificate, verifies the peer node, and names the consuming **workload**
-  (`<region>:<job>:<group>:<task>`) in a PROXY v2 TLV inside the session.
-  The receiving node trusts that attribution because the peer proved it is a
-  node. It passes the identity to `identity` rules, `requireIdentity`, and
-  `authz`.
-- A plain client that dials the port directly is refused at the handshake.
-  A non-Legion client that must reach the port has two options: present a
-  certificate from the mesh CA (`legion net ca show` prints the CA, but
-  Legion does not issue certificates for outside clients), or go through a
-  Legion task.
-- Workloads never hold certificates. The node attributes identity, which
-  keeps a per-user sandbox's identity out of the sandbox.
-
-The mesh CA is the cluster CA, the same one behind the worker plane
-([Auth & ACLs](auth-and-acls.md#the-worker-plane)). A node's mesh
-certificate is its node certificate: the worker generates the key and the
-manager signs a CSR.
-
-`legion net ca show` prints the CA trust bundle (never a key), its pin, and
-where a rotation stands. `legion net ca rotate` rotates it in two steps that
-break no mesh connection: the new CA, cross-signed by the old one, signs at
-once, and the old one stays in every trust bundle for one certificate
-lifetime (24 hours). Every node re-issues on its next heartbeat. Peers never
-fall back to plaintext ([Rotating the cluster
-CA](auth-and-acls.md#rotating-the-cluster-ca)).
-
-### Certificates from KV
-
-A public certificate (from Let's Encrypt or your own CA) can live in KV
-instead of on node disks. The node serves it on the advertised port and swaps
-it when the key changes, so renewal is a single `kv put`:
+**Originating TLS to an external upstream** needs no block: a `tls://` or
+`https://` [upstream](#upstreams) already originates. Its certificate is
+verified against the public (Mozilla) roots, or against the bundle the
+upstream's `ca` pins:
 
 ```nickel
-network = {
-    ports = [{ name = "https", static = 443 }],
-    ingress = {
-        tls = { mode = "server", certFrom = { kv = "certs/app.example.com" } },
-    },
-},
+{ name = "corp", to = "https://api.corp.example", ca = { kv = "certs/corp-ca" } }
 ```
+
+`ca` takes `{ kv }` or `{ file }` and applies to external `tls://` and
+`https://` upstreams only (a catalog service on the mesh is verified
+against the cluster CA). A pinned bundle that is missing or does not parse
+fails the upstream's connections; it never falls back to the public roots,
+and the allocation's `problems` say why.
+
+### Certificates and CAs from KV
+
+A public certificate (from Let's Encrypt or your own CA), a client CA, or an
+upstream's trust bundle can live in KV instead of on node disks. The node
+serves it and swaps it when the key changes, so renewal is a single
+`kv put`:
 
 ```bash
 legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
+legion kv put certs/admin-clients "$(cat clients-ca.pem)"
 ```
 
-- **One value, one bundle.** The KV value is PEM: the certificate chain, leaf
-  first, then the private key. Keeping both in one key means a reader never
-  pairs a new certificate with an old key.
-- **The task never holds the key.** The task speaks plain HTTP (or any TCP)
-  on its private port. The node terminates TLS.
-- **Swaps are live.** Each heartbeat, a node with KV-backed chains asks the
-  manager for certificates newer than the version it holds
-  (`GetIngressCertificates`). New connections get the new certificate, and
-  connections already open keep theirs. Nothing restarts.
-- **Fail-static.** The manager checks a bundle before sending it: it must hold
-  a certificate and a private key, and the key must match the leaf. A bad
-  value, a deleted key, or an unreachable manager leaves the node serving the
-  last good certificate. The allocation reports the problem: `tls_error`
-  names the key, and `problems` reads
+- **One value, one bundle.** A certificate's KV value is PEM: the chain,
+  leaf first, then the private key. Keeping both in one key means a reader
+  never pairs a new certificate with an old key. A CA's value is one or more
+  PEM certificates.
+- **The task never holds the key.** The node terminates TLS.
+- **Swaps are live.** Each heartbeat, a node asks the manager for material
+  newer than the version it holds (`FetchDatapathMaterial`). New connections
+  get the new certificate or CA, and connections already open keep theirs.
+  Nothing restarts.
+- **Fail-static.** The manager checks a value before sending it: a
+  certificate bundle must hold a certificate and a private key that matches
+  the leaf, and a CA bundle at least one certificate. A bad value, a deleted
+  key, or an unreachable manager leaves the node serving the last good
+  material. The allocation reports the problem: `tls_error` names the key,
+  and `problems` reads
   `ingress TLS: serving the previous certificate; kv certs/app.example.com holds no private key`.
-  An allocation that has never had a good certificate is not ready, and its
-  handshakes fail.
-- **Access.** Naming a key in `certFrom` hands its value to the datapath, so
-  it needs the right to read it. `RunJob` (and template runs) and
-  `UpsertNetPolicy` require `kv:read` on the path in addition to their own
-  permissions. Without it the submit fails with `PermissionDenied`, naming
-  the key. A node can only fetch the key that an allocation placed on it
-  declares. It names allocations, and the manager derives each path itself.
-- **Where it works.** Inline ingress chains and policy objects. `mode` may be
-  `server` or `mutual`, with `clientCa = "legion"` or a CA bundle path for
-  `mutual`. Not on egress.
+  A port that has never had good material is not ready, and its handshakes
+  fail.
+- **Access.** Naming a key hands its value to the datapath, so it needs the
+  right to read it. `RunJob` (and template runs) require `kv:read` on every
+  path a task names in `ports[].tls.cert`, `ports[].tls.clients.ca`, or
+  `connect.upstreams[].ca`, in addition to their own permissions. Without it
+  the submit fails with `PermissionDenied`, naming the field and the key. A
+  node can only fetch what an allocation placed on it declares: it names an
+  allocation and a port label (or upstream key), and the manager derives each
+  path itself.
 - **In memory only.** The node never writes the material to disk, including
-  its `netd_state.json`. After a worker restart it fetches the certificate
-  again on its first heartbeat.
+  its `netd_state.json`. After a worker restart it fetches it again on its
+  first heartbeat.
 
-To renew automatically, run a scheduled batch job that puts the new bundle.
+To get and renew certificates automatically, apply a `certs/Certificate`
+naming the key: the bundled [cert manager](cert-manager.md) issues it (from
+Let's Encrypt, a private CA, or self-signed), writes it to the key in this
+format, and renews it before it expires. To run your own ACME client instead,
+use a scheduled batch job that puts the new bundle:
 [`configs/jobs/cert-renewer.ncl`](../configs/jobs/cert-renewer.ncl) does it
 with lego and DNS-01, and
 [`configs/jobs/tls-edge.ncl`](../configs/jobs/tls-edge.ncl) serves the result.
@@ -741,19 +1065,40 @@ a file with `onChange = "update"` instead
 ([Live file updates](kv-store.md#live-file-updates)).
 
 Limits: a renewal reaches the node on its next heartbeat, so expect up to
-one heartbeat interval of delay. There is no `clientCa = { kv }` yet: a
-client CA bundle comes from the mesh or a path. Legion does not run an ACME
-client itself.
+one heartbeat interval of delay.
 
-**Doctor.** `legion net doctor` reports `tls` as a layer. It flags BYO files
-that do not parse, and a mesh certificate the node has not received yet.
-Until it arrives, mesh peers are refused, and the allocation's `problems`
-say so. For a KV-backed chain, it names the key and shows the
-`legion kv put` that fixes it.
+**Doctor.** `legion net doctor` reports `tls` as a layer. It flags files
+that do not parse, a KV value that was rejected (naming the key and the
+`legion kv put` that fixes it), and a mesh certificate the node has not
+received yet. Until it arrives, mesh peers are refused, and the
+allocation's `problems` say so.
 
-Limits: there is no kTLS/`splice` fast path, so a terminated mesh connection
-is copied in user space. TLS 1.2 and 1.3 are supported. There is no
-certificate revocation. The 24-hour lifetime takes its place.
+Limits: there is no kTLS/`splice` fast path, so a terminated connection is
+copied in user space. TLS 1.2 and 1.3 are supported. There is no
+certificate revocation; the mesh's 24-hour lifetime takes its place.
+
+## Sources
+
+Everywhere a value comes from somewhere, it is the same record:
+
+| Source | Read by | Allowed in |
+| --- | --- | --- |
+| `{ kv = "<path>" }` | the manager, for the node; the submitter needs `kv:read` on it | `ports[].tls.cert`, `ports[].tls.clients.ca`, `connect.upstreams[].ca`, `credentials[].from` |
+| `{ identity = "<name>" }` | the manager mints the task's workload identity of that name for the allocation | `credentials[].from` |
+| `{ file = "<path>" }` or `{ file = { cert, key } }` | the node itself; never sent over the wire | `ports[].tls.cert`, `ports[].tls.clients.ca`, `connect.upstreams[].ca` |
+
+Each field allows the kinds that make sense for it, and anything else is a
+submit error that names the field. Credentials take no `file`, so a node's
+disk never becomes a secret store, and every credential's access is checked
+at submit against `kv:read`. Exactly one key per source: `{ kv = …,
+identity = … }` does not parse.
+
+A node fetches everything `kv` and `identity` sources hold, plus the policy
+bodies its allocations are assigned, in **one** worker-plane call per
+heartbeat, `FetchDatapathMaterial`. Each request entry names a kind
+(`policy`, `port_cert`, `client_ca`, `upstream_ca`, `credential`) and what
+it is for, with the version the node holds, so an unchanged value costs
+nothing on the wire. Values stay in memory only.
 
 ## `network.mode`
 
@@ -762,7 +1107,6 @@ certificate revocation. The 24-hour lifetime takes its place.
 | `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `exec`, `sandbox`, `container` on macOS |
 | `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. Every destination the egress proxy dials is judged by the [host guard](#the-host-guard) and then by policy, by the address a name resolves to. A root `exec` task can leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | `container` on Linux |
 | `auto` (the default) | `gated` for a `container` on a Linux node, `host` for everything else | — |
-| `bridge`, `cni/<name>` | reserved for the datapath plugin, rejected at submit | — |
 
 The effective mode is resolved **at placement**, with the node in hand:
 `auto` reads the node's `os` fingerprint, so one `container` job runs gated
@@ -778,7 +1122,7 @@ With `mode = "gated"`, the worker creates an empty network namespace for the
 allocation before it starts: `/var/run/netns/legion-<allocation>`, with
 loopback up, no other interface, and no route. It binds every datapath
 listener inside that namespace: the upstream loopback ports, the VIPs, the
-allocation's resolver (at `127.42.<b>.1:53` with a VIP block, else at
+allocation's resolver (at `127.<a>.<b>.1:53` with a VIP block, else at
 `127.0.0.53:53`), an **ingress listener** for every declared port, and an
 **egress proxy** at `127.0.0.1:1080`. A `container` joins the namespace by path (an OCI
 `network` namespace entry). An `exec` task enters it with `setns` before
@@ -788,11 +1132,14 @@ namespace, so the listeners are the only way out.
 The worker's heartbeat creates the namespace ahead of the reconcile that
 starts the task. An allocation the manager pushes straight to the worker can
 start before any heartbeat lists it (at once, or as soon as its artifacts are
-staged), so the start creates the namespace itself when it is missing; the two
-paths are serialized and idempotent. The datapath listeners inside it are
-bound on the worker's next heartbeat, so for up to one heartbeat interval a
-pushed task has a namespace with loopback only: its egress and upstream
-connections fail until the listeners exist. A worker that cannot
+staged). For such a start the worker creates the namespace before the
+launch, and binds the egress proxy, the resolver, and the upstream listeners
+inside it from the allocation the push carried. It also triggers a heartbeat
+at once, which brings the allocation's policy and its ingress listeners.
+Until that policy lands, the egress proxy and the upstreams fail closed:
+each connection is refused, and none goes out unjudged. The start itself
+also creates the namespace when it is missing, and every creation is
+serialized and idempotent. A worker that cannot
 create namespaces (no `CAP_SYS_ADMIN`, or not Linux) fails the start with
 `allocation <id> is network.mode = "gated" but its network namespace could not
 be created`, and never falls back to host networking.
@@ -812,23 +1159,29 @@ Both cases are set because tools disagree: curl ignores upper-case
 variables on Node 22.21 and 24.5 or later. Older Node ignores it, and so has
 no route out.
 
-The proxy supports three protocols:
+The proxy is an HTTP proxy, and every proxy variable names it as
+`http://`. It takes both forms:
 
 - HTTP `CONNECT`, for TLS and other opaque traffic, checked by host and port.
 - Absolute-URI plain HTTP, also checked by the request head and forwarded in
-  origin form, one request per connection.
-- SOCKS5 `CONNECT`, with domain-name targets checked by name.
+  origin form on an upstream connection of its own. A client may keep its
+  connection to the proxy open or pipeline requests on it: each request is
+  checked on its own, so a request behind an allowed one is never let
+  through unchecked.
+
+There is no SOCKS listener: Legion never sets a `socks5://` proxy, and a
+client configured for one gets no answer.
 
 Nothing is added to traffic through the proxy. In particular, a
 [credential](#credential-injection) is only injected on a declared
 `https://` upstream, never into a `CONNECT` tunnel, which the node cannot
 read. Point a client that needs one at its upstream, not the proxy.
 
-Every denial is a `403` with `Legion-Denied-By` (or a SOCKS "connection not
-allowed") and a `net.denied` event. **A tool that ignores the proxy
-variables has no route and fails.** That failure is how the policy is
-enforced. Transparent capture (a TUN inside the namespace so unmodified tools
-work) is not implemented.
+Every denial is a `403` with `Legion-Denied-By` and a `net.denied` event.
+**On a node without the [kernel classifier](#the-kernel-classifier), a tool
+that ignores the proxy variables has no route and fails.** That failure is
+how the policy is enforced. With the classifier, its `connect()` is captured
+transparently and judged the same way.
 
 Three fail-closed rules apply only to gated allocations. Every listener
 denies while the allocation's policy has not arrived (`policy-pending`), and
@@ -837,6 +1190,60 @@ check runs before the policy, so a shut gate denies every destination, even
 ones the policy allows. So for gated `container` and `exec` tasks, the `boot`
 gate is enforced, unlike the advisory gate in host networking. And a gated
 allocation that nothing allows is denied, below.
+
+### Gated mode on macOS
+
+macOS has no network namespaces, so a gated task there is **confined**
+instead: same jobspec, same meaning ("the datapath is the only way out"),
+different mechanism. Only an explicit `network.mode = "gated"` takes this
+path; `auto` stays `host` on macOS.
+
+> **Status.** Implemented, with every command it runs built by functions
+> that are unit-tested, but **not yet run on macOS hardware**. Treat it as a
+> preview, and report what you find
+> (internal_docs/plans/macos-gated-plan.md tracks the verification).
+
+At placement a confined allocation gets an **egress proxy port** of its own
+on the node's loopback (`AllocNetwork.egressProxy`), and its proxy variables
+name it (`HTTPS_PROXY=http://127.0.0.1:<port>`). Every declared port gets a
+private twin, so the datapath fronts it. The proxy and upstreams fail closed
+exactly as in a namespace: `policy-pending` until the policy arrives, `gate`
+while the boot gate is shut, `gated-default` when nothing allows the
+destination. What keeps the task on those listeners depends on the runtime:
+
+| Runtime | Confinement | Needs |
+| --- | --- | --- |
+| `exec` | runs as `/usr/bin/sandbox-exec -p <profile> <command>`. The Seatbelt profile allows outbound connections only to the allocation's own listener ports on `localhost` (its proxy and its upstreams), denies the `mDNSResponder` socket, and allows binds on the loopback only | `/usr/bin/sandbox-exec` |
+| `container`, dev-mode `sandbox` (Apple `container`) | runs on Legion's Apple container network `legion-gated` (`192.168.239.0/24`). A `pf` anchor, `com.apple/legion`, drops every packet from that subnet except an `rdr pass` from each VM's address to its own ports on the gateway (`192.168.239.1`), which lands on the allocation's listeners on the Mac's `127.0.0.1`. The VM's `LEGION_UPSTREAM_*` and proxy variables name the gateway | macOS 26 or later (`container network create`), and a worker running as root (`pfctl`) |
+
+The `pf` block is loaded before a VM starts, and a VM's own `rdr` follows
+once `container inspect` reports its address, so a VM is confined from its
+first packet. The anchor is flushed and `pf`'s reference released when the
+last confined VM stops. No system file is edited: macOS's stock
+`/etc/pf.conf` already evaluates `com.apple/*` anchors.
+
+**Failures are start failures, never a fall back:**
+
+```
+allocation 41 is network.mode = "gated" but /usr/bin/sandbox-exec is missing, so it cannot be confined on macOS
+allocation 42: gated Apple containers need the worker to run as root to load the pf rules that confine them
+allocation 43: gated Apple containers need macOS 26 or later (container network create failed: …)
+```
+
+**Limits:**
+
+- **No DNS.** A confined task cannot resolve names itself: proxy-aware tools
+  send the name to the proxy, as a gated Linux task without upstreams does.
+  `localhost` by name fails inside a confined `exec` task (macOS resolves it
+  through `mDNSResponder`); the env vars use `127.0.0.1`.
+- **No transparent capture.** A tool that ignores the proxy variables has no
+  route out.
+- **A fixed subnet.** `192.168.239.0/24` is not configurable yet; a Mac that
+  already uses it for something else conflicts.
+- **Ungated Apple containers still cannot reach their upstreams.**
+  `LEGION_UPSTREAM_*` names `127.0.0.1`, which is the VM's own loopback.
+- **`sandbox-exec` is deprecated by Apple.** If it disappears, a confined
+  `exec` task fails to start, saying so.
 
 ### Default deny
 
@@ -927,12 +1334,14 @@ allocation's policy is pending. Names work too. The
 resolver on vsock port 53 answers `<key>.svc.legion` with the upstream's
 VIP, and the agent also listens on `<vip>:<canonical port>` in the guest
 (the guest's `lo` holds all of 127/8), relaying to the same vsock port.
-`LEGION_UPSTREAM_VIP_<KEY>` and `LEGION_UPSTREAM_HOST_<KEY>` are set as for
-a container.
+In the guest, `LEGION_UPSTREAM_<KEY>` is the guest-side loopback address the
+agent relays, `127.0.0.1:<port>`, with `LEGION_UPSTREAM_HOST_<KEY>` and
+`LEGION_UPSTREAM_PORT_<KEY>` as its parts, and the VIP name works as for a
+container.
 
 ```nickel
 connect = {
-    upstreams = [{ service = "db" }],
+    upstreams = [{ to = "db" }],
 },
 network = { mode = "gated" },
 ```
@@ -985,8 +1394,8 @@ What is and is not enforced:
   a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress proxy`)
   or on 1100 (`... but in a gated sandbox guest the node serves each port on
   the guest vsock port of the same number, and vsock port 1100 is the guest
-  agent's exec listener`), and an upstream `localPort` of 1080 or 53 (`task
-  "workspace" connect.upstreams entry "db" sets localPort 53, but a gated
+  agent's exec listener`), and an upstream `port` of 1080 or 53 (`task
+  "workspace" connect.upstreams entry "db" sets port 53, but a gated
   sandbox's upstreams are relayed to the node on vsock ports of the same
   number, and 1080 and 53 are the guest's egress proxy and resolver`).
   Dynamic ports never collide with any of them.
@@ -1032,8 +1441,8 @@ capture are not implemented.
 
 Requirements and limits:
 
-- Linux only. macOS has no network namespaces, so `gated` is rejected at
-  start there with that reason.
+- Namespaces are Linux only. On macOS, `gated` is enforced another way
+  ([Gated mode on macOS](#gated-mode-on-macos)).
 - The worker needs `CAP_SYS_ADMIN`. It already does, for `exec` hardening's
   mount namespace and for running the OCI runtime.
 - IPv4 loopback only inside the namespace.
@@ -1043,6 +1452,32 @@ Requirements and limits:
   itself fails. (A gated `sandbox` always gets its resolver.)
 - No raw UDP and no ICMP.
 - No inbound traffic except through the datapath's ingress listeners (below).
+
+### Isolates
+
+An [`isolate`](task-runtime-isolate.md) task has no network of its own: its
+isolates run in a host process with no network at all. The task's
+`network.ports`, egress policy, and `connect` upstreams are bound for its
+**envelope allocation**, always gated, and the worker's isolate supervisor
+serves and dials those listeners on the isolates' behalf over Unix sockets
+in the envelope's directory:
+
+- **Ingress.** Each declared port's ingress listener (TLS, the ingress
+  chain) delivers HTTP/1.1 requests to the task's isolates.
+- **Egress.** An isolate's outbound request (`wasi:http/outgoing-handler`)
+  goes to the upstream whose key is the URL's host (`http://<key>/` or
+  `http://<key>.svc.legion/`), with its handlers and credential injection,
+  or else through the envelope's egress proxy under the task's policy and
+  the host guard. The worker originates TLS for `https://` URLs.
+- **Attribution.** Denials, access logs, and the identity string name the
+  isolate task, not `<task>-envelope`, and not the isolate or tenant.
+
+Bodies are buffered whole, up to the worker's `isolate.maxBodyBytes`, with
+at most 8 outbound requests in flight per invocation. Ingress refuses a
+request that carries `Legion-Tenant` or `Legion-Session` more than once
+(`400`); both are routing keys the client chooses, not identities. See
+[Outbound HTTP](task-runtime-isolate.md#outbound-http) and
+[HTTP handlers](task-runtime-isolate.md#http-handlers).
 
 ## The host guard
 
@@ -1067,8 +1502,8 @@ address they map.
 **Where it applies.** Every connection the datapath dials to a destination
 the allocation named:
 
-- the gated egress proxy, on all three paths (HTTP `CONNECT`, absolute-URI
-  HTTP, SOCKS5);
+- the gated egress proxy, on both paths (HTTP `CONNECT` and absolute-URI
+  HTTP);
 - external upstreams (`to = "tcp://…"`, `tls://`, `http://`, `https://`), in
   L4 and HTTP mode;
 - `proxy` handler targets, on egress and ingress. A handler that points at
@@ -1131,6 +1566,8 @@ hostGuard = {
   allow = ["10.0.1.7:9100"],
   # Extra destinations to treat like metadata.
   deny = ["192.0.2.10/32"],
+  # How often the nftables guard's drop counters are read (default 10s).
+  counterInterval = "10s",
 },
 ```
 
@@ -1147,16 +1584,25 @@ in `allow` is refused for the same reason.
   below covers it on Linux nodes that can run it.
 - A root `exec` task in `gated` mode can `setns` back into the host
   namespace.
-- The guard judges destinations, not the node's own outbound traffic:
-  artifact fetches, `authz` webhooks, and the worker's own calls to the
-  manager are not judged.
+- The guard judges what allocations reach, and the artifact fetches a job
+  points the worker at: `http(s)` artifact sources and their redirects are
+  judged and pinned, and an `s3://` `endpoint` is judged
+  ([Artifacts](artifacts.md#what-the-host-guard-checks)). Git and OCI
+  artifact fetches, `authz` webhooks (the operator's), and the worker's own
+  calls to the manager are not judged.
 
 ### The host guard in the kernel
 
 A `host`-mode task (an `exec` task, a container with `network.mode =
 "host"`) never passes through the datapath, so on Linux the worker also
-installs one `nftables` table, `inet legion_host_guard`, that applies a
-floor to every socket an allocation opens. It matches sockets by the
+applies a floor to every socket an allocation opens. On a node that can run
+the [kernel classifier](#the-kernel-classifier), the classifier's eBPF
+programs apply it (`hostGuard = active (ebpf)`), with the same classes,
+`EPERM`, and `net.denied` events described here. Elsewhere the worker
+installs one `nftables` table, `inet legion_host_guard` (named after the
+worker's cgroup parent when it is not the default `legion`:
+`inet legion_host_guard_legion-system` for a manager's system worker, so two
+workers on one host keep their own). It matches sockets by the
 allocation's cgroup leaf (`<cgroupParent>/{share,reserve}/legion-<alloc>`)
 in the output hook and drops:
 
@@ -1165,13 +1611,23 @@ in the output hook and drops:
 | `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200` | the cloud metadata service |
 | `hostGuard.deny` entries | operator additions |
 | Legion's ports on any local address: the worker plane, and the manager's API, exec, and telemetry ports when the manager shares the node | the node's control plane |
-| `127.42.0.0/16` and every allocation's upstream loopback ports | other allocations' datapath listeners |
+| `127.64.0.0/10` (every VIP block) and every allocation's upstream loopback ports | other allocations' datapath listeners |
 
 An allocation keeps its own VIP block and upstream ports, and
 `hostGuard.allow` entries are accepted first. A dropped `connect()` fails at
-once with `EPERM` ("Operation not permitted"), not a timeout. Each allocation
-has its own chain with its own counters. The worker reads them every
-heartbeat and reports new drops as `net.denied` events with source
+once with `EPERM` ("Operation not permitted"), not a timeout.
+
+The guard judges a connection once. Packets of an established flow are
+accepted before anything else is walked (`ct state established,related
+accept`), and a socket reaches its allocation's chain through one verdict-map
+lookup on its cgroup leaf, not one rule per allocation, so the cost per
+packet does not grow with the allocations on the node. A flow that was
+allowed keeps going after a later policy change; the change applies to the
+next `connect()`.
+
+Each allocation has its own chain with its own counters. The worker reads
+them at most every `hostGuard.counterInterval` (default `10s`; each read
+runs `nft -j list table`) and reports new drops as `net.denied` events with source
 `host-guard`, the class as the destination (`cloud metadata`, `a Legion
 control port`, `another allocation's datapath`), and `dropped in the kernel`
 in the reason, so `legion net doctor` and the event stream name the cause.
@@ -1234,6 +1690,122 @@ GCP and Azure require a `Metadata-Flavor: Google` or `Metadata: true`
 header, which a browser-style SSRF can't set but a task can. Grant each
 node's instance role only what the worker itself needs.
 
+## The kernel classifier
+
+On a Linux node that can run it, one fixed set of Legion-owned eBPF
+programs decides every flow a host-mode task opens, at `connect()`. Users
+write the same rules they write today; nothing in a job changes.
+
+```
+task: connect(151.101.0.223:443)
+  │
+  ▼  cgroup programs on the worker's cgroup parent
+  ├─ its own datapath (VIP block, upstream ports) ───► pass
+  ├─ host guard ─────────────────────────────────────► EPERM (final)
+  ├─ port 53 ────────────────────────────────────────► the allocation's resolver
+  ├─ the compiled egress chain ──────────────────────► pass | EPERM | redirect
+  └─ redirect ─► capture listener: SNI/Host, then the egress proxy's judge
+```
+
+- **Allowed flows that nothing reads connect directly.** No proxy hop: a
+  few map lookups at `connect()`. Denied flows fail at once with `EPERM`
+  ("Operation not permitted"), and nothing is sent.
+- **Host-mode egress chains are enforced.** In host mode, a chain used to
+  apply only to traffic that went through an upstream or the allocation's
+  resolver. On a node with the classifier, it applies to every TCP
+  `connect()`, every connected or unconnected UDP send, TCP Fast Open, and
+  `io_uring` connects. A task that dialed past its own chain now gets
+  `EPERM`.
+- **Hostnames are learned from the resolver.** The kernel sees addresses,
+  and rules name hosts. Every port-53 query a governed task sends goes to
+  its allocation's own resolver, whatever `resolv.conf` says, and the reply
+  reads as if it came from the nameserver the task asked. When the resolver
+  answers a name the chain allows, the addresses it returns satisfy that
+  name's host rules in the kernel for the record's TTL (at least five
+  minutes, so a client that caches longer is not cut off mid-use). A
+  host-mode task with an egress chain gets a VIP block on Linux nodes for
+  that resolver, upstreams or not.
+- **What only netd can decide is redirected**, to a capture listener on the
+  node's loopback: an address no answer taught the kernel under a chain with
+  host rules (a cached answer, `/etc/hosts`, a hard-coded IP), a rule that
+  needs the request head, and a chain with handlers or an HTTP access log.
+  The listener recovers the original destination, reads the TLS SNI or the
+  HTTP `Host`, and allows a named flow only if the address the task dialed is
+  one of that name's addresses, so a client that lies in its SNI gets
+  nothing (`Legion-Denied-By: capture/name` in the event). Then the flow is
+  judged, its hops run, and it is dialed and spliced exactly as a `CONNECT`
+  to the gated proxy is; plaintext HTTP under an HTTP chain is served request
+  by request. A flow with no name (a protocol where the server speaks first)
+  is judged by its address alone.
+- **Gated tasks never pass.** Their namespace is the boundary. The
+  classifier only makes capture **transparent**: a connect from a gated
+  `exec` or `container` task is redirected to a capture listener inside its
+  namespace (`127.0.0.1:1081`, beside its proxy), so a tool that ignores
+  `HTTPS_PROXY` still gets out under policy. The proxy variables stay set.
+- **Raw and packet sockets are refused** to governed tasks, so raw IP cannot
+  slip past the rest.
+- **Fail-static across restarts.** With bpffs mounted at `/sys/fs/bpf`, the
+  programs and maps are pinned under `/sys/fs/bpf/legion/` (under
+  `/sys/fs/bpf/legion_<cgroupParent>/` for a worker whose cgroup parent is
+  not the default, such as a manager's system worker, so two workers on one
+  host never share pins). A worker that
+  restarts re-opens them, attaches fresh programs, and drops the old ones;
+  in between, the kernel keeps enforcing the last policy it was given, and
+  allowed flows that never entered netd are untouched. Without bpffs, the
+  classifier stops enforcing while the worker is down, and the worker logs a
+  `WARN` at start.
+
+Whether a node runs it is the `netKernel` node attribute, and `hostGuard`
+says which mechanism guards the host:
+
+```console
+$ legion node info wkr-1
+Host guard     active (ebpf)
+Net kernel     active (ebpf: cgroup sock_addr, sock_create, sockops, cgroup_skb, ringbuf)
+```
+
+The probe runs once at start and checks features, not kernel versions
+(distribution kernels backport): the programs must load and attach to a
+cgroup. A node that cannot run the classifier says why, keeps the
+`nftables` guard, and treats host-mode egress as cooperative, exactly as
+before:
+
+```text
+Net kernel     unavailable (no cgroup v2 unified hierarchy at /sys/fs/cgroup)
+```
+
+Each allocation's datapath status (`legion net doctor`, `NetAllocStatus.kernel`)
+reports whether the kernel enforces its chain, whether capture is on, its
+compiled rule count, and how many connections the kernel passed,
+redirected, and refused since the last heartbeat. Kernel counters feed the
+`legion_net_*` connection metrics, and bytes the kernel moved count as
+activity for the [idle policy](suspend-and-resume.md#idle-policy),
+so pass flows are not invisible.
+
+**Limits.**
+
+- Up to 64 connect-time rules and 64 distinct host names per chain. A chain
+  beyond either keeps today's behavior (netd judges what goes through it),
+  and the allocation's status says why.
+- A root `exec` task with `CAP_SYS_ADMIN` or `CAP_BPF` can detach the
+  programs from its cgroup, as it can delete the `nftables` table. Governed
+  tasks must not hold `CAP_NET_RAW`.
+- DNS over HTTPS skips the resolver. Its addresses are never learned, so
+  those flows are redirected and judged by their SNI, which the policy has to
+  allow. A CDN address that an allowed name and a denied name share can be
+  reached through the allowed name, as with any egress control based on SNI
+  or address.
+- The resolver and the capture listener are IPv4: an IPv6 flow is passed or
+  refused in the kernel, never redirected, and an IPv6 address a resolver
+  returned is learned like an IPv4 one.
+- A sandbox's sockets live in its guest kernel, which the classifier never
+  sees: a gated sandbox's egress is judged by netd per vsock stream, as
+  before. macOS has no classifier.
+- UDP other than DNS is passed or refused in the kernel, never captured.
+- A body-reading hop (`dlp`) on a captured flow runs only on plaintext HTTP
+  under an HTTP chain; a TLS flow it cannot read is spliced after its SNI is
+  judged.
+
 ## The datapath across worker restarts
 
 Tasks survive a worker restart, because the worker re-adopts their processes
@@ -1250,6 +1822,18 @@ ports, plus identities and policy bodies. Because this state is on disk, a
 node that restarts while the manager is down comes back with the same
 datapath it had.
 
+The namespaces of gated allocations that died while the worker was down
+are removed on the first heartbeat the manager acknowledges. The worker
+lists `/var/run/netns/legion-<allocation>` and unmounts every one that is not
+in the acknowledged desired set and not an allocation the worker holds
+(including one a push started before that heartbeat). A namespace that a
+process is still inside (any `/proc/<pid>/ns/net` pointing at it) is left in
+place, with a warning. It may belong to another worker on the same host, or
+to a process nothing tracks. Namespace names carry no node id, so two
+workers on one host (of one cluster or of two) whose gated allocations have
+the same id would share a namespace. Run gated tasks on only one worker per
+host.
+
 Connections in flight during the restart drop, because the listeners are new
 sockets. There is also a gap while the process starts. A separate
 `legion netd` process with listener hand-off (`SCM_RIGHTS`) and zero dropped
@@ -1264,8 +1848,10 @@ count it as up, and `legion net doctor` names the cause.
 
 ## Ingress
 
-Declare an `ingress` chain on a task, or impose one with a `require` policy
-object, and the datapath fronts every port the task advertises:
+Declare an `ingress` chain on a task, impose one with a `require` policy
+object, put the service on the [mesh](#the-mesh), or give a port its own
+[`tls`](#tls-on-ports), and the datapath fronts every port the task
+advertises:
 
 ```nickel
 network = {
@@ -1284,18 +1870,21 @@ network = {
 
 - **The datapath owns the advertised port.** The node's datapath binds
   `LEGION_PORT_HTTP` as consumers see it (the port in the catalog and in
-  `LEGION_UPSTREAM_*` feeds) on the host. The task gets a **private twin**
+  `LEGION_UPSTREAM_*` feeds) on the host, on every address of both families
+  (one `[::]` socket that also takes IPv4, or `0.0.0.0` on a host without
+  IPv6). The task gets a **private twin**
   as its own `LEGION_PORT_HTTP` (a container's port publish uses the twin
   too), so nothing in the task changes. On the host the twin comes from the
-  same dynamic range. Inside a gated namespace, which has its own ports, the
+  datapath's port range, `61000–65535`, apart from task ports
+  (`20000–32000`). Inside a gated namespace, which has its own ports, the
   twin is the port's `to`, or the advertised port number itself when `to` is
   unset, so an image that listens on a fixed port (`{ name = "pg", to =
   5432 }`) needs no change. The task cannot take the advertised port back, because the bind
   fails with the address already in use. This makes ingress enforceable on
   every runtime and platform, not only on gated Linux.
 - **Every accepted connection is checked** against the ingress chain using
-  the peer's address (`cidr`, `port`) and, with mesh mTLS, the peer's
-  attributed identity (`identity`). In HTTP mode, the request head is
+  the peer's address (`cidr`, `port`) and, on the mesh port or a mutual
+  port, the peer's verified identity (`identity`). In HTTP mode, the request head is
   checked too, with the same request rules, `dlp`, structured `403`s, and
   access log as egress. A denial closes the connection and records
   `net.denied` with `direction = ingress`.
@@ -1318,8 +1907,11 @@ Limits: TCP only. The task sees the datapath as the peer. Legion does not
 pass the original peer to the task (no PROXY header and no forwarding
 headers). The original peer appears in the access log and in `net.denied`
 events, and an ingress `proxy` hop receives it in the PROXY v2 header. There
-is one listener per advertised port per allocation. The cluster edge and per-tag routing on ingress are not part of
-this feature.
+is one listener per advertised port per allocation. Per-tag routing on
+ingress is not part of this feature. The cluster edge, public hostnames
+routed to services over HTTP and HTTPS, is the bundled
+[ingress app](ingress.md), which reaches a task's port like any other
+client, through this chain.
 
 ### Ingress into a sandbox
 
@@ -1474,6 +2066,7 @@ legion net policy test <job> --to <dest> [--method M --path P]  # dry-run a verd
 legion net policy test <job> --from <peer> [--identity <sub>]
 legion net doctor <job> [--task <task>]                         # policy → mode → datapath → handlers → tls
 legion net handler test <url|host:port>                         # probe an authz webhook or a proxy
+legion net plugin new|test|apply|list|describe|status|delete     # WASM plugins (docs/network-plugins.md)
 legion net ca show | rotate                                     # the mesh CA
 ```
 
@@ -1513,13 +2106,17 @@ hang.
   `legion_net_denied_total{direction}`, `legion_net_bytes_total{direction}`,
   `legion_net_handler_total{handler,outcome}` (authz/proxy calls by
   allow|deny|proxy|error), `legion_net_handler_seconds` (webhook latency,
-  cache misses only).
+  cache misses only), and for [plugins](network-plugins.md#status-and-diagnostics)
+  `legion_net_plugin_calls_total{plugin,stage,outcome}`,
+  `legion_net_plugin_callback_seconds`, and
+  `legion_net_plugin_metric{plugin,scope,name}`.
   Attribution is never a metric label. The registry caps label
   combinations, and a per-user label would silently break the series.
 - **Events**: `net.denied` (warn) with the destination, the deciding rule,
   the reason, the peer identity, and the task's `network.labels`.
-  `net.policy_applied` and `net.policy_deleted` (info).
-- **Access log** (`accessLog = true`, or a `log` handler): one NDJSON line
+  `net.policy_applied` and `net.policy_deleted` (info), and
+  `net.plugin_applied` and `net.plugin_deleted` (info).
+- **Access log** (`accessLog = true` on the chain): one NDJSON line
   per request in HTTP mode, at `<worker logs>/<allocation>/net-access.log`.
   L4 connections are counted in metrics, not logged one by one.
 - **Datapath status**: every heartbeat carries the node's view of each
@@ -1540,15 +2137,23 @@ The `net` resource controls access:
   can set policy for their pool without cluster-wide write access.
 
 A cluster-wide policy (no pools in its selector) and `ca rotate` need
+unscoped `net:write`. [Plugin objects](network-plugins.md#acls) follow the
+same rule on their own `nodePools`, and a `usableBy = "jobs"` plugin needs
 unscoped `net:write`. `IssueNodeCertificate` is worker-plane, and a node may
 only mint its own certificate.
 
 Naming a KV key in a job needs `kv:read` on it, because the datapath hands
-the value out: `certFrom = { kv }` on an ingress chain
-([Certificates from KV](#certificates-from-kv)) and
+the value out: `ports[].tls.cert`, `ports[].tls.clients.ca`, and
+`connect.upstreams[].ca`
+([Certificates and CAs from KV](#certificates-and-cas-from-kv)), and
 `connect.upstreams[].credentials` ([Credential injection](#credential-injection)).
-`GetIngressCertificates` and `GetUpstreamCredentials` are worker-plane, and a
-node only receives values that allocations placed on it declare.
+The same rule covers every other place a job names a key
+([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
+`FetchDatapathMaterial`, the one call a node's datapath fetches everything
+with, is worker-plane, and a node only receives values that allocations
+placed on it declare: the request names an allocation and what it needs
+(an upstream and a header, say), never a KV path, and the manager derives the
+path from the allocation's own declaration.
 
 ## Current scope and limitations
 
@@ -1560,18 +2165,30 @@ This section lists what that covers and what it does not.
   header), `dlp`, the `http` traffic block, and the external `authz` and
   `proxy` hops on every path (upstream splices, HTTP mode, the gated egress
   proxy, ingress).
-- **Egress is cooperative in `host` mode, and `gated` mode is not yet a full
-  boundary.** In `host` mode, policy applies to traffic that goes through an
-  upstream and to names resolved through the allocation's resolver. A
-  process that dials a raw address bypasses it. `mode = "gated"` (Linux,
+- **Only HTTP-mode upstream hand-offs ride the mesh.** A `proxy` hop on an
+  HTTP-mode upstream reaches a proxy on another node only over mesh mTLS.
+  TCP hand-offs and the gated proxy's `http://` hand-offs dial the endpoint
+  directly, so they cannot use a proxy on a mesh port
+  ([How an HTTP hand-off travels](#proxy--bring-your-own-proxy)).
+- **Egress in `host` mode is enforced only where the kernel classifier
+  runs, and `gated` mode is not yet a full boundary.** On a Linux node with
+  the [kernel classifier](#the-kernel-classifier), a host-mode `exec` or
+  `container` task's egress chain is enforced at `connect()`. Elsewhere, in
+  `host` mode, policy applies to traffic that goes through an upstream and
+  to names resolved through the allocation's resolver, and a process that
+  dials a raw address bypasses it. `mode = "gated"` (Linux,
   `container` and `exec`) closes that gap, because the namespace has no
   route except Legion's listeners, and every destination those listeners
   dial is judged by the [host guard](#the-host-guard) before policy. A root
-  `exec` task can still leave the namespace. A host-mode task's policy stays
-  cooperative, but the [kernel guard](#the-host-guard-in-the-kernel) keeps it
-  off the node's Legion ports, the metadata service, and other allocations'
-  listeners where it runs. On macOS, egress stays cooperative, and
-  there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
+  `exec` task can still leave the namespace. Without the classifier, a
+  host-mode task's policy stays cooperative, but the
+  [kernel guard](#the-host-guard-in-the-kernel) keeps it off the node's
+  Legion ports, the metadata service, and other allocations' listeners where
+  it runs. On macOS, a host-mode task's egress stays cooperative, there are
+  no VIPs or per-allocation resolvers, and a `gated` task is confined by
+  Seatbelt or `pf` instead of a namespace
+  ([Gated mode on macOS](#gated-mode-on-macos), not yet verified on macOS
+  hardware). A gated
   `sandbox` is captured over vsock, upstreams included. That path is
   implemented and unit-tested but not exercised on a real VMM in CI. A
   TAP-wired or loopback-only sandbox cannot reach its upstreams. `auto`
@@ -1582,19 +2199,27 @@ This section lists what that covers and what it does not.
   platform. A gated or TAP-wired sandbox's ports are always fronted, over
   vsock or at the guest's bridge address. TCP only. The task sees the
   datapath as the peer, not the original client.
-- **TLS**: ingress chains terminate `server`/`mutual` TLS with your files, a
-  certificate held in KV (swapped live on renewal), or the mesh certificate.
-  Legion stores and serves certificates but does not issue public ones: a
-  renewal job (or any ACME client) writes them to KV. The mesh is node-to-node mTLS with attributed
-  workload identity, never per-workload certificates. There is no kTLS fast
-  path (a terminated connection is copied in user space), no revocation
+- **TLS**: a port terminates TLS (mutual with `clients`) with your files or
+  a certificate held in KV (swapped live on renewal), and a mesh service's
+  port with the node certificate.
+  The bundled [cert manager](cert-manager.md) issues and renews certificates
+  into KV (Let's Encrypt, a private CA, or self-signed); a renewal job of
+  your own, or any ACME client, can write them there instead. The mesh is node-to-node mTLS with attributed
+  workload identity, never per-workload certificates. Mesh hops resume TLS
+  sessions ([Sessions](#sessions)) but are not pooled: each L4 connection is
+  its own TLS connection, with no multiplexed node-to-node tunnels. There is
+  no kTLS fast path (a TLS connection, mesh hops included, is copied in user
+  space rather than spliced), no revocation
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
   gated task's private port or a port inside a sandbox guest.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
-  no UDP, no WASM handlers, and no TLS interception. Legion will not add TLS
+  no UDP, and no TLS interception. Custom per-request logic runs as
+  [WASM plugins](network-plugins.md); their own limits are listed there. Legion will not add TLS
   interception. Use external upstreams when policy needs to see the body,
   or when the node should add a credential the task never holds
   ([Credential injection](#credential-injection)): both work because the
   task speaks plaintext to the node and the node opens TLS itself.
-- **Legion has no job namespaces.** Every job is in `default`, so
-  `selector.namespaces` either matches every job or none.
+- **Net policies are cluster objects.** `selector.namespaces` matches each
+  task's real [namespace](namespaces.md), but writing a policy needs a
+  cluster-wide `net:write`: a namespace's tenants cannot author policy for
+  their own namespace.

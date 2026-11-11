@@ -20,7 +20,7 @@ and may have drifted.
 ## Critical
 
 ### W1. An empty desired set never stops anything
-- `src/worker/daemon.rs` wraps the whole reconcile in
+- `crates/worker/src/worker/daemon.rs` wraps the whole reconcile in
   `if !reply.desired_allocations.is_empty()`.
 - The manager sends an empty list when a node has nothing left, which the
   proto documents as valid. So stopping, draining, or preempting the last
@@ -31,7 +31,7 @@ and may have drifted.
 - **Status:** Fixed. Every acknowledged reply reconciles, including an empty one. The guard protected nothing: failed heartbeats return early, and the manager errors rather than returning an empty list.
 
 ### S1. Worker registration lets any node take over any other node's identity
-- `verify_join_for_registration` (`src/manager/server.rs`) returns `Ok` for any
+- `verify_join_for_registration` (`crates/manager/src/manager/server.rs`) returns `Ok` for any
   caller that is already a worker and discards the verified join token record.
 - `worker_register` then trusts `request.name` and `request.pool`, upserts the
   node, and mints a token for it, which revokes the victim's token.
@@ -45,7 +45,7 @@ and may have drifted.
 - **Status:** Fixed. Join tokens pin worker type and pool, node tokens may only re-register their own node, and worker-plane node ids are bound to the caller. Open: a join secret can still claim an existing node name (calls #3, TODO).
 
 ### R1. A new raft leader captures writes before it has applied the log
-- `execute_replicated` (`src/storage/raft/driver.rs`) only checks
+- `execute_replicated` (`crates/manager/src/storage/raft/driver.rs`) only checks
   `state == Leader` before `capture_mutation`. Nothing waits for `last_applied`
   to reach the leader's first entry of the term.
 - Old leader A logs `put_kv x` at entry 100, dies before the commit is known.
@@ -88,7 +88,7 @@ and may have drifted.
 ## High
 
 ### SC2. The claim sweep deletes unrelated or newer evals
-- `claim_eval_apply` (`src/storage/store.rs`) deletes pending evals with the
+- `claim_eval_apply` (`crates/manager/src/storage/store.rs`) deletes pending evals with the
   same kind and the same job **or the same node**, ignoring `job_config_id`.
 - Reschedule evals for jobs A, B, and C on one node collapse into A's, leaving
   B and C under-replicated. A stale v2 `rollout_tick` sweeps the v3 tick and

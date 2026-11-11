@@ -1,0 +1,706 @@
+//! Getting a task's component compiled for this node's engine (plan §6.5):
+//! fetch the bytes (a `config.module` through the artifact stager into the
+//! content store, or a built-in image from the images directory), then
+//! compile them once per node with a `legion-isolate compile` child
+//! process into derived content (`DerivedKind::Cwasm`, a confined recipe
+//! keyed by the component's digest and the engine's compatibility key).
+
+use super::binary::{ImageCatalog, IsolateBinary};
+use crate::content_store::{ContentDigest, ContentStore, DerivedKind, Recipe};
+use crate::prelude::*;
+use crate::structs::isolate::{IsolateModule, WorkerIsolateConfigFull};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long one compile may take.
+pub const COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The compile process's address-space limit. Generous: Cranelift on a
+/// large interpreter image needs a few GiB of virtual memory.
+pub const COMPILE_ADDRESS_SPACE: u64 = 16 << 30;
+
+/// The compile process's cgroup `memory.max` (its resident memory), when
+/// the node gives isolate hosts cgroups. Cranelift on the Python image
+/// stays well under 2 GiB resident; twice that leaves room.
+pub const COMPILE_MEMORY_MAX: u64 = 4 << 30;
+
+/// The artifact file inside a derived entry.
+pub const ARTIFACT_FILE: &str = "module.cwasm";
+
+/// What a task runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleWant {
+    /// `config.module`.
+    Component(IsolateModule),
+    /// `config.image`, as written (possibly pinned).
+    Image(String),
+}
+
+/// A compiled module a host can load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleArtifact {
+    /// The derived-content key: the module's id in every host.
+    pub module_id: String,
+    /// The `.cwasm` file, inside one of the hosts' `read_dirs`.
+    pub path: PathBuf,
+}
+
+/// Fetches and compiles modules. Blocking; called on a blocking thread.
+pub trait ModuleSource: Send + Sync + 'static {
+    fn compiled(&self, want: &ModuleWant) -> Result<ModuleArtifact, String>;
+
+    /// `config.entry`'s file: its name in the run directory and its bytes,
+    /// staged from the task's artifacts (no allocation exists for an
+    /// isolate task to stage them into).
+    fn entry_file(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+        allocation_id: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String>;
+}
+
+/// The real source: the artifact stager, the images directory, the node
+/// content store, and the `legion-isolate` binary.
+pub struct Compiler {
+    pub binary: IsolateBinary,
+    pub config: WorkerIsolateConfigFull,
+    pub stager: Option<Arc<crate::artifacts::stage::ArtifactStager>>,
+    pub store: Option<Arc<ContentStore>>,
+    pub images: Option<ImageCatalog>,
+    /// Where artifacts go when the content store cannot keep them.
+    pub fallback_dir: PathBuf,
+    /// The isolate hosts' cgroup directory, when the node governs resources
+    /// with cgroup v2: each compile runs in its own leaf there, with
+    /// [`COMPILE_MEMORY_MAX`].
+    pub cgroup_dir: Option<PathBuf>,
+}
+
+/// A compile's own cgroup leaf, removed when the compile is done.
+struct CompileCgroup {
+    leaf: PathBuf,
+    procs: std::os::fd::OwnedFd,
+}
+
+impl CompileCgroup {
+    /// A fresh leaf `compile.<n>` under `dir` (host leaves always end in
+    /// `-r<replica>`, so the names never meet).
+    fn prepare(dir: &Path) -> R<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (leaf, procs) = super::host::prepare_leaf(
+            dir,
+            &format!("compile.{}.{n}", std::process::id()),
+            Some(COMPILE_MEMORY_MAX),
+            256,
+        )?;
+        Ok(Self { leaf, procs })
+    }
+}
+
+impl Drop for CompileCgroup {
+    fn drop(&mut self) {
+        // Empty once the compiler and its PID-namespace child are gone (the
+        // child dies with its parent, a moment after it).
+        for _ in 0..50 {
+            if std::fs::remove_dir(&self.leaf).is_ok() || !self.leaf.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        debug!(cgroup = %self.leaf.display(), "Compile cgroup not removed (still busy)");
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompileReport {
+    ok: bool,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    kind: String,
+}
+
+impl Compiler {
+    /// The component's bytes on disk and their digest.
+    fn component(&self, want: &ModuleWant) -> Result<(PathBuf, ContentDigest), String> {
+        match want {
+            ModuleWant::Component(module) => {
+                let stager = self
+                    .stager
+                    .as_ref()
+                    .ok_or("this node has no artifact stager to fetch the module with")?;
+                let mut spec = crate::structs::artifact::ArtifactSpec::from_source(&module.source);
+                spec.checksum = Some(module.checksum());
+                let fetched = stager
+                    .fetch_into_store(
+                        &spec,
+                        crate::content_store::ContentClass::Artifacts,
+                        crate::content_store::PutOptions::default().label("isolate module"),
+                    )
+                    .map_err(|err| format!("fetching config.module.source: {err:#}"))?;
+                Ok((fetched.entry.path, fetched.entry.digest))
+            }
+            ModuleWant::Image(image) => {
+                let catalog = self.images.as_ref().ok_or_else(|| {
+                    "this node has no isolate images (set isolate.images, or install \
+                     isolate-images beside legion-isolate)"
+                        .to_string()
+                })?;
+                let (entry, path) = catalog.resolve(image)?;
+                let digest = ContentDigest::of_file(&path)
+                    .map_err(|err| format!("reading image {}: {err:#}", path.display()))?;
+                if !entry.sha256.is_empty() {
+                    let declared = ContentDigest::parse(&if entry.sha256.starts_with("sha256:") {
+                        entry.sha256.clone()
+                    } else {
+                        format!("sha256:{}", entry.sha256)
+                    })
+                    .map_err(|err| format!("the image manifest's sha256 is invalid: {err:#}"))?;
+                    if declared != digest {
+                        return Err(format!(
+                            "image file {} does not match its manifest sha256 ({declared}); the \
+                             images directory is damaged",
+                            path.display()
+                        ));
+                    }
+                }
+                Ok((path, digest))
+            }
+        }
+    }
+
+    fn recipe(&self, digest: &ContentDigest) -> Recipe {
+        Recipe::new(DerivedKind::Cwasm, self.binary.engine_version.clone())
+            .digest("component", digest)
+            .fingerprint("compat", self.binary.compat_key.as_bytes())
+            .confined()
+    }
+
+    /// Run `legion-isolate compile` with a timeout and an address-space
+    /// limit, and read its report.
+    fn compile(&self, input: &Path, output: &Path) -> Result<(), String> {
+        // At most COMPILE_CONCURRENCY compiles on the node at once.
+        let _slot = CompileSlot::take();
+        // The compiler reads from a private directory holding only this
+        // input, so the directory it may read is never every job's
+        // artifacts.
+        let private = self
+            .fallback_dir
+            .parent()
+            .unwrap_or(&self.fallback_dir)
+            .join("compile-inputs");
+        std::fs::create_dir_all(&private)
+            .map_err(|err| format!("creating {}: {err}", private.display()))?;
+        let scratch = tempfile::Builder::new()
+            .prefix("in-")
+            .tempdir_in(&private)
+            .map_err(|err| format!("creating a compile directory: {err}"))?;
+        let copy = scratch.path().join("module.wasm");
+        if std::fs::hard_link(input, &copy).is_err() {
+            std::fs::copy(input, &copy)
+                .map_err(|err| format!("copying the module to compile: {err}"))?;
+        }
+        self.compile_from(&copy, output)
+    }
+
+    fn compile_from(&self, input: &Path, output: &Path) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        let started = Instant::now();
+        let mut command = std::process::Command::new(&self.binary.path);
+        command
+            .arg("compile")
+            .arg("--input")
+            .arg(input)
+            .arg("--output")
+            .arg(output)
+            // The compiler ends itself shortly after the timeout even if
+            // this worker is gone by then (the worker's own kill at the
+            // timeout comes first while it lives).
+            .arg("--deadline-secs")
+            .arg((COMPILE_TIMEOUT.as_secs() + 10).to_string())
+            .arg("--confine")
+            .arg(match self.config.confine {
+                crate::structs::isolate::ConfineMode::Enforce => "enforce",
+                crate::structs::isolate::ConfineMode::BestEffort => "best-effort",
+                crate::structs::isolate::ConfineMode::Off => "off",
+            })
+            .args(super::binary::engine_args(&self.config))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_clear();
+        // Its own cgroup leaf with a memory ceiling, when the node gives
+        // hosts cgroups (best effort, like the hosts').
+        let cgroup = self.cgroup_dir.as_deref().and_then(|dir| {
+            CompileCgroup::prepare(dir)
+                .map_err(|err| {
+                    warn!(error = %format!("{err:#}"), "Could not create a cgroup for the isolate compiler; it runs in the worker's")
+                })
+                .ok()
+        });
+        let procs_fd = {
+            use std::os::fd::AsRawFd;
+            cgroup.as_ref().map(|c| c.procs.as_raw_fd())
+        };
+        // SAFETY: setrlimit, prctl, and write are async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                let limit = libc::rlimit {
+                    rlim_cur: COMPILE_ADDRESS_SPACE as libc::rlim_t,
+                    rlim_max: COMPILE_ADDRESS_SPACE as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Dies with the thread that forked it, which waits for it
+                // below (a blocking-pool thread that cannot retire while it
+                // waits): a worker that dies takes the compile with it.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(fd) = procs_fd {
+                    let _ = libc::write(fd, b"0".as_ptr().cast(), 1);
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("could not start legion-isolate compile: {err}"))?;
+        // Drain stdout/stderr on threads so a chatty compiler never blocks.
+        let mut stdout = child.stdout.take().expect("piped");
+        let mut stderr = child.stderr.take().expect("piped");
+        let out = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+            buf
+        });
+        let err = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+            buf
+        });
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() > COMPILE_TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "compiling the module took longer than {}s",
+                        COMPILE_TIMEOUT.as_secs()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(err) => return Err(format!("waiting for the compiler: {err}")),
+            }
+        };
+        drop(cgroup);
+        let stdout = out.join().unwrap_or_default();
+        let stderr = err.join().unwrap_or_default();
+        let seconds = started.elapsed().as_secs_f64();
+        crate::telemetry::worker_metrics()
+            .isolate_compile_seconds
+            .observe(seconds);
+        if let Some(store) = self.store.as_ref() {
+            store.derived_observe_build(DerivedKind::Cwasm, seconds);
+        }
+        let line = String::from_utf8_lossy(&stdout);
+        let report: Option<CompileReport> = line
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line.trim()).ok());
+        match report {
+            Some(report) if report.ok && status.success() => Ok(()),
+            Some(report) => Err(if report.kind.is_empty() {
+                format!("the module failed to compile: {}", report.error)
+            } else {
+                format!(
+                    "the module failed to compile ({}): {}",
+                    report.kind, report.error
+                )
+            }),
+            None => Err(format!(
+                "legion-isolate compile {status} without a report: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )),
+        }
+    }
+
+    fn compile_to_fallback(&self, input: &Path, key: &str) -> Result<ModuleArtifact, String> {
+        let dir = self.fallback_dir.join(key);
+        let path = dir.join(ARTIFACT_FILE);
+        if !path.is_file() {
+            std::fs::create_dir_all(&dir)
+                .map_err(|err| format!("creating {}: {err}", dir.display()))?;
+            self.compile(input, &path)?;
+        }
+        Ok(ModuleArtifact {
+            module_id: key.to_string(),
+            path,
+        })
+    }
+}
+
+/// Where `config.entry` artifacts are staged (one private directory per
+/// staging, removed once the entry is read).
+fn entries_dir(fallback_dir: &Path) -> PathBuf {
+    fallback_dir
+        .parent()
+        .unwrap_or(fallback_dir)
+        .join("entries")
+}
+
+/// Remove every staging directory a previous worker left (it crashed
+/// between staging and reading). Called once at start, before any task is
+/// prepared.
+pub fn remove_stale_entries(fallback_dir: &Path) {
+    let dir = entries_dir(fallback_dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => debug!(dir = %dir.display(), "Removed stale config.entry staging"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(dir = %dir.display(), error = %err, "Could not remove stale config.entry staging")
+        }
+    }
+}
+
+impl ModuleSource for Compiler {
+    fn entry_file(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+        allocation_id: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String> {
+        self.stage_entry(job_id, task, allocation_id, entry)
+    }
+
+    fn compiled(&self, want: &ModuleWant) -> Result<ModuleArtifact, String> {
+        let (input, digest) = self.component(want)?;
+        let recipe = self.recipe(&digest);
+        let key = recipe.key();
+        let Some(store) = self.store.as_ref() else {
+            return self.compile_to_fallback(&input, &key);
+        };
+        loop {
+            if let Ok(Some(entry)) = store.derived_get(&recipe) {
+                return Ok(ModuleArtifact {
+                    module_id: key,
+                    path: entry.path.join(ARTIFACT_FILE),
+                });
+            }
+            // Single-flight: one compile per key on the node; the rest wait
+            // and look again.
+            let Some(flight) = store.derived_claim(DerivedKind::Cwasm, &key) else {
+                continue;
+            };
+            let stage = store
+                .derived_stage()
+                .map_err(|err| format!("staging the compiled module: {err:#}"))?;
+            if let Err(err) = self.compile(&input, &stage.join(ARTIFACT_FILE)) {
+                let _ = std::fs::remove_dir_all(&stage);
+                return Err(err);
+            }
+            let committed = store.derived_commit(&recipe, &stage);
+            drop(flight);
+            return match committed {
+                Ok(entry) => Ok(ModuleArtifact {
+                    module_id: key,
+                    path: entry.path.join(ARTIFACT_FILE),
+                }),
+                Err(crate::content_store::DerivedSkip::AlreadyPresent) => continue,
+                Err(skip) => {
+                    debug!(reason = skip.reason(), "Compiled module not kept as derived content; using the worker's own directory");
+                    self.compile_to_fallback(&input, &key)
+                }
+            };
+        }
+    }
+}
+
+impl Compiler {
+    fn stage_entry(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+        allocation_id: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String> {
+        let stager = self
+            .stager
+            .as_ref()
+            .ok_or("this node has no artifact stager to fetch config.entry with")?;
+        // A private directory for this staging only, removed when the entry
+        // has been read (its artifacts may have been fetched with the job's
+        // credentials, and nothing reads them again; a re-preparation stages
+        // afresh). `remove_stale_entries` clears what a crash left behind.
+        let entries = entries_dir(&self.fallback_dir);
+        std::fs::create_dir_all(&entries)
+            .map_err(|err| format!("creating {}: {err}", entries.display()))?;
+        let staging = tempfile::Builder::new()
+            .prefix(&format!(
+                "{}-{}-",
+                crate::structs::session::derived_session_id(&task.name, job_id, "entry"),
+                allocation_id
+            ))
+            .tempdir_in(&entries)
+            .map_err(|err| format!("creating a directory to stage config.entry in: {err}"))?;
+        let dir = staging.path().to_path_buf();
+        let board = crate::artifacts::status::ArtifactStatusBoard::new();
+        let staged = stager
+            .stage_task_artifacts(allocation_id, &dir, &task.artifacts, &board)
+            .map_err(|err| format!("staging the task's artifacts for config.entry: {err:#}"))?;
+        let path = match crate::structs::isolate::entry_artifact(entry) {
+            Some(name) => staged
+                .iter()
+                .find(|artifact| artifact.name.as_deref() == Some(name))
+                .map(|artifact| artifact.reference_path().to_path_buf())
+                .ok_or_else(|| {
+                    format!("config.entry names artifact {name:?}, which the task does not declare")
+                })?,
+            None => dir.join(entry.trim()),
+        };
+        // The artifact is job-controlled (a git tree or an archive can carry
+        // symlinks): read it only beneath the staging directory, following
+        // no symlink, as a regular file of bounded size.
+        let relative = path.strip_prefix(&dir).map_err(|_| {
+            format!("config.entry {entry:?} is not inside the task's staged artifacts")
+        })?;
+        let content = read_beneath(&dir, relative, crate::structs::run::MAX_RUN_STAGED)
+            .map_err(|why| format!("config.entry {entry:?} cannot be used: {why}"))?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "main".into());
+        Ok((name, content))
+    }
+}
+
+/// Read `relative` beneath `root` without following any symlink (in any
+/// component, the last one included) and without leaving `root` (`..` and
+/// absolute components are refused). The file must be a regular file of at
+/// most `cap` bytes. Each component is opened with `openat(O_NOFOLLOW)`
+/// from the previous one's descriptor, so a symlink swapped in after a
+/// check cannot redirect the read (no time-of-check gap).
+pub fn read_beneath(root: &Path, relative: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => return Err("its path contains \"..\"".into()),
+            Component::RootDir | Component::Prefix(_) => return Err("its path is absolute".into()),
+        }
+    }
+    let Some((last, dirs)) = parts.split_last() else {
+        return Err("it names a directory, not a file".into());
+    };
+    let open = |at: libc::c_int, name: &std::ffi::OsStr, flags: libc::c_int| {
+        let name = CString::new(name.as_bytes()).map_err(|_| "a NUL in its path".to_string())?;
+        // SAFETY: `name` is a valid C string; the result is checked.
+        let fd = unsafe {
+            libc::openat(
+                at,
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => format!(
+                    "{} is a symlink (or reached through one), which an entry may not be",
+                    name.to_string_lossy()
+                ),
+                _ => format!("{}: {err}", name.to_string_lossy()),
+            });
+        }
+        // SAFETY: a fresh descriptor this function owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let root_name = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| "a NUL in the staging path".to_string())?;
+    // SAFETY: a valid C string; the result is checked.
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(format!(
+            "the staging directory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a fresh descriptor this function owns.
+    let mut at = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for dir in dirs {
+        use std::os::fd::AsRawFd;
+        at = open(at.as_raw_fd(), dir, libc::O_PATH | libc::O_DIRECTORY)?;
+    }
+    let file = {
+        use std::os::fd::AsRawFd;
+        open(at.as_raw_fd(), last, libc::O_RDONLY | libc::O_NONBLOCK)?
+    };
+    let mut file = std::fs::File::from(file);
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    if !meta.file_type().is_file() {
+        return Err("it is not a regular file".into());
+    }
+    if meta.len() > cap {
+        return Err(format!(
+            "it is {} bytes, over the {cap}-byte limit for an entry",
+            meta.len()
+        ));
+    }
+    let mut content = Vec::with_capacity(meta.len() as usize);
+    file.by_ref()
+        .take(cap + 1)
+        .read_to_end(&mut content)
+        .map_err(|err| err.to_string())?;
+    if content.len() as u64 > cap {
+        return Err(format!("it is over the {cap}-byte limit for an entry"));
+    }
+    Ok(content)
+}
+
+/// Compiles allowed at once on a node.
+const COMPILE_CONCURRENCY: usize = 2;
+
+static COMPILES: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// One of the node's [`COMPILE_CONCURRENCY`] compile slots, held for a
+/// compile (blocking: compiles run on blocking threads).
+struct CompileSlot;
+
+impl CompileSlot {
+    fn take() -> Self {
+        let (count, freed) = &COMPILES;
+        let mut held = count.lock().unwrap_or_else(|p| p.into_inner());
+        while *held >= COMPILE_CONCURRENCY {
+            held = freed.wait(held).unwrap_or_else(|p| p.into_inner());
+        }
+        *held += 1;
+        CompileSlot
+    }
+}
+
+impl Drop for CompileSlot {
+    fn drop(&mut self) {
+        let (count, freed) = &COMPILES;
+        let mut held = count.lock().unwrap_or_else(|p| p.into_inner());
+        *held = held.saturating_sub(1);
+        freed.notify_one();
+    }
+}
+
+/// The `cwasm` derived-content directory, which every host may read.
+pub fn derived_dir(store: &ContentStore) -> PathBuf {
+    store
+        .derived_path(DerivedKind::Cwasm, &"0".repeat(64))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod read_beneath_test {
+    use super::read_beneath;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    #[test]
+    fn an_entry_is_read_only_beneath_its_root_without_symlinks_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("staged");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.py"), "print(1)").unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "node secret").unwrap();
+        // A normal entry.
+        assert_eq!(
+            read_beneath(&root, Path::new("src/main.py"), 1 << 20).unwrap(),
+            b"print(1)"
+        );
+        assert_eq!(
+            read_beneath(&root, Path::new("./src/main.py"), 1 << 20).unwrap(),
+            b"print(1)"
+        );
+        // A direct symlink entry.
+        symlink(&secret, root.join("src/link.py")).unwrap();
+        let err = read_beneath(&root, Path::new("src/link.py"), 1 << 20).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // A symlinked directory component.
+        symlink(dir.path(), root.join("up")).unwrap();
+        let err = read_beneath(&root, Path::new("up/secret"), 1 << 20).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // A chain to an absolute target.
+        symlink("/etc/passwd", root.join("abs")).unwrap();
+        symlink(root.join("abs"), root.join("chain.py")).unwrap();
+        let err = read_beneath(&root, Path::new("chain.py"), 1 << 20).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // `..` and absolute paths.
+        let err = read_beneath(&root, Path::new("../secret"), 1 << 20).unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        let err = read_beneath(&root, Path::new("/etc/passwd"), 1 << 20).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        // Not a regular file; over the cap.
+        let err = read_beneath(&root, Path::new("src"), 1 << 20).unwrap_err();
+        assert!(err.contains("regular file"), "{err}");
+        let err = read_beneath(&root, Path::new("src/main.py"), 3).unwrap_err();
+        assert!(err.contains("limit"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod compile_hygiene_test {
+    use super::*;
+
+    #[test]
+    fn each_compile_gets_its_own_cgroup_leaf_with_a_ceiling_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = CompileCgroup::prepare(dir.path()).unwrap();
+        let b = CompileCgroup::prepare(dir.path()).unwrap();
+        assert_ne!(a.leaf, b.leaf);
+        let name = a.leaf.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("compile."), "{name}");
+        assert!(!name.contains("-r"), "never a host leaf's shape: {name}");
+        assert_eq!(
+            std::fs::read_to_string(a.leaf.join("memory.max")).unwrap(),
+            COMPILE_MEMORY_MAX.to_string()
+        );
+        // (A plain directory stands in for cgroupfs here: its files keep
+        // the leaf from being removed, which a real, empty cgroup does
+        // not.)
+        let leaf = a.leaf.clone();
+        for file in ["memory.max", "pids.max", "cgroup.procs"] {
+            std::fs::remove_file(leaf.join(file)).unwrap();
+        }
+        drop(a);
+        assert!(!leaf.exists(), "an empty leaf is removed with the compile");
+    }
+
+    #[test]
+    fn stale_entry_staging_is_removed_at_start_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("cwasm");
+        let stale = entries_dir(&fallback).join("run-abc-7-x1y2");
+        std::fs::create_dir_all(stale.join("src")).unwrap();
+        std::fs::write(stale.join("src/secret.py"), "token").unwrap();
+        remove_stale_entries(&fallback);
+        assert!(!entries_dir(&fallback).exists());
+        // Nothing there: a no-op.
+        remove_stale_entries(&fallback);
+    }
+}

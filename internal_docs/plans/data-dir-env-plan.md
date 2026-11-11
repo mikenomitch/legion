@@ -21,7 +21,7 @@ That bites whenever two Legion processes share a working directory:
   another branch (a failed migration, say) blocks `cargo run -- start manager`
   until it is deleted.
 - `LEGION_WORKER_STATE_PATH` moves the state file, but the worker still picks
-  its ID by scanning `./.legion/workers` (`src/worker/daemon.rs:518`). A second
+  its ID by scanning `./.legion/workers` (`crates/worker/src/worker/daemon.rs:518`). A second
   worker sees the first one's IDs and refuses to start without `--name`.
 - Identity token fallbacks always land in `./.legion/identity`.
 
@@ -71,13 +71,13 @@ Non-goals:
 
 ## What exists today
 
-- `DEF_STORE_PATH = ".legion/store.sqlite"` (`src/constants.rs:57`). The store
+- `DEF_STORE_PATH = ".legion/store.sqlite"` (`crates/common/src/constants.rs:57`). The store
   path is a *directory* (`Store::db_path` joins `store.sqlite` to it), so the
   built-in default produces `.legion/store.sqlite/store.sqlite`. Every shipped
   config overrides it with `storePath = ".legion"`.
-- `DEF_RAFT_DATA_DIR = ".legion/raft"` (`src/structs/config.rs:1482`).
-- `DEF_WORKER_STATE_DIR`, `DEF_WORKER_STATE_PATH` (`src/constants.rs:148`).
-- `IDENTITY_TOKEN_DIR = ".legion/identity"` (`src/worker/identity.rs:57`).
+- `DEF_RAFT_DATA_DIR = ".legion/raft"` (`crates/common/src/structs/config.rs:1482`).
+- `DEF_WORKER_STATE_DIR`, `DEF_WORKER_STATE_PATH` (`crates/common/src/constants.rs:148`).
+- `IDENTITY_TOKEN_DIR = ".legion/identity"` (`crates/worker/src/worker/identity.rs:57`).
 
 ## Design
 

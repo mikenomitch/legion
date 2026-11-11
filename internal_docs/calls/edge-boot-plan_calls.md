@@ -18,7 +18,7 @@ entry 9.
 
 - **The call:** an unratified start is confirmed by submitting a normal plan
   submission with one placement and a one-element candidate list, applied
-  through `apply_plan_submission_apply` (`src/storage/store.rs:2552`) with its
+  through `apply_plan_submission_apply` (`crates/manager/src/storage/store.rs:2552`) with its
   epoch checks, its constraint re-validation, and its
   `assign_stateful_instance_tx` call. "The id was claimed by someone else" is
   not a new check — it is the existing stateful-instance binding failing, which
@@ -148,7 +148,7 @@ using it. Entry 12 records why nothing is rekeyed and no directory moves.
 - **The call:** every failure mode — refusal, timeout, partition, worker
   restart, manager amnesia — ends with the node killing the work. The
   implementation is a *protection window* exempting provisional allocations
-  from `reconcile_allocations` (`src/worker/task_manager.rs:762`) until their
+  from `reconcile_allocations` (`crates/worker/src/worker/task_manager.rs:762`) until their
   lease expires; after that, the existing "stop anything the manager does not
   list" logic reaps them with no new reaper.
 - **Alternatives:** (a) let unratified work keep running while the node retries

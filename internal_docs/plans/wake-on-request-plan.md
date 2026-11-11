@@ -135,12 +135,12 @@ to run.
 ## 5. Background: what exists today
 
 - `StartInstance` on a `suspended` instance is a resume
-  (`src/manager/server.rs`, `start_instance`), idempotent on a live
+  (`crates/manager/src/manager/server.rs`, `start_instance`), idempotent on a live
   instance, so any number of callers can send it.
 - `suspend.idle` suspends a quiet instance (`docs/suspend-and-resume.md`).
 - An allocation's `network` row carries the node's advertised host
   (`workerAddress`) and each port's advertised number
-  (`src/storage/store.rs`, `worker_address_host`, `AllocNetwork.ports`).
+  (`crates/manager/src/storage/store.rs`, `worker_address_host`, `AllocNetwork.ports`).
 - `GetInstance` had no endpoint or wake information, so a router had to read
   the allocation and the job spec separately.
 - Sandboxes: a gated sandbox could not declare ports, and a TAP sandbox's
@@ -268,14 +268,14 @@ on the bridge (gated plan §6.10). The gateway sees an ordinary
 
 ## 9. Testing plan
 
-- `src/structs/suspend.rs`: `wake` resolves with defaults, refuses an
+- `crates/common/src/structs/suspend.rs`: `wake` resolves with defaults, refuses an
   undeclared port, an empty port, and out-of-range timeouts.
 - `src/gateway.rs`: routing (host, header, `CONNECT`, webhook, health,
   nested hosts), one resume for three concurrent requests, the timeout
   answer, `404` for an instance without `wake` and an unknown one, a stopped
   instance not woken, the webhook body, `CONNECT` to a declared port and
   `404` for an undeclared one, TLS termination.
-- `tests/wake_integration.rs`: a real manager, a suspended exec instance,
+- `tests/integration/wake_integration.rs`: a real manager, a suspended exec instance,
   the gateway resumes it through `StartInstance`, and the held request is
   answered by the resumed port.
 - Not in CI: a real microVM resume behind the gateway (no KVM in CI).

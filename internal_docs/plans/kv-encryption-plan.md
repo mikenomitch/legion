@@ -42,17 +42,17 @@ The user-facing page is `docs/kv-encryption.md`, cross-referenced from
 Concretely, today:
 
 - `kv_entry.value` is a plaintext `TEXT` column
-  (`src/storage/migrations.rs:207-214`). The store makes no distinction
+  (`crates/manager/src/storage/migrations.rs:207-214`). The store makes no distinction
   between a feature flag and a database password.
 - That plaintext is copied everywhere the store goes:
   - `<storePath>/store.sqlite` and its WAL;
   - every `legion state backup` file (`VACUUM INTO`,
-    `src/storage/store.rs:2229`) — "a plain SQLite database — copy it
+    `crates/manager/src/storage/store.rs:2229`) — "a plain SQLite database — copy it
     off-host with ordinary tooling" (`docs/upgrades.md`);
   - the streamed replica in object storage when `persistence.type =
     "streaming"` (`docs/persistence-streaming.md`, `replicaUrl`);
   - in raft mode, every committed changeset in the raft log (a changeset
-    carries the row's new value, `src/storage/raft/capture.rs:1-12`), every
+    carries the row's new value, `crates/manager/src/storage/raft/capture.rs:1-12`), every
     whole-DB snapshot under `raft.dataDir/<lane>/snapshots/`, and the
     snapshot image shipped to a joining manager.
 - `state:read` is an ACL bypass for KV. The `kv` resource scopes policies by
@@ -377,9 +377,9 @@ the public doc as a limitation)
 
 - **Encrypting the rendered copies.** `job_config` / `task_config` rows hold
   the *rendered* results of KV references and templates
-  (`src/manager/server.rs:670-785`, `869-…`), so a KV secret that a task
+  (`crates/manager/src/manager/server.rs:670-785`, `869-…`), so a KV secret that a task
   consumes also exists, rendered, in those columns and in the worker's state
-  file (`src/worker/state.rs:115-116`). This plan encrypts the source of
+  file (`crates/worker/src/worker/state.rs:115-116`). This plan encrypts the source of
   truth only. The keyring is designed to be reused by the follow-up that
   covers derived columns (or that moves rendering to the worker); §6.9 states
   the residual exposure plainly.
@@ -405,14 +405,14 @@ the public doc as a limitation)
 ## 5. Background — what exists today
 
 **Schema.** `kv_entry(key, value TEXT, value_type, version, created_at,
-updated_at)` (`src/storage/migrations.rs:207-214`); `kv_lock`
+updated_at)` (`crates/manager/src/storage/migrations.rs:207-214`); `kv_lock`
 (`218-224`); `job_kv_reference` (`228-236`). All three are owned by the
-control lane (`src/storage/raft/ownership.rs:148-150`); any new table must be
+control lane (`crates/manager/src/storage/raft/ownership.rs:148-150`); any new table must be
 classified there or the coverage test fails (`ownership.rs:289-292, 555-563`).
 
 **Write and read paths — one chokepoint each.** `Store::put_kv` wraps
 `put_kv_apply` in `self.replicated(Lane::Control, …)`
-(`src/storage/store.rs:15616-15730`); `get_kv` (`15733`), `list_kv` (`15748`),
+(`crates/manager/src/storage/store.rs:15616-15730`); `get_kv` (`15733`), `list_kv` (`15748`),
 `delete_kv` (`15759`), `patch_kv` (`15813-15903`, a read-modify-write of the
 JSON value inside one transaction). Every row is hydrated by
 `kv_entry_from_row` (`5943-5955`). So encryption on write lives in
@@ -422,14 +422,14 @@ mapper — there is no second path to the column.
 **Raft mechanics decide where encryption must happen.** In raft mode a
 mutation's body runs inside a SQLite session capture on the leader; the
 captured changeset (row images) is what gets proposed, committed, and applied
-byte-identically on every manager (`src/storage/raft/capture.rs:1-12`).
+byte-identically on every manager (`crates/manager/src/storage/raft/capture.rs:1-12`).
 Therefore: encrypt *inside* the `_apply` body, before capture, and only
 ciphertext ever enters the log, the snapshots, or a follower. Conversely,
 followers serve reads from their own replica and must decrypt locally —
 **every manager needs the root key**, not just the leader.
 
 **Every consumer of plaintext goes through `Store::get_kv`/`list_kv`:**
-jobspec `$` references (`src/manager/server.rs:670-705`), re-materialization
+jobspec `$` references (`crates/manager/src/manager/server.rs:670-705`), re-materialization
 on KV change (`746-785`), template rendering (`812-844`) and dependency
 extraction (`851-867`), the KV RPCs (`6276`, `6286`), artifact credentials
 (`GetArtifactCredential`, `6313`), the CLI (`src/cmd/kv.rs`), the UI
@@ -439,7 +439,7 @@ Decrypting in the row mapper makes all of them correct at once.
 
 **KV reconciliation is triggered by the RPC handlers, not by row changes.**
 `reconcile_kv_changes` is called from the put/delete/patch handlers
-(`src/manager/server.rs:6269, 6376, 6407`), so a store-level rewrite of a
+(`crates/manager/src/manager/server.rs:6269, 6376, 6407`), so a store-level rewrite of a
 row (a rewrap) does not fire the reactive machinery — which is exactly what a
 rewrap needs.
 
@@ -447,13 +447,13 @@ rewrap needs.
 - A bootstrap-minted secret persisted next to the data: the raft cluster
   secret is minted at bootstrap and written to `<dataDir>/cluster_secret`, or
   taken from config, or delivered by the join token
-  (`src/storage/raft/driver.rs:795-831`, `JoinTokenPayload` at `556-564`).
+  (`crates/manager/src/storage/raft/driver.rs:795-831`, `JoinTokenPayload` at `556-564`).
 - A replicated key table with a rotation loop: `signing_key` stores the
   workload-identity keypair *including the private PEM* in the store
-  (`src/storage/migrations.rs:422-442` — "the same trust domain as the CA
+  (`crates/manager/src/storage/migrations.rs:422-442` — "the same trust domain as the CA
   material; whoever can read the store can mint identities"), and
   `start_workload_identity_rotation` ticks on the primary and reloads on
-  standbys (`src/manager/daemon.rs:492-522`), driven by
+  standbys (`crates/manager/src/manager/daemon.rs:492-522`), driven by
   `workloadIdentity.rotationAge`.
 - Secrets hashed, never stored: ACL and join tokens (`docs/auth-and-acls.md`).
 - A version-gated feature: edge boot fences pre-commit dispatch on the
@@ -478,7 +478,7 @@ restore path (`--restore-from`) copies the DB in before the store starts
 (`docs/upgrades.md:233-245`).
 
 **Manager config.** Top-level blocks on `ManagerConfigFull`
-(`src/structs/config.rs:1373-1407`): `workloadIdentity`, `acl`, `edgeBoot`,
+(`crates/common/src/structs/config.rs:1373-1407`): `workloadIdentity`, `acl`, `edgeBoot`,
 `heartbeat`, `liveness`, … — the new `encryption` block sits beside them.
 
 ---
@@ -865,7 +865,7 @@ CREATE TABLE keyring_key (
 ```
 
 `keyring_key` is classified `Owner::Lane(Lane::Control)` in
-`src/storage/raft/ownership.rs` — the lane that owns `kv_entry`, so a rewrap
+`crates/manager/src/storage/raft/ownership.rs` — the lane that owns `kv_entry`, so a rewrap
 batch and a key-state flip are one changeset. Adding a table to a lane is a
 rolling-safe change (`docs/multi-raft.md`, "Table ownership is a cluster-wide
 agreement"); the column addition is covered by §10.
@@ -900,7 +900,7 @@ a changeset touches `keyring_key`).
 `keyring.status` (read-only) and `keyring.rotate|rewrap|root_key_rewrap|reset`
 (`mutates: true`, `read_only_safe: false`); MCP tool
 `legion_keyring_status` (read-only) and `legion_keyring_rotate`
-(`mutates: true`, behind `--allow-write`). `tests/acl_endpoints.rs` gains the
+(`mutates: true`, behind `--allow-write`). `tests/integration/acl_endpoints.rs` gains the
 four RPCs — `every_manager_rpc_is_classified` fails the build otherwise.
 
 **Docs**: new `docs/kv-encryption.md`; cross-links from `docs/kv-store.md`,
@@ -987,7 +987,7 @@ outage during a rotation tick is retried and never touches KV traffic.
 **Join (Phase 4).** A joiner with only a join token ends up unlocked; the
 join token's secret alone does not decrypt anything in the store.
 
-**ACL.** `tests/acl_endpoints.rs` entries for the four RPCs; `status` denied
+**ACL.** `tests/integration/acl_endpoints.rs` entries for the four RPCs; `status` denied
 without `operator:read`.
 
 **Backup/restore.** The reply carries `encryption`; `--restore-from` with the
@@ -1218,7 +1218,7 @@ with a threshold of shares (or one passphrase — Docker autolock).
 - `legion state backup -j` carries `encryption.root_key_ids`; the human
   output prints the "NOT included" reminder.
 - `docs/kv-encryption.md` exists, `cargo test --all --locked` and
-  `cargo test --test acl_endpoints` pass, and the calls doc has its
+  `cargo test --test integration acl_endpoints::` pass, and the calls doc has its
   implementation-time entries.
 
 **Phase 2**

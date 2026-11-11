@@ -17,6 +17,15 @@ At manager startup:
 - Any worker that exits is immediately restarted.
 - Startup recovery calls `requeue_in_flight_evals()`, which forgets every
   claim this manager held and arms the blocked-eval wake replay (below).
+- A manager that starts as the scheduler's writer (always in `local_disk`
+  and `streaming` mode; the scheduler-lane leader in raft mode) then runs
+  the same reconciliation a raft manager runs when it gains leadership:
+  missing rollouts are created, and an eval is queued for every job, stop,
+  drain, and lost node whose stored state still needs work and has none
+  queued. That is what heals a crash between two writes of one operation,
+  such as a lost-node reschedule that removed allocations and died before
+  it re-placed them. Each regenerated eval is an idempotent pass, so the
+  cost is one re-plan per active job at startup.
 
 Each worker loop:
 
@@ -39,14 +48,46 @@ Each worker loop:
    rejection returns the row to `pending` after a delay. The permit is
    released, and asked for again at the next batch.
 
-**An eval can settle with its own plan.** A `job_reschedule` whose plan is
-its last write (no scheduled batch task needs a follow-up) carries its
-settle into that plan's apply: the applied plan deletes the eval row,
-deletes the duplicates its claim subsumed, and records `eval.completed` in
-the same entry. The worker then has nothing to write for it. On an idle
-cluster this makes a placement one scheduler-lane entry (the plan) instead
-of three (claim, plan, settle). A plan that is rejected or places nothing
-leaves the eval to the ordinary settle.
+**A settle only writes over its own claim.** Claims live in the leader's
+memory and are forgotten whenever the manager loses or gains scheduler-lane
+leadership, but a handler that was already running finishes anyway. If
+leadership left and came back while it ran, another worker may have claimed
+the same eval again. Every forget therefore starts a new claim epoch, a
+batch is settled against the epoch it was claimed in, and an outcome whose
+eval is no longer claimed in that epoch is dropped with a warning (`Dropping
+eval outcomes whose claims were cleared while their handlers ran`). The row
+is still `pending`, so whoever holds it now, or the next claim, settles it.
+The handler's own writes are not undone, which is safe because handlers are
+idempotent reconciles; a handler whose plan settled its eval in the plan's
+own entry (below) is not fenced this way.
+
+**A no-op rollout tick requeues itself quietly.** A `rollout_tick` that only
+waited and changed nothing asks the worker to put its eval back to `pending`
+for the wait instead of completing it and enqueueing a successor, so it
+writes no `eval.completed` and no `eval.enqueued` event
+([rollouts.md](rollouts.md)).
+
+**An eval can settle with its own plan.** An eval whose plan is its last
+write carries its settle into that plan's apply: the applied plan deletes
+the eval row, deletes the duplicates its claim subsumed, and records
+`eval.completed` in the same entry. The worker then has nothing to write for
+it. On an idle cluster this makes a placement one scheduler-lane entry (the
+plan) instead of three (claim, plan, settle). These handlers settle with
+their plan:
+
+- `job_reschedule`, the placement path of every keyed create and resume.
+- `job_submit` for a job's first config. A resubmit removes the previous
+  config's allocations after its plan, so it settles on its own.
+- `job_update`, whose removals and resets all happen before its plan.
+- `job_scale` when it scales out. A scale-in queues a capacity pass after
+  its plan.
+
+None of them settles with its plan when a scheduled batch task needs a
+follow-up queued after it. A plan that is rejected, places nothing, or
+leaves replicas unplaced also leaves the eval to the ordinary settle: after
+a partial plan the handler may still plan the rest with an avoided node
+allowed, or queue a retry for preemption victims that are too young, and
+the eval must stay queued until those writes land.
 
 **Why claims are memory.** A claim used to be a replicated write
 (`pending → in_flight`). The only thing it bought was recovery: a new
@@ -157,6 +198,19 @@ settle, in the same write:
   field only matches another empty field),
 - already claimable (`ready_at <= now`).
 
+A claim costs the same whatever the queue holds. The duplicate lookup is an
+equality seek on a partial index over pending rows (an absent scope is stored
+as NULL and matched with `IS`), the head of the queue is read in index order
+and stops after the batch, and the pending count that sizes the batch stops
+counting at the point where a deeper queue would not change the batch
+(`evalThreads × 16`). Measured on one store at 50,000 pending evals, a batch of
+16 went from 116 ms to under a millisecond.
+
+`legion_eval_queue_depth` is exact while the queue is shallower than that
+point. Deeper, it is refreshed from a full count at most once a second, and
+each enqueue adds one in between, so on a deep queue it can lag by about a
+second.
+
 This keeps the queue from filling with redundant work for the same entity.
 It only discards work the claimed eval covers. Node-scoped kinds
 (`node_drain`, `node_lost_reschedule`) carry no job, so they collapse per
@@ -228,7 +282,7 @@ Placement apply uses optimistic concurrency with partitioned epochs.
 Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 
 1. Scheduler reads the current epoch for the target job config.
-2. Scheduler writes `plan_submission.expected_epoch` with that value.
+2. Scheduler carries that value in the plan's expected version vector.
 3. Apply path re-reads the current epoch for that same job config in-transaction.
 4. Apply proceeds only when epochs still match.
 5. On successful allocation changes, only that job config epoch is bumped.
@@ -260,7 +314,30 @@ the v2 rollout finished, is a no-op instead of placing the full count.
 The plan submission and its apply run as **one replicated store op**
 (`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`).
 That means one write-transaction boundary, and on raft one
-propose→quorum-commit→apply instead of two.
+propose→quorum-commit→apply instead of two. The apply walks the plan's
+placements as the planner handed them over; the plan is not written to the
+store and read back first.
+
+### Plan records
+
+`plan_submission` is a short record of plans a person might want to look at,
+not a log of every plan:
+
+| Plan | Row in `plan_submission` |
+| --- | --- |
+| Applied (every scheduler plan and edge-boot ratification) | none |
+| Rejected at apply | one row, `status = 'rejected'`, with `rejection_reason`, the placements, and the evictions |
+| Staged through the two-step `insert_plan_submission` / `apply_plan_submission` API (tests and benchmarks) | a `queued` row until its apply deletes it, or marks it rejected |
+
+The table keeps about the last 1,000 rows: each new row deletes the ones more
+than 1,000 ids older, in the same write. The scheduler-lane leader also sweeps
+it on startup and whenever it gains leadership, which removes rows outside
+that window and staged rows that were never applied within ten minutes. A
+staged plan that falls out of the window before it is applied cannot be
+applied; its apply fails with `plan submission N no longer exists`.
+
+Before this, every plan left a row carrying all of its candidate lists, in the
+raft log and in every snapshot, and nothing deleted them.
 
 ### Candidate lists (late-binding apply)
 
@@ -294,14 +371,6 @@ from that captured copy. Anything that commits after the snapshot is
 invisible to it, so the plan-apply compare-and-set rejects only the plans
 whose scopes moved. A plan never re-runs because something unrelated
 committed.
-
-`schedulerSettings.lazy_version_sample` is **retired**. It still parses,
-so existing configs keep loading, but it has no effect, and the manager
-logs one warning when it is set:
-
-```text
-WARN schedulerSettings.lazy_version_sample is retired and has no effect: plans now sample the fence epochs from their own snapshot
-```
 
 ### Group commit
 
@@ -435,7 +504,7 @@ inserting it:
 
 - **Availability**: the node must still be `available`.
 - **Constraints and permits**: the task's constraint and permit sets must
-  still be satisfied.
+  still be satisfied, and the node must still accept the job's namespace.
 - **Resource totals**: the node's free pool is rebuilt inside the
   transaction, and every placement must still fit, with earlier placements
   in the same plan debited. The free pool is current capacity minus the
@@ -471,7 +540,8 @@ What this means in practice:
   allocation (a placement, a stop, a preemption, a node removal, a job
   destroy) moves the fingerprint, which invalidates the affected rows. A
   stale, wrong, or missing row costs one rebuild. It can never inflate a
-  node's free capacity.
+  node's free capacity. The row of a removed node is deleted by a periodic
+  scheduler-lane sweep.
 - **Version skew is safe in both directions.** A manager binary without
   this feature neither reads nor writes the table, so a leader on either
   side of an upgrade finds the fingerprints stale and rebuilds. The table
@@ -544,10 +614,17 @@ member that cannot fit fails the plan. `legion job plan` also keeps
 all-or-nothing, so a dry run reports the first replica that would not fit as
 its error.
 
+A task that sets [`gang`](gang-scheduling.md) opts out of partial placement:
+when one of its replicas does not fit and fewer than its quorum (`gang.min`,
+else the whole count) would run, the plan places nothing at all, for any task
+of the job, and blocks. Above the quorum the rest of the gang is ordinary
+unplaced work. A dry run reports a gang that would wait in
+`PlanJobReply.gang_reports` rather than as an error.
+
 ### Static ports
 
 A task that declares a static port (`network.ports[].static`, or an upstream
-`localPort`) can run once per node. The planner reads the host ports each
+`port`) can run once per node. The planner reads the host ports each
 node's allocations already hold, plus the ports this plan has claimed so
 far, and a node where one of the task's static ports is taken is not a
 candidate for it. The apply transaction makes the same check, so the planner
@@ -663,7 +740,12 @@ changeset.
 Per task, the candidate set is then built one of two ways:
 
 - **Scan** (the baseline): every available node is tested against the
-  task's constraints, permit, and volume-driver requirements.
+  task's constraints, permit, and volume-driver requirements, and against
+  the node's own `namespaces` restriction: a node whose worker type lists
+  namespaces is ineligible for a job outside them, whatever the permit says
+  ([namespaces.md](namespaces.md#nodes-that-accept-only-some-namespaces)).
+  The check is one attribute lookup per node, and it rides inside the permit
+  check, so the scan, the index walk, and the apply recheck all make it.
 - **Scheduling index** ([scheduling-indexes.md](scheduling-indexes.md)):
   when the fleet is at or above `schedulerSettings.index_min_nodes` and a
   declared index binds the task's equality constraints, candidates come
@@ -699,6 +781,80 @@ Selection policy:
 - optional score jitter on reschedule mode for less deterministic stickiness
 
 Resource fit is checked before a node can be selected.
+
+### Scoring
+
+`bin_pack` and `spread` score a node by how full it would be **after** the
+placement, measured in the resources the task asks for against what the node
+has:
+
+```text
+util_d   = (in use_d + request_d) / capacity_d    for each resource d the task requests
+                                                   whose capacity is finite:
+                                                   memory, cpu, cores, allocation slots
+dominant = the largest util_d                      (0 if no resource qualifies)
+balance  = 1 - (largest util_d - smallest util_d)
+
+bin_pack term = dominant       + 0.05 × balance    fullest node first
+spread term   = (1 - dominant) + 0.05 × balance    emptiest node first
+```
+
+Capacity is the node's schedulable capacity: its fingerprint, capped by
+`capacity`, less `reservedResources`, times any oversubscription ratio. A node
+that does not report a resource (no `maxAllocations`, say) has unlimited
+capacity of it, and that resource does not count.
+
+The score is the policy's term times its weight, plus the other terms:
+
+```text
+score = affinities × weights.affinities
+      + bin_pack term × weights.bin_pack            (1 under bin_pack, else 0)
+      + spread term × weights.spread                (1 under spread, else 0)
+      - anti-affinity × weights.automatic_anti_affinity (0.2)
+      + content locality × weights.locality
+```
+
+Two properties follow:
+
+- **A large allocation weighs what it uses.** A node holding one 12 GiB
+  allocation is fuller than one holding three of 256 MiB. `bin_pack` tops off
+  the first and keeps the second whole for a large task; `spread` sends new
+  work to the second.
+- **A node's score does not depend on the other candidates.** Utilization is
+  absolute, so truncating the candidate list (scheduling indexes,
+  `nodes_considered`, `score_sample`) changes which nodes are scored, never
+  how any one of them scores.
+
+The balance term breaks near-ties toward the node whose resources fill
+evenly, so a node is less likely to be left with memory and no CPU, or the
+reverse.
+
+The **anti-affinity** term is scaled by the task's replica count, the shape
+of Nomad's job anti-affinity:
+
+```text
+collisions    = allocations of this task (or its group) already on the node,
+                counting the ones this plan placed
+anti-affinity = 0                                  when collisions = 0
+              = (collisions + 1) / desired count   otherwise
+```
+
+A replica of a small service moves a node's utilization by a few hundredths,
+so how the two terms trade off depends on the count:
+
+- **A few replicas spread.** For three replicas a first collision costs
+  0.2 × 2/3 ≈ 0.13, more than the packing gain of one more small replica, so
+  under `bin_pack` too they land on different nodes.
+- **Many replicas pack.** For twenty, a first collision costs 0.2 × 2/20 =
+  0.02, less than one replica's share of a typical node, so `bin_pack` fills
+  a node with them before starting the next, and `spread` still spreads them
+  (its term already prefers the emptier node).
+
+Set `schedulerSettings.weights.automatic_anti_affinity = 0` to stack replicas
+whatever their count, or raise it to spread larger tasks.
+
+Scheduling plugins are not affected: their context still carries allocation
+counts and no capacity ([plugin system](plugin-system.md)).
 
 Constraints, permit, and volume-driver support are applied once, when the
 task's candidate list is built. The per-placement passes (eligibility, load
@@ -808,7 +964,26 @@ for a task:
   memory;
 - the node holding an instance's node-local storage, or a resume's
   checkpoint, is unavailable;
-- the cluster has no schedulable node at all.
+- the cluster has no schedulable node at all;
+- the task's runtime is [disabled](runtime-disable.md) for the job's
+  namespace. The job's other tasks still place; the eval blocks under
+  `runtime_disabled:<runtime>` only when nothing of the plan could place;
+- a [gang](gang-scheduling.md) task cannot reach its quorum. The plan then
+  places nothing, and the eval blocks under the key of the gang's first
+  missing replica, with the gang's report in its detail. A gang that sets
+  `placementTimeout` is also woken by the clock: the scheduler-lane leader
+  wakes its blocked eval (cause `timeout`) once the deadline passes, and if
+  the quorum still does not fit, the eval fails the job instead of blocking
+  again ([Placement timeout](gang-scheduling.md#placement-timeout)).
+
+One placement waits on the clock instead of blocking: preemption that could
+make room, but only once its victims age past `preemption.victimExemptAge`.
+No capacity event marks a victim getting older, so a blocked eval would wait
+for an unrelated one. The eval goes back to `pending` with a delay that ends
+when the youngest victim it needs is old enough, and records `eval.blocked`
+with a message that names the wait. A plan that placed part of the job and
+left a replica waiting this way queues a delayed `job_reschedule` instead
+([Preemption and eviction](preemption-and-eviction.md#which-of-them-are-taken)).
 
 Node-scoped passes (`node_lost_reschedule`, `node_drain`, the capacity pass)
 already queue a per-job `job_reschedule` for each job they could not place,
@@ -830,11 +1005,17 @@ The key says what the eval waits for:
 | `class:pool=<pool>[,<attr>=<value>...]` | The task's pool and the attributes its constraints pin with `=`. `pool=*` when the permit's pool rule is not a plain `=` | Capacity on a node the task's permit and constraints accept |
 | `node:<id>` | A resume or restore pinned to the node holding its checkpoint or node-local storage | Capacity on that node only |
 | `escaped` | No schedulable node at all, so no class to wait on | Any capacity anywhere |
+| `runtime_disabled:<runtime>` | The task's runtime is [disabled](runtime-disable.md) for the job's namespace | `legion operator runtime enable`, never capacity |
 
 The match is exact rather than by key string: the wake pass re-runs the
-blocked task's own permit and constraint checks against the node whose
-capacity changed, so operators the key cannot spell (`>`, `matches`,
-`version_matches`, `contains`) still wake only on nodes that satisfy them.
+blocked task's own permit and constraint checks, and the node's namespace
+restriction against the task's job, on the node whose capacity changed, so
+operators the key cannot spell (`>`, `matches`, `version_matches`,
+`contains`) still wake only on nodes that satisfy them, and a node that
+accepts only other namespaces (a manager's system worker, say) wakes
+nothing in the job's pool. When the restriction is why a task cannot place,
+the blocked reason says so (`3 nodes accept only namespaces
+[legion-system]`).
 Whether the room is *enough* is not checked: the plan that runs next
 decides that, and blocks again if not.
 
@@ -848,7 +1029,10 @@ A capacity event is any committed change that may have made room:
 - a node's liveness status changing, as when it returns to `ready`
   (`ready`);
 - allocations leaving a node: a stop, a destroy, a suspend, a preemption
-  (`freed`).
+  (`freed`);
+- a changeset whose projection failed (`recovered`): its own events are
+  lost with the projection, so the manager records one for every available
+  node instead ([state-store.md](state-store.md#read-model-coherence)).
 
 The changeset projection records these on every manager. The scheduler-lane
 leader's wake pass runs within 50 ms of an event (a burst costs one pass),

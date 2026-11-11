@@ -2,7 +2,7 @@
 //
 // The bridge speaks the same protobuf frames as the native gRPC path, one
 // protobuf message per binary WebSocket frame. It listens on the manager
-// port + 1 (see `src/manager/exec_ws.rs`).
+// port + 1 (see `crates/manager/src/manager/exec_ws.rs`).
 
 import {
   ExecClientFrame,

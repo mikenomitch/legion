@@ -84,9 +84,9 @@ them:
 
 1. **A raft group without its own state file is not a shard.** The pipeline
    is strictly serial per group — capture, then `block_on(client_write)`,
-   then reply (`src/storage/raft/driver.rs:1965`, `:2064`) — and both the
+   then reply (`crates/manager/src/storage/raft/driver.rs:1965`, `:2064`) — and both the
    capture and the apply hold the process-global `CAPTURE_MUTEX`
-   (`src/storage/raft/capture.rs:230`, `:760`). Extra groups over one file
+   (`crates/manager/src/storage/raft/capture.rs:230`, `:760`). Extra groups over one file
    therefore overlap only the quorum round-trip. Since the batching work
    landed, the local write work per batch (tens of ms at depth) dwarfs the
    round-trip (1–3 ms on a LAN), so the arithmetic in §1.2 says shared-file
@@ -132,11 +132,11 @@ spreading planning across managers (M3), with or without shards.
    ([`../aws-phase3-findings.md`](../aws-phase3-findings.md)); phase 3 put
    `apply` at 67% of plan time and throughput ~7× below planner capacity.
 2. **One active planner.** Eval workers idle on every manager that does not
-   lead the scheduler lane (`src/manager/daemon.rs:2765`).
+   lead the scheduler lane (`crates/manager/src/manager/daemon.rs:2765`).
 3. **One SQLite writer for every group.** `CAPTURE_MUTEX` is a
    process-global static (`capture.rs:163`) held for the whole of every
    capture (`:230`) and every apply (`:760`), across all lanes, because all
-   lanes write one `store.sqlite` (`src/storage/raft/state_machine.rs:44`;
+   lanes write one `store.sqlite` (`crates/manager/src/storage/raft/state_machine.rs:44`;
    acknowledged at `driver.rs:3533`). Lanes isolate raft logs, replication
    pipelines, and elections — not SQLite write work.
 
@@ -146,7 +146,7 @@ Per group, one replicated op costs `T = W_c + R + W_a`: local capture work
 (`W_c`, under the mutex), the propose → quorum round-trip (`R`, mutex
 free), and the local apply (`W_a`, under the mutex). The two phases are
 already metered separately — `legion_raft_capture_seconds` versus
-`legion_raft_propose_apply_seconds` (`src/manager/telemetry.rs:872`) — so
+`legion_raft_propose_apply_seconds` (`crates/manager/src/manager/telemetry.rs:872`) — so
 the ratio is readable from any archived campaign.
 
 - A single pipeline delivers at most `B / T` batches-worth of work per
@@ -211,7 +211,7 @@ cadence and per-type lost windows size the RPC load; digests decouple
 manager count from fleet size. What still grows with fleet size:
 
 - **The read model, on every manager.** `SchedulingReadModel` is an
-  unconditional full mirror (`src/storage/store.rs:403`, built by
+  unconditional full mirror (`crates/manager/src/storage/store.rs:403`, built by
   unfiltered table scans at `store.rs:3203`, kept current on every replica
   by projecting each applied changeset, `store.rs:11067`, and rebuilt
   after a snapshot install, `state_machine.rs:650`). No in-cluster sharding shrinks
@@ -324,13 +324,13 @@ clusters, not more groups.
 ### 5.1 The lane engine is multi-group; the lane set and layout are frozen
 
 - `Lane { Control, Scheduler, Status }` is a hard-coded enum
-  (`src/storage/raft/mod.rs:43`); `Lane::ALL` drives bring-up and the
+  (`crates/manager/src/storage/raft/mod.rs:43`); `Lane::ALL` drives bring-up and the
   exhaustiveness tests (`mod.rs:54`).
 - `wire_name()` strings double as gRPC `group_id`, per-lane data-dir name,
   and `raft_applied` key — documented frozen (`mod.rs:100`). One channel pool
-  carries every group (`src/storage/raft/network.rs:304`, `driver.rs:3612`);
+  carries every group (`crates/manager/src/storage/raft/network.rs:304`, `driver.rs:3612`);
   one openraft core per lane (`driver.rs:3629`); one log DB per lane
-  (`src/storage/raft/log_store.rs:86`); per-lane snapshot dirs
+  (`crates/manager/src/storage/raft/log_store.rs:86`); per-lane snapshot dirs
   (`driver.rs:3644`). **Adding groups is mechanical at this layer.**
 - Snapshot scope is chosen by group count: `WholeDb` (`VACUUM INTO`) for
   one group, table-scoped `LaneTables` dumps otherwise (`driver.rs:3577`).
@@ -344,7 +344,7 @@ clusters, not more groups.
 ### 5.2 Single-writer ownership is the soundness foundation
 
 - `TABLE_OWNERS` maps every replicated table to one lane, `Commutative`, or
-  `LocalOnly` (`src/storage/raft/ownership.rs:139`), with the reason at
+  `LocalOnly` (`crates/manager/src/storage/raft/ownership.rs:139`), with the reason at
   `ownership.rs:5`: row-changeset replication from two logs into one table
   applies in different orders on different replicas.
 - `verify_changeset_ownership` rejects a cross-lane changeset before
@@ -357,7 +357,7 @@ clusters, not more groups.
 - Cross-lane **foreign keys exist**: `allocation`, `eval`, `rollout`,
   `rollout_event`, `instance`, and friends carry `REFERENCES job /
   job_config / task_config / node … ON DELETE CASCADE` into control-lane
-  tables (`src/storage/migrations.rs:224`, `:243`, `:371`, `:411`), and
+  tables (`crates/manager/src/storage/migrations.rs:224`, `:243`, `:371`, `:411`), and
   one runs the other way: status-lane `allocation_health` references
   scheduler-lane `allocation` (`migrations.rs:392`). Under lanes a
   cascade would be a cross-lane write inside a control changeset and the
@@ -411,7 +411,7 @@ clusters, not more groups.
    mark-lost (`store.rs:9819`, `:9317`, `:8047`, `:7693`, and
    `mark_node_lost` at `:7420`) —
    each half its own entry, completed under divergence by forwarding
-   (`ForwardableLaneWrite`, `src/storage/raft/forward.rs:53`, including
+   (`ForwardableLaneWrite`, `crates/manager/src/storage/raft/forward.rs:53`, including
    `enqueue_eval`) and the lane reconcilers (`daemon.rs:1680`–`1811`).
 3. **Co-location is deliberate.** `ANCHOR_LANE = Lane::Control` and the
    convergence loop gather all leadership on one manager
@@ -426,12 +426,12 @@ clusters, not more groups.
   `"job_config"` (`migrations.rs:324`): the row-scope
   vocabulary (node-scoped vs job-scoped state) that ownership by shard
   needs, even though today it partitions conflicts, not data.
-- **`node.pool`** (`src/structs/node.rs:16`) — the only real,
+- **`node.pool`** (`crates/common/src/structs/node.rs:16`) — the only real,
   user-visible, index-backed partition key: an implicit permit pins
-  pool-less tasks to `default` (`src/constraints.rs:117`), `pool_binding()`
+  pool-less tasks to `default` (`crates/common/src/constraints.rs:117`), `pool_binding()`
   resolves a task's pool (`constraints.rs:181`), the scheduling index
-  partitions by pool (`src/scheduling_index.rs:156`), preemption and ACLs
-  are pool-scoped (`scheduler.rs:4222`, `src/structs/acl.rs:135`).
+  partitions by pool (`crates/common/src/scheduling_index.rs:156`), preemption and ACLs
+  are pool-scoped (`scheduler.rs:4222`, `crates/common/src/structs/acl.rs:135`).
 - **Namespaces do not exist yet.** The ACL vocabulary has a `namespaces`
   selector hardcoded to `DEFAULT_NAMESPACE` (`acl.rs:236`), and
   [`namespaces-plan.md`](namespaces-plan.md) (PLANNED) turns it into a
@@ -819,7 +819,7 @@ wall per regime, and the plan-path plan needs the same read.
   cross-lane `ON DELETE CASCADE`, run with foreign keys disabled.
 - **Snapshots:** whole-file round-trip per shard; install refusal on a
   shard-map mismatch; `move-pool` round-trip (rung C).
-- **Isolation/scaling A/B** (`tests/raft_perf_smoke.rs` precedent):
+- **Isolation/scaling A/B** (`tests/integration/raft_perf_smoke.rs` precedent):
   alloc/s vs shard count on one box; one-pool storm isolation.
 - **Failure:** kill the leader → every shard fails over together (rung A)
   and independently (rung B); queue recovery on acquisition per shard.

@@ -1,6 +1,7 @@
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
+use crate::structs::ForgetNodeRequest;
 use crate::structs::{
     GetHeartbeatCadenceRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeRequest,
     GetNodeUsageReply, GetNodeUsageRequest, GetNodesRequest, ListNodeUsageReply,
@@ -158,6 +159,37 @@ pub fn config() -> Command {
         .arg(idempotency_arg())
         .arg(json_flag());
 
+    let forget_node_cmd = Command::new("forget")
+        .about("Remove a dead node's record and revoke its node token")
+        .long_about(
+            "\
+        Remove a node's record and revoke its node token, in one write.\n\
+        \n\
+        For a machine that is gone and will not come back. A running worker\n\
+        on a forgotten node can no longer heartbeat or re-register under its\n\
+        old identity. Refused, unless --force, while the node still has\n\
+        allocations, is live and not cordoned, or holds node-local volumes.\n\
+        See docs/architecture-managers-workers.md, \"Forgetting a node\".\
+        ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to forget")
+                .required(true),
+        )
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "The machine is gone for good: forget it whatever its state, releasing its \
+                     allocations for replacement at once",
+                ),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
     let cadence_cmd = Command::new("cadence")
         .about("Report whether this fleet is sustaining its heartbeat cadence")
         .long_about(
@@ -187,9 +219,10 @@ pub fn config() -> Command {
         .subcommand(cordon_node_cmd)
         .subcommand(drain_node_cmd)
         .subcommand(uncordon_node_cmd)
+        .subcommand(forget_node_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("list", arg_matches)) => {
@@ -292,11 +325,24 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             set_node_availability(id.to_string(), availability, evict, idempotency_key, format)
                 .await
         }
+        Some(("forget", arg_matches)) => {
+            let id = arg_matches
+                .get_one::<String>("id")
+                .context("Must provide id")?;
+            let format = OutputFormat::from_matches(arg_matches);
+            forget_node(
+                id.to_string(),
+                arg_matches.get_flag("force"),
+                arg_matches.get_one::<String>("idempotency-key").cloned(),
+                format,
+            )
+            .await
+        }
         _ => unreachable!(),
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_nodes(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodesRequest {
@@ -325,7 +371,7 @@ async fn get_nodes(format: OutputFormat) -> R<()> {
 /// Deliberately a command rather than only a metric: an operator debugging
 /// "why did detection take 90s" needs the answer without a Prometheus scrape,
 /// and cadence changes make cluster behavior time-varying.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -417,7 +463,7 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
 
 /// `legion node usage <NODE>` — what the node has, what is reserved on it,
 /// and what its allocations actually use.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_usage(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -442,7 +488,7 @@ async fn get_node_usage(node_id: String, format: OutputFormat) -> R<()> {
 
 /// `legion node usage` with no node — one summary line per node, from
 /// ListNodeUsage.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_node_usage(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -553,7 +599,7 @@ fn cpu_capacity_label(cpu: &crate::structs::NodeResourceUsage) -> String {
 
 /// `legion node content <NODE>` — the node's advertised content and the
 /// snapshots it holds.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_content(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -625,6 +671,55 @@ fn render_node_content(reply: &GetNodeContentReply) -> String {
         out.push('\n');
         out.push_str(&Table::new(rows).with(Style::blank()).to_string());
         out.push('\n');
+    }
+
+    // Derived content: what Legion built on the node and can build again.
+    #[derive(Tabled)]
+    struct DerivedRow {
+        #[tabled(rename = "KIND")]
+        kind: String,
+        #[tabled(rename = "KEY")]
+        key: String,
+        #[tabled(rename = "MiB")]
+        mib: String,
+        #[tabled(rename = "BUILDER")]
+        builder: String,
+        #[tabled(rename = "PINNED")]
+        pinned: &'static str,
+    }
+    if let Some(derived) = reply.derived.as_ref() {
+        out.push('\n');
+        if derived.budget_bytes == 0 {
+            out.push_str("Derived content: off on this node (content.budgets.derived = \"0\")\n");
+        } else {
+            out.push_str(&format!(
+                "Derived content: {} entries, {} of {} MiB\n",
+                derived.entry_count,
+                usage_display::mib(derived.used_bytes),
+                usage_display::mib(derived.budget_bytes),
+            ));
+        }
+        if !derived.entries.is_empty() {
+            let rows: Vec<DerivedRow> = derived
+                .entries
+                .iter()
+                .map(|entry| DerivedRow {
+                    kind: entry.kind.clone(),
+                    key: entry.key.chars().take(12).collect(),
+                    mib: usage_display::mib(entry.bytes),
+                    builder: entry.builder_version.clone(),
+                    pinned: if entry.pinned { "yes" } else { "no" },
+                })
+                .collect();
+            out.push_str(&Table::new(rows).with(Style::blank()).to_string());
+            out.push('\n');
+        }
+        if derived.entry_count > derived.entries.len() as u64 {
+            out.push_str(&format!(
+                "({} more not listed)\n",
+                derived.entry_count - derived.entries.len() as u64
+            ));
+        }
     }
 
     #[derive(Tabled)]
@@ -984,7 +1079,7 @@ fn render_pressure_order(reply: &GetNodeUsageReply) -> String {
     out
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn update_node(
     node_id: String,
     dynamic_diff: Map<String, Value>,
@@ -1017,7 +1112,7 @@ async fn update_node(
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_info(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
@@ -1047,7 +1142,7 @@ async fn get_node_info(node_id: String, format: OutputFormat) -> R<()> {
 /// Deliberately a separate view from `node info`: unratified work is live,
 /// short-lived state reported on the last heartbeat, not part of the node
 /// record, and mixing the two would suggest a durability it does not have.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_claims(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
@@ -1095,7 +1190,7 @@ async fn get_node_claims(node_id: String, format: OutputFormat) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn restart_node(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(RestartWorkerRequest { node_id });
@@ -1115,7 +1210,7 @@ async fn restart_node(node_id: String, format: OutputFormat) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn set_node_availability(
     node_id: String,
     availability: &str,
@@ -1151,9 +1246,90 @@ async fn set_node_availability(
     Ok(())
 }
 
+#[instrument(skip_all)]
+async fn forget_node(
+    node_id: String,
+    force: bool,
+    idempotency_key: Option<String>,
+    format: OutputFormat,
+) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to forget node",
+        client
+            .forget_node(tonic::Request::new(ForgetNodeRequest {
+                node_id,
+                force,
+                idempotency_key,
+            }))
+            .await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+            "allocationsRemoved": reply.allocations_removed,
+            "tokensRevoked": reply.tokens_revoked,
+            "volumesOrphaned": reply.volumes_orphaned,
+            "snapshotsLost": reply.snapshots_lost,
+        }));
+        return Ok(());
+    }
+    println!("{}", reply.message);
+    if reply.allocations_removed > 0 {
+        println!(
+            "  {} allocation(s) removed; the scheduler places them elsewhere",
+            reply.allocations_removed
+        );
+    }
+    if reply.snapshots_lost > 0 {
+        println!(
+            "  {} snapshot(s) stored on it are now lost",
+            reply.snapshots_lost
+        );
+    }
+    if reply.volumes_orphaned > 0 {
+        println!(
+            "  {} node-local volume(s) stay pinned to it; replace their instances \
+             (`legion instance replace`)",
+            reply.volumes_orphaned
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_forget_command_parses() -> R<()> {
+        let matches = config().try_get_matches_from([
+            "node",
+            "forget",
+            "node-1",
+            "--force",
+            "--idempotency-key",
+            "k1",
+            "-j",
+        ])?;
+        let (name, forget) = matches.subcommand().context("subcommand")?;
+        assert_eq!(name, "forget");
+        assert_eq!(
+            forget.get_one::<String>("id").map(String::as_str),
+            Some("node-1")
+        );
+        assert!(forget.get_flag("force"));
+        assert_eq!(
+            forget
+                .get_one::<String>("idempotency-key")
+                .map(String::as_str),
+            Some("k1")
+        );
+        Ok(())
+    }
 
     #[test]
     fn node_restart_command_parses() -> R<()> {
@@ -1281,8 +1457,30 @@ mod tests {
                 parts_total: 2,
                 bytes_here: 512 * 1024 * 1024,
             }],
+            derived: Some(crate::structs::DerivedContentReport {
+                budget_bytes: 20 * 1024 * 1024 * 1024,
+                used_bytes: 900 * 1024 * 1024,
+                pinned_bytes: 0,
+                entry_count: 3,
+                entries: vec![crate::structs::DerivedContentEntry {
+                    kind: "rootfs".into(),
+                    key: "0123456789abcdef".repeat(4),
+                    bytes: 900 * 1024 * 1024,
+                    builder_version: "legion-0.1.0+rootfs.1".into(),
+                    ..Default::default()
+                }],
+            }),
         };
         let out = render_node_content(&reply);
+        assert!(
+            out.contains("Derived content: 3 entries, 900 of 20480 MiB"),
+            "{out}"
+        );
+        assert!(
+            out.contains("rootfs") && out.contains("0123456789ab "),
+            "{out}"
+        );
+        assert!(out.contains("(2 more not listed)"), "{out}");
         assert!(
             out.contains("Advertises 1 entries, 512 MiB (epoch 3)"),
             "{out}"
@@ -1295,6 +1493,13 @@ mod tests {
             ..Default::default()
         });
         assert!(empty.contains("No content report"), "{empty}");
+        assert!(!empty.contains("Derived content"), "{empty}");
+        let off = render_node_content(&GetNodeContentReply {
+            index_reported: true,
+            derived: Some(Default::default()),
+            ..Default::default()
+        });
+        assert!(off.contains("Derived content: off on this node"), "{off}");
         assert!(empty.contains("No snapshots on this node."), "{empty}");
     }
 

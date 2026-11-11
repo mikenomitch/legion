@@ -205,7 +205,7 @@ the change is wrong. Every failing test fell in the first bucket, and the
 three that define the second bucket —
 `concurrent_plans_cannot_oversubscribe_a_node`,
 `plan_walk_job_config_epoch_mismatch_rejects_despite_fresh_candidates`,
-and `tests/raft_apply_roundtrip.rs` — passed unmodified throughout. A
+and `tests/integration/raft_apply_roundtrip.rs` — passed unmodified throughout. A
 kill-switch setting was rejected because two live apply semantics in one
 binary is a raft determinism hazard for a change with no rollback need:
 the old behavior is strictly a subset of the new one.

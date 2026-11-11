@@ -21,7 +21,7 @@ user-facing semantics):
   noop: neither) enforced at submit.
 - Integration tests across the delete matrix, watch=false, policy
   precedence, template_kv transitivity, debounce coalescing, fail/recovery,
-  multi-task isolation, and capability rejection (`src/manager/server.rs`).
+  multi-task isolation, and capability rejection (`crates/manager/src/manager/server.rs`).
 
 Deliberate deviations from this plan:
 

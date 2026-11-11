@@ -108,9 +108,13 @@ scripts/bootstrap-operator-box.sh start
 Two teardowns, in this order:
 
 ```bash
-scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh'
+scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh --yes'
 scripts/bootstrap-operator-box.sh destroy
 ```
+
+`teardown.sh` asks before destroying anything. With no terminal to ask on
+(a command over `ssh`, `nohup`, `< /dev/null`) it refuses with exit 2 and
+says so, rather than guessing, so an unattended teardown needs `--yes`.
 
 `destroy` warns if rig instances are still up, because the box holds the
 only copy of their terraform state.
@@ -215,6 +219,28 @@ actually ran. `legion-a` only; passing it to another system is an error
 rather than a silent no-op, because a cell archived as a 16-thread result
 whose config says 4 is worse than a failed run.
 
+### Scheduling policy (the scenario's own)
+
+Every scenario names a `scheduling_policy`: `web_fleet`, `dense_fleet`,
+and `unit_fleet` are `spread`; `batch_burst` and `mixed_heterogeneous` are
+`bin_pack`. In Legion that is the manager's `schedulingPolicy`, not a
+jobspec field, so `run-campaign.sh` reads it from the campaign's scenario
+and the installers render it into `configs/legion/manager-{a,b}.ncl.tpl`
+(through `LEGION_SCHEDULING_POLICY`; a hand-run installer gets `bin_pack`,
+Legion's default). The translator records it in each cell's
+`manifest.json`, `pre-cell.json` records what the manager actually ran,
+and `run-step.sh` refuses a Legion cell whose running manager disagrees.
+To measure one workload under the other policy:
+
+```bash
+scripts/run-campaign.sh --system legion-a --scenarios web_fleet --scheduling-policy bin_pack
+```
+
+Like `--eval-threads`, it is one value per campaign and needs the
+control-plane reset. Nomad and K8s keep their own default placement
+(Nomad binpack, the K8s `LeastAllocated` score); the fairness record
+names it rather than tuning them toward the scenario.
+
 ### Heartbeat cadence (adaptive, the default)
 
 Run scale steps with Legion's default heartbeat cadence, which is adaptive.
@@ -251,14 +277,23 @@ against a fixed 2s. See
 
 `run-campaign.sh` wipes and reinstalls the control plane before its first
 step (`scripts/reset-control-plane.sh`, `--no-reset-control-plane` to opt
-out). This is load-bearing, not hygiene: **Legion cannot deregister a
-node**, so `stop-sim-fleet.sh` leaves every node record behind and the
-node table becomes a high-water mark of every fleet the boxes have ever
-carried. A 1,000-node cell run after a 4,000-node experiment otherwise
-measures a scheduler holding 3,000 corpses while reporting itself as a
-1,000-node result. Every cell now also gates on an exact node census —
+out). `stop-sim-fleet.sh` forgets every `sim-*` node it stops
+(`legion node forget --force`, 16 in flight; `SIM_FORGET=0` skips it), but
+a fleet stopped any other way, or a forget that failed, leaves its rows,
+and a 1,000-node cell run after a 4,000-node experiment would then measure
+a scheduler holding 3,000 corpses while reporting itself as a 1,000-node
+result. The reset rules that out and clears the previous run's jobs and
+evals too. Every cell now also gates on an exact node census —
 right count, all active and available, all named from this fleet's
 slices — and refuses to run otherwise, printing what it actually saw.
+
+## Sandbox-boot rig (real KVM)
+
+[`sandbox-boot/`](sandbox-boot/README.md) is a separate, smaller rig for
+session sandboxes on real KVM: spot c8i workers with nested virtualization
+running cloud-hypervisor microVMs, `legion-loadgen --mode sessions`, and a
+host-side timeline of every guest. Its last campaign is in
+[`sandbox-boot/RESULTS.md`](sandbox-boot/RESULTS.md).
 
 ## Sandbox-scaling campaign (cheap, standalone)
 
@@ -378,7 +413,7 @@ the absolute values.
 | 3 | StreamWork delivery | `work_stream` measurement | none |
 | 4 | Heartbeat load | `heartbeat_scale_benchmark`, `--simulate` | none, or one sim host |
 | 5 | ListInstances and session listing | `instance_scale_measure`, the density cell; session listing is a TODO | none, or one sim host |
-| 6 | Session starts per node (launch pool) | `session_start_latency_measure`; a real-node probe is a TODO | none, or one worker |
+| 6 | Session starts per node (launch pool) | `session_start_latency_measure`, `session_start_cost_breakdown_measure`; a real-node probe is a TODO | none, or one worker |
 | 7 | sessions.db group commit | TODO | one worker |
 | 8 | Session ticket verification cache | TODO | one worker |
 | 9 | Manager routing by node tag | a timed `instance get` loop, tagged vs untagged | two workers |
@@ -399,8 +434,8 @@ cargo bench --bench scheduler_bench -- candidate_construction
 cargo bench --bench scheduler_bench -- plan_under_fill
 LEGION_BENCH_SCALING_NODES=1000,10000,50000 cargo bench --bench scheduler_bench -- plan_fleet_scaling
 cargo bench --bench eval_critical_path_bench
-cargo test --release --test plan_contention -- --ignored --nocapture
-LEGION_BENCH_BACKENDS=local_disk,raft1,raft3 cargo test --release --test scheduler_scale_benchmark -- --ignored --nocapture
+cargo test --release --test integration plan_contention:: -- --ignored --nocapture
+LEGION_BENCH_BACKENDS=local_disk,raft1,raft3 cargo test --release --test integration scheduler_scale_benchmark:: -- --ignored --nocapture
 ```
 
 **Signal:** plan time grows no faster than linearly in nodes. Contention
@@ -418,7 +453,7 @@ one commit, and how many raft entries each lifecycle step takes.
 **Tool and command:**
 
 ```bash
-cargo test --release --test raft_perf_smoke --locked -- --ignored --nocapture
+cargo test --release --test integration raft_perf_smoke:: --locked -- --ignored --nocapture
 cargo test --release --test raft_lifecycle_ops -- --nocapture       # entries per keyed lifecycle stage, asserted exactly
 benchmarks/aws/experiments/heartbeat-commit-probe.sh                 # on the 3-manager rig
 ```
@@ -442,7 +477,7 @@ with a large desired set per node.
 **Tool and command:**
 
 ```bash
-LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test --release --test work_stream -- a_streaming_heartbeat --nocapture
+LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test --release --test integration work_stream::a_streaming_heartbeat -- --nocapture
 ```
 
 On a live cluster, read `legion_dispatch_send_seconds` with a simulated
@@ -460,7 +495,7 @@ degrades past that.
 
 ```bash
 LEGION_HEARTBEAT_NODES=1000,5000,10000 LEGION_HEARTBEAT_THREADS=8 LEGION_HEARTBEAT_SECONDS=10 \
-  cargo test --release --test heartbeat_scale_benchmark -- --ignored --nocapture
+  cargo test --release --test integration heartbeat_scale_benchmark:: -- --ignored --nocapture
 legion start worker $TOKEN --simulate 2000 --register-rate 200     # a live manager
 ```
 
@@ -473,7 +508,7 @@ many nodes it can carry; also record `legion_heartbeats_total`,
 **Bar:** the sustainable-nodes estimate exceeds the target fleet size with
 headroom. With 1,000 allocations per node (the dense-sandbox case), the
 cost of one steady beat comes from
-`LEGION_MEASURE_HEARTBEAT_ALLOCS=1000,10000 cargo test --release --test instance_scale_measure -- --ignored --nocapture`.
+`LEGION_MEASURE_HEARTBEAT_ALLOCS=1000,10000 cargo test --release --test integration instance_scale_measure:: -- --ignored --nocapture`.
 
 ### 5. ListInstances and session listing at large counts
 
@@ -484,8 +519,8 @@ creates/s, suspended rows, and churn of unnamed instances) is measured
 in-process:
 
 ```bash
-LEGION_MEASURE_INSTANCES=100000,1000000 cargo test --release --test instance_scale_measure -- --ignored --nocapture
-LEGION_MEASURE_SUSPENDED=50000 LEGION_MEASURE_CHURN=1000000 cargo test --release --test instance_scale_measure -- --ignored --nocapture
+LEGION_MEASURE_INSTANCES=100000,1000000 cargo test --release --test integration instance_scale_measure:: -- --ignored --nocapture
+LEGION_MEASURE_SUSPENDED=50000 LEGION_MEASURE_CHURN=1000000 cargo test --release --test integration instance_scale_measure:: -- --ignored --nocapture
 ```
 
 For list latency, hold instances resident on a simulated fleet with the
@@ -518,7 +553,7 @@ message limit at around 20k sessions per node.
 **Tool and command:**
 
 ```bash
-cargo test --release --test session_integration -- session_start_latency_measure --ignored --nocapture
+cargo test --release --test integration session_integration::session_start_latency_measure -- --ignored --nocapture
 ```
 
 That covers the control plane's share: pick a node, send the start, and
@@ -847,6 +882,16 @@ and tear it down when the campaign is over.
 - **Same hardware, serially.** One control-plane trio hosts every
   system in turn; instance types pinned; `wipe-control-plane.sh`
   between campaigns.
+- **Same disk.** Every system's store sits on the control plane's local
+  NVMe: cloud-init bind-mounts it onto `/var/lib/legion`,
+  `/var/lib/nomad`, and `/var/lib/etcd`. Before 2026-10-14 only Legion's
+  was there and the competitors' raft log and WAL sat on gp3 (calls entry
+  5). Rerun on NVMe, neither competitor got meaningfully faster: both are
+  CPU-bound on their leader box, which `cpu_by_mode` and `disk_busy` in
+  every cell now show directly.
+- **The measurement does not tax the measured.** Control-plane scrapes run
+  at 15s, not 5s: Nomad's leader exposes ~49,000 samples at 4,000 jobs
+  and took 1.25s to encode each scrape (calls entry 12).
 - **Each ecosystem's own simulator.** Legion `--simulate`
   (docs/worker-simulation.md), nomad-nodesim, KWOK — every system's
   fake nodes speak that system's real node protocol, shaped from the
@@ -866,7 +911,7 @@ and tear it down when the campaign is over.
   Nomad and K8s use the driver's `http_submit_all`: one process, one
   keep-alive HTTP connection per worker thread, `POST /v1/jobs` and
   `POST .../deployments`, at the same concurrency. This is the
-  cross-system default since 2026-10-09 (calls entry 5). Before then only
+  cross-system default since 2026-10-09 (calls entry 6). Before then only
   Legion had a native path and a comparison had to force all three onto
   the CLI loop, which capped every system at the loadgen box's
   process-spawn rate and made the table a tie by construction.
@@ -953,12 +998,25 @@ and tear it down when the campaign is over.
 - K8s runs with its API client QPS raised (scheduler and
   controller-manager) but stock eviction timers, so its storm cell is
   capped at 30 minutes and reported as a replaced fraction. See
-  `configs/k8s/kubeadm-config.yaml.tpl` and calls entry 6.
+  `configs/k8s/kubeadm-config.yaml.tpl` and calls entry 7. Its etcd quota
+  is raised to 8 GiB so the largest `dense_fleet` cells cannot end on a
+  NOSPACE alarm (calls entry 13), and each KWOK slice talks to a different
+  apiserver rather than all to cp-0 (calls entry 8).
+- K8s campaigns before 2026-10-14 have no scheduler or apiserver metrics.
+  Prometheus mounted `prometheus.yml` as a single file, which pins its
+  inode, so the scrape jobs `install-k8s.sh` appends never loaded. It now
+  mounts the directory.
+- Nomad's leader serves a heartbeat after nearly every client RPC (Nomad
+  2.0.5's client wakes its heartbeat loop on each successful RPC), so it
+  handled ~2,500-3,300 `Node.UpdateStatus` calls/sec at 2k-5k nodes where
+  its 50/sec TTL target suggests ~50. That is Nomad's real client inside
+  nodesim, so it stays in, and every cell archives the rate as
+  `nomad_heartbeats` (calls entry 9).
 - Competitor watches reconnect when the server ends them (the K8s
   apiserver closes watchers that fall behind in a burst). Binds in the
   gap are stamped late, which biases that system's latency upward, so
   every cell records `watch_restarts`. Check it before quoting a K8s or
-  Nomad latency. See calls entry 8.
+  Nomad latency. See calls entry 11.
 - Nomad's down nodes stay in its node table until GC, so its fleet gate
   counts *ready* nodes; a restarted nodesim fleet registers new node IDs.
 - Batch workloads translate to K8s Deployments (not Jobs) so all three
@@ -968,13 +1026,13 @@ and tear it down when the campaign is over.
   `run-step.sh` supplies one (`CELL_START_EPOCH`), and falls back to a
   trailing 2h superset otherwise; the fairness record says which. The
   driver's own timestamps remain authoritative for the reported numbers.
-- **Nothing removes node records.** There is no deregistration RPC
-  (`Store::remove_node` has no production caller), so a fleet's nodes
-  outlive it and only a control-plane reset clears them. Node names are
-  therefore reused run to run on purpose — a unique per-run prefix would
-  make every run leak its whole fleet instead of overwriting the last
-  one's. The consequences are handled by the reset at campaign start and
-  the per-cell census gate, but the underlying gap is real.
+- **Forgetting a fleet costs one RPC per node.** `stop-sim-fleet.sh`
+  forgets each `sim-*` node with `legion node forget --force`; there is no
+  batch forget, so a 10,000-node fleet takes a few minutes to clear, and
+  the forced forget releases each node's allocations for rescheduling (the
+  same churn a node loss raises). Node names are still reused run to run;
+  with the forget in place a unique per-run prefix would no longer leak a
+  fleet, but nothing uses one yet.
 - **Fleet churn contaminates the cell that follows it.** Every fleet
   stop/start marks thousands of nodes lost and raises a reschedule eval
   per node (measured: 5,760 reschedules against 2,503 job submissions at

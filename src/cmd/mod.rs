@@ -2,17 +2,24 @@
 
 pub mod acl;
 pub mod action;
+pub mod app;
+pub mod app_view;
 pub mod boot_ticket;
 pub mod capabilities;
+pub mod cert;
+pub mod device;
 pub mod docs;
 pub mod events;
 pub mod exec;
 pub mod exec_key;
 pub mod exec_ticket;
+pub mod gitops;
+pub mod governance;
 pub mod guest_agent;
 pub mod guest_resume;
 pub mod helpers;
 pub mod instance;
+pub mod isolate;
 pub mod job;
 pub mod join;
 pub mod join_token;
@@ -21,12 +28,22 @@ pub mod kv;
 pub mod ledger;
 pub mod login;
 pub mod mcp;
+pub mod namespace;
+pub mod namespace_policy;
 pub mod net;
+pub mod net_plugin;
 pub mod node;
+pub mod object;
 pub mod oidc;
+pub mod operator;
 pub mod output;
 pub mod raft;
+pub mod resize;
 pub mod sandbox;
+pub mod scaling;
+pub mod scaling_demand;
+pub mod scaling_plugin;
+pub mod scaling_simulate;
 pub mod scheduler;
 pub mod service;
 pub mod session;
@@ -35,6 +52,7 @@ pub mod start;
 pub mod state;
 pub mod template;
 pub mod volume;
+pub mod watch;
 
 use crate::prelude::*;
 
@@ -42,6 +60,10 @@ use crate::prelude::*;
 /// `main.rs` so tests can walk it — every command must accept `--json`
 /// (AGENTS.md, "Agent-Friendly Contributions"; see `tests` below).
 pub fn cli() -> Command {
+    helpers::with_namespace_flags(base_cli())
+}
+
+fn base_cli() -> Command {
     Command::new("legion")
         .about("A simple, extensible, fast orchestrator")
         .bin_name("legion")
@@ -49,20 +71,32 @@ pub fn cli() -> Command {
         .propagate_version(true)
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .arg(governance::approval_flag())
         .subcommand(capabilities::config())
         .subcommand(mcp::config())
         .subcommand(docs::config())
         .subcommand(job::config())
+        .subcommand(scaling::config())
+        .subcommand(app::config())
+        .subcommand(namespace::config())
+        .subcommand(object::config())
+        .subcommand(cert::config())
+        .subcommand(gitops::config())
         .subcommand(template::config())
         .subcommand(instance::config())
+        .subcommand(resize::alloc_config())
         .subcommand(node::config())
         .subcommand(start::config())
         .subcommand(join_token::config())
         .subcommand(boot_ticket::config())
         .subcommand(sandbox::config())
         .subcommand(session::config())
+        .subcommand(isolate::config())
         .subcommand(join::config())
         .subcommand(ledger::config())
+        .subcommand(governance::audit_config())
+        .subcommand(governance::approval_config())
+        .subcommand(governance::usage_config())
         .subcommand(events::config())
         .subcommand(kv::config())
         .subcommand(keyring::config())
@@ -71,9 +105,11 @@ pub fn cli() -> Command {
         .subcommand(guest_agent::config())
         .subcommand(guest_resume::config())
         .subcommand(volume::config())
+        .subcommand(device::config())
         .subcommand(snapshot::config())
         .subcommand(state::config())
         .subcommand(raft::config())
+        .subcommand(operator::config())
         .subcommand(scheduler::config())
         .subcommand(acl::config())
         .subcommand(exec::config())
@@ -98,6 +134,13 @@ mod tests {
         "legion start gateway",
         "legion join",
         "legion mcp serve",
+        // The in-task entrypoint of a bundled app: a long-running process.
+        "legion app run",
+        // gitops's renderer, which only the app runs: its stdout is already
+        // a JSON answer for the app.
+        "legion app gitops-render",
+        // The cert manager's HTTP-01 responder: a long-running server.
+        "legion cert http01",
         "legion guest-agent",
         "legion guest-resume",
     ];
@@ -126,6 +169,53 @@ mod tests {
         }
     }
 
+    /// The namespace flag goes exactly where a namespace means something: on
+    /// commands that act on a job, never on cluster-scoped ones, where it
+    /// would look like a scope and silently be ignored (kubectl#1413).
+    #[test]
+    fn namespace_flags_only_on_namespaced_commands() {
+        let cli = cli();
+        cli.clone().debug_assert();
+        let find = |path: &[&str]| -> Command {
+            let mut command = cli.clone();
+            for name in path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no subcommand {name}"))
+                    .clone();
+            }
+            command
+        };
+        let has_namespace = |command: &Command| {
+            command
+                .get_arguments()
+                .any(|arg| arg.get_id() == "namespace")
+        };
+        for path in [
+            &["job", "run"][..],
+            &["job", "info"],
+            &["job", "list"],
+            &["instance", "list"],
+            &["snapshot", "list"],
+            &["service", "resolve"],
+            &["net", "policy", "show"],
+        ] {
+            assert!(has_namespace(&find(path)), "{path:?} should take -n");
+        }
+        for path in [
+            &["node", "list"][..],
+            &["acl", "policy", "list"],
+            &["kv", "get"],
+            &["namespace", "list"],
+        ] {
+            assert!(!has_namespace(&find(path)), "{path:?} must not take -n");
+        }
+        assert!(cli
+            .clone()
+            .try_get_matches_from(["legion", "node", "list", "-n", "prod"])
+            .is_err());
+    }
+
     /// AGENTS.md: "Every CLI command must accept `--json`/`-j`". This walks
     /// the real tree, so a new command without the flag fails here.
     #[test]
@@ -142,5 +232,21 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         cli().debug_assert();
+    }
+
+    /// Every top-level CLI command is a reserved noun, so a kind never reads
+    /// like a command (calls entry 20).
+    #[test]
+    fn every_top_level_command_is_reserved_test() {
+        for command in cli().get_subcommands() {
+            let name = command.get_name();
+            if name == "help" {
+                continue;
+            }
+            assert!(
+                crate::structs::app_object::reserved_noun(name).is_some(),
+                "`legion {name}` is not in RESERVED_KIND_NOUNS"
+            );
+        }
     }
 }
