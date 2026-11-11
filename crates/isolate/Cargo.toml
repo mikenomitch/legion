@@ -59,5 +59,10 @@ seccompiler.workspace = true
 confinement-test = []
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["async_tokio"] }
 tempfile.workspace = true
 wat.workspace = true
+
+[[bench]]
+name = "isolate_bench"
+harness = false

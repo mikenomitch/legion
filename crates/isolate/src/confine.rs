@@ -236,6 +236,10 @@ pub const ALLOWED: &[(&str, i64)] = &[
     ("recvmsg", libc::SYS_recvmsg),
     ("sendmsg", libc::SYS_sendmsg),
     ("shutdown", libc::SYS_shutdown),
+    // tonic asks the inherited sockets for their peer address and options.
+    ("getpeername", libc::SYS_getpeername),
+    ("getsockname", libc::SYS_getsockname),
+    ("getsockopt", libc::SYS_getsockopt),
     ("close", libc::SYS_close),
     ("fcntl", libc::SYS_fcntl),
     ("ioctl", libc::SYS_ioctl),

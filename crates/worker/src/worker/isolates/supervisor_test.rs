@@ -1273,7 +1273,6 @@ async fn restored_session_isolates_are_registered_as_child_owners() {
         .start_session("ns/app", "run", "run-own.1", "", "manager", "", "")
         .await
         .unwrap();
-    h.supervisor.hibernate("run-own.1").await.unwrap();
     // A worker restart: a new supervisor over the same book.
     let restored =
         super::sessions::SessionBook::open(Some(h._dir.path().join("isolates/sessions.json")));

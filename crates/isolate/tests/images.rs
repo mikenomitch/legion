@@ -31,8 +31,8 @@ use legion_isolate::scratch::RUN_DIR;
 use legion_isolate::worker_api::WorkerApi;
 use legion_isolate::world::{runner, Image as HostWorld, ImagePre as HostWorldPre};
 use legion_proto::isolate_host::{
-    vm_request, CheckpointHeader, EgressError, EgressErrorKind, EgressReply, EgressRequest,
-    Header, HttpOutcome, Lifetime, LogBatch, Origin, SaveCheckpointReply, VmError, VmErrorKind,
+    vm_request, CheckpointHeader, EgressError, EgressErrorKind, EgressReply, EgressRequest, Header,
+    HttpOutcome, Lifetime, LogBatch, Origin, SaveCheckpointReply, VmError, VmErrorKind,
     VmExecResult, VmReply, VmRequest,
 };
 use sha2::{Digest, Sha256};
@@ -234,7 +234,11 @@ impl WorkerApi for FakeWorker {
                 }
             }
             vm_request::Op::Put(p) => {
-                log.push(format!("put {} {}", p.path, String::from_utf8_lossy(&p.content)));
+                log.push(format!(
+                    "put {} {}",
+                    p.path,
+                    String::from_utf8_lossy(&p.content)
+                ));
                 VmReply::default()
             }
             vm_request::Op::Get(g) => {
@@ -506,7 +510,9 @@ async fn python_hello_and_exit_codes_test() {
     assert_eq!(ran.stdout, "hello from python\n");
     assert_eq!(ran.result, None);
 
-    let ran = i.src("main.py", "import sys\nprint('bye')\nsys.exit(3)\n").await;
+    let ran = i
+        .src("main.py", "import sys\nprint('bye')\nsys.exit(3)\n")
+        .await;
     assert_eq!(ran.exit, Some(3));
     assert_eq!(ran.stdout, "bye\n");
 
@@ -522,12 +528,14 @@ async fn python_hello_and_exit_codes_test() {
     assert_eq!(ran.exit, Some(1), "{ran:?}");
     assert_eq!(ran.stdout, "before\n");
     assert!(
-        ran.stderr.starts_with("Traceback (most recent call last):\n"),
+        ran.stderr
+            .starts_with("Traceback (most recent call last):\n"),
         "{}",
         ran.stderr
     );
     assert!(
-        ran.stderr.contains("File \"snippet.py\", line 5, in <module>"),
+        ran.stderr
+            .contains("File \"snippet.py\", line 5, in <module>"),
         "{}",
         ran.stderr
     );
@@ -538,7 +546,8 @@ async fn python_hello_and_exit_codes_test() {
     );
     assert!(ran.stderr.contains("    return 1 / x"), "{}", ran.stderr);
     assert!(
-        ran.stderr.ends_with("ZeroDivisionError: division by zero\n"),
+        ran.stderr
+            .ends_with("ZeroDivisionError: division by zero\n"),
         "{}",
         ran.stderr
     );
@@ -551,7 +560,11 @@ async fn python_hello_and_exit_codes_test() {
 
     let ran = i.run(&[], None, None, &[]).await;
     assert_eq!(ran.exit, Some(2));
-    assert!(ran.stderr.contains("no entry file was given"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("no entry file was given"),
+        "{}",
+        ran.stderr
+    );
 
     let ran = i.run(&[], Some("missing.py"), None, &[]).await;
     assert_eq!(ran.exit, Some(2));
@@ -570,7 +583,12 @@ result = {"n": legion.input["n"] * 2, "argv": sys.argv, "cwd": os.getcwd(),
           "from_file": json.load(open("input.json"))["n"]}
 "#;
     let ran = i
-        .run(&[("main.py", src)], Some("main.py"), Some(r#"{"n": 21}"#), &["a", "b"])
+        .run(
+            &[("main.py", src)],
+            Some("main.py"),
+            Some(r#"{"n": 21}"#),
+            &["a", "b"],
+        )
         .await;
     ran.ok();
     let v: serde_json::Value = serde_json::from_str(ran.result.as_deref().unwrap()).unwrap();
@@ -601,7 +619,10 @@ with open("result.json", "w") as f:
     // the next run's file, not the cached module.
     let ran = i
         .run(
-            &[("helper.py", "X = 1\n"), ("main.py", "import helper\nresult = helper.X\n")],
+            &[
+                ("helper.py", "X = 1\n"),
+                ("main.py", "import helper\nresult = helper.X\n"),
+            ],
             Some("main.py"),
             None,
             &[],
@@ -610,7 +631,10 @@ with open("result.json", "w") as f:
     assert_eq!(ran.ok().result.as_deref(), Some("1"));
     let ran = i
         .run(
-            &[("helper.py", "X = 2\n"), ("main.py", "import helper\nresult = helper.X\n")],
+            &[
+                ("helper.py", "X = 2\n"),
+                ("main.py", "import helper\nresult = helper.X\n"),
+            ],
             Some("main.py"),
             None,
             &[],
@@ -622,7 +646,11 @@ with open("result.json", "w") as f:
     let ran = i.src("main.py", "result = object()\n").await;
     ran.ok();
     assert_eq!(ran.result, None);
-    assert!(ran.stderr.contains("not JSON-serializable"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("not JSON-serializable"),
+        "{}",
+        ran.stderr
+    );
 }
 
 #[tokio::test]
@@ -638,12 +666,21 @@ async fn python_globals_persist_per_instance_test() {
         },
     )
     .await;
-    assert_eq!(a.src("main.py", src).await.ok().result.as_deref(), Some("1"));
-    assert_eq!(a.src("main.py", src).await.ok().result.as_deref(), Some("2"));
+    assert_eq!(
+        a.src("main.py", src).await.ok().result.as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        a.src("main.py", src).await.ok().result.as_deref(),
+        Some("2")
+    );
     // A run that sets no `result` reports none, not the previous run's.
     assert_eq!(a.src("main.py", "x = 1\n").await.ok().result, None);
     let mut b = instance(python(), Opts::default()).await;
-    assert_eq!(b.src("main.py", src).await.ok().result.as_deref(), Some("1"));
+    assert_eq!(
+        b.src("main.py", src).await.ok().result.as_deref(),
+        Some("1")
+    );
 }
 
 #[tokio::test]
@@ -672,7 +709,12 @@ async fn python_unsupported_stops_the_run_test() {
     ];
     for (src, detail) in cases {
         let mut i = instance(python(), Opts::default()).await;
-        let ran = i.src("main.py", &format!("print('started')\n{src}print('not reached')\n")).await;
+        let ran = i
+            .src(
+                "main.py",
+                &format!("print('started')\n{src}print('not reached')\n"),
+            )
+            .await;
         assert_stopped(&ran, detail);
         assert_eq!(ran.stdout, "started\n", "{src}");
     }
@@ -853,7 +895,10 @@ result = {"id": m.id, "exit": r.exit, "stdout": r.stdout.decode(), "stderr": r.s
     let v: serde_json::Value = serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap();
     assert_eq!(
         v,
-        serde_json::json!(["not-configured", "legion.vm.acquire: this task has no VM task (set config.vm.task)"])
+        serde_json::json!([
+            "not-configured",
+            "legion.vm.acquire: this task has no VM task (set config.vm.task)"
+        ])
     );
 }
 
@@ -872,7 +917,10 @@ async fn python_restore_hygiene_test() {
         seen.push(v);
     }
     for k in 0..seen[0].len() {
-        assert_ne!(seen[0][k], seen[1][k], "value {k} repeated across instances: {seen:?}");
+        assert_ne!(
+            seen[0][k], seen[1][k],
+            "value {k} repeated across instances: {seen:?}"
+        );
     }
 }
 
@@ -918,7 +966,6 @@ result = {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // JavaScript
 // ---------------------------------------------------------------------------
@@ -940,7 +987,8 @@ async fn js_hello_and_exit_codes_test() {
     assert_eq!(ran.stdout, "bye\n");
     assert_eq!(ran.stderr, "oops\n");
 
-    let src = "function f(x) {\n  throw new Error('boom ' + x);\n}\nconsole.log('before');\nf(1);\n";
+    let src =
+        "function f(x) {\n  throw new Error('boom ' + x);\n}\nconsole.log('before');\nf(1);\n";
     let ran = i.src("snippet.js", src).await;
     assert_eq!(ran.exit, Some(1), "{ran:?}");
     assert_eq!(ran.stdout, "before\n");
@@ -948,14 +996,22 @@ async fn js_hello_and_exit_codes_test() {
     assert_eq!(lines.len(), 3, "{}", ran.stderr);
     assert_eq!(lines[0], "Uncaught Error: boom 1");
     assert_eq!(lines[1], "    at f (snippet.js:2:9)");
-    assert!(lines[2].starts_with("    at <anonymous> (snippet.js:5:"), "{}", ran.stderr);
+    assert!(
+        lines[2].starts_with("    at <anonymous> (snippet.js:5:"),
+        "{}",
+        ran.stderr
+    );
 
     // A rejected await is an uncaught error too.
     let ran = i
         .src("main.js", "await Promise.reject(new TypeError('nope'));\n")
         .await;
     assert_eq!(ran.exit, Some(1));
-    assert!(ran.stderr.starts_with("Uncaught TypeError: nope\n"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.starts_with("Uncaught TypeError: nope\n"),
+        "{}",
+        ran.stderr
+    );
 
     let ran = i.src("main.js", "throw 'a string';\n").await;
     assert_eq!(ran.exit, Some(1));
@@ -963,12 +1019,20 @@ async fn js_hello_and_exit_codes_test() {
 
     let ran = i.src("main.js", "let x = (;\n").await;
     assert_eq!(ran.exit, Some(1));
-    assert!(ran.stderr.starts_with("Uncaught SyntaxError: "), "{}", ran.stderr);
+    assert!(
+        ran.stderr.starts_with("Uncaught SyntaxError: "),
+        "{}",
+        ran.stderr
+    );
     assert!(ran.stderr.contains("main.js:1:"), "{}", ran.stderr);
 
     let ran = i.run(&[], None, None, &[]).await;
     assert_eq!(ran.exit, Some(2));
-    assert!(ran.stderr.contains("no entry file was given"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("no entry file was given"),
+        "{}",
+        ran.stderr
+    );
     let ran = i.run(&[], Some("missing.js"), None, &[]).await;
     assert_eq!(ran.exit, Some(2));
     assert!(ran.stderr.contains("can't open file"), "{}", ran.stderr);
@@ -985,7 +1049,12 @@ async fn js_input_result_and_files_test() {
                return { n: legion.input.n * 2, argv: process.argv, env: process.env.IMAGE_TEST,\n\
                         runDir: process.env.LEGION_RUN_DIR, fromFile };\n";
     let ran = i
-        .run(&[("main.js", src)], Some("main.js"), Some(r#"{"n": 21}"#), &["a", "b"])
+        .run(
+            &[("main.js", src)],
+            Some("main.js"),
+            Some(r#"{"n": 21}"#),
+            &["a", "b"],
+        )
         .await;
     let v: serde_json::Value = serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap();
     assert_eq!(
@@ -1020,7 +1089,11 @@ async fn js_input_result_and_files_test() {
     let ran = i.src("main.js", "return 10n;\n").await;
     ran.ok();
     assert_eq!(ran.result, None);
-    assert!(ran.stderr.contains("not JSON-serializable"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("not JSON-serializable"),
+        "{}",
+        ran.stderr
+    );
 }
 
 #[tokio::test]
@@ -1036,11 +1109,20 @@ async fn js_globals_persist_per_instance_test() {
         },
     )
     .await;
-    assert_eq!(a.src("main.js", src).await.ok().result.as_deref(), Some("1"));
-    assert_eq!(a.src("main.js", src).await.ok().result.as_deref(), Some("2"));
+    assert_eq!(
+        a.src("main.js", src).await.ok().result.as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        a.src("main.js", src).await.ok().result.as_deref(),
+        Some("2")
+    );
     assert_eq!(a.src("main.js", "let x = 1;\n").await.ok().result, None);
     let mut b = instance(js(), Opts::default()).await;
-    assert_eq!(b.src("main.js", src).await.ok().result.as_deref(), Some("1"));
+    assert_eq!(
+        b.src("main.js", src).await.ok().result.as_deref(),
+        Some("1")
+    );
 }
 
 #[tokio::test]
@@ -1060,16 +1142,26 @@ async fn js_unsupported_stops_the_run_test() {
     for (src, detail) in cases {
         let mut i = instance(js(), Opts::default()).await;
         let ran = i
-            .src("main.js", &format!("console.log('started');\n{src}\nconsole.log('not reached');\n"))
+            .src(
+                "main.js",
+                &format!("console.log('started');\n{src}\nconsole.log('not reached');\n"),
+            )
             .await;
         assert_stopped(&ran, detail);
-        let expect = if src.starts_with("import") || src.starts_with("export") { "" } else { "started\n" };
+        let expect = if src.starts_with("import") || src.starts_with("export") {
+            ""
+        } else {
+            "started\n"
+        };
         assert_eq!(ran.stdout, expect, "{src}");
     }
     // A package is a normal error the code can catch.
     let mut i = instance(js(), Opts::default()).await;
     let ran = i
-        .src("main.js", "try { require('lodash'); } catch (e) { return e.message; }\n")
+        .src(
+            "main.js",
+            "try { require('lodash'); } catch (e) { return e.message; }\n",
+        )
         .await;
     assert_eq!(
         ran.ok().result.as_deref(),
@@ -1116,7 +1208,10 @@ async fn js_state_test() {
     let ran = r
         .src("main.js", "try { legion.state.get('k'); } catch (e) { return [e.kind, e instanceof LegionStateError]; }\n")
         .await;
-    assert_eq!(ran.ok().result.as_deref(), Some(r#"["not-available",true]"#));
+    assert_eq!(
+        ran.ok().result.as_deref(),
+        Some(r#"["not-available",true]"#)
+    );
 }
 
 #[tokio::test]
@@ -1194,11 +1289,16 @@ async fn js_vm_test() {
     );
     let mut n = instance(js(), Opts::default()).await;
     let ran = n
-        .src("main.js", "try { legion.vm.acquire(); } catch (e) { return [e.kind, e.message]; }\n")
+        .src(
+            "main.js",
+            "try { legion.vm.acquire(); } catch (e) { return [e.kind, e.message]; }\n",
+        )
         .await;
     assert_eq!(
         ran.ok().result.as_deref(),
-        Some(r#"["not-configured","legion.vm.acquire: this task has no VM task (set config.vm.task)"]"#)
+        Some(
+            r#"["not-configured","legion.vm.acquire: this task has no VM task (set config.vm.task)"]"#
+        )
     );
 }
 
@@ -1216,7 +1316,10 @@ async fn js_restore_hygiene_test() {
         seen.push(v);
     }
     for k in 0..seen[0].len() {
-        assert_ne!(seen[0][k], seen[1][k], "value {k} repeated across instances: {seen:?}");
+        assert_ne!(
+            seen[0][k], seen[1][k],
+            "value {k} repeated across instances: {seen:?}"
+        );
     }
 }
 
@@ -1247,9 +1350,15 @@ fn ten_kb(js: bool) -> String {
     let mut n = 0;
     while s.len() < 10_000 {
         if js {
-            s.push_str(&format!("function f{n}(x) {{ const y = x * {n} + {}; return y % 1000; }}\n", n % 7));
+            s.push_str(&format!(
+                "function f{n}(x) {{ const y = x * {n} + {}; return y % 1000; }}\n",
+                n % 7
+            ));
         } else {
-            s.push_str(&format!("def f{n}(x):\n    y = x * {n} + {}\n    return y % 1000\n", n % 7));
+            s.push_str(&format!(
+                "def f{n}(x):\n    y = x * {n} + {}\n    return y % 1000\n",
+                n % 7
+            ));
         }
         calls.push(format!("f{n}({n})"));
         n += 1;
@@ -1402,11 +1511,12 @@ result = sorted(n for n in names if "." not in n)
     let names: Vec<String> =
         serde_json::from_str(i.src("main.py", list).await.ok().result.as_deref().unwrap()).unwrap();
     // `ctypes` is a stub the runner installs so that using it stops the run
-    // by name; it is not a module code can use, so it is not listed.
+    // by name; it is not a module code can use, so it is not listed. Nor is
+    // componentize-py's own runtime module.
     let stubs = ["ctypes"];
     let mut ok = vec!["legion".to_string()];
     for n in names {
-        if stubs.contains(&n.as_str()) {
+        if stubs.contains(&n.as_str()) || n.starts_with("componentize_py") {
             continue;
         }
         let mut i = instance(python(), Opts::default()).await;
@@ -1436,12 +1546,18 @@ async fn manifest_write_test() {
         let measured = measure(image).await;
         let (extensions, vm_entry, modules, runtime) = if name == "python" {
             let modules = python_modules().await;
-            println!("python image: {} importable top-level modules", modules.len());
+            println!(
+                "python image: {} importable top-level modules",
+                modules.len()
+            );
             (
                 vec![".py"],
                 "main.py",
                 modules,
-                format!("CPython {} (componentize-py 0.25.1)", python_version().await),
+                format!(
+                    "CPython {} (componentize-py 0.25.1)",
+                    python_version().await
+                ),
             )
         } else {
             // The js image resolves no module specifiers by itself: no
@@ -1481,17 +1597,10 @@ async fn manifest_write_test() {
 async fn python_version() -> String {
     let mut i = instance(python(), Opts::default()).await;
     let ran = i
-        .src("main.py", "import sys\nresult = '%d.%d.%d' % sys.version_info[:3]\n")
+        .src(
+            "main.py",
+            "import sys\nresult = '%d.%d.%d' % sys.version_info[:3]\n",
+        )
         .await;
     serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap()
-}
-
-#[tokio::test]
-#[ignore = "debug"]
-async fn zz_debug_test() {
-    let (img, name) = if std::env::var("DBG_JS").is_ok() { (js(), "main.js") } else { (python(), "main.py") };
-    let src = std::env::var("DBG_SRC").unwrap();
-    let mut i = instance(img, Opts::default()).await;
-    let ran = i.src(name, &src).await;
-    println!("{ran:#?}");
 }

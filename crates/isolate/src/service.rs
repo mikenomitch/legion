@@ -146,13 +146,78 @@ pub async fn channel_over(stream: UnixStream) -> Result<Channel, tonic::transpor
 }
 
 /// Serve `IsolateHost` on one connection until it closes.
+///
+/// tonic returns as soon as its incoming stream ends, so the stream stays
+/// open after yielding the one connection, and the server shuts down when
+/// hyper drops that connection (the worker closed its end, or died).
 pub async fn serve(host: Host, control: UnixStream) -> Result<(), tonic::transport::Error> {
     let svc = IsolateHostServer::new(HostService::new(host))
         .max_decoding_message_size(usize::MAX)
         .max_encoding_message_size(usize::MAX);
-    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(control));
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let conn = OneConnection {
+        inner: control,
+        closed: Some(closed_tx),
+    };
+    let incoming = tokio_stream::StreamExt::chain(
+        tokio_stream::once(Ok::<_, std::io::Error>(conn)),
+        tokio_stream::pending(),
+    );
     Server::builder()
         .add_service(svc)
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, async {
+            let _ = closed_rx.await;
+        })
         .await
+}
+
+/// The control connection; says when it is dropped.
+struct OneConnection {
+    inner: UnixStream,
+    closed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for OneConnection {
+    fn drop(&mut self) {
+        if let Some(tx) = self.closed.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl tonic::transport::server::Connected for OneConnection {
+    type ConnectInfo = ();
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl tokio::io::AsyncRead for OneConnection {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for OneConnection {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }

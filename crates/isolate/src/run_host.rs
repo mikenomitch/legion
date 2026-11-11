@@ -184,10 +184,11 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
                 e.raw_os_error()
             )),
         },
+        // Reads `cmd.cwasm` in the first read dir (what LoadModule does).
         "read-inside" => {
             let dir = plan.read_dirs.first().cloned().unwrap_or_default();
-            match std::fs::read_dir(&dir) {
-                Ok(d) => report(format!("read-inside: {} entries", d.count())),
+            match std::fs::read(dir.join("cmd.cwasm")) {
+                Ok(b) => report(format!("read-inside: {} bytes", b.len())),
                 Err(e) => report(format!("read-inside: {e}")),
             }
         }
@@ -197,11 +198,6 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
                 Ok(_) => report("write-inside: wrote".into()),
                 Err(e) => report(format!("write-inside: {} ({:?})", e, e.raw_os_error())),
             }
-        }
-        "uid" => {
-            // SAFETY: plain syscalls.
-            let (u, g) = unsafe { (libc::getuid(), libc::getgid()) };
-            report(format!("uid {u} gid {g}"))
         }
         "anon-exec" => {
             // Documented, not denied: seccomp cannot tell a file mapping from

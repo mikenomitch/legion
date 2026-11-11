@@ -805,7 +805,7 @@ impl IsolateSupervisor {
                 .as_ref()
                 .map(|c| c.notes.join("; "))
                 .unwrap_or_default();
-            warn!(cordon = %replica.cordon, missing = %missing.join(","), %notes, "Isolate host runs without every confinement layer (isolate.confine = best-effort)");
+            warn!(cordon = %replica.cordon, missing = %missing.join(","), %notes, confine = ?self.config.confine, "Isolate host runs without every confinement layer");
         }
         let conn = Arc::new(HostConn {
             client: launched.client,

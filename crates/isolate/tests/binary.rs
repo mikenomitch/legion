@@ -99,8 +99,11 @@ impl Drop for Spawned {
 }
 
 /// Start the binary as a worker would: control socket on fd 3, worker
-/// socket on fd 4, the configuration on fd 5.
-fn command(cfg: &HostConfig, extra: &[&str]) -> (Command, StdUnix, StdUnix) {
+/// socket on fd 4, the configuration on fd 5. Drop the returned
+/// `ChildEnds` once the child is spawned, so its death closes the sockets.
+struct ChildEnds(#[allow(dead_code)] [OwnedFd; 3]);
+
+fn command(cfg: &HostConfig, extra: &[&str]) -> (Command, StdUnix, StdUnix, ChildEnds) {
     let (control_ours, control_theirs) = StdUnix::pair().unwrap();
     let (worker_ours, worker_theirs) = StdUnix::pair().unwrap();
     let (cfg_read, cfg_write) = std::io::pipe().unwrap();
@@ -127,14 +130,13 @@ fn command(cfg: &HostConfig, extra: &[&str]) -> (Command, StdUnix, StdUnix) {
             Ok(())
         });
     }
-    // Keep the child's ends alive until spawn.
-    std::mem::forget(fds);
-    (cmd, control_ours, worker_ours)
+    (cmd, control_ours, worker_ours, ChildEnds(fds))
 }
 
 async fn spawn(cfg: HostConfig) -> Spawned {
-    let (mut cmd, control, worker_sock) = command(&cfg, &[]);
+    let (mut cmd, control, worker_sock, ends) = command(&cfg, &[]);
     let child = cmd.spawn().unwrap();
+    drop(ends);
     let worker = Arc::new(FakeWorker::default());
     let svc = IsolateWorkerServer::new(Grpc(worker.clone()));
     // SAFETY: we own these sockets.
@@ -274,8 +276,9 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_host_exits_when_the_control_socket_closes_test() {
-    let (mut cmd, control, _worker) = command(&bin_config(Confine::BestEffort), &[]);
+    let (mut cmd, control, _worker, ends) = command(&bin_config(Confine::BestEffort), &[]);
     let mut child = cmd.spawn().unwrap();
+    drop(ends);
     {
         // SAFETY: we own the socket.
         let cs = unsafe { inherited(OwnedFd::from(control).into_raw_fd_for_test()) }.unwrap();
@@ -301,7 +304,7 @@ async fn the_host_exits_when_the_control_socket_closes_test() {
 fn a_protocol_version_mismatch_exits_before_serving_test() {
     let mut cfg = bin_config(Confine::Off);
     cfg.protocol_version = PROTOCOL_VERSION + 7;
-    let (mut cmd, _c, _w) = command(&cfg, &[]);
+    let (mut cmd, _c, _w, _ends) = command(&cfg, &[]);
     let out = cmd.output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -360,7 +363,7 @@ fn compat_key_changes_with_layout_test() {
 #[cfg(feature = "confinement-test")]
 fn attempt(what: &str) -> (std::process::ExitStatus, String, String) {
     let cfg = bin_config(Confine::BestEffort);
-    let (mut cmd, _c, _w) = command(&cfg, &["--test-attempt", what]);
+    let (mut cmd, _c, _w, _ends) = command(&cfg, &["--test-attempt", what]);
     let out = cmd.output().unwrap();
     (
         out.status,
@@ -466,14 +469,11 @@ fn landlock_denies_files_outside_read_dirs_test() {
             return;
         }
         assert!(out.contains(&format!("Some({})", libc::EACCES)), "{out}");
+        artifact("cmd");
         let (_, out, _) = attempt("read-inside");
-        assert!(out.contains("entries"), "{out}");
+        assert!(out.contains("bytes"), "{out}");
         let (_, out, _) = attempt("write-inside");
         assert!(out.contains(&format!("Some({})", libc::EACCES)), "{out}");
-        let (_, out, _) = attempt("uid");
-        if c.user_namespace {
-            assert_eq!(out.trim(), "uid 65534 gid 65534");
-        }
     }
 }
 
@@ -507,4 +507,13 @@ async fn the_host_network_namespace_has_no_interface_test() {
     // Loopback exists in every namespace but is not configured (down).
     let flags = std::fs::read_to_string(format!("/proc/{pid}/net/if_inet6")).unwrap_or_default();
     assert!(flags.is_empty(), "no addresses: {flags}");
+    // Its user namespace maps only our uid, to 65534 inside.
+    let map = std::fs::read_to_string(format!("/proc/{pid}/uid_map")).unwrap();
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    assert_eq!(
+        map.split_whitespace().collect::<Vec<_>>(),
+        ["65534", &uid.to_string(), "1"],
+        "{map}"
+    );
 }

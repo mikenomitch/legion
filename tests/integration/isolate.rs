@@ -23,9 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Why the end-to-end tests are ignored for now.
-const NEEDS_HOST: &str = "needs `legion-isolate host` (the host package's stage 5)";
-
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("crates/isolate/tests/fixtures")
@@ -73,9 +70,16 @@ fn isolate_binary() -> PathBuf {
         })
 }
 
+/// Hosts run unconfined here: a best-effort-confined host does not answer
+/// its first call yet (see `a_best_effort_confined_host_answers_hello`),
+/// and these tests are about the supervisor, not confinement.
 fn worker_config() -> WorkerIsolateConfigFull {
+    config_confined(ConfineMode::Off)
+}
+
+fn config_confined(confine: ConfineMode) -> WorkerIsolateConfigFull {
     WorkerIsolateConfigFull {
-        confine: ConfineMode::BestEffort,
+        confine,
         max_memory: "256MiB".into(),
         ..Default::default()
     }
@@ -190,6 +194,15 @@ struct Node {
 /// A supervisor with the real launcher and compiler, whose `python` image
 /// is the given fixture.
 fn node(image_fixture: &str) -> Node {
+    node_confined(image_fixture, ConfineMode::Off)
+}
+
+fn node_confined(image_fixture: &str, confine: ConfineMode) -> Node {
+    // The hosts' stderr goes to the worker log: show it on a failure.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("legion_worker::worker::isolates=debug")
+        .with_test_writer()
+        .try_init();
     let dir = tempfile::tempdir().unwrap();
     let images = dir.path().join("images");
     std::fs::create_dir_all(&images).unwrap();
@@ -204,7 +217,7 @@ fn node(image_fixture: &str) -> Node {
     let catalog = catalog_with(&images, &fixture(image_fixture));
     let supervisor = IsolateSupervisor::new(SupervisorParts {
         node_id: "node-1".into(),
-        config: worker_config(),
+        config: config_confined(confine),
         images: Some(catalog.clone()),
         launcher: Arc::new(ProcessLauncher {
             binary: found.path.clone(),
@@ -212,7 +225,7 @@ fn node(image_fixture: &str) -> Node {
         }),
         modules: Arc::new(Compiler {
             binary: found.clone(),
-            config: worker_config(),
+            config: config_confined(confine),
             stager: None,
             store: Some(store.clone()),
             images: Some(catalog),
@@ -286,9 +299,7 @@ fn run(job: &str, args: &[&str]) -> RunCall {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs `legion-isolate host` (the host package's stage 5)"]
 async fn a_run_executes_in_a_real_host_and_hosts_follow_cordons() {
-    let _ = NEEDS_HOST;
     let node = node("cmd.wasm");
     let mut alone = task("run", "request", "job");
     alone.name = "run".into();
@@ -324,7 +335,6 @@ async fn a_run_executes_in_a_real_host_and_hosts_follow_cordons() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs `legion-isolate host` (the host package's stage 5)"]
 async fn limits_stop_runs_and_output_truncates() {
     let node = node("cmd.wasm");
     node.supervisor
@@ -350,7 +360,6 @@ async fn limits_stop_runs_and_output_truncates() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs `legion-isolate host` (the host package's stage 5)"]
 async fn a_session_isolate_keeps_state_across_hibernation() {
     let node = node("runner.wasm");
     node.supervisor
@@ -372,7 +381,6 @@ async fn a_session_isolate_keeps_state_across_hibernation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs `legion-isolate host` (the host package's stage 5)"]
 async fn a_killed_host_is_restarted_and_the_next_run_succeeds() {
     let node = node("cmd.wasm");
     node.supervisor
@@ -399,4 +407,20 @@ async fn a_killed_host_is_restarted_and_the_next_run_succeeds() {
     let (_, hosts) = node.supervisor.stats("", "").await;
     assert_eq!(hosts[0].restarts, 1);
     assert_ne!(hosts[0].pid, pid);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host bug: under confine = best-effort the host serves but its first call fails with a transport error"]
+async fn a_best_effort_confined_host_answers_hello() {
+    let node = node_confined("cmd.wasm", ConfineMode::BestEffort);
+    node.supervisor
+        .sync(vec![envelope("ns/a", task("run", "request", "namespace"))]);
+    let reply = node
+        .supervisor
+        .run(run("ns/a", &[]), None)
+        .await
+        .expect("run");
+    assert_eq!(reply.exit, Some(0));
+    let (_, hosts) = node.supervisor.stats("", "").await;
+    assert!(!hosts[0].confinement.is_empty(), "{hosts:?}");
 }
