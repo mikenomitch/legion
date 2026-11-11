@@ -166,7 +166,16 @@ The [isolate runtime](task-runtime-isolate.md) has tests in three places:
   test make the confined host or compiler attempt a forbidden action and
   leave chosen layers out (`--test-skip seccomp,pidns,scopes,mount,landlock,userns,setattr`),
   so each layer is shown to stop its attacks on its own; they exist only in
-  a build with the feature.
+  a build with the feature. A test whose layer the machine does not offer
+  (user namespaces refused to an unprivileged user, as on Ubuntu 24.04;
+  Landlock scopes on a kernel older than ABI 6; mounting a tmpfs without
+  root) prints `LAYER UNAVAILABLE HERE:` or `SKIP-REASON:` and returns, and
+  fails instead when the machine does offer it but the host did not apply
+  it. The ordinary Cargo Test job runs them as the unprivileged `runner`
+  user, so the namespace layers skip there; the **Isolate Confinement
+  Tests** CI job runs `cargo test -p legion-isolate --features
+  confinement-test --test binary` as root, where every layer the kernel
+  offers applies.
 - **Image tests** (`crates/isolate/tests/images.rs`) need the built images
   and are all ignored, since CI does not build them:
   `crates/isolate/images/build.sh`, then `cargo test -p legion-isolate
