@@ -435,12 +435,16 @@ export function CreateJoinTokenForm(props: { onCreated?: () => void }) {
   const [ttl, setTtl] = createSignal('24h')
   const [description, setDescription] = createSignal('')
   const [joinCommand, setJoinCommand] = createSignal<string | null>(null)
+  // Set when the token names a loopback manager address no other machine
+  // can reach (CreateJoinTokenReply.warning).
+  const [warning, setWarning] = createSignal<string | null>(null)
   const [error, setError] = createSignal<string | null>(null)
 
   const create = async (event: Event) => {
     event.preventDefault()
     setError(null)
     setJoinCommand(null)
+    setWarning(null)
     try {
       const reply = await managerClient.createJoinToken({
         workerType: workerType(),
@@ -448,6 +452,7 @@ export function CreateJoinTokenForm(props: { onCreated?: () => void }) {
         description: description(),
       })
       setJoinCommand(`legion join ${reply.token}`)
+      setWarning(reply.warning || null)
       setDescription('')
       props.onCreated?.()
     } catch (err) {
@@ -472,6 +477,7 @@ export function CreateJoinTokenForm(props: { onCreated?: () => void }) {
         </Button>
       </form>
       <Feedback error={error()} notice={null} />
+      <Show when={warning()}>{(text) => <Note tone="warn">{text()}</Note>}</Show>
       <Show when={joinCommand()}>
         {(value) => <SecretReveal label="Run on the worker host" secret={value()} />}
       </Show>

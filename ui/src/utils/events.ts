@@ -3,7 +3,7 @@ import type { SchedulerEvent } from '../gen/legion_pb'
 /*
  * Typed views of the event metadata the UI renders as more than raw JSON.
  * Event metadata is a JSON blob whose keys are stable per kind (see
- * src/storage/events.rs). Every field is optional here because an older
+ * crates/manager/src/storage/events.rs). Every field is optional here because an older
  * manager may not send it, and a missing field must render as absent, never
  * crash the row.
  */

@@ -76,6 +76,9 @@ const ICON_PATHS: Record<string, string> = {
 
 export type IconName = keyof typeof ICON_PATHS
 
+/** Whether `name` is an icon this UI draws (app manifests name icons). */
+export const hasIcon = (name: string): boolean => Object.prototype.hasOwnProperty.call(ICON_PATHS, name)
+
 export function Icon(props: { name: IconName; size?: number; class?: string; strokeWidth?: number }) {
   return (
     <svg

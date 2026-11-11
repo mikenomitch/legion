@@ -41,22 +41,22 @@ We found this while preparing a pre-launch spot check on AWS: three raft
 managers and two workers on separate EC2 instances. The cause is two lines:
 
 - The worker serves its gRPC API on `127.0.0.1:4848` only
-  (`src/worker/daemon.rs:155`).
+  (`crates/worker/src/worker/daemon.rs:155`).
 - It registers `workerAddress = "http://127.0.0.1:4848"` no matter where it
   runs, hardcoded from `DEF_MANAGER_HOSTNAME` after the user attribute loop,
-  so config cannot override it (`src/worker/daemon.rs:376-379`).
+  so config cannot override it (`crates/worker/src/worker/daemon.rs:376-379`).
 
 What that breaks on a multi-host cluster:
 
 | Surface | What happens | Code |
 | --- | --- | --- |
-| `legion exec`, actions, the UI terminal | The manager dials `127.0.0.1:4848` on itself and fails | `src/manager/exec.rs:217-223`, `:260` |
-| `legion job logs` | Same | `src/manager/server.rs:9561`, `:9623-9644` |
-| `legion node restart` | Same | `src/manager/server.rs:6879-6882` |
-| Service discovery | Every endpoint resolves to `127.0.0.1:<port>`, because the endpoint IP is the host part of `workerAddress` | `src/storage/store.rs:216-226` |
-| Cross-node mesh (`connect`) | A caller's forwarder dials `127.0.0.1:<remote port>` on its own node: refused, or worse, a local process that owns that port | `src/worker/daemon.rs:2684` |
+| `legion exec`, actions, the UI terminal | The manager dials `127.0.0.1:4848` on itself and fails | `crates/manager/src/manager/exec.rs:217-223`, `:260` |
+| `legion job logs` | Same | `crates/manager/src/manager/server.rs:9561`, `:9623-9644` |
+| `legion node restart` | Same | `crates/manager/src/manager/server.rs:6879-6882` |
+| Service discovery | Every endpoint resolves to `127.0.0.1:<port>`, because the endpoint IP is the host part of `workerAddress` | `crates/manager/src/storage/store.rs:216-226` |
+| Cross-node mesh (`connect`) | A caller's forwarder dials `127.0.0.1:<remote port>` on its own node: refused, or worse, a local process that owns that port | `crates/worker/src/worker/daemon.rs:2684` |
 | Edge boot | `legion sandbox start --node http://10.0.1.7:4848` (the documented form, `docs/edge-boot.md:283`) cannot connect | `src/cmd/sandbox.rs:109` |
-| Work dispatch | Still works, slower: the push fails and the next heartbeat reply carries the allocation | `src/manager/dispatcher.rs:139-146` |
+| Work dispatch | Still works, slower: the push fails and the next heartbeat reply carries the allocation | `crates/manager/src/manager/dispatcher.rs:139-146` |
 
 The AWS benchmarks never hit this because they ran simulated fleets, which
 take an explicit `--advertise-host` (`src/cmd/start.rs:110`).
@@ -65,7 +65,7 @@ take an explicit `--advertise-host` (`src/cmd/start.rs:110`).
 unauthenticated remote-exec endpoint**, so the fix is not "bind 0.0.0.0." The
 `Worker` service (`proto/legion.proto:7257-7290`) has five RPCs, and none of
 `PostWork`, `ExecTask`, `GetTaskLogs`, or `RestartWorker` checks who is calling
-(`src/worker/server.rs`). Their proto comments say "called only by the
+(`crates/worker/src/worker/server.rs`). Their proto comments say "called only by the
 manager," and the loopback bind is what makes that true. Reachable as-is, any
 host on the network could open a root shell in any task, read any log, or post
 arbitrary work.
@@ -74,11 +74,11 @@ Two related gaps sit on the same channel:
 
 - **The worker-to-manager channel is always plaintext.** `create_manager_client`
   ignores TLS with a `TODO: Temporarily doesn' do any TLS`
-  (`src/worker/daemon.rs:799-811`), even when the manager serves TLS. Heartbeat
+  (`crates/worker/src/worker/daemon.rs:799-811`), even when the manager serves TLS. Heartbeat
   replies carry work payloads with KV-rendered secrets, and
   `IssueNodeCertificate` returns the node's mesh *private key* over it
-  (`src/manager/mesh_ca.rs:72-75`). The edge-boot JWKS is fetched over the
-  same plaintext address (`src/worker/daemon.rs:500-508`), so an on-path
+  (`crates/common/src/mesh_ca.rs:72-75`). The edge-boot JWKS is fetched over the
+  same plaintext address (`crates/worker/src/worker/daemon.rs:500-508`), so an on-path
   attacker can swap the keys that verify boot tickets.
   `docs/auth-and-acls.md:342-343` claims "the listener-level TLS below
   already covers transport encryption," which is not true for workers.
@@ -96,19 +96,19 @@ Closing port 4848 to the network is not enough, because the attacker we
 most need to stop is already on the host. Linux `container` tasks share the
 host's network by default (`docs/task-runtime-container.md:316`, `:392`), and
 so do `exec` tasks (`docs/task-runtime-exec.md:89`). `network.mode = "auto"`
-resolves to `host` for every runtime (`src/structs/network.rs:39-49`). Code in
+resolves to `host` for every runtime (`crates/common/src/structs/network.rs:39-49`). Code in
 any such task reaches everything the host reaches. We checked each target in
 the code:
 
 | Target | What a host-network task gets | Verified at |
 | --- | --- | --- |
-| **The manager on 4747**, when co-located (`--run-worker`, single-box setups) | Full control of the cluster with no token. ACLs are off by default (`docs/auth-and-acls.md:9`, `src/structs/config.rs:1129-1131`). The manager binds `127.0.0.1` by default (`src/constants.rs:73`, `configs/manager.ncl:4`), which a host-network task shares. The origin guard does not help: it ignores requests without an `Origin` header (`src/structs/config.rs:37-41`). | `src/manager/daemon.rs:432-433` |
-| **The manager on another host**, in any multi-host cluster | The same, over the network. Workers must reach the manager, so `server.host` is a reachable address, and every task on every worker can reach it too. | `src/structs/config.rs:1633-1647` |
-| **The open `BootstrapAcl` RPC**, even with ACLs on | Succeeds whenever no management token exists (`src/manager/server.rs:8752-8754`, `docs/auth-and-acls.md:371`). A task on the manager's host can race the operator to it after first start, or after a recovery. | `tests/acl_endpoints.rs:194` (`Plane::Open`) |
-| **The exec WebSocket on 4748** and **metrics on 4749** | Both bind `server.host`. The WebSocket enforces ACLs, so with ACLs off it is another unauthenticated shell into every task. `/metrics` is unauthenticated, though its labels are bounded and low-cardinality, so it leaks cluster shape rather than secrets. | `src/manager/daemon.rs:436-477` |
-| **The worker plane on 4848** | `ExecTask` into any allocation on the node, `GetTaskLogs`, `PostWork`, `RestartWorker`, with no credential. `StartClaim` is ticket-protected and fine. | `src/worker/daemon.rs:155`, `src/worker/server.rs` |
+| **The manager on 4747**, when co-located (`--run-worker`, single-box setups) | Full control of the cluster with no token. ACLs are off by default (`docs/auth-and-acls.md:9`, `crates/common/src/structs/config.rs:1129-1131`). The manager binds `127.0.0.1` by default (`crates/common/src/constants.rs:73`, `configs/manager.ncl:4`), which a host-network task shares. The origin guard does not help: it ignores requests without an `Origin` header (`crates/common/src/structs/config.rs:37-41`). | `crates/manager/src/manager/daemon.rs:432-433` |
+| **The manager on another host**, in any multi-host cluster | The same, over the network. Workers must reach the manager, so `server.host` is a reachable address, and every task on every worker can reach it too. | `crates/common/src/structs/config.rs:1633-1647` |
+| **The open `BootstrapAcl` RPC**, even with ACLs on | Succeeds whenever no management token exists (`crates/manager/src/manager/server.rs:8752-8754`, `docs/auth-and-acls.md:371`). A task on the manager's host can race the operator to it after first start, or after a recovery. | `tests/integration/acl_endpoints.rs:194` (`Plane::Open`) |
+| **The exec WebSocket on 4748** and **metrics on 4749** | Both bind `server.host`. The WebSocket enforces ACLs, so with ACLs off it is another unauthenticated shell into every task. `/metrics` is unauthenticated, though its labels are bounded and low-cardinality, so it leaks cluster shape rather than secrets. | `crates/manager/src/manager/daemon.rs:436-477` |
+| **The worker plane on 4848** | `ExecTask` into any allocation on the node, `GetTaskLogs`, `PostWork`, `RestartWorker`, with no credential. `StartClaim` is ticket-protected and fine. | `crates/worker/src/worker/daemon.rs:155`, `crates/worker/src/worker/server.rs` |
 | **The cloud metadata service** (`169.254.169.254`, `fd00:ec2::254`) | The instance role's credentials. IMDSv2 does not help: a host-network task is zero hops from the instance. | (host networking) |
-| **Other allocations' datapath listeners** | Every host-mode allocation's upstream ports (`127.0.0.1:<port>`), VIPs (`127.42.<b>.x`), and resolver (`127.42.<b>.1:53`) live on the host's loopback. The datapath attributes a connection to the allocation that owns the listener, not to the process that connected (`src/worker/netd/dns.rs:4-10`, `src/worker/forwarder.rs:1024-1029`). A neighbor dials through another allocation's egress policy and wears its mesh identity at the remote ingress. | `src/worker/forwarder.rs:1601` |
+| **Other allocations' datapath listeners** | Every host-mode allocation's upstream ports (`127.0.0.1:<port>`), VIPs (`127.42.<b>.x`), and resolver (`127.42.<b>.1:53`) live on the host's loopback. The datapath attributes a connection to the allocation that owns the listener, not to the process that connected (`crates/worker/src/worker/netd/dns.rs:4-10`, `crates/worker/src/worker/forwarder.rs:1024-1029`). A neighbor dials through another allocation's egress policy and wears its mesh identity at the remote ingress. | `crates/worker/src/worker/forwarder.rs:1601` |
 | **Any other host daemon** | sshd, node exporters, a Docker socket over TCP, anything on loopback or the node's IPs. | (host networking) |
 
 **`gated` mode does not close this today, and the docs say it does.**
@@ -117,15 +117,15 @@ the code:
 a door to the host:
 
 - The proxy dials from the worker's host namespace
-  (`src/worker/netd/proxy.rs:20-21`), and nothing in the datapath refuses
+  (`crates/worker/src/worker/netd/proxy.rs:20-21`), and nothing in the datapath refuses
   loopback, link-local, or node-local destinations. A grep for
-  `is_loopback`, `is_link_local`, or `169.254` in `src/worker` finds nothing.
+  `is_loopback`, `is_link_local`, or `169.254` in `crates/worker/src/worker` finds nothing.
   `curl -x 127.0.0.1:1080 http://127.0.0.1:4747/` from a gated task reaches
   the host's manager.
 - A gated allocation with no policy allows everything through the proxy
-  (`docs/network-handlers.md:602-604`, `src/worker/netd/policy.rs:198-201`).
+  (`docs/network-handlers.md:602-604`, `crates/worker/src/worker/netd/policy.rs:198-201`).
 - CIDR rules never see hostnames. All three proxy paths set `ip` only when
-  the target is an IP literal (`src/worker/netd/proxy.rs:512`, `:621`,
+  the target is an IP literal (`crates/worker/src/worker/netd/proxy.rs:512`, `:621`,
   SOCKS at `:879`), then let the host resolve the name at dial time. So the
   documented metadata rule (`{ cidr = "169.254.0.0/16", action = "deny" }`,
   `docs/network-handlers.md:118`) is bypassed by any name that resolves to
@@ -133,12 +133,12 @@ a door to the host:
   `2130706433` that `host.parse::<IpAddr>()` rejects and `getaddrinfo`
   accepts.
 - An `exec` task enters the gated namespace with `setns` while still holding
-  the worker's privileges (`src/task_plugins/exec.rs:647-658`). Without a
+  the worker's privileges (`crates/worker/src/task_plugins/exec.rs:647-658`). Without a
   `user`, it stays root with every capability and can `setns` straight back
   to the host namespace. Gated `exec` is a boundary only for a non-root task.
 
 **What an in-container compromise is worth** (separate from the network).
-The Linux OCI bundle (`src/task_plugins/oci_bundle.rs:564-679`), used by
+The Linux OCI bundle (`crates/worker/src/task_plugins/oci_bundle.rs:564-679`), used by
 youki (the default), runc, and crun:
 
 - It runs the image's `User`, which is root when the image says nothing
@@ -174,9 +174,9 @@ the worker's user, which is root on a real node. It can read the worker's
 node token, the co-located manager's store (with the cluster CA key and KV
 keyring), and `~/.legion/token`. `privateTmp`, capability drops, and
 `noNewPrivileges` are opt-in and off by default
-(`src/task_plugins/exec_isolation.rs:27-50`). The user switch calls
+(`crates/worker/src/task_plugins/exec_isolation.rs:27-50`). The user switch calls
 `setgid` and `setuid` but never `setgroups`, so a task keeps the worker's
-supplementary groups (`src/task_plugins/exec.rs:679-687`). The ACL model
+supplementary groups (`crates/worker/src/task_plugins/exec.rs:679-687`). The ACL model
 already calls `exec` "host-level" (`docs/task-runtime-exec.md:119-122`), but
 anyone with `job:write` can submit one.
 
@@ -226,7 +226,7 @@ TLS from a cluster CA, and encodes the peer's *role* in the certificate so
     [Consul agent mTLS](https://developer.hashicorp.com/consul/docs/secure/encryption/mtls).
 
 What Legion already has that the others had to build: a cluster CA replicated
-with the control lane (`src/manager/mesh_ca.rs`), short-lived node certificates
+with the control lane (`crates/common/src/mesh_ca.rs`), short-lived node certificates
 with `ServerAuth` and `ClientAuth`, refreshed on the heartbeat loop, and
 authenticated per-node principals (`node:<id>`) on every worker-plane RPC when
 ACLs are on.
@@ -423,7 +423,7 @@ ACLs are on.
 ### Non-goals
 
 - **Raft transport encryption.** Peers already authenticate with the cluster
-  secret (`src/storage/raft/driver.rs:1884`, `src/storage/raft/server.rs:70`),
+  secret (`crates/manager/src/storage/raft/driver.rs:1884`, `crates/manager/src/storage/raft/server.rs:70`),
   but in plaintext. The manager certificates this plan introduces are the
   building block for that work. It gets its own plan.
 - **TLS by default on the user-facing API (CLI, UI, MCP).** Phase 4 encrypts
@@ -434,6 +434,10 @@ ACLs are on.
   node-to-node reachability anyway, so a reverse tunnel would not make such a
   worker fully functional (calls entry 3).
 - **External or pluggable CAs** (Vault PKI, ACME). The CA stays built in.
+  *Reversed by [`cluster-ca-provider-plan.md`](cluster-ca-provider-plan.md)
+  (2026-10-14): the built-in CA stays the default, and an operator can supply
+  an intermediate on each manager's disk (`file`) or an external signer such
+  as Vault PKI (`exec`). ACME remains out of scope.*
 - **Registration through a raft follower.** `WorkerRegister` is not forwarded
   to the leader today, so a worker whose token names a follower fails to
   register. That is a separate bug, filed in `internal_docs/TODO.md`.
@@ -458,88 +462,88 @@ ACLs are on.
 ### Worker plane
 
 - **Worker listener.** Plain gRPC on `127.0.0.1:<LEGION_WORKER_PORT|4848>`
-  (`src/worker/daemon.rs:75-80`, `:155`, `:318-320`). No TLS, no interceptor.
+  (`crates/worker/src/worker/daemon.rs:75-80`, `:155`, `:318-320`). No TLS, no interceptor.
 - **Advertised address.** `workerAddress` is hardcoded to loopback
-  (`src/worker/daemon.rs:376-379`). The simulator alone takes
-  `--advertise-host` (`src/cmd/start.rs:110-118`, `src/worker/simulate.rs:66-78`).
+  (`crates/worker/src/worker/daemon.rs:376-379`). The simulator alone takes
+  `--advertise-host` (`src/cmd/start.rs:110-118`, `crates/worker/src/worker/simulate.rs:66-78`).
 - **Manager-side clients.** Seven places build a `WorkerClient`, each with its
   own copy of `worker_address_for_node`:
-  - dispatch (`src/manager/dispatcher.rs:40-54`, `:362`, `:464`, `:502`)
-  - exec (`src/manager/exec.rs:217-223`, `:260`)
-  - logs and restart (`src/manager/server.rs:9561`, `:9623-9644`,
+  - dispatch (`crates/manager/src/manager/dispatcher.rs:40-54`, `:362`, `:464`, `:502`)
+  - exec (`crates/manager/src/manager/exec.rs:217-223`, `:260`)
+  - logs and restart (`crates/manager/src/manager/server.rs:9561`, `:9623-9644`,
     `:6879-6882`)
   - edge boot from the CLI (`src/cmd/sandbox.rs:109`)
 - **Dispatch is best-effort by design.** A failed push costs one heartbeat
   interval, because the heartbeat reply carries the desired set
-  (`src/manager/dispatcher.rs:139-146`).
+  (`crates/manager/src/manager/dispatcher.rs:139-146`).
 - **The mesh CA.** One CA per cluster, generated on first use and replicated
   in the control lane (`net_mesh_ca`). It signs node certs with SANs
   `<node>.node.legion` and `legion://node/<id>`, valid 24 hours and refreshed
-  after 8 (`src/manager/mesh_ca.rs`). The manager generates the key pair and
+  after 8 (`crates/common/src/mesh_ca.rs`). The manager generates the key pair and
   returns both halves (`:72-75`).
 - **Node cert issuance on the worker is lazy.** The worker asks for one only
-  once something on the node needs mesh TLS (`src/worker/daemon.rs:1962-1990`).
+  once something on the node needs mesh TLS (`crates/worker/src/worker/daemon.rs:1962-1990`).
 - **Worker credentials.** With ACLs on, registration needs the join secret and
   mints a per-node token. Every worker-plane RPC on the manager checks that the
   token's node matches the request (`docs/auth-and-acls.md:312-325`).
 - **The join token** is `lgnjoin_` plus base64url JSON
-  `{v, addr, secret, workerType}` (`src/structs/token.rs:30-40`). It carries no
+  `{v, addr, secret, workerType}` (`crates/common/src/structs/token.rs:30-40`). It carries no
   trust anchor.
 - **Edge boot's ticket verifier** fetches the JWKS from
   `<manager addr>/.well-known/jwks.json`, which is plain `http://` today, and
   is built only when `edgeBoot.acceptClaims` is on
-  (`src/worker/daemon.rs:284-310`, `:488-519`).
+  (`crates/worker/src/worker/daemon.rs:284-310`, `:488-519`).
 - **`StartClaim`** is authorized by the boot ticket alone and is meant to be
   called by an external router, not a manager (`proto/legion.proto:7289`).
 - **TLS dependencies** are already in the tree: `tonic` with `tls`, `rustls`,
   `rcgen`, and `x509-parser` (`Cargo.toml:43-78`).
-- **The protocol version** is `PROTOCOL_VERSION = 2` (`src/constants.rs:13`).
+- **The protocol version** is `PROTOCOL_VERSION = 2` (`crates/common/src/constants.rs:13`).
 
 ### Local reachability
 
 - **Manager listeners.** gRPC (and raft transport) on `server.host:4747`,
   the exec WebSocket on `+1`, telemetry on `+2`, all on `server.host`, which
-  defaults to `127.0.0.1` (`src/manager/daemon.rs:432-477`,
-  `src/structs/config.rs:1664-1679`). Workers on other hosts need a reachable
+  defaults to `127.0.0.1` (`crates/manager/src/manager/daemon.rs:432-477`,
+  `crates/common/src/structs/config.rs:1664-1679`). Workers on other hosts need a reachable
   `server.host`, so multi-host managers bind beyond loopback.
-- **ACLs.** Off by default (`src/structs/config.rs:1020-1028`, `:1129-1131`).
+- **ACLs.** Off by default (`crates/common/src/structs/config.rs:1020-1028`, `:1129-1131`).
   `--run-worker` with ACLs on already mints an in-process join secret
-  (`src/manager/daemon.rs:350-360`). `BootstrapAcl` is open while no
-  management token exists (`src/manager/server.rs:8746-8759`). The CLI reads
+  (`crates/manager/src/manager/daemon.rs:350-360`). `BootstrapAcl` is open while no
+  management token exists (`crates/manager/src/manager/server.rs:8746-8759`). The CLI reads
   `LEGION_TOKEN`, then `~/.legion/token` (`src/cmd/helpers.rs:50-62`).
   `catalog()` lists `acl.bootstrap` (`src/cmd/capabilities.rs:727-729`).
 - **The ACL `host` flag** exists on `exec` rules only, marking exec into
-  host-level runtimes (`src/structs/acl.rs:174-178`, `:224-226`,
+  host-level runtimes (`crates/common/src/structs/acl.rs:174-178`, `:224-226`,
   `docs/exec-and-actions.md:150-164`).
 - **Network mode.** `auto` resolves to `host` for every runtime
-  (`src/structs/network.rs:39-49`), at placement, in
-  `effective_network_mode` (`src/storage/store.rs:12034-12053`), where a
+  (`crates/common/src/structs/network.rs:39-49`), at placement, in
+  `effective_network_mode` (`crates/manager/src/storage/store.rs:12034-12053`), where a
   `require` policy can impose a mode.
 - **Gated namespaces.** Created per allocation at
   `/var/run/netns/legion-<alloc>` with loopback only. Containers join by path
-  (`src/task_plugins/oci_bundle.rs:619-621`, `src/task_plugins/container.rs:840-868`).
+  (`crates/worker/src/task_plugins/oci_bundle.rs:619-621`, `crates/worker/src/task_plugins/container.rs:840-868`).
   `exec` tasks `setns` before the user switch
-  (`src/task_plugins/exec.rs:647-658`). The worker binds listeners inside with
-  `netns::within` (`src/worker/netd/netns.rs:219-250`).
+  (`crates/worker/src/task_plugins/exec.rs:647-658`). The worker binds listeners inside with
+  `netns::within` (`crates/worker/src/worker/netd/netns.rs:219-250`).
 - **The egress proxy** judges gate, then pending policy, then the egress
-  chain (`src/worker/netd/proxy.rs:294-343`), and dials with
+  chain (`crates/worker/src/worker/netd/proxy.rs:294-343`), and dials with
   `TcpStream::connect((host, port))` from the host namespace (`:544`, `:731`,
   `:913`).
 - **Gated ingress.** Only a task with an ingress chain gets private twin ports
-  and ingress listeners (`src/storage/store.rs:12182-12195`,
-  `src/structs/network.rs:940-951`, `src/worker/daemon.rs:2417-2446`). A gated
+  and ingress listeners (`crates/manager/src/storage/store.rs:12182-12195`,
+  `crates/common/src/structs/network.rs:940-951`, `crates/worker/src/worker/daemon.rs:2417-2446`). A gated
   task without one binds its declared ports inside its namespace, where
   nothing outside can reach them.
 - **Gated DNS.** A gated task gets a resolver only with a VIP block, which
   comes with upstreams (the gated-sandbox plan §6.5 records this gap).
 - **cgroups.** Tasks get a `legion/{share,reserve}/legion-<alloc>` leaf only
-  with `resourceEnforcement.enabled` (`src/worker/resources.rs:180-258`).
+  with `resourceEnforcement.enabled` (`crates/worker/src/worker/resources.rs:180-258`).
 - **The OCI bundle** is generated by Legion from the image layout
-  (`src/task_plugins/oci_bundle.rs:67-115`, `:564-679`), and the worker
+  (`crates/worker/src/task_plugins/oci_bundle.rs:67-115`, `:564-679`), and the worker
   extracts layers itself (`:211-268`).
-- **`exec` hardening** is opt-in (`src/task_plugins/exec_isolation.rs:27-50`),
+- **`exec` hardening** is opt-in (`crates/worker/src/task_plugins/exec_isolation.rs:27-50`),
   applied in privilege order around the user switch
-  (`src/task_plugins/exec.rs:618-718`).
+  (`crates/worker/src/task_plugins/exec.rs:618-718`).
 
 ## 6. Proposed design
 
@@ -615,7 +619,7 @@ ERROR:
 
 **The classification test.** `every_worker_rpc_is_classified` parses
 `proto/legion.proto` and fails the build if a `Worker` RPC has no caller
-class, the same way `tests/acl_endpoints.rs` guards the `Manager` service. It
+class, the same way `tests/integration/acl_endpoints.rs` guards the `Manager` service. It
 reads a table that allows more than one class per RPC:
 
 ```rust
@@ -1185,7 +1189,7 @@ code belongs on Linux.
     `ExecTask: manager | ticket` and when the ticket class is admitted.
   - `NetDenial` and the denial events gain `host-guard` as a documented
     source value.
-- `src/constants.rs`: `PROTOCOL_VERSION = 3`. Version 3 means "serves the
+- `crates/common/src/constants.rs`: `PROTOCOL_VERSION = 3`. Version 3 means "serves the
   mTLS worker plane and advertises a reachable address."
 - `JoinToken`: `v = 2`, with a required `ca_hash` (`caHash` on the wire).
 - Node record: `workerAddress` changes scheme to `https`. New config attrs for
@@ -1205,8 +1209,8 @@ code belongs on Linux.
   - new `userNamespaces = { idPool = "<first id>-<last id>" }`, with a
     default the worker validates against `/etc/subuid` (open question 7)
   - `exec.direct` (from the sandbox-exec plan) builds the JWKS verifier
-- ACL: `host` becomes valid on `job` rules (`src/structs/acl.rs:174-178`).
-  `tests/acl_endpoints.rs` drops `BootstrapAcl`. `catalog()` drops
+- ACL: `host` becomes valid on `job` rules (`crates/common/src/structs/acl.rs:174-178`).
+  `tests/integration/acl_endpoints.rs` drops `BootstrapAcl`. `catalog()` drops
   `acl.bootstrap`.
 - Job config:
   - `container.config.security = { userNamespace, seccomp }`, both into
@@ -1278,12 +1282,12 @@ pieces of #17 survived). As merged:
   simulator (calls entry 26), route-based detection, the startup log line,
   and an `https://` `workerAddress`. The in-process worker of
   `--run-worker` advertises the manager's routable `server.advertiseAddr`
-  (from #17). Code: `src/worker/plane.rs`.
+  (from #17). Code: `crates/worker/src/worker/plane.rs`.
 - [x] The mTLS listener with per-RPC caller classes (§6.1), including the
   `ticket` class on `ExecTask` behind `exec.direct` (sandbox-exec plan).
 - [x] Manager certificates (§6.2) and the one `WorkerPlane` factory (§6.3),
   channels cached per (CA, address, name). Code:
-  `src/manager/worker_plane.rs`.
+  `crates/manager/src/manager/worker_plane.rs`.
 - [x] CSR issuance, eager at registration, persisted under
   `<state-dir>/identity/` mode `0600` (§6.4). The mesh uses the same
   identity.
@@ -1291,7 +1295,7 @@ pieces of #17 survived). As merged:
 - [x] Two-step CA rotation by cross-signing (§6.9).
 - [x] The simulator's fleet certificate, `<prefix>.fleet.legion` (open
   question 4, calls entry 21).
-- [x] `PROTOCOL_VERSION = 3`; `tests/worker_plane_classes.rs` classifies
+- [x] `PROTOCOL_VERSION = 3`; `tests/integration/worker_plane_classes.rs` classifies
   every `Worker` RPC.
 - [ ] Two workers on `127.0.0.2`/`127.0.0.3` in one test process, and the
   AWS 1,000-node throughput comparison (§9).
@@ -1516,7 +1520,7 @@ sudo -E LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_security -- --ignor
 
 **Regression and performance**
 
-- `cargo test --all --locked`, `tests/acl_endpoints.rs`, and the simulator
+- `cargo test --all --locked`, `tests/integration/acl_endpoints.rs`, and the simulator
   smoke at 1,000 nodes.
 - Dispatch now runs over TLS. Run the AWS rig's 1,000-node cell before and
   after, and put both placement-throughput numbers in the PR. Channels are
@@ -1540,10 +1544,10 @@ item in `internal_docs/TODO.md`.
 
 - **Phases 0 to 2** ran in a Linux 6.18 VM as root (cgroup hybrid, `nft`,
   `runc`, no KVM): `cargo test --all --locked` green, including
-  `tests/worker_plane_e2e.rs` (the real binary with an in-process worker
+  `tests/integration/worker_plane_e2e.rs` (the real binary with an in-process worker
   over mTLS: logs, exec with exit status, a CA rotation in the middle) and
   the datapath guard tests against real namespaces.
-- **Phase 3** ran on the same VM: `tests/gated_container_default.rs`
+- **Phase 3** ran on the same VM: `tests/integration/gated_container_default.rs`
   (placement), the network unit tests, and both start benchmarks with `runc`:
   the namespace and listeners add p50 1.0 ms / p99 3.9 ms
   (`gated_start_overhead_benchmark`, 200 runs), and a whole `alpine` start
@@ -1575,7 +1579,7 @@ item in `internal_docs/TODO.md`.
   and crun. Five older ignored runc tests fail here with and without the
   floor (listed in TODO.md).
 - **Phase 7** ran as unit and integration tests: the host-grant matrix in
-  `tests/acl_endpoints.rs` (an exec task, a host-network container, and a
+  `tests/integration/acl_endpoints.rs` (an exec task, a host-network container, and a
   floor-less container refused without `host` and admitted with it), the
   gated-root refusal, and the classification table.
 - **Phase 8** ran end to end in `worker_plane_e2e` (the in-process worker is
@@ -1665,7 +1669,7 @@ decision and not a surprise:
 - `<dataDir>/bootstrap-token` and `~/.legion/token` exist with mode `0600`
   after first start. A restart mints nothing new.
 - `legion acl bootstrap` and `BootstrapAcl` no longer exist, and
-  `tests/acl_endpoints.rs` passes.
+  `tests/integration/acl_endpoints.rs` passes.
 
 **Phase 1**
 - On two hosts with only 4747 and 4848 open, `legion job logs`, `legion exec

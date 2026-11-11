@@ -10,7 +10,16 @@ global:
 scrape_configs:
   # Legion managers: /metrics on the telemetry port. The scheduler
   # phase histogram here is the campaign's core measurement.
+  #
+  # Every control-plane job scrapes at 15s, not the global 5s. A scrape runs
+  # on the box under test, and Nomad's leader exposes ~49,000 samples at
+  # 4,000 jobs (per-job summary gauges), taking 1.25s to encode: at 5s that
+  # was a quarter of a core of the leader spent on the rig's own
+  # measurement (2026-10-14). The apiserver's /metrics is similarly large.
+  # Same interval for all three systems; collect.sh's rate()s use 1m windows,
+  # which still hold four samples.
   - job_name: legion-managers
+    scrape_interval: 15s
     static_configs:
       - targets:
           - "${CP0_IP}:4749"
@@ -37,6 +46,7 @@ scrape_configs:
   # Nomad campaign: servers publish Prometheus-format telemetry on the
   # HTTP API port (configs/nomad/server.hcl.tpl enables it).
   - job_name: nomad-servers
+    scrape_interval: 15s
     metrics_path: /v1/metrics
     params:
       format: ["prometheus"]

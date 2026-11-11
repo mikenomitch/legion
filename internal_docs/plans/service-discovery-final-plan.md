@@ -98,12 +98,12 @@ turned out not to need the rest of the mesh. User-facing docs:
   (statics across both lists first, then dynamics from one cursor), persisted on
   `AllocNetwork.upstreams`, and injected as `LEGION_UPSTREAM_<SVC>` /
   `LEGION_UPSTREAM_PORT_<SVC>`.
-- **Per-node L4 forwarder** (`src/worker/forwarder.rs`): one loopback TCP listener per
+- **Per-node L4 forwarder** (`crates/worker/src/worker/forwarder.rs`): one loopback TCP listener per
   `(allocation, upstream service)`; dial with a 2s timeout, fail over across up to 3
   candidates, then `copy_bidirectional`. Never a per-task sidecar — the anti-pattern §1
   calls out. Bind failures warn once and retry on the next heartbeat; nothing here can
   kill the heartbeat loop.
-- **Pluggable balancing** (`src/worker/balance.rs`): `Balancer` trait + registry;
+- **Pluggable balancing** (`crates/worker/src/worker/balance.rs`): `Balancer` trait + registry;
   `round_robin` (default), `random`, `least_conn`. The wire carries the strategy *name*,
   so a new strategy is one impl + one row in the `BALANCERS` table — no proto change, no
   migration. That table is the only name list: config validation reads it too, so a
@@ -147,19 +147,19 @@ turned out not to need the rest of the mesh. User-facing docs:
 
 | Change | Exact location | Mechanism |
 | --- | --- | --- |
-| Port/service types | new `src/structs/network.rs` | `NetworkConfig`, `PortConfig`, `ServiceConfig`, `AllocNetwork`, assignment + env helpers |
-| Jobspec fields | `TaskConfig` ([src/structs/job.rs:815](../../src/structs/job.rs)) | `network: Option<NetworkConfig>`, `service: Option<ServiceConfig>` |
-| Sugar + validation | `JobConfig` normalize + `validate_job_config` ([src/task_plugins/mod.rs:185](../../src/task_plugins/mod.rs)); called at [src/manager/server.rs:847](../../src/manager/server.rs) | int/`'dynamic'` `service.port` materializes a `network.ports` entry before storage |
-| Schema | [src/storage/migrations.rs](../../src/storage/migrations.rs) | `task_config` +`network`,+`service`; `allocation` +`network`; index `allocation(node_id)` |
-| Query consts | [src/storage/queries.rs](../../src/storage/queries.rs) | extend `TASK_CONFIG_*` and `ALLOCATION_*` attr lists |
-| Port assignment | `Store::insert_allocation` ([src/storage/store.rs:2647](../../src/storage/store.rs)) | in-transaction: read task network + used ports on node → assign → persist on allocation row. Static conflict = placement error |
-| Node address | `node.config_attrs.workerAddress` (set at [src/worker/agent.rs:118](../../src/worker/agent.rs)) | endpoint IP = host of workerAddress; resolved at insert, stored in `AllocNetwork.address` |
-| Wire to worker | `TaskAllocation` proto +`network` field; `build_task_allocation` ([src/manager/dispatcher.rs:112](../../src/manager/dispatcher.rs)) | covers both PostWork and HeartbeatReply paths (shared builder) |
+| Port/service types | new `crates/common/src/structs/network.rs` | `NetworkConfig`, `PortConfig`, `ServiceConfig`, `AllocNetwork`, assignment + env helpers |
+| Jobspec fields | `TaskConfig` ([crates/common/src/structs/job.rs:815](../../crates/common/src/structs/job.rs)) | `network: Option<NetworkConfig>`, `service: Option<ServiceConfig>` |
+| Sugar + validation | `JobConfig` normalize + `validate_job_config` ([crates/worker/src/task_plugins/mod.rs:185](../../crates/worker/src/task_plugins/mod.rs)); called at [crates/manager/src/manager/server.rs:847](../../crates/manager/src/manager/server.rs) | int/`'dynamic'` `service.port` materializes a `network.ports` entry before storage |
+| Schema | [crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs) | `task_config` +`network`,+`service`; `allocation` +`network`; index `allocation(node_id)` |
+| Query consts | [crates/manager/src/storage/queries.rs](../../crates/manager/src/storage/queries.rs) | extend `TASK_CONFIG_*` and `ALLOCATION_*` attr lists |
+| Port assignment | `Store::insert_allocation` ([crates/manager/src/storage/store.rs:2647](../../crates/manager/src/storage/store.rs)) | in-transaction: read task network + used ports on node → assign → persist on allocation row. Static conflict = placement error |
+| Node address | `node.config_attrs.workerAddress` (set at [crates/worker/src/worker/agent.rs:118](../../crates/worker/src/worker/agent.rs)) | endpoint IP = host of workerAddress; resolved at insert, stored in `AllocNetwork.address` |
+| Wire to worker | `TaskAllocation` proto +`network` field; `build_task_allocation` ([crates/manager/src/manager/dispatcher.rs:112](../../crates/manager/src/manager/dispatcher.rs)) | covers both PostWork and HeartbeatReply paths (shared builder) |
 | Env injection | `exec.rs` `start()` (`cmd.envs`), `container.rs` `build_launch` (`--env`) | shared `allocation_env()` helper; user env wins on conflict |
 | Catalog queries | new fns in `store.rs` | one JOIN over `task_config`(service not null) × `allocation` × `allocation_health` × `node` |
-| RPCs | `proto/legion.proto` `service Manager`; handlers in `src/manager/server.rs` | `ListServices`, `ResolveService` (documented per AGENTS.md proto rule) |
+| RPCs | `proto/legion.proto` `service Manager`; handlers in `crates/manager/src/manager/server.rs` | `ListServices`, `ResolveService` (documented per AGENTS.md proto rule) |
 | CLI | new `src/cmd/service.rs`, wired in `src/main.rs` + `src/cmd/mod.rs` | `list`, `resolve`, `doctor` |
-| Health feed | heartbeat → `upsert_allocation_health_snapshots` ([src/manager/server.rs:2203](../../src/manager/server.rs)) | already exists — the projection reads it; tasks without checks report healthy |
+| Health feed | heartbeat → `upsert_allocation_health_snapshots` ([crates/manager/src/manager/server.rs:2203](../../crates/manager/src/manager/server.rs)) | already exists — the projection reads it; tasks without checks report healthy |
 
 Liveness-as-lease note: node heartbeats already gate node status; v1 `resolve` excludes
 endpoints on nodes whose status is not ready/alive — endpoint life is bounded by the
@@ -201,7 +201,7 @@ points**; the verification matrix in §7 is another (parallel manual-verify agen
 Linux and macOS). A workflow can pipeline: implement-step → review-step per item.
 
 ### S1 — Types, sugar, validation (pure, no I/O)
-- `src/structs/network.rs`: `NetworkConfig { mode, ports }`, `PortConfig { name,
+- `crates/common/src/structs/network.rs`: `NetworkConfig { mode, ports }`, `PortConfig { name,
   static, to }`, `ServiceConfig { name?, port: int|label, tags, meta }`,
   `AllocNetwork { address?, ports: [{name, host_port, to}] }`;
   `assign_ports(network, used: &HashSet<u16>) -> R<Vec<AllocPort>>`;

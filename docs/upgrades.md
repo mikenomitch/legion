@@ -50,6 +50,21 @@ on every worker restart, even though the task itself never restarted:
   moves the allocations to other nodes before you restart the worker, and
   `legion node uncordon <node>` returns the node afterward.
 
+A worker keeps some state as JSON files in its state directory, and some of
+them hold API messages as written by the binary that saved them. A newer
+binary cannot yet read such a file when a field was added to the message
+since, and it fails naming the field, for example `missing field
+envelopeResources` reading `netd_state.json`. This is a known gap.
+
+The record of running tasks, `worker_state.json`, is read one task at a
+time. A task whose record the new binary cannot read is stopped, through its
+cgroup and its process group, rather than left running unmanaged; the
+manager then places it again. The worker logs `The worker state file holds
+records this build cannot read` and keeps the old file beside the new one as
+`worker_state.json.unreadable-<unix seconds>`. Before, one such record made
+the restarted worker forget every running task, and the manager started a
+second copy of each beside the first.
+
 ## Stopping a manager
 
 Restart managers with SIGTERM (or Ctrl-C, which sends SIGINT). That's what
@@ -95,7 +110,7 @@ Workers and managers exchange versions during registration
 
 - The worker sends `build_version` (its Cargo package version, e.g.
   `"0.1.0"`) and `protocol_version` (the wire-contract version it speaks,
-  `PROTOCOL_VERSION` in `src/constants.rs`).
+  `PROTOCOL_VERSION` in `crates/common/src/constants.rs`).
 - The manager replies with `manager_build_version` and
   `manager_protocol_version`.
 
@@ -135,7 +150,8 @@ keep that hot path lean. The check runs once per registration.
 
 | Version | Added | Behavior with an older worker |
 | --- | --- | --- |
-| 3 | The authenticated worker plane: the worker serves `Worker` over mutual TLS with a node certificate it requested by CSR (the `IssueNodeCertificate` reply no longer carries a key), binds all interfaces, and advertises a reachable `https://` address ([Managers and Workers](architecture-managers-workers.md#the-worker-plane)). Join tokens are format v2 and pin the cluster CA | Managers never dial a worker in plaintext. A protocol-2 worker keeps registering, heartbeating, and running the work its heartbeat replies carry, but exec, actions, logs, and restart against it fail with an error naming its protocol version until it is upgraded. Push dispatch to it is skipped (the heartbeat delivers the work one interval later), and its mesh certificate requests are refused (no CSR), so `certFrom = "legion"` flows on that node stop until it is upgraded. Join tokens minted by an older manager (format v1) are refused; mint new ones. Upgrade workers promptly after the managers, and allow TCP 4848 from every manager (and edge router) to every worker first |
+| 4 | One datapath fetch: `FetchDatapathMaterial` replaces `FetchNetPolicy`, `GetIngressCertificates`, and `GetUpstreamCredentials`. The mesh is `service.mesh`, and TLS that is not the mesh lives on `network.ports[].tls`, read off the allocation's ports. Allocations carry the task's group and service, so a mesh caller is named by its real group ([Network Handlers](network-handlers.md#the-mesh)) | A protocol-3 worker calls the three removed RPCs, which a protocol-4 manager no longer serves: it keeps the policy bodies, certificates, and credentials it already holds, a new allocation on it gets none (a gated one stays closed), and it does not terminate mesh or port TLS for allocations placed after the manager upgraded. Upgrade workers right after the managers |
+| 3 | The authenticated worker plane: the worker serves `Worker` over mutual TLS with a node certificate it requested by CSR (the `IssueNodeCertificate` reply no longer carries a key), binds all interfaces, and advertises a reachable `https://` address ([Managers and Workers](architecture-managers-workers.md#the-worker-plane)). Join tokens are format v2 and pin the cluster CA | Managers never dial a worker in plaintext. A protocol-2 worker keeps registering, heartbeating, and running the work its heartbeat replies carry, but exec, actions, logs, and restart against it fail with an error naming its protocol version until it is upgraded. Push dispatch to it is skipped (the heartbeat delivers the work one interval later), and its mesh certificate requests are refused (no CSR), so mesh flows on that node stop until it is upgraded. Join tokens minted by an older manager (format v1) are refused; mint new ones. Upgrade workers promptly after the managers, and allow TCP 4848 from every manager (and edge router) to every worker first |
 | 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), so a batch task's `Success` comes from its exit code. See [Task Supervision](task-supervision.md) | The manager reads the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as before. Nothing stalls mid-rollout. New placements get exit-code-based status once the worker is upgraded. |
 | 1 | The versioned handshake itself | Workers reporting `0` are pre-versioning builds and are accepted with a warning |
 
@@ -181,6 +197,12 @@ runs ungated.
 The other direction fails closed on its own. `RatifyClaim` is a new RPC, so
 an old manager rejects it and the worker kills the claim when its lease
 expires. The result is a wasted boot, never a duplicate.
+
+`TaskAllocation.task_speculative_start` carries a task's `speculativeStart`
+block into the node's spec cache. While either side predates it, a node
+reads every cached task as `off` and refuses its boot tickets with `task
+<name> does not permit speculative starts`. That also fails closed, and it
+ends once both sides are upgraded and the node is dispatched the task again.
 
 Neither the `boot` ACL resource nor the `edgeBoot` config blocks need a
 coordinated upgrade. Both are off by default, and a manager that does not
@@ -231,6 +253,23 @@ never sends such a worker suspend work or a resume's restore payload.
   so allocation ids are never reused afterwards. The rebuild copies every
   row and runs in the migration, before the manager serves requests.
 
+## Cluster CA under skew
+
+Heartbeat replies name the cluster CA's whole trust bundle
+(`HeartbeatReply.cluster_ca_pins`, which replaced the single
+`cluster_ca_pin`; see [The Cluster CA](cluster-ca.md#how-workers-learn)).
+Between a worker and a manager on either side of that change, the field the
+other side reads is empty, which a worker treats as "no news": it keeps its
+certificate and re-issues on its own 8-hour timer instead of within one
+heartbeat of a CA change. Nothing breaks, but finish the rollout before you
+rotate the cluster CA, or a CA change reaches the older nodes only on that
+timer.
+
+Every manager in a raft cluster needs the same `clusterCa` block. A manager
+upgraded with a different one (or without one, while the others use `file`
+or `exec`) refuses to sign and says why in `legion net ca show`
+([Every manager must agree](cluster-ca.md#every-manager-must-agree)).
+
 ## Durable checkpoints under skew
 
 Publishing (`suspend.durability = "store"`, `snapshot create --publish`) is
@@ -249,6 +288,14 @@ anything is captured.
   `published_at` columns it does not read, and it reads a `published`
   snapshot's state as unknown. Resume, or stop, instances with published
   checkpoints first.
+- **Chunked parts and whole-object parts do not mix.** Workers from the
+  release that publishes parts as chunks ([How published parts are
+  stored](suspend-and-resume.md#how-published-parts-are-stored)) cannot open
+  a part an older worker published as one object, and older workers cannot
+  open a chunked part. Both fail the fetch with `failed authentication`, and
+  `onRestoreFailure` decides what happens. Upgrade every worker that shares
+  a `contentStore` together, and resume published instances on the node
+  that took them (which needs no fetch) or let them boot cold.
 - **A VMM upgrade strands published memory checkpoints too.** A published
   checkpoint resumes on any node with the VMM version and CPU it was taken
   on, so upgrading the whole fleet's VMM leaves it nowhere to run. Upgrade a
@@ -314,6 +361,101 @@ shapes:
 - **Downgrading a worker** ends its running sessions: an older worker does
   not know them. Promote the sessions you need first.
 
+## Namespaces
+
+The release that added [namespaces](namespaces.md) changed these shapes. A
+cluster that never creates a namespace keeps every job in `default` under
+its bare name, so job ids, and every key derived from one, are unchanged for
+it.
+
+- **ACL policies must say their reach.** An allow rule over a namespaced
+  resource (`job`, `exec`, `action`, `scale`, `boot`, `snapshot`,
+  `namespace`) without `namespaces` is refused when the policy is written,
+  and so is `namespaces` on a rule over only cluster-scoped resources.
+  Policies stored before the upgrade are not rewritten: re-apply each one with
+  `namespaces = ["default"]` (what they meant) or `["*"]` (every namespace,
+  including future ones) before relying on them for namespaced jobs. Until
+  then a stored allow rule that names namespaced resources without
+  `namespaces` matches `default` jobs only, which is what it meant before:
+  it never widens to a namespace created later. A `resources = ["*"]` rule
+  and a deny rule without `namespaces` match every namespace.
+- **The default workload-identity subject gains `{namespace}`**:
+  `{region}:{namespace}:{job}:{group}:{task}` (`auto:default:api:web:server`).
+  Trust policies that match the old `auto:api:web:server` must be updated.
+  A configured `subTemplate` without `{namespace}` stops the manager from
+  starting; add it.
+- **Content-store paths spell the namespace out.** Archive manifests move
+  from `manifests/<job>/…` to `manifests/<namespace>/<job>/…`, session
+  manifests from `sessions/<job>/…` to `sessions/<namespace>/<job>/…`, and
+  fence markers from `sessions/fence/` to `sessions/_fence/`. Objects written
+  under the old paths are not found by the new release: resume the archived
+  instances and store sessions you need before upgrading.
+- **List RPCs default to `default`.** `ListJobs`, `ListServices`,
+  `ListRollouts`, `ListVolumes` and `ListSnapshots` with an empty `namespaces`
+  list only `default` (`["*"]` lists every readable namespace), unless a
+  request names a job.
+- **Service `allow` entries without a `/` match the service's own
+  namespace**, and an absent `allow` admits only its own namespace.
+- **Exec-key `jobs` patterns without a `/` match `default` only.**
+- **Endpoint feeds carry the upstream key**, so an aliased service upstream
+  (`{ name = "db", service = "postgres" }`) now receives endpoints; it did not
+  before.
+- **Downgrading a manager** past this release loses namespaces and namespace
+  policies (their tables are not read), and jobs in other namespaces keep
+  their qualified ids, which an older manager treats as plain names.
+
+## Strict jobspec fields
+
+The release that made [unknown jobspec
+fields](jobs-tasks-and-scheduling.md#unknown-fields) errors changed this
+behavior on purpose:
+
+- **A spec carrying a stray or misspelled key now fails to submit.** Before,
+  the key was accepted and silently ignored. Run `legion job validate` over
+  your specs before upgrading the managers: each error names the key, its
+  path, and the closest known key. Fix the spec, or pass
+  `--allow-unknown-fields` to submit it as before while you do (keys on the
+  job, a task, a volume, a port, or a service are kept as pending, the rest
+  are dropped, and both are reported and recorded on the version).
+- **Blocks that were already strict now report every key the same way.**
+  `volumes`, `stateful`, `stateful.storage`, `stop`, `disruption`,
+  `actions`, `network.ports[].tls`, `connect.upstreams`, `speculativeStart`,
+  `snapshots`, `suspend`, and the session blocks used to fail on the first
+  unknown key with serde's message; they now report every unknown key with
+  its path and a suggestion, and the flag can drop (or, on a volume, keep)
+  them.
+- **Stored jobs are unaffected.** A stored config never carried an unknown
+  key (the old parser dropped them before storing), so reading, re-rendering,
+  and restarting existing jobs works unchanged.
+
+Under skew:
+
+- **A manager older than this release drops unknown keys silently**, as it
+  always did, and ignores `allow_unknown_fields`. Nothing records what it
+  dropped. Upgrade the managers before relying on the error.
+- **The CLI's `legion job validate` checks locally**, with the parser
+  compiled into the CLI binary, and asks the manager (`GetJobSchema`) which
+  keys installed apps add. An older CLI does not catch unknown keys; a
+  newer CLI catches them even against an older manager, but against a
+  manager that predates `GetJobSchema` it reports keys at extension points
+  as not checked.
+- **A newer CLI's `--allow-unknown-fields` against an older manager** is
+  harmless: the manager ignores the field and drops the keys, as before.
+- **Downgrading a manager** past this release ignores the task- and
+  job-level `pendingExtensions` maps and the recorded warnings (nothing acted
+  on them anyway), but an older manager cannot read a version whose volumes
+  carry pending keys: its volume parser refuses unknown keys. Resubmit those
+  jobs without `--allow-unknown-fields` before downgrading.
+- **Jobspec extension values** ([Apps: Jobspec
+  extensions](apps.md#jobspec-extensions)) live in the version's
+  `job_config.meta.extensions`. A manager from before they existed does not
+  read them: to it the version has no extension values, and in a
+  mixed-version cluster an older manager cannot apply a replicated submit
+  that carries them (its parser refuses the `extensions` key). Upgrade every
+  manager before installing an app that declares jobspec keys. Values an
+  earlier release kept as pending are adopted by the app that declares them
+  when it is installed, with no resubmit.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by
@@ -332,6 +474,22 @@ rebuild every dylib plugin with the new binary, managers included (rollout
 and scheduling plugins load there). A stale plugin is refused at load instead
 of crashing the process. See
 [plugin-system.md](plugin-system.md#build-fingerprint-required-for-dynamic-plugins).
+
+## The isolate host binary
+
+`legion-isolate`, the [isolate runtime](task-runtime-isolate.md)'s host and
+compiler, ships beside the worker as its own binary and is not covered by
+`protocol_version`. It has a protocol version of its own with the worker:
+at start the worker runs `legion-isolate engine-info` and uses the binary
+only when the versions match exactly, so upgrade the two together. A worker
+whose binary does not match advertises no `isolates` capability and takes
+no isolate envelope.
+
+Compiled modules are keyed by the engine's compatibility key (which
+`engine-info` prints): a new engine version, a changed `isolate.layout`,
+or, with `layout = "small"`, a changed `isolate.maxMemory` recompiles every
+module on its first use on each node. Hibernation checkpoints of session isolates hold only their `state`
+map, so they restore across an engine upgrade.
 
 ## Build-version skew expectations
 
@@ -464,6 +622,40 @@ schema only adds columns and tables. That gives the safe order:
 If an upgraded manager takes leadership while an older one is still
 running, writes that need the new schema fail with the error above until
 you finish the upgrade. Nothing diverges in the meantime.
+
+### Data migrations run once, through the log, after the upgrade
+
+A release can carry two kinds of migration
+([state-store.md](state-store.md#schema-and-data-migrations)). **Schema
+steps** (new tables, new columns) run on each manager as it starts, as
+above. **Data steps** — rewriting existing rows, such as filling a new
+column for rows written before it existed — do not: run locally, two
+managers that start at different points in the log would rewrite different
+sets of rows and silently disagree. Instead:
+
+1. Each manager adds the new columns at startup (schema steps).
+2. Once **every voter** advertises the new release's schema version, the
+   control-lane leader runs every pending data step as one replicated
+   write. Every manager applies the rewritten rows at the same log index.
+3. Each step is recorded in the replicated `data_migration` table in that
+   same entry, so it runs exactly once, even if leadership moves.
+
+Until the last manager is upgraded, data steps wait (the leader logs which
+managers it is waiting for, once). Code that reads a column a data step
+fills already copes with the unfilled value, so nothing breaks in the
+meantime; the column is just not backfilled yet. There is nothing to run by
+hand. A single `local_disk` manager runs its pending data steps at startup.
+
+### The raft log format changed (2026-11)
+
+The raft log, the snapshot images and the state DB of a cluster from
+before the 2026-11 write-path change cannot be resumed by this release: a
+raft entry now carries a batch of writes (`StoreCommand` gained `ops`,
+`proposal` and `schema_version`), the log records each entry's append time,
+and the state DB has two new tables. There is no rolling upgrade across
+this change. Take a `legion state backup` on the old release, start a
+fresh cluster on the new one with `--restore-from`, and re-join the other
+managers. `local_disk` stores migrate in place.
 
 ## Raft persistence upgrades
 

@@ -1,6 +1,12 @@
 # Certificate renewer: keeps a Let's Encrypt certificate for one domain in
 # Legion KV, and renews it before it expires.
 #
+# Most clusters do not need this job: the bundled cert manager does the same
+# for any number of domains, with status and backoff (docs/cert-manager.md;
+# configs/certs/). This is the bring-your-own-ACME-client version, for when
+# you want lego (an RSA key, a DNS provider the cert manager has no built-in
+# support for, or a client you can read and change).
+#
 # What it does, every 12 hours:
 #   1. Reads the current certificate from KV and exits if it is still good
 #      for more than 30 days. Most runs stop here.
@@ -11,7 +17,7 @@
 #      never see a new certificate paired with an old key.
 #
 # Consumers pick the new value up on their own: see configs/jobs/tls-edge.ncl,
-# which serves it straight from the node datapath (`certFrom = { kv }`) and
+# which serves it straight from the node datapath (`ports[].tls.cert = { kv }`) and
 # also hands it to nginx as a file that is rewritten in place on renewal
 # (`onChange = "update"`, then SIGHUP).
 #
@@ -26,26 +32,27 @@
 #     certificate if a bad one ever lands.
 #
 # Before you run it:
-#   - The worker node needs `legion` on PATH and `openssl`, and the task
-#     needs LEGION_ADDR (below) pointing at a manager.
-#   - Workload identity enabled on the manager, with a binding that lets
-#     this job write its KV key (docs/workload-identity.md, "Control-plane
-#     identity"):
+#   - The worker node needs `legion` on PATH and `openssl`.
+#   - Workload identity enabled on the manager (`workloadIdentity.enabled =
+#     true`). Nothing else on the manager: no binding, no policy, no address.
+#     The job asks for what it needs (`permissions` on its `legion` identity,
+#     below), and Legion grants it at submit because the token that submits
+#     the job holds it (docs/workload-identity.md, "Permissions").
+#   - Submit it with a token that holds `kv:read` and `kv:write` on `certs/*`
+#     (and `kv:read` on the DNS token below, which the env template reads).
+#     A token that does not is refused before anything is stored:
 #
-#       # manager.ncl
-#       workloadIdentity = {
-#         enabled = true,
-#         controlPlaneBindings = [
-#           { claim = "legion.io/job", value = "cert-renewer-app-example-com",
-#             policies = ["cert-writer"] },
-#         ],
-#       },
+#       Error: failed to run job: cert-renewer-app-example-com: identity
+#       'legion' asks for kv:write on certs/*, which your token does not hold
+#       [code=PermissionDenied]
+#       Hint: have someone with that access submit this job, or ask for it
+#       to be granted to you
 #
-#       # the policy, created once:
-#       legion acl policy apply cert-writer --rules '[
-#         {"resources": ["kv"], "actions": ["read", "write"], "paths": ["certs/*"]}
-#       ]'
-#
+#   - Inside the task, `legion` reaches the cluster through the worker's
+#     per-allocation socket: the worker sets
+#     LEGION_ADDR=unix://$LEGION_SECRETS_DIR/legion.sock and attaches this
+#     allocation's current identity token to every call, so the task holds
+#     no token and needs no route to a manager.
 #   - A Cloudflare API token with Zone.DNS edit rights, stored in KV:
 #       legion kv put secrets/cloudflare-dns-token "<token>"
 #     (lego supports 150+ DNS providers; swap `--dns cloudflare` and the env
@@ -53,6 +60,7 @@
 #
 # Run and inspect:
 #   legion job run configs/jobs/cert-renewer.ncl
+#   legion acl grants list --job cert-renewer-app-example-com
 #   legion job logs cert-renewer-app-example-com
 #   legion kv get certs/app.example.com
 #
@@ -77,15 +85,17 @@ let email = "ops@example.com" in
       "https://github.com/go-acme/lego/releases/download/v4.21.0/lego_v4.21.0_linux_amd64.tar.gz",
     ],
 
-    # A short-lived token for talking to Legion itself, as this job. The
-    # `legion` CLI reads LEGION_TOKEN. A token refreshed mid-run restarts the
-    # run, which is safe: every step is idempotent.
+    # Talking to Legion itself, as this job. `permissions` is what the job
+    # may do (the same rule shape `legion acl policy apply` takes); the
+    # submitter must hold it. The worker serves the allocation a local API
+    # socket that authenticates as this identity and refreshes it on its
+    # own, so nothing here restarts when the token rotates.
     identities = [
       {
         name = "legion",
-        ttl = "1h",
-        env = "LEGION_TOKEN",
-        changeMode = "restart",
+        permissions = [
+          { resources = ["kv"], actions = ["read", "write"], paths = ["certs/*"] },
+        ],
       },
     ],
 
@@ -99,7 +109,6 @@ let email = "ops@example.com" in
 
     config = {
       env = {
-        LEGION_ADDR = "http://manager.internal:4747",
         DOMAIN = domain,
         EMAIL = email,
         KV_KEY = "certs/%{domain}",
@@ -138,6 +147,6 @@ let email = "ops@example.com" in
         echo "stored a new certificate for $DOMAIN in kv $KV_KEY"
       "%],
     },
-    resources = { cpus = 0.1, memory = 64 },
+    resources = { cpu = 100, memory = 64 },
   },
 }

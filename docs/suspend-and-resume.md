@@ -119,6 +119,7 @@ suspend = {
   idle = { after = "3m" },        # suspend automatically when quiet
   onPressure = true,              # let a short node suspend it instead of evicting
   wake = { port = "http" },       # resume on a request through `legion start gateway`
+  park = { after = "10s" },       # the workload says when it waits ($LEGION_PARK_SOCKET)
 },
 ```
 
@@ -135,6 +136,7 @@ suspend = {
 | `onPressure` | `false` | Let the node's memory pressure response suspend this instance (the `suspend` step) before it evicts anything. See [Under memory pressure](#under-memory-pressure). |
 | `keepFor`, `checkpointEvery`, `onWorkerStop` | `24h`, off, `keep` | Session tasks only: how long a suspended session's local checkpoint is kept, a periodic live checkpoint, and whether a stopping worker checkpoints running sessions. See [Idle sessions](session-mode.md#idle-sessions). With `durability = "store"` each of these checkpoints is published and written to the session's manifest, and `stateful.fenceAfter` (default `2m`) sets when a node cut off from managers and the bucket suspends its running sessions ([No split brain](session-mode.md#no-split-brain)). |
 | `wake` | none | `{ port, timeout = "30s" }`: requests through `legion start gateway` for this instance go to the `network.ports` label `port`, and a request for a suspended instance resumes it and is held until it serves. Without it, the gateway refuses the instance. See [Waking on a request](#waking-on-a-request). |
+| `park` | none | `{ after = "10s" }`: give the task a park socket (`$LEGION_PARK_SOCKET`) on which the workload says when it is waiting; the node suspends it a park's `after` later, and `busy` holds the idle policy off. `exec`, `container`, and `sandbox`. See [Park](park.md). |
 
 Submit refuses anything the block cannot honor, with the fix in the hint:
 
@@ -200,15 +202,21 @@ $ legion instance suspend <instance> [--checkpoint memory|disk] [--wait] [--time
 1. The manager records a `purpose = suspend` snapshot in state `capturing` and
    marks the instance `suspending`. The call returns here (`--wait` keeps
    going).
-2. On its next heartbeat, the instance's node captures the allocation and
+2. The request reaches the instance's node over its work stream, one round
+   trip after the record commits, and the node captures the allocation and
    then stops it. For a memory checkpoint the guest stays paused from the
    capture until the VMM is killed, so it never runs past the captured
    instant. The node only stops the task once the checkpoint is safely in
    its content store.
-3. When the node reports, one transaction deletes the allocation (freeing
-   its reservation), marks the snapshot `local`, and sets the instance
-   `suspended` with `checkpoint_id`. `instance.suspended` and
-   `allocation.removed` with `cause = suspended` are emitted.
+3. The node reports at once, on a heartbeat it sends early. One transaction
+   deletes the allocation (freeing its reservation), marks the snapshot
+   `local`, and sets the instance `suspended` with `checkpoint_id`.
+   `instance.suspended` and `allocation.removed` with `cause = suspended` are
+   emitted.
+
+So a suspend takes the capture itself plus about two round trips and two
+commits, whatever the heartbeat interval. A node whose stream is down gets
+the request on its next heartbeat instead (see [How it works](#how-it-works)).
 
 **A suspend never stops a workload it failed to capture.** If the capture
 fails, the guest is resumed, the instance stays `active`, its allocation keeps
@@ -232,11 +240,13 @@ or `pending` one fails with `FailedPrecondition`.
 
 ## Automatic suspend
 
-Calling `instance suspend` is one way in. Two more put an instance into
+Calling `instance suspend` is one way in. Three more put an instance into
 `suspended` without anyone asking: the idle policy, when nothing has happened
-for a while, and the node itself, when it runs short of memory. Both take the
-same checkpoint a manual suspend takes, and `instance get` names which one did
-it in `suspend_reason`: `manual`, `idle`, or `pressure`.
+for a while; the node itself, when it runs short of memory; and the workload,
+when it [parks](park.md) on its park socket because it is about to wait. All
+take the same checkpoint a manual suspend takes, and `instance get` names
+which one did it in `suspend_reason`: `manual`, `idle`, `pressure`, or `park`
+(or `make_room`, when the manager made room for a resume).
 
 ### Idle policy
 
@@ -272,9 +282,9 @@ signal, so it tracks when each allocation went quiet and reports that
 row, so it runs a sweep every 15 seconds over those reports, in memory, and
 starts a suspend for each instance quiet past `after`. From there it is an
 ordinary suspend: the capture, the stop, the freed reservation. Counting the
-report interval, the sweep, and the next heartbeat, an idle instance is
-suspended within `after` plus about 30 seconds. The sweep interval is the
-manager's `suspend.idleSweep`.
+report interval and the sweep, an idle instance is suspended within `after`
+plus about 25 seconds. The sweep interval is the manager's
+`suspend.idleSweep`.
 
 `instance get` shows the window while it runs:
 
@@ -307,9 +317,13 @@ connection through the proxy, and a long streamed response counts as
 makes its outbound connections around the datapath, so there is nothing to
 count for a model call. See the next section.
 
-Suspending *during* a model call, and waking when it returns, needs the
-workload to say it is parked. That is the `hint` signal, which is not
-available yet. A spec that lists it is refused with a hint.
+Only the workload knows for sure whether it is waiting or working. A task
+that sets [`suspend.park`](park.md) gets a socket for saying so: `busy`
+on it holds this policy off whatever the signals see (on a TAP sandbox, the
+only way to keep it awake through a quiet model call), and `park` suspends
+the instance when it starts a long wait, within seconds rather than after
+`idle.after`. There is no `hint` signal: a spec that lists it is refused
+with a pointer at `suspend.park`.
 
 ### What each signal sees on a sandbox
 
@@ -421,7 +435,7 @@ What differs from Linux:
   Apple containers instead of stalling the worker's heartbeat.
 
 The end-to-end test for this loop is
-`cargo test --test apple_container_idle -- --ignored`. It needs the
+`cargo test --test integration apple_container_idle:: -- --ignored`. It needs the
 `container` CLI and starts its service when it is down.
 
 ### Under memory pressure
@@ -479,8 +493,14 @@ The node restores instead of booting, reports the outcome, and the manager
 emits `instance.resumed` with the restore time, which `instance get` shows as
 the last restore. The spent checkpoint is then reclaimed from the node.
 
-A memory resume is the cost of loading the guest's memory: the target is
-under 300 ms for a 1 GiB guest on local NVMe. A disk resume is a cold boot.
+A memory resume loads the guest's device state and lets it run. By default
+(on Firecracker, and on cloud-hypervisor v52 and later) its memory then loads
+as the guest touches it, so on the node that holds the checkpoint the time
+before the guest runs does not grow with its memory. A task
+whose workload touches most of its memory right after it wakes can load all
+of it first instead (`memory_restore = "eager"`, see
+[How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)). A
+disk resume is a cold boot.
 
 `--cold` discards the checkpoint and boots fresh on the retained storage. It
 is the escape hatch when a checkpoint cannot be restored.
@@ -697,7 +717,8 @@ placed in time (no eligible instances, or a node that is down) follows
 
 Memory checkpoints live in the node content store under the `snapshots`
 budget (`content.budgets.snapshots`). By default that is 20% of the disk
-holding the worker's state directory, clamped to 2 GiB to 200 GiB (see
+holding the worker's state directory, clamped to 2 GiB to 200 GiB, with the
+floor giving way on a disk too small for every class's floor (see
 [the node content store](artifacts.md#the-node-content-store)). Every
 suspended instance's `local` checkpoint stays pinned there until it resumes
 or is destroyed, so a node full of suspended instances can run out of room
@@ -708,7 +729,8 @@ checkpoint needs.
 
 The budget is not the only limit. The store also keeps `content.minFreeDisk`
 (5 GiB by default) free on its disk: it evicts unpinned content of any class
-to stay above that floor, then refuses the write. So a node whose disk is
+to stay above that floor ([derived content](artifacts.md#derived-content)
+first, because the node can rebuild it), then refuses the write. So a node whose disk is
 filled by something else (volumes, logs, images) has no room for a
 checkpoint even with budget to spare.
 
@@ -737,8 +759,8 @@ its content card.
 When a node's checkpoint room is smaller than one more checkpoint of a
 task, the scheduler does not place **new** instances of that task on the
 node. This applies only to tasks whose `suspend` block checkpoints memory. A
-checkpoint's size is estimated as the guest's memory (`config.memory_mib`,
-else `resources.memoryMax`, else `resources.memory`). Resumes and other
+checkpoint's size is estimated as the guest's memory (`resources.memoryMax`,
+else `resources.memory`). Resumes and other
 restores are never held back, since their checkpoint already exists. When no
 node has room, placement fails with a count of which limit was short:
 
@@ -780,12 +802,16 @@ contentStore = { url = "s3://legion-content-usw2/" },
 1. The suspend runs exactly as with `local`: the instance becomes
    `suspended`, and its reservation is freed, as soon as the checkpoint is
    written on the node. Capacity never waits on an upload.
-2. On its next heartbeat the node seals each part of the checkpoint with a
-   key the manager sends it and uploads it to its content store (see
-   [Security](#security)). While the upload runs the snapshot is `local`, and
+2. The publish request reaches the node over its work stream as soon as the
+   suspend commits. The node cuts each part of the checkpoint into chunks,
+   seals them with keys derived from what the manager sends it, and uploads
+   the chunks its content store does not hold yet, then a sealed index per
+   part (see [How published parts are
+   stored](#how-published-parts-are-stored) and [Security](#security)).
+   While the upload runs the snapshot is `local`, and
    a resume in that window is pinned to the node like any local checkpoint.
 3. When the upload finishes the snapshot moves to `published`, its manifest
-   records each part's URL and the key it is sealed under, and
+   records each part's URL (its index) and the key it is sealed under, and
    `snapshot.published` is emitted with the bytes sent and the time it took. `instance list` shows the checkpoint as
    `(memory, published)`.
 4. The node unpins its copy of the parts. They stay in its content store,
@@ -805,18 +831,23 @@ From then on:
   and the [`locality` score](artifacts.md#content-locality) prefers a node
   that already holds the parts. With weights otherwise equal, that is the
   node that took the checkpoint, while it still holds them.
-- **The new node fetches the parts first.** A part missing from its node
-  content store is fetched from its URL through the node's ordinary artifact
-  fetchers (`s3://` or `file://`), opened with the key the manager sent with
-  the restore, verified against its digest, and stored in the content store
-  before the restore starts. The fetch signs with the restoring node's own
+- **The new node fetches the parts first.** For a part missing from its node
+  content store, the node reads the part's index from its URL (`s3://` or
+  `file://`), opens it with the key the manager sent with the restore,
+  fetches the non-zero chunks it lists 16 at a time, opens and checks each
+  one, and stores the reassembled part, verified against its digest, in the
+  content store before the restore starts. The node's
+  `artifacts.fetch` limits (allowed schemes, attempts, timeout, and the
+  maximum size) apply. The fetch signs with the restoring node's own
   `contentStore.auth` (its KV credential, read at fetch time, or its ambient
   AWS credentials when `auth` is omitted), because the part URL sits under
   that node's `contentStore.url`. Cluster `artifacts.auth` matchers do not
   apply to parts. So every node that may restore the instance needs the same
-  `contentStore` url and auth as the node that published it. A node whose
-  `contentStore` points elsewhere has no credential for the part and fails
-  the restore saying so (see
+  `contentStore` url and auth as the node that published it. Placement
+  prefers such a node (see [Where a restore can run](#where-a-restore-can-run)).
+  A node whose `contentStore` points elsewhere, picked because no node
+  that holds the parts could take the instance, has no credential for the
+  part and fails the restore saying so (see
   [Which credential a reading node uses](artifacts.md#publishing-content)).
   The allocation shows
   `fetching snapshot` meanwhile. This includes the node that took the
@@ -838,6 +869,171 @@ $ legion instance start user-42 -j
 {"ok":true,"data":{"instance":"user-42","state":"pending",
  "resumingFrom":"snap-5b10e2c7a9d04f31", ...}}
 # "Resuming instance user-42 from published snap-5b10e2c7a9d04f31 on any compatible node"
+```
+
+### How published parts are stored
+
+Two checkpoints of one sandbox are mostly the same bytes, and much of a
+young guest's memory and root disk is still zero. So a published part is
+not uploaded as one object. The worker cuts it into fixed-size chunks
+(1 MiB by default) and uploads each distinct, non-zero chunk once:
+
+```text
+<contentStore.url>/sealed/<index name>   the part's index: the object its manifest url names
+<contentStore.url>/sealed/<chunk name>   one sealed object per distinct non-zero chunk
+```
+
+- **A repeat checkpoint uploads only what changed.** Every chunk the store
+  already holds is reused, so a `checkpointEvery` tick or a second suspend
+  of the same sandbox sends the chunks the guest touched since the last
+  one, plus a small index.
+- **Zero chunks are never uploaded.** Memory the guest never touched and
+  the root disk's free space cost nothing to publish or fetch, and a
+  restore writes them as holes in a sparse file.
+- **Sandboxes of one job share chunks.** Every sandbox of a job boots from
+  the same image, so after the first sandbox publishes, the others upload
+  only the root-disk chunks they changed. Jobs never share chunks (see
+  [Published checkpoint encryption](#published-checkpoint-encryption)).
+- **Chunks move in parallel.** A publish uploads 16 chunks at a time, and a
+  restore fetches 16 at a time and opens each in memory, so a part lands on
+  the restoring node's disk once. A chunk that repeats inside a part is
+  fetched once and written at each offset. When a chunk fails for good, the
+  other transfers of that part stop: a failed publish writes no index, and
+  a failed restore leaves no partial file behind.
+
+Measured on a Linux guest under QEMU (512 MiB of memory and a 605 MiB root
+disk, running a Python workload that writes to its heap, a SQLite file, and
+a log every second), capturing its guest memory and root disk once a
+minute:
+
+| Checkpoint | Uploaded as one object per part | Uploaded as 1 MiB chunks |
+| --- | --- | --- |
+| First | 1,117 MiB | 549 MiB (zero chunks skipped) |
+| First, of a second sandbox of the same job | 1,117 MiB | 227 MiB |
+| After a minute of activity | 1,117 MiB | 131 MiB |
+| After a minute idle | 1,117 MiB | 38 MiB |
+
+The publish report's `total_bytes`, the `snapshot.published` event's
+`uploadedBytes`, and `legion_checkpoint_publish_bytes` count only what was
+uploaded.
+
+**Chunks are shared inside a dedup window.** A publish reuses a chunk only
+if it was uploaded during the same window (`dedupWindow`, 24 hours by
+default). So no chunk a checkpoint needs is ever more than one window older
+than the checkpoint, which keeps the bucket's lifecycle rule simple: expire
+objects under `sealed/` that are older than your longest-lived checkpoint
+plus `dedupWindow` ([Expiring published parts](#expiring-published-parts)). The cost is that each sandbox uploads its non-zero
+bytes in full once per window.
+
+Both settings live on the worker's `contentStore` block, and the defaults
+suit most fleets:
+
+```nickel
+contentStore = {
+  url = "s3://legion-content-usw2/",
+  chunkSize = "1MiB",    # 64KiB to 16MiB, a multiple of 4KiB
+  dedupWindow = "24h",   # at least 1m
+},
+```
+
+| Setting | Default | Trade-off |
+| --- | --- | --- |
+| `chunkSize` | `1MiB` | Smaller chunks upload fewer unchanged bytes around each change (256 KiB sent 98 MiB instead of 131 MiB for the active minute above) but make four times the objects and requests. On S3, a `PUT` costs about what storing 3 MiB for two days does, so 1 MiB is the cheaper default for checkpoints kept days, not months |
+| `dedupWindow` | `24h` | A longer window shares chunks for longer, and lengthens the lifecycle rule by the same amount |
+
+Workers that share a bucket can use different settings. Their chunks simply
+do not dedupe with each other.
+
+### Expiring published parts
+
+Legion never deletes a published part from the bucket. Deleting a
+snapshot, resuming or destroying an instance, and finishing a fork all leave
+the part's index and chunks where they are, because a chunk can belong to
+several checkpoints of the job and Legion keeps no count of who uses it.
+The bucket's own lifecycle rules are what remove them. What Legion writes
+under a `contentStore.url`, and what a rule on each prefix does:
+
+| Prefix (under the `contentStore.url` path) | What is there | Expiring it |
+| --- | --- | --- |
+| `sealed/` | The index and chunks of every published part | Makes every checkpoint that names an expired object unrestorable |
+| `manifests/<namespace>/<job>/<group>/<task>/<instance>.json` | [Archive manifests](#archiving-idle-instances) | Ends an archived instance: a `manifestOnly` instance is gone, and a `slim` one's resume follows `onRestoreFailure` |
+
+An age-based rule is safe because of the [dedup window](#how-published-parts-are-stored):
+a publish reuses only chunks uploaded in the current window, so no object a
+checkpoint needs is more than one `dedupWindow` older than the checkpoint
+itself. Pick **N**, the longest any checkpoint has to stay restorable, then:
+
+- expire `manifests/` after N days;
+- expire `sealed/` after N days plus the largest `dedupWindow` of any
+  worker that publishes to the bucket, rounded up to whole days (N + 1 with
+  the default `24h`).
+
+N is a limit you are setting, not one Legion enforces, so make it at least
+as long as each of these:
+
+- **Published snapshots:** their `snapshots.ttl`. A snapshot with no `ttl`
+  never expires on its own, so set one no longer than N.
+- **Named snapshots** that new instances are created from: rebuild and
+  repoint the name more often than every N days.
+- **Suspended instances with `durability = "store"`**, archived or not:
+  Legion does not end a suspension, so N is how long an instance can stay
+  suspended and still resume with its memory. Past it, the resume follows
+  `onRestoreFailure` (`cold` boots fresh on its retained storage).
+
+A rule shorter than this deletes chunks a checkpoint still needs. The
+restore then fails with `chunk N (...) of the published part is missing
+from the content store`, which is not retried; see
+[When a part cannot be opened](#when-a-part-cannot-be-opened). Nothing warns you ahead of that, so err long: storage
+for an extra day of chunks costs less than a lost suspension.
+
+On S3, with `contentStore.url = "s3://legion-content-usw2/"`, N = 30 days,
+and the default `dedupWindow`:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "legion-sealed-parts",
+      "Filter": { "Prefix": "sealed/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 31 }
+    },
+    {
+      "ID": "legion-archive-manifests",
+      "Filter": { "Prefix": "manifests/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 30 }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket legion-content-usw2 --lifecycle-configuration file://lifecycle.json
+```
+
+`put-bucket-lifecycle-configuration` replaces the bucket's whole lifecycle
+configuration, so merge these rules into any it already has. When the
+`contentStore.url` has a path (`s3://bucket/legion/`), the prefixes carry
+it: `legion/sealed/` and `legion/manifests/`. On a versioned bucket an
+expiration only adds a delete marker; add a `NoncurrentVersionExpiration`
+to free the storage. S3 runs lifecycle rules once a day, so objects go up
+to a day after they qualify, never before.
+
+On MinIO, the same two rules:
+
+```bash
+mc ilm rule add --prefix "sealed/" --expire-days 31 myminio/legion-content
+mc ilm rule add --prefix "manifests/" --expire-days 30 myminio/legion-content
+```
+
+A `file://` content store has no lifecycle rules. Delete by modification
+time on the same schedule, for example from a daily timer:
+
+```bash
+find /mnt/store/sealed -type f -mtime +31 -delete
+find /mnt/store/manifests -type f -mtime +30 -delete
 ```
 
 ### The volume has to move too
@@ -901,7 +1097,9 @@ Skipped (incompatible): w-09: cpu.model is "6:143:8", the checkpoint needs "6:10
 
 Every available node that matches the constraints (node attributes, matched
 like a jobspec `constraint` block) and passes the checkpoint's `compat` gets a
-`warm` request on its next heartbeat, with the keys for the snapshot's parts.
+`warm` request, with the keys for the snapshot's parts: at once over its work
+stream when the node streams from the manager that accepted the call, and on
+its next heartbeat to that manager otherwise.
 It fetches and opens the parts it lacks into its node content store and reports `snapshot.warmed` (or `snapshot.warm_failed`
 with the reason). The location index then advertises the parts, so placement
 prefers those nodes.
@@ -911,7 +1109,7 @@ cache entries (LRU and the content store's idle TTL can evict them), and
 warming a node that already holds the parts or already has a warm queued does
 nothing. Only a `published` snapshot can be warmed. Queued warms live in the
 memory of the manager that accepted the call, so a manager restart before the
-nodes heartbeat drops them, and you warm again.
+nodes pick them up drops them, and you warm again.
 
 `snapshot warm` needs `snapshot:read` on the snapshot's job. It is gated like
 a mutating call in the MCP server (`--allow-write`), because it starts
@@ -953,7 +1151,7 @@ Hint: set suspend.durability = "store" so the checkpoint is published to the wor
 
 1. The suspend and the publish run exactly as in [What happens](#what-happens).
 2. Once every part is uploaded, the node writes an **archive manifest** to
-   `<contentStore.url>/manifests/<job>/<group>/<task>/<instance>.json`: the
+   `<contentStore.url>/manifests/<namespace>/<job>/<group>/<task>/<instance>.json`: the
    checkpoint's manifest, plus the instance's identity (its id, job, task,
    when it was created and suspended, the fork it came from, and its identity
    epoch).
@@ -973,7 +1171,7 @@ as `(archived)`:
 $ legion instance get user-42 -j
 {"ok":true,"data":{"instance":{"instanceId":"user-42","state":"suspended",
  "checkpointId":"snap-5b10e2c7a9d04f31","archived":true,
- "manifestUrl":"s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json", ...}}}
+ "manifestUrl":"s3://legion-content-usw2/manifests/default/workspaces/main/workspace/user-42.json", ...}}}
 ```
 
 #### Resuming an archived instance
@@ -995,7 +1193,7 @@ exactly as for a lost checkpoint: `cold` boots fresh, `fail` leaves the
 instance suspended with the reason in its detail:
 
 ```text
-instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
+instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/default/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
 ```
 
 #### Listing archived instances
@@ -1006,7 +1204,7 @@ other. `manifestOnly` instances live only in the bucket, and
 
 ```console
 $ legion instance list workspaces --include-idle --idle-page-size 500 -j
-{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/workspaces/main/workspace/workspace-7k2q..."}}
+{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/default/workspaces/main/workspace/workspace-7k2q..."}}
 $ legion instance list workspaces --include-idle --idle-page-token '0:manifests/...' -j
 ```
 
@@ -1028,9 +1226,17 @@ rule on `manifests/` is how long an idle `manifestOnly` instance lives: once
 its manifest expires, the instance is gone.
 
 The manager reads, lists, and deletes manifests itself, so it needs read,
-list, and delete access to every `contentStore`. A bucket whose worker type
-sets `contentStore.auth.kv` is reached with that credential, and otherwise
-with the manager's ambient credentials (instance role, environment).
+list, and delete access to every `contentStore`. A manifest URL under a
+worker type's `contentStore` that sets `contentStore.auth.kv` (the same
+bucket, the same `endpoint`, under its prefix: the rule a restoring node
+applies) is reached with that credential. Any other is reached with the
+manager's ambient credentials, resolved in the same order a worker's are
+(the `AWS_*` key variables, web identity, an ECS task role, then the
+instance profile; see
+[Publishing content](artifacts.md#publishing-content)). An ambiguous
+configuration (one web-identity variable without the other, or EKS Pod
+Identity) continues down the chain to the instance profile with a warning,
+as a worker's does.
 
 ## Identity after a resume
 
@@ -1084,7 +1290,8 @@ See [workload identity on sandboxes](workload-identity.md#sandboxes).
   rest of the [stop-cause vocabulary](graceful-stop.md)), a sentence, the
   allocation and node, and when. A memory pressure eviction carries the
   worker's own detail and hint, the same text as its `node.pressure` event,
-  so a job-scoped token without `operator:read` still sees it. The manager
+  so a job-scoped token without `operator:read` still sees it. A failure
+  the worker reported (`failed`) carries the node and the failure reason. The manager
   writes it in the same transaction that removes the allocation, and each
   later stop replaces it.
 - **What can it checkpoint right now?** For an `active` instance,
@@ -1114,7 +1321,7 @@ snapshots, plus placements and failures of the allocations that ran it (see
 [Event Stream](event-stream.md#events-about-one-instance-or-one-allocation)).
 
 In the UI, every instance id on the job page's Instances table opens the
-instance page (`/jobs/<job>/instances/<id>`). It shows:
+instance page (`/jobs/<namespace>/<job>/instances/<id>`). It shows:
 
 - the state, mode, slot, current allocation and node, storage volume, and
   fork lineage (forked from, and the forks of this instance);
@@ -1209,9 +1416,12 @@ $ legion snapshot create <instance> [--memory|--disk] [--name NAME] [--publish] 
 ```
 
 `create` returns as soon as the manager has recorded the snapshot, in state
-`capturing`. The instance's node takes it on its next heartbeat (within the
-heartbeat interval, 2 seconds by default) and reports back. `--wait` blocks
-until it is `local` or `failed` and exits non-zero on failure.
+`capturing`. The instance's node gets the request over its work stream one
+round trip later, takes it, and reports back on an early heartbeat as soon
+as the capture finishes. A node whose stream is down takes it on its next
+heartbeat instead (within the heartbeat interval, 2 seconds by default).
+`--wait` blocks until it is `local` or `failed` and exits non-zero on
+failure.
 
 `--publish` gives the snapshot `durability = "store"`: once captured, the node
 publishes it to its `contentStore` and it becomes `published` (see
@@ -1239,7 +1449,7 @@ is `capturing` fails with `AlreadyExists`.
 | `local` | Captured. The bytes live on `node`. |
 | `published` | Captured and uploaded to the capturing node's `contentStore`. Any compatible node restores it, and it survives losing `node`. |
 | `failed` | The node could not capture it. `error` says why. The task kept running. |
-| `deleting` | Deleted, or expired. The node reclaims the bytes on its next heartbeat. |
+| `deleting` | Deleted, or expired. The node is asked to reclaim the bytes at once (on its next heartbeat if its work stream is down), and the row goes when it confirms. |
 | `lost` | Its node was removed from the cluster, and the bytes went with it. |
 
 ## Restoring
@@ -1277,9 +1487,15 @@ pins its instance. When the node is down or full, the instance waits in
 `pending` and the placement error says why.
 
 A `published` snapshot has no pin. Every candidate node is checked against
-its `compat` block, the [`locality` score](artifacts.md#content-locality)
-prefers nodes holding its parts, and the chosen node fetches what it lacks
-before restoring. The same rule applies to every instance that restores from
+its `compat` block. Among the nodes that pass, those whose own
+`contentStore.url` holds every published part come first: they are the
+nodes that read the parts with a credential (see [Which credential a
+reading node uses](artifacts.md#publishing-content)). Each worker advertises
+its store's URL, never its `auth`, as the `contentStore` node attribute.
+When no candidate's store holds the parts, every candidate stays, and the
+restore fetches anonymously, which works only against a public store. Then
+the [`locality` score](artifacts.md#content-locality) prefers nodes holding
+the parts, and the chosen node fetches what it lacks before restoring. The same rule applies to every instance that restores from
 a snapshot, however it came to restore.
 
 A memory snapshot also records the VMM and CPU it was taken on. A node whose
@@ -1369,21 +1585,27 @@ moves the guest onto the **restoring allocation's own** socket:
 - cloud-hypervisor gets the socket rewritten in the restore's own copy of
   the snapshot's `config.json`, the same rewrite a fork's TAP uses.
 
-The datapath has already bound that allocation's listeners by the time the
-restore starts, and it judges every connection by the listener it arrived
-on. So the restored guest's traffic is attributed to the new allocation and
-judged by the policy in force **now**: a `require` policy applied while the
+The datapath judges every connection by the listener it arrived on. So the
+restored guest's traffic is attributed to the new allocation and judged by
+the policy in force **now**: a `require` policy applied while the
 instance was suspended applies to its first connection after the resume. A
 fork is its own allocation with its own socket, so its traffic, denials, and
 service-graph edges are its own, and forks cannot collide on the network
 because there is no guest address to collide on.
 
 Before resuming the guest, the restore waits up to 5 seconds for the egress
-proxy socket (`vsock.sock_1080`). It is normally there already. If it never
-appears, the guest resumes anyway with no working door (each connection is
-reset), the allocation reports `net_capture_unavailable`, and `legion net
-doctor` names the unbound socket. A transient bind error never turns a
-resume into a cold boot.
+proxy socket (`vsock.sock_1080`). It is normally there already: the node
+binds it before it launches the restore, whether the start arrived on a
+heartbeat, a `PostWork` push, or the work stream. For a start that arrived
+outside a heartbeat it binds the resolver and upstream listeners then too,
+and triggers a heartbeat right away, which brings the allocation's policy.
+Until that policy
+lands, the proxy resets each connection. If the socket never appears, the
+guest resumes anyway with no working door (each connection is reset), the
+allocation reports `net_capture_unavailable`, and `legion net doctor` names
+the unbound socket. A transient bind error never turns a resume into a cold
+boot. A sandbox that is not gated has no egress proxy, and its restore does
+not wait.
 
 **Advertised ports keep working.** The restoring allocation's ingress
 listeners dial the restored guest through its new socket (see
@@ -1408,9 +1630,9 @@ upstream listener is. The agent relays the old port to it from the first
 connection. The agent also listens on the new allocation's VIPs, and keeps
 relaying the old ones, so a resolver cache that still holds an old
 `<key>.svc.legion` answer works too. In `/legion/resume.env`,
-`LEGION_UPSTREAM_<KEY>` and `LEGION_UPSTREAM_PORT_<KEY>` name the loopback
-port the restored workload dials, and `LEGION_UPSTREAM_VIP_<KEY>` the new
-VIP. An upstream the job added while the instance was suspended gets its
+`LEGION_UPSTREAM_<KEY>` (with its `_HOST_` and `_PORT_` parts) names the
+loopback address the restored workload dials, and `<key>.svc.legion`
+resolves to the new allocation's VIP. An upstream the job added while the instance was suspended gets its
 listener in the guest on restore. One the job removed stops working: its
 loopback port in the guest stays open, but the new allocation has no
 listener behind it.
@@ -1485,10 +1707,12 @@ one, are removed at once. You cannot delete a snapshot that is still
 `capturing`, or one an instance is restoring from right now.
 
 Deleting a `published` snapshot does not delete its parts from the content
-store. The same bytes always seal to the same object, so one object can
-belong to more than one snapshot, and Legion keeps no count of who else uses
-it. Expire them with the bucket's own lifecycle rules (for example, delete
-objects under `sealed/` that are older than your longest-lived snapshot).
+store. A chunk belongs to every checkpoint of its job that holds the same
+bytes in the same dedup window, and Legion keeps no count of who else uses
+it. Expire them with the bucket's own lifecycle rules: delete objects under
+`sealed/` that are older than your longest-lived snapshot plus the workers'
+`contentStore.dedupWindow` (see [Expiring published
+parts](#expiring-published-parts)).
 
 `snapshots.ttl` and `snapshots.keep` delete through the same path. They never
 touch suspend checkpoints, which belong to their instance and go when it
@@ -1710,8 +1934,10 @@ start well under 20 GiB of real memory and grow as they diverge.
 Legion still charges each fork its full reservation. Sharing decays as forks
 diverge, and placement must not depend on a number that changes under it. The
 saving shows up as headroom that [oversubscription](resource-enforcement.md)
-and the memory pressure response can use. cloud-hypervisor copies the memory
-file into each guest at restore, so its forks share nothing.
+and the memory pressure response can use. cloud-hypervisor loads its own
+copy of the memory into each guest, all at once or on demand
+([How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)), so
+its forks share nothing.
 
 ### Networking for forks
 
@@ -1793,9 +2019,14 @@ The snapshot must be a `local` or `published`, `manual` snapshot of the same
 job and task. A suspend checkpoint belongs to its instance, and a fork
 checkpoint to its forks, so neither can seed new instances. A memory snapshot
 seeds only a task with the same network shape: a gated snapshot into a gated
-task, a TAP or loopback one into a task without gated networking. The other
-way round fails each restore by name (`restore needs gated networking: ...`),
-and `onRestoreFailure` decides. One call creates at most 64 instances.
+task, a TAP or loopback one into a task without gated networking. The shape
+is the task's `network.mode`, not its devices: every microVM guest has a
+vsock for `exec`, gated or not. The other way round fails each restore by
+name (`restore needs gated networking: ...` or `restore needs the guest's
+network layout: ...`), and `onRestoreFailure` decides. A memory snapshot
+taken before this rule recorded every microVM guest as gated, so restoring
+one into a task that is not gated is refused the same way; restart such an
+instance cold. One call creates at most 64 instances.
 
 ### Named snapshots
 
@@ -1823,16 +2054,25 @@ JSON). Deleting a snapshot removes its names.
 ## How it works
 
 The manager owns each snapshot's state machine. The node that holds the bytes
-does the work. They talk over the heartbeat:
+does the work. Requests travel on the node's work stream, and the heartbeat
+keeps the record:
 
-- Every heartbeat reply carries a `CheckpointRequest` for each snapshot of
-  that node in `capturing` (`op = capture`) or `deleting` (`op = delete`).
-  The manager re-sends it until it has applied the node's answer.
-- The worker runs each request once and answers with a `SnapshotReport` on its
-  next heartbeat. When it sees a request again for work it already finished,
-  it re-sends the same report instead of redoing the work. That makes a lost
-  heartbeat, a worker restart, or a report that landed on a manager that
-  could not apply it a retry rather than an outage.
+- A snapshot of the node entering `capturing` (`op = capture`) or `deleting`
+  (`op = delete`) is pushed to the node as a `CheckpointRequest` on its
+  `StreamWork` stream (see
+  [Delivery](architecture-managers-workers.md#delivery)) as soon as its row
+  commits, so the node starts one round trip later.
+- Every heartbeat reply also carries a `CheckpointRequest` for each such
+  snapshot, and the manager re-sends it until it has applied the node's
+  answer. A push lost with its stream, or one a node never got because its
+  stream was down, costs a heartbeat interval, not the work.
+- The worker runs each request once and answers with a `SnapshotReport` on a
+  heartbeat it sends at once instead of waiting for its next scheduled one.
+  When it sees a request again for work it already finished, it re-sends the
+  same report instead of redoing the work. That makes a lost heartbeat, a
+  worker restart, or a report that landed on a manager that could not apply
+  it a retry rather than an outage. A delete's confirmation is the one
+  report that waits for the scheduled beat, since nothing waits on it.
 - An allocation that restores from a snapshot carries the snapshot's manifest
   in its dispatch payload (`TaskAllocation.restore`). The worker reports the
   restore's outcome the same way, and the manager clears the payload once it
@@ -1847,17 +2087,31 @@ does the work. They talk over the heartbeat:
   the checkpoint `local`, and enqueues their placement.
 - A `local` snapshot with `durability = "store"` is publish work for its
   node (`op = publish`) until the node reports the upload. A queued warm is
-  `op = warm` work for its node until the node reports the fetch.
+  `op = warm` work for its node until the node reports the fetch. Both are
+  pushed the same way.
 
 The manager sends checkpoint work only to workers that advertised the
 `checkpoint` capability when they registered. A request for an instance on an
 older worker fails with `FailedPrecondition` naming the worker's version.
 
+**What the early heartbeat costs.** Each capture, restore, publish, or warm a
+node finishes sends one extra heartbeat, so a full suspend and resume adds
+two beats to the node's cadence. Reports that finish together share a beat.
+The extra rate is bounded by how fast the cluster can suspend and resume at
+all, which the scheduler lane limits (see
+[Limits to know about](sandboxes-at-scale.md#limits-to-know-about)), so it
+stays small next to a fleet's scheduled beats. A publish retried after a
+failure, at the time its row names, is not pushed: the node picks it up on
+its next heartbeat.
+
 On the node, a memory capture writes the VMM's memory and state files into the
 content store's staging directory, then moves each one into the store's
 `snapshots` class, pinned to the snapshot id and verified against the digest
-the capture recorded. A restore re-verifies each part (rehashing it) and
-hardlinks it into the new allocation. A `local` snapshot's pinned parts are
+the capture recorded. A restore checks that each part is present at its
+recorded size and hardlinks it into the new allocation. It does not rehash
+the part: the store checked the digest when the bytes came in and keeps
+them read-only, and rehashing would read all of the guest's memory before
+it could start. A `local` snapshot's pinned parts are
 never evicted, and they count toward `content.budgets.snapshots`. A capture
 that would go over the budget fails with an error naming it. Once a
 snapshot is published, the node drops its pins and the parts become
@@ -1946,9 +2200,15 @@ encrypts [KV values](kv-encryption.md).
 root key          outside the store, as for KV (file, env, or a KMS)
    │ wraps
 checkpoint key    ck_…, a replicated keyring row, minted with the keyring
-   │ derives, per part digest
-part key          sent by the manager to the one worker doing that part's
-                  publish, warm, or restore, and held in memory only
+   ├─ derives, per part digest
+   │  part key     sent by the manager to the one worker doing that part's
+   │               publish, warm, or restore, and held in memory only. It
+   │               opens the part's index, which holds its chunks' keys
+   └─ derives, per job
+      chunk key    sent with a snapshot publish, or derived by a store
+                   session's node from the job's session sealing key. A
+                   publishing worker derives each chunk's key from it, per
+                   dedup window and chunk digest
 ```
 
 - **The manager holds the checkpoint key.** Workers never see it. A worker
@@ -1956,17 +2216,22 @@ part key          sent by the manager to the one worker doing that part's
   for a snapshot it captured, a warm accepted through `snapshot warm`
   (`snapshot:read`), or a restore placed through resume, `snapshot restore`,
   fork, or `instance create --from-snapshot`, each checked against its own
-  ACL first. A worker cannot ask for a key.
-- **Each part is sealed in 1 MiB chunks** (AES-256-GCM, with every chunk
-  bound to its position and to the part's length). A part of any size is
-  sealed and opened with one chunk in memory. Opening happens in place, so
-  a fetch needs no disk beyond the downloaded object.
-- **The same bytes seal to the same object**, so a re-publish uploads
-  nothing and identical parts are stored once. Both the key and the object
-  name are keyed by the checkpoint key, so without it nobody can tell what a
-  part contains, or test a guess against it. Someone who can list the bucket
-  can still see object sizes, and that one object is shared by two
-  snapshots.
+  ACL first. A worker cannot ask for a key. A publishing worker also gets
+  its job's chunk key, which can name and seal that job's chunks and open
+  nothing.
+- **Every chunk and every index is a sealed object** (AES-256-GCM in 1 MiB
+  pieces, each bound to its position and to the object's length). A
+  restore opens each chunk in memory as it arrives, so ciphertext never
+  lands on the node's disk.
+- **The same chunk of one job seals to the same object** within a dedup
+  window, so a re-publish uploads only new chunks, and identical chunks are
+  stored once. Chunk keys and names are keyed by the job's chunk key, and
+  the index that lists them is sealed under the part key, so without the
+  keys nobody can tell what a part contains, or test a guess against it.
+  A worker holding a job's chunk key could test a guess against that job's
+  chunks (did any checkpoint of this job contain exactly this chunk?), never
+  another job's. Someone who can list the bucket can still see object
+  sizes, and how many new chunks each publish adds.
 - **The manifest records which key** sealed each part (`keyId`, beside
   `url`). `legion snapshot get` shows it. Key bytes never appear in a
   manifest, a log line, an event, or the worker's state file.
@@ -1999,6 +2264,9 @@ while the manager's keyring is locked.
 | `failed authentication at chunk N: it was modified, or sealed under a different key` | The object was changed in the bucket, or belongs to another cluster. Not retried |
 | `truncated or has trailing bytes` | The object is cut short or has bytes appended |
 | `is not a sealed checkpoint part (no LGNSEAL1 header)` | A plaintext object, for example one published before this release. Not retried |
+| `chunk N (...) of the published part is missing from the content store` | An object the part's index names was deleted, usually by a lifecycle rule shorter than the checkpoint's age plus `dedupWindow`. Not retried |
+| `the published part's index ... is not in the content store` | The part's index was deleted, or the snapshot was published to a different store |
+| `the manager sent no chunk key` | The manager could not derive the job's chunk key, for the same reasons as a part key (below). The publish fails and is retried like any failed publish |
 | `was published before checkpoint encryption, and Legion no longer reads unsealed parts` | The manifest has a `url` and no `keyId`. Take a new snapshot |
 | `this cluster has no checkpoint key yet` | The keyring leader has not minted it. It does within seconds of initializing |
 | `this cluster has no checkpoint key, because the keyring is off` | `encryption.enabled = false` on the managers. Publishing needs the keyring |
@@ -2008,9 +2276,10 @@ while the manager's keyring is locked.
 ### Limits
 
 - **Object sizes are visible.** Sealing adds 20 bytes plus 16 bytes per MiB.
-- **Identical parts share one object**, and the bucket shows that two
-  snapshots share it. Only the checkpoint key turns that into knowing what
-  the part is.
+- **Identical chunks of one job share one object**, and the bucket shows how
+  many new chunks each publish added, so roughly how much a sandbox changed
+  between checkpoints. Only the job's chunk key turns a shared chunk into
+  knowing what it is.
 - **The checkpoint key cannot be rotated by hand yet.** A root-key rewrap
   covers the usual rotation need.
 - **The node copy is not encrypted.** A part in a worker's own content store
@@ -2033,7 +2302,7 @@ while the manager's keyring is locked.
 | `snapshot.publish_failed` | warn | A `durability = "store"` snapshot could not be uploaded and stays `local`. The metadata carries `error`, which says whether the manager will retry. |
 | `snapshot.warmed` | info | A node fetched a published snapshot's parts after `snapshot warm`. The metadata carries `fetchedBytes` and `durationMs`. |
 | `snapshot.warm_failed` | warn | A node could not warm a snapshot. The metadata carries `error`. |
-| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, or `make_room`). |
+| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, `park`, `make_room`, or `runtime_disabled`, a [runtime disable](runtime-disable.md#draining) with a drain). |
 | `instance.archived` | info | A published suspend checkpoint was archived (`suspend.archive`). The metadata carries `snapshotId`, `manifestUrl`, and `manifestOnly` (whether the instance row was dropped too). |
 | `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends to make room. The metadata carries the resume's `instanceId` and the instances it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed. The instance keeps running. The metadata carries `error`. |
@@ -2054,14 +2323,17 @@ A suspend by the node's pressure response also emits `node.pressure` with
 | --- | --- | --- | --- |
 | `legion_instance_suspend_seconds` | histogram | `kind` | How long each successful suspend's capture took on its node. |
 | `legion_instance_resume_seconds` | histogram | `kind` | How long each successful resume's restore took on its node. Placement time is not included. |
+| `legion_snapshot_capture_seconds` | histogram | `kind` | How long each successful manual snapshot capture took on its node. |
+| `legion_snapshot_restore_seconds` | histogram | `kind` | How long each successful restore from a snapshot took on its node. Resumes are `legion_instance_resume_seconds`. |
 | `legion_checkpoint_bytes` | histogram | `kind` | Size of each captured checkpoint (suspends and snapshots). A disk suspend reports 0, since its volume stays in place. |
-| `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, `pressure`, or `make_room`. |
+| `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, `pressure`, `park`, or `make_room`. |
 | `legion_make_room_suspends_total` | counter | `outcome` | Make-room suspends: `started`, `failed` (could not start), or `no_room` (a round that would not have made enough room, so nothing was suspended). |
 | `legion_idle_sweep_suspends_total` | counter | `outcome` | Suspends the idle sweep tried to start: `started`, or `skipped` (the instance changed, an operation was in flight, or the node cannot checkpoint). |
-| `legion_checkpoint_publish_bytes` | histogram | `kind` | Bytes a node uploaded to publish one checkpoint. 0 when the store already held every part. |
+| `legion_checkpoint_publish_bytes` | histogram | `kind` | Bytes a node uploaded to publish one checkpoint: only the chunks the store did not hold yet. 0 when it held every one. |
 | `legion_checkpoint_publish_seconds` | histogram | `kind` | How long each successful publish took on its node. |
 | `legion_instance_archived_total` | counter | `mode` | Instances archived after their checkpoint published, by `slim` (a slim row stays) or `manifestOnly` (no row stays). |
 | `legion_checkpoint_publish_total` | counter | `outcome` | Publishes reported, by `published`, `retrying` (failed, the manager asks again), or `failed` (the last attempt failed). |
+| `legion_content_store_bytes`, `legion_content_store_pinned_bytes`, `legion_content_store_budget_bytes` | gauge (worker) | `class` | What each node content store class (`artifacts`, `snapshots`, `derived`) holds, holds pinned, and may hold. `snapshots` is where local checkpoints live. |
 
 See [metrics](metrics.md#suspend-and-resume).
 
@@ -2138,9 +2410,17 @@ See [metrics](metrics.md#suspend-and-resume).
   `local` for good. Take a new snapshot (or suspend again) once the store is
   fixed. There is no command to retry by hand.
 - **Published parts are not deleted from the store.** Deleting the snapshot
-  removes the row and the node's local copy only. Use bucket lifecycle rules.
-- **Published part sizes are visible in the bucket, and identical parts
-  share one object.** See
+  removes the row and the node's local copy only. Use bucket lifecycle rules
+  that expire `sealed/` objects older than the longest-lived checkpoint plus
+  `dedupWindow` ([Expiring published parts](#expiring-published-parts)). A
+  shorter rule can delete a chunk a checkpoint still needs, and its restore
+  then fails naming the missing chunk. Legion does not bound how long a
+  suspended instance stays suspended, so the rule is that bound.
+- **A restore fetches every distinct non-zero chunk of a part it lacks**,
+  even when the node holds an earlier checkpoint of the same sandbox. Only
+  the publish side skips what the store already holds.
+- **Published object sizes are visible in the bucket, and identical chunks
+  of one job share one object.** See
   [Published checkpoint encryption](#published-checkpoint-encryption).
 - **Archive manifests outlive some of their instances.** `instance stop`
   and `destroy` delete an archived instance's manifest, but `job stop` and
@@ -2172,7 +2452,8 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Warms and the location index are held by one manager.** In a
   multi-manager cluster, nodes that heartbeat a different manager than the
   one that accepted `snapshot warm`, or that scheduled the placement, are
-  invisible to it until they heartbeat it.
+  invisible to it until they heartbeat it, and a warm is pushed only to
+  nodes that stream from it.
 - **Rollback is in place and keyed-only.** `snapshot restore` rolls back only
   the instance a snapshot was taken from. To start a new instance from it,
   use `instance create --from-snapshot`. Slot instances can be snapshotted
@@ -2192,6 +2473,13 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Each fork is charged its full reservation**, even though forks of one
   memory checkpoint share pages on Firecracker. cloud-hypervisor forks share
   no pages.
+- **A published checkpoint is fetched whole before it restores.** A resume
+  on a node that holds the parts runs the guest before its memory is read,
+  but a node that must fetch them downloads every part first. Warm the node
+  ahead of time (`snapshot warm`) to keep that off the resume.
+- **A lazily resumed guest pays for its memory as it touches it.** See
+  [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back) for
+  when to set `memory_restore = "eager"`.
 - **A fork's TAP needs Firecracker 1.12 or later** for a memory fork of a
   TAP-wired sandbox. A disk fork of a TAP-wired sandbox is refused, since it
   would boot on the origin's TAP.

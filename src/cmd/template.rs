@@ -5,7 +5,10 @@
 //! version, `run` renders one with `--var` values and submits the result as
 //! a job, and `render` is the dry-run twin of `run`.
 
-use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::helpers::{
+    active_namespace, allow_unknown_fields_flag, connect_manager_client, json_flag, namespace_flag,
+    print_table,
+};
 use crate::cmd::job::{
     asap_flag, idempotency_arg, priority_arg, priority_from_matches, timeout_arg, wait_flag,
     wait_for_convergence, wait_timeout,
@@ -99,6 +102,7 @@ pub fn config() -> Command {
                 .arg(name_arg.clone())
                 .arg(version_arg.clone())
                 .args(var_args.clone())
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -119,6 +123,8 @@ pub fn config() -> Command {
                 .arg(idempotency_arg())
                 .arg(wait_flag())
                 .arg(timeout_arg())
+                .arg(allow_unknown_fields_flag())
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -420,6 +426,7 @@ async fn render_template(matches: &ArgMatches) -> R<()> {
                 name: required_name(matches),
                 version: matches.get_one::<u32>("version").copied(),
                 variables_json,
+                namespace: active_namespace(matches),
             }))
             .await,
     )?;
@@ -454,6 +461,8 @@ async fn run_template(matches: &ArgMatches) -> R<()> {
                 priority: priority_from_matches(matches),
                 force_reschedule: matches.get_flag("force-reschedule"),
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                namespace: active_namespace(matches),
+                allow_unknown_fields: matches.get_flag("allow-unknown-fields"),
             }))
             .await,
     )?;
@@ -474,10 +483,21 @@ async fn run_template(matches: &ArgMatches) -> R<()> {
             "deduplicated": reply.deduplicated,
             "jobName": reply.job_name,
             "jobConfigId": reply.job_config_id,
+            "warnings": reply.warnings,
             "wait": wait,
         }));
     } else {
-        println!("{} (job {})", reply.message, reply.job_name);
+        // The message's first line is the outcome; the rest are its
+        // `warning: ` lines, printed after the job they belong to.
+        let mut lines = reply.message.lines();
+        println!(
+            "{} (job {})",
+            lines.next().unwrap_or_default(),
+            reply.job_name
+        );
+        for line in lines {
+            println!("{line}");
+        }
         if let Some(wait) = wait {
             println!(
                 "wait: converged={} success={} status={}",

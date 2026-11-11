@@ -19,10 +19,10 @@
 ## Problem Statement
 
 Legion can place tasks but a task has no first-class way to **find and reach another
-task**. Today an allocation ([src/structs/ledger.rs:12](../../src/structs/ledger.rs))
+task**. Today an allocation ([crates/common/src/structs/ledger.rs:12](../../crates/common/src/structs/ledger.rs))
 records `node_id`/`job_id`/`task_config_id` but **no port, no address, and no service
 name**. There is no `network` block, no `service` block, and `Node`
-([src/structs/node.rs:13](../../src/structs/node.rs)) exposes no routable address
+([crates/common/src/structs/node.rs:13](../../crates/common/src/structs/node.rs)) exposes no routable address
 outside of opaque `fingerprint_attrs`. The TODO states the gap exactly
 ([internal_docs/TODO.md](../TODO.md)):
 
@@ -143,15 +143,15 @@ Grounding the design in current code so we extend rather than reinvent.
 
 | Concern | Where | Notes |
 | --- | --- | --- |
-| Allocation record | [src/structs/ledger.rs:12](../../src/structs/ledger.rs) | `id`, `node_id`, `job_id`, `task_config_id`. **No port, no address, no service.** |
-| Task spec | `TaskConfig` ([src/structs/job.rs:815](../../src/structs/job.rs)) | Where `network`, `service`, `allow` blocks attach. No networking fields today. |
-| Health checks | `TaskCheck` / `TaskCheckKind` ([src/structs/job.rs:475](../../src/structs/job.rs), [:359](../../src/structs/job.rs)) | `http`/`tcp`/`exec`, plus `boot`/`readiness`/`health` types. The feed for only-healthy. Add `grpc`. |
-| Node record | [src/structs/node.rs:13](../../src/structs/node.rs) | `fingerprint_attrs`/`dynamic_attrs` (JSON). A **networking fingerprinter** records routable addrs + available datapaths here. |
-| Template engine | `KvTemplateSource` ([src/structs/job.rs:874](../../src/structs/job.rs)), `{{ kv "…" }}` | Already renders env/files from KV. Add `service`/`endpoints` template funcs. |
+| Allocation record | [crates/common/src/structs/ledger.rs:12](../../crates/common/src/structs/ledger.rs) | `id`, `node_id`, `job_id`, `task_config_id`. **No port, no address, no service.** |
+| Task spec | `TaskConfig` ([crates/common/src/structs/job.rs:815](../../crates/common/src/structs/job.rs)) | Where `network`, `service`, `allow` blocks attach. No networking fields today. |
+| Health checks | `TaskCheck` / `TaskCheckKind` ([crates/common/src/structs/job.rs:475](../../crates/common/src/structs/job.rs), [:359](../../crates/common/src/structs/job.rs)) | `http`/`tcp`/`exec`, plus `boot`/`readiness`/`health` types. The feed for only-healthy. Add `grpc`. |
+| Node record | [crates/common/src/structs/node.rs:13](../../crates/common/src/structs/node.rs) | `fingerprint_attrs`/`dynamic_attrs` (JSON). A **networking fingerprinter** records routable addrs + available datapaths here. |
+| Template engine | `KvTemplateSource` ([crates/common/src/structs/job.rs:874](../../crates/common/src/structs/job.rs)), `{{ kv "…" }}` | Already renders env/files from KV. Add `service`/`endpoints` template funcs. |
 | KV → reconcile | [docs/kv-store.md](../../docs/kv-store.md) `on_change` actions | `none`/`restart`/`rollout`/`fail` vocabulary reused for endpoint-change reactions. |
 | Eval loop | [docs/scheduler-and-eval-loop.md](../../docs/scheduler-and-eval-loop.md) | Eval kinds + dedup-on-claim; a new endpoint-sync trigger rides this. |
-| Scheduler | `src/manager/scheduler.rs` | Port assignment happens at placement, alongside resource fit. |
-| Plugin runtime | [src/plugin_runtime.rs](../../src/plugin_runtime.rs), [docs/plugin-system.md](../../docs/plugin-system.md) | In-process cdylib plugins (`get` symbol, `plugin.json`, `legionApiVersion`). The datapath plugin is a **new plugin kind** here. |
+| Scheduler | `crates/manager/src/manager/scheduler.rs` | Port assignment happens at placement, alongside resource fit. |
+| Plugin runtime | [crates/worker/src/plugin_runtime.rs](../../crates/worker/src/plugin_runtime.rs), [docs/plugin-system.md](../../docs/plugin-system.md) | In-process cdylib plugins (`get` symbol, `plugin.json`, `legionApiVersion`). The datapath plugin is a **new plugin kind** here. |
 | Workload identity | [workload-identity-oidc-plan.md](workload-identity-oidc-plan.md) | SPIFFE-style `sub` — the identity intentions are keyed on. |
 | Instance identity | [stateful-workloads-and-instance-identity-plan.md](stateful-workloads-and-instance-identity-plan.md) | Stable `instance_id`/slot → stable *per-instance* DNS (headless analog). |
 
@@ -311,7 +311,7 @@ the hot path → no single bottleneck, no cross-node hop.
 
 ### 5) Template discovery (the change-reactive path)
 
-Extend the existing template engine (`{{ kv "…" }}`, [src/structs/job.rs:874](../../src/structs/job.rs))
+Extend the existing template engine (`{{ kv "…" }}`, [crates/common/src/structs/job.rs:874](../../crates/common/src/structs/job.rs))
 with service functions — direct Nomad/`consul-template` parity:
 
 ```jsonnet
@@ -506,26 +506,26 @@ L4 + L7 intentions, template `endpoints` function).
 
 ## Proto, Struct, and Persistence Changes
 
-1. **`src/structs/`**
+1. **`crates/common/src/structs/`**
    - new `network.rs`: `NetworkConfig`, `PortConfig`, `AllocNetwork` (assigned ip/ports),
      `DatapathCapabilities`.
    - new `service.rs`: `ServiceConfig`, `Endpoint`, `Intention`, `ConnectConfig`.
-   - extend `TaskConfig` ([src/structs/job.rs:815](../../src/structs/job.rs)) with
+   - extend `TaskConfig` ([crates/common/src/structs/job.rs:815](../../crates/common/src/structs/job.rs)) with
      `network`, `service`, `connect`.
-   - extend `Allocation` ([src/structs/ledger.rs:12](../../src/structs/ledger.rs)) with
+   - extend `Allocation` ([crates/common/src/structs/ledger.rs:12](../../crates/common/src/structs/ledger.rs)) with
      `network: Option<AllocNetwork>`.
-   - add `Grpc` to `TaskCheckKind` ([src/structs/job.rs:359](../../src/structs/job.rs)).
+   - add `Grpc` to `TaskCheckKind` ([crates/common/src/structs/job.rs:359](../../crates/common/src/structs/job.rs)).
 2. **`proto/legion.proto`** — new `Manager` RPCs: `ListServices`, `GetService`,
    `ResolveService` (endpoints + ports, for the resolver/template/UI); extend the
    `Worker` stream ([proto/legion.proto:1783](../../proto/legion.proto)) with a
    per-service endpoint push message; carry assigned ports on alloc-related messages.
    Every method/field documented per AGENTS.md proto-comment rule. Regenerate via
    `build.rs`.
-3. **Migration** ([src/storage/migrations.rs](../../src/storage/migrations.rs)) — add
+3. **Migration** ([crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs)) — add
    `network` column to allocations; `services` and `service_endpoints` views/tables
    (the projection); `intentions` table; a `port_allocations` index for dynamic-port
    bookkeeping.
-4. **Scheduler** (`src/manager/scheduler.rs`) — dynamic-port assignment during placement
+4. **Scheduler** (`crates/manager/src/manager/scheduler.rs`) — dynamic-port assignment during placement
    (fit ports alongside resources; respect static-port conflicts as a hard filter);
    write `AllocNetwork` onto the allocation.
 5. **Eval loop** ([docs/scheduler-and-eval-loop.md](../../docs/scheduler-and-eval-loop.md)) —
@@ -535,7 +535,7 @@ L4 + L7 intentions, template `endpoints` function).
 6. **Worker** — networking fingerprinter populates `DatapathCapabilities`; datapath
    plugin invocation at alloc setup/teardown; node-local resolver + L4 forwarder
    lifecycle; env-var injection; resolv.conf management.
-7. **Plugin runtime** ([src/plugin_runtime.rs](../../src/plugin_runtime.rs)) — register
+7. **Plugin runtime** ([crates/worker/src/plugin_runtime.rs](../../crates/worker/src/plugin_runtime.rs)) — register
    `datapath` plugin kind + manifest validation; ship built-ins `host`, `bridge`, `cni`.
 8. **Docs** — new `docs/service-discovery.md` (user-facing), `docs/datapath-plugins.md`
    (ABI), update README doc list, plugin-system "Planned categories", and TODO.

@@ -12,7 +12,10 @@
 //! Every subcommand takes `--json`/`-j` and emits the standard
 //! [`crate::cmd::output`] envelope so agents never have to scrape prose.
 
-use crate::cmd::helpers::{connect_manager_client, json_flag, AuthedManagerClient};
+use crate::cmd::helpers::{
+    connect_manager_client, job_ref, json_flag, list_namespace_flags, lists_many_namespaces,
+    namespace_flag, namespace_selection, AuthedManagerClient,
+};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
@@ -68,7 +71,8 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(
             Command::new("list")
-                .about("Lists all declared services with endpoint health counts")
+                .about("Lists declared services with endpoint health counts")
+                .args(list_namespace_flags())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -76,7 +80,7 @@ pub fn config() -> Command {
                 .about("Resolves a service to its healthy endpoint addresses")
                 .arg(
                     Arg::new("service")
-                        .help("Service name to resolve")
+                        .help("Service to resolve: `name`, or `namespace/name`")
                         .required(true),
                 )
                 .arg(
@@ -91,6 +95,7 @@ pub fn config() -> Command {
                         .action(ArgAction::SetTrue)
                         .help("Print a single randomly picked endpoint address:port (scripts)"),
                 )
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -113,6 +118,7 @@ pub fn config() -> Command {
                         .help("Service name to diagnose")
                         .required(true),
                 )
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
 }
@@ -275,7 +281,7 @@ fn service_json(service: &ServiceSummary) -> Value {
         "healthyCount": service.healthy_count,
         "totalCount": service.total_count,
         "tags": service.tags,
-        // Connect intentions; empty means every job may connect.
+        // Who may call the service; empty means every caller may connect.
         "allow": service.allow,
     })
 }
@@ -297,7 +303,7 @@ fn endpoint_json(endpoint: &ServiceEndpoint) -> Value {
 
 /// `host:port` form of an endpoint — what a client actually dials.
 fn endpoint_address(endpoint: &ServiceEndpoint) -> String {
-    format!("{}:{}", endpoint.address, endpoint.port)
+    crate::structs::hostport::join(&endpoint.address, endpoint.port as u16)
 }
 
 async fn list(matches: &ArgMatches) -> R<()> {
@@ -307,7 +313,9 @@ async fn list(matches: &ArgMatches) -> R<()> {
         format,
         "failed to list services",
         client
-            .list_services(tonic::Request::new(ListServicesRequest {}))
+            .list_services(tonic::Request::new(ListServicesRequest {
+                namespaces: namespace_selection(matches),
+            }))
             .await,
     )?
     .into_inner()
@@ -324,8 +332,13 @@ async fn list(matches: &ArgMatches) -> R<()> {
         return Ok(());
     }
 
+    let many = lists_many_namespaces(matches);
     let rows = services.into_iter().map(|service| ServiceRow {
-        service: service.service,
+        service: if many {
+            crate::structs::namespace::job_id(&service.namespace, &service.service)
+        } else {
+            service.service
+        },
         job: service.job_id,
         task: service.task_name,
         healthy: format!("{}/{}", service.healthy_count, service.total_count),
@@ -357,17 +370,21 @@ async fn fetch_endpoints(
 /// Pick one endpoint uniformly at random.
 ///
 /// Random rather than "the first" so repeated script invocations spread load
-/// the same way the node-local forwarder's default `round_robin` strategy
-/// does — `--one` is meant to be called in a loop.
+/// across endpoints rather than piling onto one — `--one` is meant to be
+/// called in a loop. (A one-shot CLI call has no latency history, so the
+/// forwarder's `least_latency` default does not apply here.)
 fn pick_one(endpoints: &[ServiceEndpoint]) -> Option<&ServiceEndpoint> {
     endpoints.choose(&mut rand::thread_rng())
 }
 
 async fn resolve(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let service = matches
-        .get_one::<String>("service")
-        .context("service name required")?;
+    let service = &job_ref(
+        matches,
+        matches
+            .get_one::<String>("service")
+            .context("service name required")?,
+    )?;
     let include_unhealthy = matches.get_flag("all");
     let mut client = connect_manager_client().await?;
     let endpoints = fetch_endpoints(&mut client, service, include_unhealthy, format).await?;
@@ -391,11 +408,11 @@ async fn resolve(matches: &ArgMatches) -> R<()> {
     }
 
     let rows = endpoints.into_iter().map(|endpoint| EndpointRow {
-        address: format!("{}:{}", endpoint.address, endpoint.port),
+        address: endpoint_address(&endpoint),
         public: if endpoint.public_address.is_empty() {
             "-".to_string()
         } else {
-            format!("{}:{}", endpoint.public_address, endpoint.port)
+            crate::structs::hostport::join(&endpoint.public_address, endpoint.port as u16)
         },
         alloc: endpoint.allocation_id,
         node: endpoint.node_id,
@@ -494,16 +511,22 @@ struct Diagnosis {
 
 async fn doctor(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let service = matches
-        .get_one::<String>("service")
-        .context("service name required")?;
+    let service = &job_ref(
+        matches,
+        matches
+            .get_one::<String>("service")
+            .context("service name required")?,
+    )?;
+    let (namespace, service_name) = crate::structs::namespace::split_job_id(service);
 
     let mut client = connect_manager_client().await?;
     let services = output::resolve(
         format,
         "failed to list services",
         client
-            .list_services(tonic::Request::new(ListServicesRequest {}))
+            .list_services(tonic::Request::new(ListServicesRequest {
+                namespaces: vec![namespace.to_string()],
+            }))
             .await,
     )?
     .into_inner()
@@ -512,7 +535,7 @@ async fn doctor(matches: &ArgMatches) -> R<()> {
     // Only reach for endpoints once the service is known to exist — an
     // undeclared service is diagnosed from the summary list alone. Intentions
     // ride along on the summary, so the whole report needs only `job:read`.
-    let (endpoints, allow) = match services.iter().find(|entry| entry.service == *service) {
+    let (endpoints, allow) = match services.iter().find(|entry| entry.service == service_name) {
         Some(summary) => {
             let allow = summary.allow.clone();
             let endpoints = fetch_endpoints(&mut client, service, true, format).await?;
@@ -588,7 +611,8 @@ fn walk_layers(
 
     // Connect intentions. An empty `allow` means "everyone", so only say
     // something when the service actually restricts its consumers.
-    if let Some(check) = intentions_check(allow) {
+    let mesh = endpoints.iter().any(|endpoint| endpoint.mesh_tls);
+    if let Some(check) = intentions_check(service, allow, mesh) {
         checks.push(check);
     }
 
@@ -730,8 +754,10 @@ fn walk_layers(
     (checks, resolved)
 }
 
-/// The `service.allow` line, when the service declares intentions.
-fn intentions_check(allow: &[String]) -> Option<DoctorCheck> {
+/// The `service.allow` line, when the service declares who may call it.
+/// Without the mesh there is no verified caller at the receiving node, so
+/// the list is enforced by the endpoint feed only, and the line says so.
+fn intentions_check(service: &str, allow: &[String], mesh: bool) -> Option<DoctorCheck> {
     if allow.is_empty() {
         return None;
     }
@@ -740,22 +766,24 @@ fn intentions_check(allow: &[String]) -> Option<DoctorCheck> {
         return Some(DoctorCheck::new(
             "intentions",
             STATUS_INFO,
-            format!("service.allow = {list}  (wildcard: every job may connect)"),
+            format!("allow: {list}  (wildcard: every caller may connect)"),
         ));
     }
-    Some(
-        DoctorCheck::new(
-            "intentions",
-            STATUS_INFO,
-            format!("service.allow = {list}  (only these job ids may connect)"),
-        )
-        .with_details(vec![
-            "any other job's `connect` upstream for this service resolves to an empty \
-             endpoint list"
-                .to_string(),
-            "add the consumer's job id (or \"*\") to service.allow to permit it".to_string(),
-        ]),
-    )
+    let mut details = vec![
+        "any other caller's `connect` upstream for this service resolves to an empty \
+         endpoint list"
+            .to_string(),
+        "add the caller's job id (or a <region>:<job>:<group>:<task> glob, or \"*\") to \
+         service.allow to permit it"
+            .to_string(),
+    ];
+    let line = if mesh {
+        format!("allow: {list}   enforced by the endpoint feed and on the wire (mesh)")
+    } else {
+        details.push("Hint: set service.mesh = true to enforce it on the wire".to_string());
+        format!("allow: {list}   enforced by the endpoint feed only ({service} is not on the mesh)")
+    };
+    Some(DoctorCheck::new("intentions", STATUS_INFO, line).with_details(details))
 }
 
 fn status_glyph(status: &str) -> &'static str {
@@ -785,6 +813,7 @@ mod tests {
 
     fn summary(service: &str, job: &str, task: &str) -> ServiceSummary {
         ServiceSummary {
+            namespace: Default::default(),
             service: service.to_string(),
             job_id: job.to_string(),
             task_name: task.to_string(),
@@ -798,6 +827,7 @@ mod tests {
 
     fn endpoint(alloc: i64, port: u32, healthy: bool, health_status: &str) -> ServiceEndpoint {
         ServiceEndpoint {
+            namespace: Default::default(),
             service: "web".to_string(),
             job_id: "api".to_string(),
             task_name: "web".to_string(),
@@ -991,9 +1021,34 @@ mod tests {
 
     #[test]
     fn intentions_check_calls_out_the_wildcard() {
-        let check = intentions_check(&["*".to_string()]).expect("check");
-        assert!(check.summary.contains("every job may connect"));
+        let check = intentions_check("web", &["*".to_string()], false).expect("check");
+        assert!(check.summary.contains("every caller may connect"));
         assert!(check.details.is_empty());
+    }
+
+    /// Without the mesh, nothing verifies a caller at the receiving node, so
+    /// the line says the feed is the only enforcement and how to change it.
+    #[test]
+    fn intentions_check_says_where_allow_is_enforced_test() {
+        let allow = vec!["web".to_string(), "agent-*".to_string()];
+        let feed_only = intentions_check("api", &allow, false).expect("check");
+        assert!(
+            feed_only
+                .summary
+                .contains("enforced by the endpoint feed only (api is not on the mesh)"),
+            "{}",
+            feed_only.summary
+        );
+        assert!(feed_only
+            .details
+            .iter()
+            .any(|line| line.contains("service.mesh = true")));
+        let mesh = intentions_check("api", &allow, true).expect("check");
+        assert!(mesh.summary.contains("on the wire"), "{}", mesh.summary);
+        assert!(!mesh
+            .details
+            .iter()
+            .any(|line| line.contains("service.mesh")));
     }
 
     #[test]

@@ -3,12 +3,12 @@
 This directory contains repeatable, file-backed scheduler load scenarios and SLO targets.
 
 - `scenarios/*.json`: load shapes (jobs, tasks/job, task counts, node counts, churn pattern).
-- `slo.json`: global SLO thresholds validated by `tests/scheduler_benchmark_slo.rs`.
+- `slo.json`: global SLO thresholds validated by `tests/integration/scheduler_benchmark_slo.rs`.
 
 Run locally:
 
 ```bash
-cargo test --test scheduler_benchmark_slo -- --ignored --nocapture
+cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture
 ```
 
 The benchmark test emits per-scenario metrics:
@@ -61,7 +61,7 @@ the plan path; further wins want profiling, not this list.
 
 ## Plan contention — late-binding candidate lists (2026-07-29)
 
-`cargo test --test plan_contention -- --ignored --nocapture`
+`cargo test --test integration plan_contention:: -- --ignored --nocapture`
 (dev container; N single-allocation `job_submit` evals pumped by 8 real
 eval workers against one bin_pack pool, one seeded allocation so the
 argmax is deterministic; `k` is `schedulerSettings.plan_candidates`, so
@@ -128,7 +128,7 @@ its per-candidate epoch checks to the single round-trip the fusion left.
 ## Scenario × backend matrix — baseline (2026-07-29)
 
 **Host: Apple Silicon MacBook (macOS), release build, in-process
-backends.** Run: `tests/scheduler_scale_benchmark.rs` (see
+backends.** Run: `tests/integration/scheduler_scale_benchmark.rs` (see
 `docs/testing-and-benchmarks.md`). Single-shot runs on a laptop carry
 real thermal variance between runs — compare *phases within a run* and
 before/after pairs measured close together; treat absolute evals/sec as
@@ -285,7 +285,7 @@ Readings — with measurement honesty first:
 
 ## Heartbeat path (heartbeat-scale plan) — 2026-07-30
 
-Same host/build. `tests/heartbeat_scale_benchmark.rs`, 8 driver
+Same host/build. `tests/integration/heartbeat_scale_benchmark.rs`, 8 driver
 threads, 3s measurement window per cell. Before
 (`target/benchmark-results/heartbeat-1785401390.json`, commit before
 the heartbeat pass) vs after (`heartbeat-1785406179.json`):
@@ -691,7 +691,7 @@ its cell rank and `truncate_within_boundary_cell` keeps whole ranks and
 samples the rank the cut lands in. Extra work per plan: one `u32` per
 shard member and a `sample(k of n)` on the boundary cell only.
 
-**Behavioural before/after** (`tests/index_truncation_spread.rs`: 4
+**Behavioural before/after** (`tests/integration/index_truncation_spread.rs`: 4
 slices x 150 identical nodes, 40 jobs x 4 allocations, `spread`, budget
 128 of 600): allocations per slice **104 / 56 / 0 / 0** before,
 **49 / 30 / 43 / 38** after. Slices 2 and 3 never received a candidate
@@ -881,7 +881,7 @@ pending
 
 ## Exec sessions: proxied vs direct (sandbox-exec Phase 0) — 2026-10-12
 
-`tests/exec_session_benchmark.rs`, release build, one 4-vCPU Xeon @ 2.8 GHz
+`tests/integration/exec_session_benchmark.rs`, release build, one 4-vCPU Xeon @ 2.8 GHz
 running the client, a manager, and a separate worker process (isolated
 ports). Each session runs `head -c 65536 /dev/zero` in an `exec` task and
 exits. "Open" is request sent to first output byte; for direct it includes
@@ -891,7 +891,7 @@ cost is the manager process alone: CPU from `/proc/<pid>/stat`, bytes from
 
 ```bash
 LEGION_EXEC_BENCH_CONCURRENCY=1,10,100,500 \
-  cargo test --release --test exec_session_benchmark -- --ignored --nocapture
+  cargo test --release --test integration exec_session_benchmark:: -- --ignored --nocapture
 ```
 
 | Path | Sessions at once | Open p50 | Open p99 | Manager CPU / session | Manager bytes / session |

@@ -11,10 +11,43 @@ The default file path is `<data dir>/store.sqlite`, where the data dir is
 Startup (`Store::start_storage`):
 
 - opens writable connection
-- runs migrations (`src/storage/migrations.rs`)
+- runs schema migrations (`crates/manager/src/storage/migrations.rs`)
 - creates read-only connection pool
-- enables WAL mode and foreign keys on write connection
+- enables WAL mode (`synchronous = NORMAL`) and foreign keys on write
+  connection
+- undoes any speculative raft batch a crash left behind (raft mode, see
+  [multi-raft.md](multi-raft.md#the-write-path-group-commit-and-single-execution))
 - initializes in-memory scheduling read model cache
+- runs pending data migrations (`local_disk`; under raft, the leader runs
+  them through the log — see "Schema and data migrations" below)
+
+## Schema and data migrations
+
+Migrations come in two kinds, and they run differently.
+
+**Schema steps** (`crates/manager/src/storage/migrations.rs`) create and change tables:
+`CREATE TABLE`/`INDEX`, `ADD COLUMN`, table rebuilds that copy every row
+(`INSERT INTO new SELECT … FROM old`), and constant seed rows. Every manager
+runs them locally at startup. Their result does not depend on when a
+manager runs them, so replicas that migrate at different moments still
+agree. The schema version a manager advertises to its raft peers is the
+number of schema steps it knows.
+
+**Data steps** (`crates/manager/src/storage/data_migrations.rs`) rewrite existing rows: a
+backfill of a new column, a cleanup of rows an old build left. Their
+result does depend on which rows exist when they run, so they never run
+locally on a raft replica. Instead the control-lane leader runs every
+pending data step as **one replicated write**, and records each in the
+replicated `data_migration` table in the same raft entry. Every manager
+applies the same rewritten rows at the same log index, and a step runs
+exactly once cluster-wide. The leader waits until every voter advertises
+its own schema version, so every manager has the columns the step writes.
+Under `local_disk` there is one copy of the data, and pending steps run at
+startup. A brand-new database records every step as done (it has no rows
+to migrate).
+
+A schema step may not contain `UPDATE … SET` or `DELETE FROM`; a unit test
+(`schema_migrations_carry_no_data_steps`) enforces it.
 
 ## Connection Model
 
@@ -72,12 +105,7 @@ the write's own code:
 
 - **`raft`**: each manager projects the cache from the changeset it applies
   (see [Persistence Modes](#persistence-modes)). The projection runs after
-  the changeset commits. If it fails, the manager logs `Failed to project a
-  committed changeset's side effects`, re-sends every streaming worker its
-  full desired set, and leaves the cache to the scrub below. It keeps
-  applying the log. A projection error doesn't stop the manager's raft
-  group. The scrub doesn't cover task configs, so a cached task list the
-  failed projection skipped stays stale until the manager restarts.
+  the changeset commits.
 - **`local_disk` and `streaming`**: each mutation runs with a SQLite session
   attached to the cache's tables (`node`, `node_health`, `allocation`,
   `task_config`, `allocation_epoch_partition`). When the mutation returns, the
@@ -85,6 +113,23 @@ the write's own code:
   `ON DELETE CASCADE` and rows a mutation committed before it failed.
   Mutations run one at a time on a process-wide lock, so projections apply in
   commit order.
+
+In either mode a projection that fails part way never fails the write: the
+rows are committed. The manager logs `Failed projecting a committed
+changeset; rebuilding this manager's read model and resyncing its work
+streams`, rebuilds the whole cache from SQLite, re-sends every streaming
+worker its full desired set, and restarts the change journal (open watches
+resync). The capacity events the changeset carried are lost with the
+projection, so the manager records a `recovered` capacity event for every
+available node instead, and the next wake pass re-matches every blocked eval
+against the whole fleet ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)).
+In raft mode it keeps applying the log: a projection error doesn't stop the
+manager's raft group.
+
+A task-config lookup that misses the cache reads SQLite and caches what it
+read, unless a projection or a scrub repair changed the task-config cache in
+the meantime. So a lookup racing a `job destroy` cannot put the destroyed
+config's task list back after the projection removed it.
 
 A stale cache cannot oversubscribe a node, because plan-apply rechecks free
 capacity against SQLite inside its write transaction. It can still make the
@@ -102,9 +147,10 @@ background checks run every 5 seconds on every manager to bound that:
 - **Scrub.** The manager reloads 128 nodes per tick from SQLite (the node row
   and its allocation list), compares them with the cache, and repairs any
   that differ. The rotation covers every node, cached or committed, so a
-  10,000-node fleet is swept in about 6.5 minutes. Each repair logs a warning
+  10,000-node fleet is swept in about 6.5 minutes. Task configs rotate the
+  same way, 128 job configs' task lists per tick, on their own budget, so a
+  long job history does not slow the node sweep. Each repair logs a warning
   and increments `legion_read_model_drift_repaired_total{source="scrub"}`.
-  Task configs are not scrubbed.
 
 Either counter rising in a healthy cluster is a bug worth reporting.
 
@@ -114,6 +160,18 @@ difference, naming the operation. It is always on in Legion's unit tests. It
 reloads the whole cache on every write, so never set it in production. It does
 not cover raft replicas, which apply lanes concurrently and have no quiet point
 to compare at.
+
+## Revisions and the change journal
+
+Every read of a job, an allocation, or a KV key returns the manager's
+**revision**: its applied position (each raft group's applied index, from
+`raft_applied`, which commits with the rows; in `local_disk` mode a counter
+persisted in blocks in `store_revision`). The same projection that keeps the
+read model current records, per committed entry, which jobs, allocations,
+and KV keys it changed, at which revision, in an in-memory journal of the
+newest 65,536 changes per manager. Blocking reads, `Manager.Watch`, and
+`StreamWork` resume are built on it. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
 
 ## Key Tables
 
@@ -144,7 +202,10 @@ Main tables (see migrations):
 - `eval`
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`
-- `allocation_epoch`, `plan_submission`
+- `allocation_epoch`
+- `plan_submission`, a bounded record of rejected and staged plans (about the
+  last 1,000); applied plans write no row
+  (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#plan-records)).
 - `node_alloc_usage`, a cache rather than a source of truth. It holds one
   row per node with the aggregated resource usage of that node's
   allocations. Each row also stores a fingerprint of the rows it was derived
@@ -153,6 +214,9 @@ Main tables (see migrations):
   row written under a different `taskResourceDefaults`/`customResources`
   configuration is rebuilt instead of served
   (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache)).
+  Removing a node leaves its row behind (node removal is a control-lane
+  write, and this table belongs to the scheduler lane). The scheduler-lane
+  leader sweeps rows whose node is gone on every node-status check.
 - `rollout`, `allocation_health`, `rollout_event`
 - `instance` (stateful identity), `volume` (the storage its handle points at,
   see [volumes.md](volumes.md))
@@ -214,12 +278,18 @@ durable the writes are:
 - **`streaming`**: Litestream-style WAL shipping to object storage with
   lease-fenced failover. See `docs/persistence-streaming.md`.
 - **`raft`**: quorum-replicated writes. Every mutating store method routes
-  through `Store::replicated()`. Its row-level effects are captured as a
-  SQLite session changeset on the leader (and rolled back locally),
-  committed through openraft, and applied byte-identically on every
-  manager, so replicas cannot diverge. The read-model cache and event
-  stream are built from the committed changeset at apply time. Followers
-  get both without extra work, and nothing is visible before quorum commit.
+  through `Store::replicated()`. Writes queued together are captured as one
+  batch on the leader, each in its own savepoint, and their row-level
+  effects (SQLite session changesets, combined) are committed through
+  openraft as one entry and applied byte-identically on every manager, so
+  replicas cannot diverge. Under the default `single` topology the leader
+  keeps its captured batch (committed locally with an undo record) instead
+  of rolling it back and applying it again; under `lanes` it rolls back and
+  applies on commit. The read-model cache and event stream are built from
+  the committed changeset at apply time. Followers get both without extra
+  work, and the cache and streams never see a write before quorum commit
+  (a direct SQL read on the leader can, for one round trip — see
+  [multi-raft.md](multi-raft.md#the-write-path-group-commit-and-single-execution)).
   The cache update is a delta. The changeset names which allocation rows
   changed, so the cache patches those rows instead of reloading every
   touched node's allocation list. The cost of a commit follows the size of
@@ -253,9 +323,17 @@ Server-side backups work in every mode: `legion state backup` (a
   worker-plane writes per operation (`docs/multi-raft.md` § "Non-leader
   write redirects and forwarding"); when the leader is unreachable from the
   manager that received the write, it fails with the leader hint rather than
-  being retried elsewhere.
-- Managers dial each other's raft transport over plaintext HTTP/2 and
-  authenticate with a shared cluster secret. There is no mTLS between
-  managers.
+  being retried elsewhere. A forwarded client write's reply waits (up to 5
+  seconds) for the forwarding manager to apply the write itself, so the
+  client's next read there sees it.
+- The revision journal is memory, per manager, and bounded: a manager
+  restart empties it, so watches and worker streams that reconnect to that
+  manager relist or resync
+  ([watches-and-blocking-queries.md](watches-and-blocking-queries.md#the-journal-and-its-window)).
+- Managers dial each other's raft transport over TLS, under one key every
+  manager derives from the shared cluster secret, and authenticate each
+  call with that secret. All managers hold the same key, so the transport
+  does not tell one manager from another
+  ([auth-and-acls.md](auth-and-acls.md#managers-reach-each-other-over-tls)).
 - Key-range sharding, cross-region topologies, and parallel scheduler
   planning across managers are not implemented.

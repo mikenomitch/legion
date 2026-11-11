@@ -84,7 +84,7 @@
       every = "10s",
       timeout = "5s",
       # Give initdb room on a fresh volume before failing the allocation.
-      boot_grace_time = "60s",
+      bootGraceTime = "60s",
     }],
 
     # Day-2 operations, pre-baked (docs/exec-and-actions.md). Actions run
@@ -142,7 +142,7 @@
   #   # $LEGION_UPSTREAM_POSTGRES (127.0.0.1:<port>) to the healthy Postgres,
   #   # since its host port is dynamic. In a real deployment, inject the
   #   # password from KV instead of inlining it.
-  #   connect = { upstreams = [{ service = "postgres" }] },
+  #   connect = { upstreams = [{ to = "postgres" }] },
   #   config = {
   #     image = "postgres:16-alpine",
   #     command = ["sh", "-c", "pg_dump \"postgres://postgres:legion-demo@$LEGION_UPSTREAM_POSTGRES/legion\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],

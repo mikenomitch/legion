@@ -42,7 +42,19 @@ beat marks a node dead.
 The interval decides liveness, not delivery. A worker receives its work over
 `Manager.StreamWork` ([Delivery](architecture-managers-workers.md#delivery)):
 a placement reaches it one round trip after it commits, so stretching the
-interval to relieve the manager no longer delays new work.
+interval to relieve the manager no longer delays new work. The same holds
+for suspend, resume, and fork: checkpoint requests are pushed on the stream,
+and a worker reports a finished capture, restore, publish, or warm on a
+heartbeat it sends early
+([How it works](suspend-and-resume.md#how-it-works)).
+
+Those early beats sit outside the cadence, and adaptive cadence does not
+count them. They cost a beat per finished piece of checkpoint work, two per
+suspend and resume, so they add the cluster's checkpoint rate to `N / I`. That rate
+is bounded by the scheduler lane, which on the reference host completes
+about 50 suspend-and-resume lifecycles a second: about 100 early beats a
+second at the ceiling, small next to the scheduled beats of a fleet large
+enough to need adaptive cadence.
 
 The beat's size does not grow with what the node runs either. A worker on
 the stream reports its stream position, a digest of the allocation ids it
@@ -238,9 +250,11 @@ heartbeat = {
 
   # Floor and ceiling on the served interval. The floor is never crossed
   # however small the fleet; the ceiling is where the manager gives up
-  # backing off and warns instead.
+  # backing off and warns instead. It defaults to 55s so a served interval
+  # never reaches the stateful self-fence (90s); a ceiling at or past 90s
+  # is accepted with a startup warning.
   minInterval = "2s",
-  maxInterval = "120s",
+  maxInterval = "55s",
 
   # Missed beats before a node is lost. The lost window is ALWAYS this times
   # that node's served interval — 5 x 2s = the historical 10s.
@@ -475,17 +489,21 @@ liveness reports zero. See [Metrics](metrics.md).
   1000 nodes with `targetRatePerSecond = 80`, the ladder serves 34s and the
   window is 170s. This is the cost of adaptive cadence. Nomad pays a similar
   cost (100–200s at 5k nodes).
-- **Very large fleets reach the stateful self-fence.** A worker kills its
-  stateful tasks after `stateful.onLost.selfTerminateAfter` (90s by default)
-  without a successful heartbeat. A failed beat is retried within seconds,
-  so what matters is how much of those 90 seconds the interval itself uses.
-  At the 55s rung (past about 42,500 nodes at the default rate) a worker has
-  roughly 30 seconds of retries before it fences. At the 89s rung (past about
-  68,750 nodes) a jittered interval can exceed 90 seconds, and a healthy
-  worker fences between beats. The startup check against the fence covers
-  worker-type `heartbeatSeconds`, not the served interval. In fleets that
-  large, set `maxInterval = "55s"` or raise `selfTerminateAfter` on stateful
-  jobs. See [Stateful workloads](stateful-workloads.md).
+- **The ceiling is set by the stateful self-fence, not by the ladder.** A
+  worker kills its stateful tasks after `stateful.onLost.selfTerminateAfter`
+  (90s by default) without a successful heartbeat. A failed beat is retried
+  within seconds, so what matters is how much of those 90 seconds the
+  interval itself uses. `maxInterval` defaults to 55s for that reason: at
+  the 55s rung (past about 42,500 nodes at the default rate) a worker still
+  has roughly 30 seconds of retries before it fences, and the manager never
+  serves a longer interval. Past about 68,750 nodes the fleet then beats
+  faster than `targetRatePerSecond`, and the manager warns that it is at the
+  ceiling. Raising `maxInterval` to 90s or more is accepted, with a startup
+  warning, because a jittered interval that long lets a healthy worker
+  fence between beats; do it only with `selfTerminateAfter` raised to
+  match. The check is against the default fence: a job that sets a shorter
+  `selfTerminateAfter` needs a ceiling below its own value. See
+  [Stateful workloads](stateful-workloads.md).
 - **The 50% disruption threshold is not configurable.** Open an issue if your
   cluster needs to tune it.
 - **A node's cadence comes from what it reported at registration.** If a

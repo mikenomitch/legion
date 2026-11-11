@@ -60,7 +60,7 @@ rules. It sits alongside the existing `namespaces` / `names` / `pools` /
 `templates` selectors:
 
 ```json
-{"resources": ["job"], "actions": ["write"], "names": ["prod-*"],
+{"resources": ["job"], "actions": ["write"], "namespaces": ["default"], "names": ["prod-*"],
  "bands": ["critical", "high"]}
 ```
 
@@ -196,7 +196,9 @@ The floor has two properties:
   violated in practice, including by Nomad's own drainer.
 
 Percentages round up: `minAvailable = "50%"` of 5 protects 3. The floor is
-measured against the task's live allocation count, and it holds across a whole
+measured against the task's allocation count across the whole fleet,
+including nodes the preemption pass is not considering (cordoned nodes, nodes
+outside the preemptor's constraints), and it holds across a whole
 plan. Eight placements cannot each take one allocation below the floor and
 together take eight.
 
@@ -207,6 +209,13 @@ example, a `high` job that wants 2 replicas on a node full of a 2-allocation
 `low` task with `minAvailable = "50%"` evicts one `low` allocation, places one
 replica, and leaves the other unplaced with `preemption found no eligible
 victims (1 protected by disruption.minAvailable)`.
+
+A [gang](gang-scheduling.md)'s quorum is a floor of the same kind: preemption
+never leaves fewer than `gang.min` members running (all of them for `gang =
+true`), because taking one member idles the rest. The stricter of the two
+floors binds, and the placement error names `disruption.minAvailable` either
+way. A gang that preempts does so as a unit: if every replica cannot fit with
+the victims it may take, the plan evicts nothing.
 
 **What this does not protect you from:** an operator draining half the
 cluster can take your service below `minAvailable`. A Kubernetes
@@ -350,7 +359,8 @@ The event links each victim to its preemptor and back. A user who only sees
 
 **Metrics** ([metrics.md](metrics.md)):
 
-- `legion_preemptions_total{pool,band}`: victims evicted, by pool and band.
+- `legion_preemptions_total{pool,band,namespace}`: victims evicted, by pool,
+  band, and the victim's [namespace](namespaces.md).
 - `legion_preemption_plans_total{outcome}`: preemption passes that reached a
   decision. Outcomes are `placed` (victims evicted, preemptor placed),
   `observe` (the pass ran under `observe` mode and committed nothing), or

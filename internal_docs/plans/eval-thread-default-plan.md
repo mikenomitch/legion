@@ -33,7 +33,7 @@ evaluations can be planned and applied at once. It defaults to the host's
 core count:
 
 ```rust
-// src/structs/config.rs:1889
+// crates/common/src/structs/config.rs:1889
 fn default_eval_threads() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
@@ -266,16 +266,16 @@ already structured, so there is no agent-specific surface to design here.
 ## 5. Background — What Exists Today
 
 **The knob.** `eval_threads` on `ManagerConfigFull`
-(`src/structs/config.rs:1380-1381`), `#[serde(default = "default_eval_threads")]`,
+(`crates/common/src/structs/config.rs:1380-1381`), `#[serde(default = "default_eval_threads")]`,
 so an absent `evalThreads` key takes `available_parallelism()`
-(`src/structs/config.rs:1889`). Surfaced to operators as `evalThreads` in the
+(`crates/common/src/structs/config.rs:1889`). Surfaced to operators as `evalThreads` in the
 manager Nickel config.
 
-**Where it is consumed.** `src/manager/daemon.rs:426` passes
+**Where it is consumed.** `crates/manager/src/manager/daemon.rs:426` passes
 `full_config.eval_threads` to `start_eval_loop`, which clamps it to at least
 1 as `max_threads` (`:1457-1458`), logs it (`:1459`), emits a
 `scheduler_started` cluster event carrying it (`:1486`,
-`src/storage/events.rs:170`), and spawns exactly that many workers
+`crates/manager/src/storage/events.rs:170`), and spawns exactly that many workers
 (`:1582`):
 
 ```rust
@@ -287,7 +287,7 @@ for worker_id in 0..max_threads {
 Workers are supervised forever — any exit is replaced (`daemon.rs:1587-1592`) —
 so the count is invariant for the process lifetime.
 
-**What one worker does** (`eval_worker_loop`, `src/manager/daemon.rs:1674`):
+**What one worker does** (`eval_worker_loop`, `crates/manager/src/manager/daemon.rs:1674`):
 
 1. Gate on scheduler-lane raft leadership; followers idle (`:1700`).
 2. Claim an eval — `store.claim_eval()` (`:1719`), or take the one handed
@@ -350,7 +350,7 @@ entry 5).
 
 **One new coupling to state.** As of the same change, the read-connection
 pool is sized from `evalThreads` rather than from the core count
-(`read_only_conn_pool_size`, `src/storage/store.rs`). Raising `evalThreads`
+(`read_only_conn_pool_size`, `crates/manager/src/storage/store.rs`). Raising `evalThreads`
 therefore also widens the read pool, up to a cap of 16 connections, each
 with a 64 MiB SQLite page-cache **cap** (`SQLITE_CACHE_SIZE_KIB`). This is
 deliberate — the eval workers *are* the concurrent readers — but it means a
@@ -588,7 +588,7 @@ baseline.
 
 ## 9. Testing Plan
 
-**Unit (Phase 1)** — `src/structs/config.rs`:
+**Unit (Phase 1)** — `crates/common/src/structs/config.rs`:
 
 - `eval_threads_default_is_a_measured_constant_not_the_core_count` — asserts
   the default equals `DEFAULT_EVAL_THREADS` and is **not** computed from

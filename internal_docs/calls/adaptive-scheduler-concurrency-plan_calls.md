@@ -14,7 +14,7 @@ motivating measurement (2026-08-05).
 permit.
 
 ```rust
-// src/manager/concurrency.rs
+// crates/manager/src/manager/concurrency.rs
 pub const NON_PLANNING_EVAL_KINDS: &[&str] = &["job_stop"];
 pub fn is_planning_kind(kind: &str) -> bool { !NON_PLANNING_EVAL_KINDS.contains(&kind) }
 ```
@@ -88,7 +88,7 @@ worker whose carried-ahead batch plans while the gate refuses **waits** for a
 permit before running it.
 
 ```rust
-// src/manager/daemon.rs — one iteration of eval_worker_loop
+// crates/manager/src/manager/daemon.rs — one iteration of eval_worker_loop
 let (batch, mut permit, throttled) = if carried_ahead {
     (take(claimed_ahead), wait_for_permit(..).await /* if any of it plans */, false)
 } else {
@@ -283,7 +283,7 @@ one public function in `manager::daemon`, called by `eval_worker_loop` and by
 `tests/adaptive_scheduler_concurrency.rs`.
 
 **Alternative.** Keep it inline and have the integration test re-implement
-it, the way `tests/plan_contention.rs` re-implements the claim loop around
+it, the way `tests/integration/plan_contention.rs` re-implements the claim loop around
 the already-public `handle_claimed_eval`.
 
 **Trade-off.** One more public item on `daemon`, exported for testing rather

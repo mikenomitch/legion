@@ -2,8 +2,8 @@
 
 `persistence.type = 'raft'` turns a set of Legion managers into a
 quorum-replicated cluster. A majority of managers must commit every store
-change before it is acknowledged or visible anywhere. Losing any minority of
-managers loses no committed write.
+change before it is acknowledged, cached, streamed, or visible on a
+follower. Losing any minority of managers loses no committed write.
 
 This page is the engine-level reference. The task-oriented runbook is
 [docs/raft-operations.md](raft-operations.md). Upgrade, backup, and restore
@@ -11,30 +11,39 @@ procedures are in [docs/upgrades.md](upgrades.md).
 
 ## What raft mode gives you
 
-A write runs on the leader inside a savepoint that is then rolled back.
-While it runs, a SQLite session records its row-level effects. This record is
-a **changeset**: the inserts, updates, and deletes with their values and
-rowids. The leader proposes those bytes as one [openraft] log entry. Only
-after a quorum commits it does every manager, the leader included, apply the
-same bytes to its local `store.sqlite`.
+A write runs on the leader inside a savepoint, together with any other
+writes queued at the same moment (group commit). While it runs, a SQLite
+session records its row-level effects. This record is a **changeset**: the
+inserts, updates, and deletes with their values and rowids. The leader
+proposes the batch's changeset as one [openraft] log entry. Only after a
+quorum commits it does every follower apply the same bytes to its local
+`store.sqlite`. The leader keeps the rows it captured (under the default
+`single` topology; under `lanes` it rolls them back and applies the entry
+like a follower), with an undo record in case the entry does not commit.
 
 Replicas cannot diverge, because they apply the recorded effects instead of
-re-running code. Nothing becomes visible, cached, or published as an event
-before quorum commit, not even on the leader. The caller gets its reply only
-after the local apply, so read-your-writes holds on the leader.
+re-running code. Nothing is cached or published as an event before quorum
+commit, not even on the leader, and the caller gets its reply only after
+the entry applied locally, so read-your-writes holds on the leader. For the
+one round trip between the leader's local commit and the apply, a direct SQL
+read on the leader can see the batch (see "The write path" below).
 
 ```text
 client ──write RPC──▶ leader manager
-                        │ 1. capture: run the SQL in a savepoint + session,
-                        │    extract the changeset, ROLLBACK (DB untouched)
-                        │ 2. propose changeset to the raft group
+                        │ 1. capture: run the queued writes in one savepoint
+                        │    (one nested savepoint + session each), combine
+                        │    their changesets, commit with an undo record
+                        │    (`single`) or ROLLBACK (`lanes`)
+                        │ 2. propose ONE changeset to the raft group
                         ├────── append ──────▶ follower B ──ack──┐
                         ├────── append ──────▶ follower C ──ack──┤
                         │ 3. quorum commit                 ◀─────┘
                         │ 4. every node applies the changeset + applied
-                        │    index in ONE transaction, then projects
-                        │    read-model cache / events / notifies from it
-                        ◀─ 5. reply to client (after local apply)
+                        │    index in ONE transaction (a `single` leader
+                        │    only writes the index and drops the undo
+                        │    record), then projects read-model cache /
+                        │    events / notifies from it
+                        ◀─ 5. reply to every client in the batch
 ```
 
 Raft mode also gives you:
@@ -51,7 +60,7 @@ Raft mode also gives you:
 
 All fields live under `persistence.raft` (camelCase in config files).
 Defaults come from `RaftPersistenceConfig::with_defaults` in
-`src/structs/config.rs`:
+`crates/common/src/structs/config.rs`:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -65,7 +74,8 @@ Defaults come from `RaftPersistenceConfig::with_defaults` in
 | `clusterSecret` | minted at bootstrap | Shared secret that authenticates manager-plane raft RPCs. When absent, it is minted at bootstrap and saved (mode 0600) to `<dataDir>/cluster_secret`. Joiners receive it inside the join token. |
 | `joinToken` | none | Token from `legion raft join-token` that a new manager uses to join an existing cluster. |
 | `expectedVoters` | unset | The number of voting managers this cluster should have (1, 3, or 5). Only used for warnings: `legion raft status` warns when the observed voter count is below it, config load warns when it is even, and `0` is rejected at load. Membership itself always comes from joins and operator commands, never from this setting. See "How many managers?" below. |
-| `snapshotEntries` | `10000` | Applied log entries between snapshots. Each snapshot is a whole-DB `VACUUM INTO` image. The log is purged behind it, keeping a `snapshotEntries / 2` tail (capped at 1000) for cheap follower catch-up. |
+| `snapshotEntries` | `10000` | Applied log entries between snapshots, per raft group. Each snapshot is a whole-DB `VACUUM INTO` image (`single`) or a dump of the lane's tables (`lanes`). How much log stays behind it is `logRetainBytes`. |
+| `logRetainBytes` | `268435456` (256 MiB) | Bytes of raft log each group keeps behind its latest snapshot. After each snapshot the log is purged down to its newest entries totalling at most this many bytes; entries no snapshot covers yet are never purged. A follower whose position is still in the retained log catches up by replay; one further behind gets a full snapshot install, which copies the whole state. `legion_raft_log_retained_seconds` shows how much time the budget covers at the current write rate. `0` keeps nothing behind the snapshot. See "Snapshots, compaction, and catch-up". |
 | `heartbeatIntervalMs` | `250` | How often a leader sends heartbeats (append-entries) to every follower. This sets the floor on how fast a dead leader can be noticed. openraft also uses it as the append-entries RPC **deadline**, so it bounds how long one replication batch may take, and pairs with the entries-per-batch cap. Lower values mean faster failure detection, more constant traffic, and less tolerance for a slow round trip. See "When to raise the election timings" below. |
 | `electionTimeoutMinMs` | `600` | Lower bound of the randomized election timeout. A follower that has heard nothing for a duration drawn from `[min, max)` campaigns to replace the leader. This setting controls stability. It must sit well above `heartbeatIntervalMs` so a couple of slow or dropped heartbeats never look like a dead leader. If it is too close to the heartbeat interval, the cluster flaps: followers time out under transient load, campaign, split the vote, and the term climbs while no leader holds power long enough to commit. Config load **rejects** `electionTimeoutMinMs < 2 × heartbeatIntervalMs`. |
 | `electionTimeoutMaxMs` | `1200` | Upper bound of the randomized election timeout. Must be strictly greater than `electionTimeoutMinMs` (config load rejects otherwise). The gap between min and max is what breaks up split votes, so keep it wide. This value is **also the follower leader-lease**: a follower will not grant its vote while it still believes the current leader's lease is live. A larger maximum adds stability under load, but slows every intentional leadership move (lane convergence, `trigger_lane_election`) by the same proportion. Prefer widening the window over raising both ends. The default keeps `max = 2 × min`. |
@@ -396,6 +406,69 @@ version, restore it with `legion start manager --restore-from <backup>`, then
 rejoin the members. Adding a new table to a lane is fine. Only moving an
 existing table between lanes breaks compatibility.
 
+## The write path: group commit and single execution
+
+Every mutating store call runs on one pipeline thread per raft group. The
+thread works in **batches**:
+
+1. It takes every write queued for its group (up to 64) and runs them in one
+   capture: each write in its own savepoint with its own SQLite session, so a
+   write that fails, panics, or trips the ownership or mixed-version guard
+   rolls back alone and its caller gets the error, while the others go on.
+   A batch stops taking writes once their changesets reach 128 KiB, so one
+   entry stays small enough to replicate inside the append-entries deadline.
+2. It proposes **one raft entry** carrying the batch's combined changeset.
+3. Once a quorum has committed the entry and this manager has applied it,
+   it answers every caller in the batch.
+
+Writes that queue behind an in-flight entry therefore share the next
+entry's capture, quorum round trip, log fsync, and apply transaction. A
+lone write behaves exactly as before. `legion_raft_entry_ops{lane}` shows
+how many writes each entry carried. If the proposal fails (the leader lost
+its leadership mid-flight), every write in the batch gets the error,
+because their effects were one entry.
+
+**The leader executes each write once** (`single` topology). Before it
+proposes a batch, the leader commits it to its own state DB together with
+an undo record (the batch's inverse changeset, in the node-local
+`raft_speculative` table). When the entry comes back committed, the
+leader's state machine recognizes its own batch and only advances the
+applied index; followers apply the changeset as always. If the proposal
+fails (leadership was lost with the entry in flight), the leader undoes the
+batch at once; should the entry commit anyway under the new leader, it is
+applied like any other entry. If the log goes another way while a batch is
+outstanding — another leader's entry replaces it, or a new term begins —
+the leader first undoes every outstanding batch, newest first, and then
+applies what the log says.
+A manager that crashes between committing a batch and applying its entry
+undoes the batch at startup; if the entry did commit, the log replays it.
+Snapshots and `legion state backup` copy the database and revert any
+in-flight batch in the copy, so neither ever carries uncommitted rows.
+`legion_raft_speculation_total{lane,outcome}` counts batches `committed`,
+`matched` (applied without re-running) and `undone`.
+
+What this means for readers: between the leader's local commit and the
+entry's apply — one quorum round trip — a direct SQL read **on the leader**
+can see the batch. The scheduling read model, `StreamEvents`, and the
+worker stream cannot: they are still updated only when the entry applies.
+No write can see it either: the pipeline captures the next batch only once
+the previous one has resolved.
+
+Under `lanes` the leader still runs each write twice (capture, roll back,
+apply on commit). Three pipelines share one database there, so one lane's
+capture could read another lane's in-flight rows and commit a decision
+that a leadership loss later undoes. Each lane's pipeline still batches.
+
+Limits of this design, all tracked:
+
+- **No overlap.** A group captures its next batch only after the previous
+  entry applied. Batching amortizes the round trip across everything that
+  queued, but a single sequential writer sees one round trip per write.
+- **One capture mutex for every lane.** All lanes share one SQLite file and
+  one write connection, so captures and applies of different lanes still
+  take turns locally; only quorum waits overlap. Splitting it needs one
+  database file per lane.
+
 ## Snapshots, compaction, and catch-up
 
 In `single` topology:
@@ -413,10 +486,18 @@ In `single` topology:
   a catching-up follower receives it in chunks into memory). Budget
   manager memory for at least two copies of `store.sqlite`. Install also
   blocks writes on the installing follower while it replaces its state DB.
-- The raft log is purged behind each snapshot, keeping a tail
-  (`snapshotEntries / 2`, capped at 1000). A slightly-behind follower
-  catches up by cheap log replay. Anything older is served by snapshot
-  install.
+- The raft log is purged behind each snapshot, keeping the newest
+  `logRetainBytes` bytes of entries (256 MiB per group by default). A
+  follower whose position is inside the retained log catches up by cheap
+  log replay; anything older is served by snapshot install. The budget is
+  in bytes because entries range from hundreds of bytes to megabytes: a
+  count of entries says neither how much disk the tail takes nor how long
+  it lasts. To size it, watch `legion_raft_log_retained_seconds{lane}`, the
+  age of the oldest entry still in the log. That is how long a manager can
+  be down and still rejoin by replay at the current write rate; raise
+  `logRetainBytes` if it is shorter than your longest planned maintenance
+  window. A purge runs a few seconds after the snapshot it follows, and
+  never removes an entry a follower is still being sent.
 - **Install** replaces the follower's whole state DB. It is staged to a temp
   file, the applied marker is written in, and the file is renamed
   atomically. Every connection and the read model are reopened, and then a
@@ -427,10 +508,19 @@ In `single` topology:
   Any existing data then reaches joiners through snapshot install, instead
   of being silently missing from log replay.
 - Crash and restart recovery: openraft replays the vote and log from the
-  per-lane log store (SQLite, WAL + `synchronous=FULL`). The state machine
-  resumes from the applied index, which is recorded **in the same
-  transaction** as each applied changeset, so state and index cannot
-  diverge.
+  per-lane log store (SQLite, WAL + `synchronous=FULL`: every appended entry
+  and vote is fsynced before it is acknowledged). The state machine resumes
+  from the applied index, which is recorded **in the same transaction** as
+  each applied changeset, so state and index cannot diverge.
+- **One fsync per entry, not two.** The state DB runs `synchronous=NORMAL`:
+  a commit is written to its WAL but not fsynced, so a power loss can roll
+  the state DB back a few commits. That is safe because those entries are
+  still in the (fsynced) raft log and are re-applied at startup — as long
+  as the log still holds them. So before the log purges anything, the
+  engine fsyncs the state DB (WAL, file, and directory): every purge is
+  preceded by a **purge barrier** that makes the applied index the purge
+  relies on durable. A barrier that fails fails the purge and keeps the
+  log. `legion_raft_state_syncs_total{lane,outcome}` counts barriers.
 
 In `lanes` topology, the policy, compaction, retention, and recovery are the
 same **per lane**, but the snapshot's scope differs. A whole-DB image would
@@ -474,7 +564,7 @@ Full procedures (including rollback out of raft mode): `docs/upgrades.md`.
 ## Failure modes
 
 An in-process 3-node test covers each of these, in
-`tests/raft_durability.rs` / `tests/raft_snapshot_recovery.rs`:
+`tests/integration/raft_durability.rs` / `tests/integration/raft_snapshot_recovery.rs`:
 
 | Scenario | Behavior |
 | --- | --- |
@@ -484,7 +574,7 @@ An in-process 3-node test covers each of these, in
 | **Full-cluster restart** | Every node recovers from its raft log and state DB. A leader is re-elected, and the cluster resumes with all committed state. A restarted member that cannot yet hear the leader (its inbound transport shares the manager listener) starts without a leader, logs a warning, and catches up once it is serving. Startup never deadlocks on the election. |
 | **Operator double-start** | The second process fails fast on the `dataDir` advisory lock. |
 | **Wiped `dataDir`, kept state DB** | The cluster stamp blocks startup unless `forceNewCluster = true` (an intentional re-stamp). |
-| **Standing lane split** (`lanes` topology, different managers keep leading different lanes) | Nothing is lost. Worker liveness and reports forward to the owning lane's leader. The control leader accepts submits, and lane reconcilers complete them within the checker cadence. Single-lane operations and reads are unaffected. Costs: slower scheduling, briefly lagging task statuses, claims, and rollouts, no `state backup`, and `/readyz` returns 503 after about 10s to alert the operator. Covered by `tests/raft_lanes.rs` (standing-split and forwarding tests). |
+| **Standing lane split** (`lanes` topology, different managers keep leading different lanes) | Nothing is lost. Worker liveness and reports forward to the owning lane's leader. The control leader accepts submits, and lane reconcilers complete them within the checker cadence. Single-lane operations and reads are unaffected. Costs: slower scheduling, briefly lagging task statuses, claims, and rollouts, no `state backup`, and `/readyz` returns 503 after about 10s to alert the operator. Covered by `tests/integration/raft_lanes.rs` (standing-split and forwarding tests). |
 
 ## Non-leader write redirects and forwarding
 
@@ -525,10 +615,11 @@ scheduler lane. If a later write fails, the manager asks the worker to send
 the report again (`HeartbeatReply.retry_terminated_allocations`). The
 earlier writes are idempotent, so the repeat converges. In the `lanes`
 topology the eval can run before the scheduler leader has applied the
-status-lane write. It then keeps holding the dependents, and they wait for
-the job's next evaluation (a resubmit, a node change, any other eval). The
-`single` topology, where every lane rides one group, doesn't have this
-race.
+status-lane write. That is why the scheduler, when it judges `dependsOn`,
+also reads the finished replicas' rows on its own lane: they were committed
+before the eval was, so the eval always sees them, and a dependent is
+released by the eval its dependency's exit queued even when the task's
+status still reads `running` on that manager.
 
 Scheduling is leader-only in the same way. Eval queue state replicates
 everywhere, so a failover resumes the queue. Only the leader's loops act.
@@ -538,8 +629,8 @@ check.
 ## Performance
 
 This is the raft-mode write-path baseline, measured by
-`tests/raft_perf_smoke.rs`
-(`cargo test --test raft_perf_smoke --locked -- --ignored --nocapture`). It
+`tests/integration/raft_perf_smoke.rs`
+(`cargo test --test integration raft_perf_smoke:: --locked -- --ignored --nocapture`). It
 runs a single-node bootstrap cluster (`topology = single`, self-quorum) and
 sends `put_kv` through the full propose → capture → quorum-commit →
 state-machine-apply pipeline. Debug build, 2026-07-23:
@@ -557,8 +648,31 @@ the caller experiences: the capture savepoint and changeset extraction, the
 sync→async bridge to `client_write`, local log append and fsync, and
 changeset apply with read-model and event projection.
 
+### Group commit and single execution (2026-11-08)
+
+The same smoke, before and after the write-path change (group commit, the
+leader executing each write once, one fsync per entry). Debug build on a
+shared 4-vCPU Linux VM whose other cores were compiling (load average ~4),
+so the absolute numbers are noisy; the after column is the range over
+three runs:
+
+| Workload | Before | After |
+| --- | --- | --- |
+| Sequential `put_kv`, p50 | 3.74 ms | 2.90–3.93 ms |
+| Sequential `put_kv`, throughput | 258 ops/s | 185–268 ops/s |
+| Burst (8 threads × 100), p50 | 27.2 ms | 3.4–11.8 ms |
+| Burst, p99 | 36.2 ms | 15.4–27.8 ms |
+| Burst, throughput | 289 ops/s | 666–1570 ops/s |
+| Burst, ops per raft entry | 1 | 4.5–5.7 |
+
+A lone sequential writer gains nothing from batching — it waits for one
+round trip per write either way — and its p99 is dominated by the host's
+other load in these runs. Concurrent writers are where group commit pays:
+2.3–5.4× the throughput, because the ops that queue behind one entry share
+the next one's quorum round, log fsync and apply.
+
 For comparison, the `local_disk` scheduler SLO gate
-(`cargo test --test scheduler_benchmark_slo --locked -- --ignored --nocapture`)
+(`cargo test --test integration scheduler_benchmark_slo:: --locked -- --ignored --nocapture`)
 at the same commit measured: steady-small 238.7 evals/s / p99 5.34 ms,
 churn-medium 174.0 evals/s / p99 7.27 ms, high-fanout 135.0 evals/s /
 p99 10.84 ms. All are within SLO. Raft mode does not change `local_disk`
@@ -567,7 +681,7 @@ behavior.
 ### Lane isolation A/B (lanes vs single, 2026-07-28)
 
 Lanes exist so that saturating one lane does not slow down another. The
-`lanes_vs_single_scheduler_isolation_ab` test in `tests/raft_perf_smoke.rs`
+`lanes_vs_single_scheduler_isolation_ab` test in `tests/integration/raft_perf_smoke.rs`
 measures this. It runs a 3-node in-process cluster (tonic `RaftTransport`
 listeners over loopback) and samples scheduler-lane `place_alloc`
 propose→apply latency twice per topology. The first phase is unloaded. In
@@ -615,7 +729,7 @@ counter-result.
 In order of impact:
 
 1. **`lanes` is opt-in, not the default.** It runs, it is tested (the
-   `tests/raft_lanes.rs` suite plus the standing-split and forwarding
+   `tests/integration/raft_lanes.rs` suite plus the standing-split and forwarding
    tests), and its isolation benefit is measured (above). `single` stays the
    recommended default until lanes has more production use. Choose `lanes`
    when a single group's log is clearly the bottleneck for your write load.
@@ -641,6 +755,12 @@ In order of impact:
    are not emitted. The UI's Raft page does not show per-lane quorum shape
    or voter-count warnings.
 6. There is no raft autopilot.
+7. **The write path still serializes locally.** A group captures its next
+   batch only after the previous entry applied (no overlap), every lane
+   shares one capture mutex and write connection, and under `lanes` the
+   leader still runs each write twice. Group commit amortizes all of it
+   across concurrent writers, not for a single sequential one. See "The
+   write path: group commit and single execution" above.
 
 openraft 0.9 has no leader-transfer API, so `step-down` and
 `transfer-leader` are built on remote elections: the target is asked to
@@ -662,12 +782,13 @@ Two operational issues to know about:
   divergence and aborts, instead of hiding it. The lane's raft core on that
   node crash-loops on the bad entry until the leader's log compaction
   passes it. The node then catches up by snapshot install, which with
-  default settings can be thousands of writes later. If a lane on one node
+  default settings can be many thousands of writes later (the leader keeps
+  `logRetainBytes` of log behind each snapshot). If a lane on one node
   is down with a changeset-conflict error in its log, get the leader to
   snapshot past the bad entry, or rebuild the member. There is no command to
   take a snapshot on demand. Generate write traffic, or temporarily lower
-  `snapshotEntries` on the leader and restart it. `legion raft command
-  trigger-election` does not fix it. See
+  `snapshotEntries` and `logRetainBytes` on the leader and restart it.
+  `legion raft command trigger-election` does not fix it. See
   [Recovering a replica that stopped a lane on an apply conflict](raft-operations.md#recovering-a-replica-that-stopped-a-lane-on-an-apply-conflict).
 - **Scheduler-event ids are ordered per process, not by wall clock.** After
   a failover to a manager whose clock is behind, new event ids can sort

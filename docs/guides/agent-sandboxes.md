@@ -267,9 +267,9 @@ packs on it, and the cgroup turns it into a CPU weight that only matters when
 the node's CPUs are contended. Keep it low for idle-heavy sandboxes, or CPU
 fills the node before memory does: a 64,000 MHz node fits 64 sandboxes at
 1000 MHz, and 256 at 250. An active sandbox still bursts to whatever CPU is
-free. `cpus` is an alias for this same MHz number, not a core count, so
-`cpus = 1` asks for 1 MHz, and `job run` warns about any `cpu` or `cpus` under
-10. Use `cpu` and avoid the confusion.
+free. It is MHz, not a core count, so `cpu = 1` asks for 1 MHz, and `job
+run` warns about any `cpu` under 10. (`cpus` is refused at submit: it is
+not a resource.)
 
 **`config.vcpus = 2`** is the guest's shape: how many vCPUs its kernel sees.
 It is not a reservation. The host weights the VMM's threads by
@@ -465,8 +465,16 @@ $ legion instance get user-42 -j
  "last_suspend_ms":740, ...},"provisional":null}}
 ```
 
-`suspend_reason` says who did it: `manual`, `idle`, `pressure`, or `make_room`. To follow
-it as events, tail `legion events list --kind instance.suspended`.
+`suspend_reason` says who did it: `manual`, `idle`, `pressure`, `park`, or
+`make_room`. To follow it as events, tail `legion events list --kind
+instance.suspended`.
+
+The agent can also say it is waiting, rather than leave it to the policy.
+With `park = {}` in the `suspend` block the sandbox gets
+`$LEGION_PARK_SOCKET`, and the harness sends `park` there when it starts a
+long wait (a CI run, a person's approval). Its node suspends it ten seconds
+later, reason `park`, unless the harness sends `unpark` first. See
+[Park](../park.md).
 
 Your platform can also suspend on its own signal, such as a closed browser
 tab:
@@ -989,7 +997,10 @@ failure modes follow:
   refused for that reason rather than accepted and ignored. On a gated
   sandbox the call goes through the node's egress proxy, so add
   `connections` and the open call keeps the sandbox awake (as would any
-  other connection it holds open). Otherwise set `after` longer than your
+  other connection it holds open). On any sandbox, the harness itself can
+  say so: with [`suspend.park`](../park.md) set, `busy` on
+  `$LEGION_PARK_SOCKET` before the call holds the policy off and `unpark`
+  after it lets it decide again. Otherwise set `after` longer than your
   longest model call, or leave `idle` off and suspend from your platform,
   which knows when a call is in flight.
 - **It suspends while someone is in a shell.** Not with `exec` listed: an
@@ -997,19 +1008,9 @@ failure modes follow:
   platform runs over the network is traffic on the TAP instead, which keeps
   it awake only while it sends.
 
-The `hint` signal, where the workload says it is parked, is not available,
-and a spec that lists it is refused:
-
-```text
-Error: jobspec failed validation: task "workspace": suspend.idle.signals "hint" is not
-implemented yet: the workload's own busy/idle signal ships in suspend plan Phase 8
-(remove "hint". To keep an instance awake through a quiet call, add "connections"
-(any open connection through the node datapath, inbound or out through a gated task's
-egress proxy, counts as activity; a sandbox has one only on gated networking))
-[code=InvalidArgument]
-```
-
-So does `connections` on this sandbox:
+There is no `hint` signal: a spec that lists it is refused with a pointer
+at `suspend.park`, the socket on which the workload says `busy` or `park`
+itself ([Park](../park.md)). `connections` on this sandbox is refused too:
 
 ```text
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
@@ -1170,6 +1171,8 @@ and [the limits of the pressure response](../resource-enforcement.md#limits-of-t
 
 - [Suspend and resume](../suspend-and-resume.md): the suspended state,
   snapshots, idle and pressure suspend, events, metrics
+- [Park](../park.md): the socket on which the agent says when it is
+  waiting, and suspends at once
 - [Resource enforcement](../resource-enforcement.md): `memoryMax`,
   oversubscription, the pressure steps
 - [The sandbox runtime](../task-runtime-sandbox.md): microVMs, guest size,

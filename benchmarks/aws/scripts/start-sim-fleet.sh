@@ -141,8 +141,9 @@ UNIT
     # An EXACT census, not `registered >= TOTAL`.
     #
     # The old lower bound passed against the wrong population twice over.
-    # `SELECT COUNT(*) FROM node` counts every row the control plane has
-    # ever seen — nothing in Legion removes a node record — so a 4000-node
+    # `SELECT COUNT(*) FROM node` counts every row still in the store —
+    # before stop-sim-fleet.sh forgot its nodes, that was every row the
+    # control plane had ever seen — so a 4000-node
     # experiment's orphans satisfied a 1000-node fleet's wait instantly,
     # and the "fleet" the next cell measured was 1000 live nodes plus 3000
     # corpses. It also ignores health, so a fleet where every node had
@@ -297,7 +298,21 @@ k8s)
 
         wait_for_ssh "$addr" 120
         rsh "$addr" "cloud-init status --wait >/dev/null 2>&1 || true"
-        rcp "$KUBECONFIG_LOCAL" "$addr:/tmp/kubeconfig"
+        # Spread the slices over all three apiservers, the way an HA
+        # control plane is fronted in production and the way nodesim
+        # already lists all three Nomad servers. With every controller on
+        # cp-0, that one apiserver carried every lease renewal and pod
+        # status write and sat at 4/4 cores while the other two idled
+        # (2026-10-10 archives). Each apiserver's serving cert carries its
+        # own address, so TLS verification still holds.
+        # K8S_SPREAD_APISERVERS=0 pins every slice to cp-0 again, for the
+        # ablation cell that separates this change from the NVMe one.
+        apiserver="${CP_PRIVATE_IPS[$((idx % ${#CP_PRIVATE_IPS[@]}))]}"
+        [ "${K8S_SPREAD_APISERVERS:-1}" = 0 ] && apiserver="${CP_PRIVATE_IPS[0]}"
+        sed "s#server: https://[^:]*:6443#server: https://${apiserver}:6443#" \
+            "$KUBECONFIG_LOCAL" >"$KUBECONFIG_LOCAL.slice"
+        rcp "$KUBECONFIG_LOCAL.slice" "$addr:/tmp/kubeconfig"
+        rm -f "$KUBECONFIG_LOCAL.slice"
         # Pod IPs only have to be unique per slice; 10.64+i.0.0/16 keeps
         # them out of the VPC range.
         rsh "$addr" "

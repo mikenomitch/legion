@@ -123,11 +123,10 @@ log "cell $RUN_ID (campaign $CAMPAIGN, manager ${MANAGER:-kubeconfig})"
 #
 # It used to gate on `registered >= NODES` from
 # `SELECT COUNT(*) FROM node`, which is a lower bound on the wrong
-# population. Nothing in Legion removes a node record (there is no
-# deregistration RPC), so that count is the high-water mark of every
-# fleet the control plane has ever seen: a 4000-node experiment left 3000
-# orphans, and the next 1000-node cell sailed through the gate with
-# total=4000 while reporting itself as a 1000-node measurement. The count
+# population. Before stop-sim-fleet.sh forgot its nodes, that count was
+# the high-water mark of every fleet the control plane had ever seen: a
+# 4000-node experiment left 3000 orphans, and the next 1000-node cell
+# sailed through the gate with total=4000 while reporting itself as a 1000-node measurement. The count
 # also ignores health, so a fleet in which every node had gone `lost`
 # passed too. assert_fleet (scripts/env.sh) asserts the exact count, all
 # active, all named from this fleet's slices, and prints the census it
@@ -143,6 +142,22 @@ if [ "$DRIVER_SYSTEM" = legion ]; then
         log "no recorded fleet state; assuming $SLICES slice(s) from the ASG"
     fi
     assert_fleet "$MANAGER" "$NODES" "$SLICES" 300 || exit 1
+
+    # The placement policy is a manager setting, so a cell can only run
+    # the scenario's policy if the control plane was installed with it.
+    # Measuring web_fleet (spread) on a bin_pack manager is how every
+    # cell ran before the installers rendered it, and nothing in the
+    # archive said so. LEGION_SCHEDULING_POLICY is what run-campaign.sh
+    # asked for (the scenario's, or --scheduling-policy); a hand-driven
+    # run-step.sh falls back to the scenario's.
+    WANT_POLICY="${LEGION_SCHEDULING_POLICY:-$(scenario_scheduling_policy "$SCENARIOS_DIR/$SCENARIO.json" 2>/dev/null || true)}"
+    MANAGER_POLICY=$(manager_scheduling_policy || true)
+    if [ -n "$WANT_POLICY" ] && [ "$MANAGER_POLICY" != "$WANT_POLICY" ]; then
+        echo "the manager runs schedulingPolicy '${MANAGER_POLICY:-unknown}', this cell wants '$WANT_POLICY'" >&2
+        echo "  It is set at install time: reinstall with LEGION_SCHEDULING_POLICY=$WANT_POLICY" >&2
+        echo "  (run-campaign.sh does this unless --no-reset-control-plane)." >&2
+        exit 1
+    fi
 
     # Then wait out the churn before measuring anything. Every fleet
     # stop/start marks thousands of nodes lost, and each loss raises a
@@ -190,10 +205,10 @@ cleanup_jobs() {
         names=\$(legion state query 'SELECT name FROM job' -j 2>/dev/null |
             jq -r '.data.rows[].name // empty')
         [ -z \"\$names\" ] && { echo 0; exit 0; }
-        # Stop, then destroy. A running job cannot be destroyed --
-        # 'Job must be stopped before it can be destroyed' -- and the
-        # CLI reports that as a bare Internal 'Error deleting job', so
-        # skipping the stop fails silently and leaves every job behind.
+        # Stop, then destroy. A running job cannot be destroyed (the
+        # destroy fails with FailedPrecondition, 'must be stopped'), and
+        # the output below goes to /dev/null, so skipping the stop would
+        # leave every job behind without a word.
         printf '%s\n' \"\$names\" |
             xargs -r -P 8 -n 1 -I{} legion job stop {} >/dev/null 2>&1 || true
         sleep 5
@@ -294,8 +309,10 @@ rsh "$LOADGEN_ADDR" "mkdir -p '$REMOTE_OUT' && cat >'$REMOTE_OUT/pre-cell.json'"
         --argjson nodes "$NODES" --arg scenario "$SCENARIO" \
         --arg sizing "$SIZING_DESC" \
         --argjson start_epoch "$CELL_START_EPOCH" \
+        --arg scheduling_policy "${MANAGER_POLICY:-}" \
         '{nodes: $nodes, scenario: $scenario, sizing: $sizing,
           cell_start_epoch: $start_epoch,
+          scheduling_policy: (if $scheduling_policy == "" then null else $scheduling_policy end),
           node_census: $census,
           eval_backlog_before_cell: $eval_backlog,
           note: "eval_backlog_before_cell > 0 means this cell shared the eval workers with fleet churn"}'

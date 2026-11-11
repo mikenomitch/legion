@@ -11,7 +11,7 @@
 ## Problem Statement
 
 Legion's scheduling unit today is the **allocation** — an ephemeral placement of a
-task on a node. The `Allocation` record ([src/structs/ledger.rs:12](../../src/structs/ledger.rs))
+task on a node. The `Allocation` record ([crates/common/src/structs/ledger.rs:12](../../crates/common/src/structs/ledger.rs))
 carries a churning `id` plus `node_id`/`job_id`/`task_config_id`. When a task is
 rescheduled (node failure, drain, rollout) it gets a **new** allocation with a **new**
 id, on a possibly-different node. There is no stable handle that survives that move.
@@ -70,11 +70,11 @@ volume binding. This plan introduces it.
 
 | Concern | Where | Notes |
 | --- | --- | --- |
-| Allocation record | [src/structs/ledger.rs:12](../../src/structs/ledger.rs) | `id`, `node_id`, `job_id`, `task_config_id`. No stable instance handle. |
-| Task group + count | `TaskConfig.group`, `TaskCount { num, per }` ([src/structs/job.rs:185](../../src/structs/job.rs)) | `count.num` is the natural source of slot cardinality. |
-| Scheduler / placement | [src/manager/scheduler.rs](../../src/manager/scheduler.rs) | Where slot assignment + reuse must hook in. |
-| Env injection | [src/task_plugins/exec.rs](../../src/task_plugins/exec.rs) (`cmd.envs`), [container.rs](../../src/task_plugins/container.rs) (`--env`) | Instance env vars ride this existing path. |
-| State / migrations | [src/storage/migrations.rs](../../src/storage/migrations.rs), SQLite | Instance records persisted here. |
+| Allocation record | [crates/common/src/structs/ledger.rs:12](../../crates/common/src/structs/ledger.rs) | `id`, `node_id`, `job_id`, `task_config_id`. No stable instance handle. |
+| Task group + count | `TaskConfig.group`, `TaskCount { num, per }` ([crates/common/src/structs/job.rs:185](../../crates/common/src/structs/job.rs)) | `count.num` is the natural source of slot cardinality. |
+| Scheduler / placement | [crates/manager/src/manager/scheduler.rs](../../crates/manager/src/manager/scheduler.rs) | Where slot assignment + reuse must hook in. |
+| Env injection | [crates/worker/src/task_plugins/exec.rs](../../crates/worker/src/task_plugins/exec.rs) (`cmd.envs`), [container.rs](../../crates/worker/src/task_plugins/container.rs) (`--env`) | Instance env vars ride this existing path. |
+| State / migrations | [crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs), SQLite | Instance records persisted here. |
 | Manager gRPC API | `proto/legion.proto` `service Manager` | Keyed-mode create/destroy RPCs added here. |
 
 There is **no** volume, stateful, ordinal, or instance concept in the codebase today —
@@ -154,7 +154,7 @@ Invariants:
 ### 5) Environment Variables
 
 The instance identity is injected into the task via the existing env path
-([src/task_plugins/exec.rs](../../src/task_plugins/exec.rs) / [container.rs](../../src/task_plugins/container.rs)),
+([crates/worker/src/task_plugins/exec.rs](../../crates/worker/src/task_plugins/exec.rs) / [container.rs](../../crates/worker/src/task_plugins/container.rs)),
 so it's available at process start with no app-side API call (mirrors Nomad's
 `NOMAD_ALLOC_INDEX`):
 
@@ -171,7 +171,7 @@ ephemeral placement id.
 
 ### 6) Job Spec API
 
-Add an optional `stateful` block to `TaskConfig` ([src/structs/job.rs:815](../../src/structs/job.rs)):
+Add an optional `stateful` block to `TaskConfig` ([crates/common/src/structs/job.rs:815](../../crates/common/src/structs/job.rs)):
 
 ```jsonnet
 {
@@ -240,14 +240,14 @@ plan's stateful `sub` variant can be implemented.
 
 ## Proto, Struct, and Persistence Changes
 
-1. **`src/structs/`** — new `instance.rs`: `Instance`, `InstanceMode`, `InstanceState`;
+1. **`crates/common/src/structs/`** — new `instance.rs`: `Instance`, `InstanceMode`, `InstanceState`;
    add `stateful: Option<StatefulConfig>` to `TaskConfig` and `instance_id:
    Option<String>` to `Allocation`.
 2. **`proto/legion.proto`** — `CreateInstance` / `DestroyInstance` / `ListInstances` /
    `GetInstance` RPCs + messages; regenerate via `build.rs`.
-3. **Migration** ([src/storage/migrations.rs](../../src/storage/migrations.rs)) —
+3. **Migration** ([crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs)) —
    `instances` table; add `instance_id` column to allocations.
-4. **Scheduler** ([src/manager/scheduler.rs](../../src/manager/scheduler.rs)) — slot
+4. **Scheduler** ([crates/manager/src/manager/scheduler.rs](../../crates/manager/src/manager/scheduler.rs)) — slot
    assignment/reuse on placement; storage-handle reattachment; node constraints for
    node-local handles.
 5. **Env injection** — emit the `LEGION_INSTANCE_*` vars in the task-launch pipeline.

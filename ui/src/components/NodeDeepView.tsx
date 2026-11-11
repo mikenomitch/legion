@@ -21,6 +21,7 @@ import { nodePublicAddress } from '../utils/services'
 import type { Tone } from '../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
 import { ENVELOPE_COPY, envelopeServes, jobInstancesHref } from '../utils/sessions'
+import { jobPath } from '../utils/namespaces'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -345,6 +346,13 @@ const buildHostFacts = (fingerprintData: unknown, configData: unknown, dynamicDa
     facts.push({ label: 'Host guard', value: hostGuard })
   }
 
+  // Whether host-mode egress chains are enforced in the kernel here (mesh
+  // interfaces plan §6.A).
+  const netKernel = extractField(configData, 'netKernel')
+  if (typeof netKernel === 'string' && netKernel) {
+    facts.push({ label: 'Net kernel', value: netKernel })
+  }
+
   return facts
 }
 
@@ -356,6 +364,7 @@ const OMITTED_ATTRIBUTE_KEYS = new Set([
   'reserved_resources',
   'workerAddress',
   'hostGuard',
+  'netKernel',
   'workerPlane',
 ])
 
@@ -558,7 +567,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
     retainOnError(
       async ([nodeId]: readonly [string | undefined, number]) => {
         if (!nodeId) return []
-        const reply = await managerClient.listVolumes({ nodeId })
+        const reply = await managerClient.listVolumes({ nodeId, namespaces: ['*'] })
         return reply.volumes.filter((volume) => volume.state !== 'destroyed')
       },
       ([nodeId]) => nodeId ?? '',
@@ -764,7 +773,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                       <AllocationLink id={allocation.id} job={allocation.jobId || undefined} />
                                     </td>
                                     <td class={tdClass}>
-                                      <A class="font-medium hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
+                                      <A class="font-medium hover:text-brass-strong" href={`${jobPath(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
                                     </td>
                                     <td class={tdClass}>
                                       <Show
@@ -773,7 +782,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                       >
                                         <A
                                           class="text-muted hover:text-brass-strong"
-                                          href={`/jobs/${encodeURIComponent(allocation.jobId)}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                          href={`${jobPath(allocation.jobId)}/tasks/${encodeURIComponent(allocation.taskName)}`}
                                           title={`Task config ${String(allocation.taskConfigId)}`}
                                         >
                                           {allocation.taskName}
@@ -800,7 +809,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                           fallback={<MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>}
                                         >
                                           <A
-                                            href={`/jobs/${encodeURIComponent(allocation.jobId)}/instances/${encodeURIComponent(allocation.instanceId!)}`}
+                                            href={`${jobPath(allocation.jobId)}/instances/${encodeURIComponent(allocation.instanceId!)}`}
                                             title={`Stateful instance ${allocation.instanceId}`}
                                           >
                                             <MonoBadge class="hover:border-brass/50">{allocation.instanceId}</MonoBadge>
@@ -822,7 +831,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                       <AllocationPorts network={parseAllocNetwork(allocation.network)} publicAddress={nodePublicAddress(node()?.configAttrs)} />
                                     </td>
                                     <td class={tdClass}>
-                                      <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
+                                      <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`${jobPath(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
                                         {allocation.jobConfigId || '—'}
                                       </A>
                                     </td>
@@ -946,7 +955,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                   </td>
                                   <td class={tdClass}>
                                     <Show when={volume.jobId} fallback={<span class="text-faint">—</span>}>
-                                      <A href={`/jobs/${encodeURIComponent(volume.jobId!)}`} class="text-muted hover:text-brass-strong">
+                                      <A href={`${jobPath(volume.jobId!)}`} class="text-muted hover:text-brass-strong">
                                         {volume.jobId}
                                       </A>
                                     </Show>

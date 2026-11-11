@@ -2,6 +2,18 @@ name: CI
 
 on:
   pull_request:
+  # Pushes to main run only the Rust jobs. Their job is to save the dependency
+  # cache: Actions caches written on a PR ref are visible to that PR alone,
+  # while main's are visible to every PR, so without these runs each new PR
+  # starts cold and rebuilds ~520 crates.
+  push:
+    branches: [main]
+
+# A new push to a PR supersedes the run in progress for it. Runs on main are
+# never cancelled, so each merge finishes and saves its cache.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Grant the read scopes the workflow needs. `pull-requests: read` is required by
 # dorny/paths-filter, which calls the PR "list files" API on pull_request events;
@@ -14,7 +26,10 @@ permissions:
 jobs:
   cargo-test:
     name: Cargo Test
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: rusqlite's `session` feature runs
+    # bindgen against the runner's libclang, and the newer ubuntu-latest
+    # image's libclang makes bindgen 0.69 emit empty SQLite structs.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -24,26 +39,29 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
 
-      # `cargo test --all` links ~29 test binaries, and at full debuginfo the
-      # target dir reaches ~23 GiB — more than the ~14 GiB an ubuntu-latest
-      # runner has free. The job then dies mid-link with
-      # `ld terminated with signal 7 [Bus error]`, or the runner disappears
-      # outright (step stuck `in_progress`, logs 404). Dropping debuginfo takes
-      # the same tree to ~3.5 GiB and links faster; only backtrace detail is
-      # lost, never test behavior. Use `line-tables-only` instead of `0` if
-      # file/line in panic backtraces is worth the extra size.
+      # Dependencies only: Legion's own crates are always rebuilt. Saved from
+      # main alone (see `push` above) so PR runs cannot evict main's entry
+      # from the repo's 10 GB cache budget. The scheduler benchmark gate
+      # reads the same entry through `shared-key`.
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Debuginfo size comes from `[profile.dev]` in Cargo.toml (line tables
+      # for Legion's crates, none for dependencies), which keeps the target
+      # dir well inside the runner's ~14 GiB of free disk. Integration tests
+      # link as a few binaries rather than one per file
+      # (docs/testing-and-benchmarks.md, "Test Layout").
       # --all-features so the `loadgen` feature's bin (benchmarks/loadgen,
       # the AWS rig's native job submitter) is built and its unit tests run.
       # It is feature-gated to keep it out of ordinary local builds, which
       # would otherwise leave it untested until a campaign failed on it.
       - name: Run cargo tests
         env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-          CARGO_PROFILE_TEST_DEBUG: 0
           # Compare the scheduler's read model with SQLite after every
           # local_disk mutation in the integration tests too (unit tests
           # always do). See docs/state-store.md, "Read model coherence".
@@ -52,7 +70,10 @@ jobs:
 
   cargo-clippy:
     name: Cargo Clippy
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: rusqlite's `session` feature runs
+    # bindgen against the runner's libclang, and the newer ubuntu-latest
+    # image's libclang makes bindgen 0.69 emit empty SQLite structs.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -62,23 +83,172 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run cargo clippy
         run: cargo clippy --all --all-features --locked -- -D warnings -A dead_code -A unused_variables
+
+  # The first-party `aws-asg` scaling plugin is a crate of its own, outside the
+  # workspace (docs/autoscaling-plugins.md, "The aws-asg plugin"), so
+  # `cargo test --all` does not reach it. Its tests need no AWS: SigV4 against
+  # AWS's published examples, recorded responses, and a local mock of the API.
+  aws-asg-plugin:
+    name: aws-asg Plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test and lint
+        working-directory: plugins/scaling/aws-asg
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
 
   # Mixed-version managers, workers, and CLIs exchange proto messages during a
   # rolling upgrade (docs/upgrades.md), so a wire-incompatible change to
   # proto/legion.proto must be deliberate. This compares the PR's proto with the
   # base branch's using `buf breaking` and the WIRE rules in proto/buf.yaml.
+  # The kernel classifier's programs are checked in as an object
+  # (bpf/legion_net.bpf.o) so `cargo build` needs only protoc. This rebuilds
+  # it from bpf/legion_net.bpf.c with the pinned clang and fails when the
+  # committed object is stale.
+  bpf-object:
+    name: BPF Object Is Current
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 linux-libc-dev
+
+      - name: Rebuild and compare
+        env:
+          CLANG: clang-18
+        run: bpf/build.sh --check
+
+  # The network-plugin test modules are checked in as built .wasm
+  # (tests/netplugins/*.wasm) so `cargo test` needs no WASM target. This
+  # rebuilds them from their sources with the toolchain, lockfiles, and path
+  # remapping tests/netplugins/build.sh pins, and fails when a committed
+  # module is stale. The toolchain here must match NETPLUGIN_TOOLCHAIN's
+  # default in that script.
+  netplugin-wasm:
+    name: Net Plugin Modules Are Current
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          targets: wasm32-wasip1
+
+      - name: Rebuild and compare
+        run: tests/netplugins/build.sh --check
+
+  # The kernel classifier's tests load the programs into the runner's
+  # kernel, attach them to scratch cgroups, and dial from child processes,
+  # so they need root. They are `#[ignore]`d in the ordinary run.
+  kernel-tests:
+    name: Kernel Classifier Tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # protoc from the pinned release (setup-protoc), so an Ubuntu mirror
+      # outage cannot fail the job: the runner image already ships clang-18,
+      # so the apt step below downloads nothing on an image that has it.
+      - name: Install protobuf compiler
+        uses: ./.github/actions/setup-protoc
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
+
+      - name: Build the tests and the io_uring probe
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          cargo test -p legion-worker --lib --locked --no-run
+          clang-18 -O2 -o "$RUNNER_TEMP/uring_connect" bpf/tests/uring_connect.c
+
+      - name: Run the root-only kernel tests
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          sudo -E env "PATH=$PATH" LEGION_URING_PROBE="$RUNNER_TEMP/uring_connect" \
+            cargo test -p legion-worker --lib --locked -- --ignored --test-threads=1 kernel:: capture_kernel
+
+  # The isolate host's confinement (crates/isolate/src/confine.rs: user,
+  # network, PID, and mount namespaces, the mount root, capabilities,
+  # Landlock, seccomp), proved layer by layer by `crates/isolate/tests/binary.rs`
+  # through the `confinement-test` hooks. The Cargo Test job runs the same
+  # tests as the unprivileged `runner` user, where Ubuntu 24.04 refuses user
+  # namespaces (`kernel.apparmor_restrict_unprivileged_userns`): the
+  # namespace layers cannot apply there, and the tests that need them say so
+  # and return. Root may make user namespaces under that restriction, so here
+  # every layer the kernel offers applies, a missing one fails the test, and
+  # the checks that need root themselves (mounting a tmpfs inside a read
+  # directory, a host emptying its bounding set) run in full.
+  isolate-confinement:
+    name: Isolate Confinement Tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        uses: ./.github/actions/setup-protoc
+
+      - name: Build the tests and the test-hook binary
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo test -p legion-isolate --features confinement-test --locked --no-run
+
+      - name: Run the confinement tests as root
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          sudo -E env "PATH=$PATH" \
+            cargo test -p legion-isolate --features confinement-test --locked --test binary
+
   # For an intentional break, bump PROTOCOL_VERSION and label the PR
   # `proto-breaking-ok` to skip the check.
   proto-breaking:
     name: Proto Breaking Changes
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'proto-breaking-ok') }}
+    if: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'proto-breaking-ok') }}
 
     steps:
       - name: Checkout repository
@@ -89,10 +259,18 @@ jobs:
         env:
           BUF_VERSION: 1.50.0
           BUF_SHA256: 154ea883ce098eac4fa106ff9ee4e4964bb97f809dd8ec9c34a432b466ce1494
+        # Retried like setup-protoc's download: fail on HTTP errors, and
+        # try again until the bytes match the pinned checksum.
         run: |
-          curl -sSL -o "$RUNNER_TEMP/buf" \
-            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
-          echo "${BUF_SHA256}  $RUNNER_TEMP/buf" | sha256sum -c -
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 2 -o "$RUNNER_TEMP/buf" \
+                "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64" \
+              && echo "${BUF_SHA256}  $RUNNER_TEMP/buf" | sha256sum -c -; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep $((attempt * 5))
+          done
           chmod +x "$RUNNER_TEMP/buf"
 
       # Extract the base branch's proto into a plain directory rather than
@@ -109,6 +287,7 @@ jobs:
   ui-build:
     name: UI Build
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout repository
@@ -124,6 +303,8 @@ jobs:
               # The generated client in ui/src/gen is derived from the proto;
               # a proto change must regenerate it (see the drift check).
               - 'proto/legion.proto'
+              # The ACL parity cases the UI's mirror is checked against.
+              - 'tests/fixtures/acl_parity_cases.json'
 
       - name: Install Node
         if: steps.changes.outputs.ui == 'true'
@@ -135,9 +316,7 @@ jobs:
 
       - name: Install protobuf compiler
         if: steps.changes.outputs.ui == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
 
       - name: Install UI dependencies
         if: steps.changes.outputs.ui == 'true'
@@ -160,9 +339,18 @@ jobs:
         working-directory: ui
         run: npm run build
 
+      - name: Unit tests (ACL parity with the manager)
+        if: steps.changes.outputs.ui == 'true'
+        working-directory: ui
+        run: npm run test:unit
+
   scheduler-benchmark-gate:
     name: Scheduler Benchmark Gate
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: rusqlite's `session` feature runs
+    # bindgen against the runner's libclang, and the newer ubuntu-latest
+    # image's libclang makes bindgen 0.69 emit empty SQLite structs.
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout repository
@@ -174,12 +362,12 @@ jobs:
         with:
           filters: |
             scheduler:
-              - 'src/manager/scheduler.rs'
-              - 'src/storage/store.rs'
-              - 'src/manager/daemon.rs'
+              - 'crates/manager/src/manager/scheduler.rs'
+              - 'crates/manager/src/storage/store.rs'
+              - 'crates/manager/src/manager/daemon.rs'
               - 'benchmarks/scheduler/**'
-              - 'tests/scheduler_benchmark_slo.rs'
-              - 'tests/benchmark_support/**'
+              - 'tests/integration/scheduler_benchmark_slo.rs'
+              - 'tests/integration/benchmark_support/**'
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.scheduler == 'true'
@@ -187,17 +375,25 @@ jobs:
 
       - name: Install protobuf compiler
         if: steps.changes.outputs.scheduler == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
+
+      # Reads the Cargo Test job's dependency cache (same profile and
+      # dependency set; the `loadgen` feature adds no crates). Never saves.
+      - name: Cache cargo dependencies
+        if: steps.changes.outputs.scheduler == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-test
+          save-if: false
 
       - name: Run scheduler benchmark SLO gate
         if: steps.changes.outputs.scheduler == 'true'
-        run: cargo test --test scheduler_benchmark_slo -- --ignored --nocapture
+        run: "cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture"
 
   aws-benchmark-rig:
     name: AWS Benchmark Rig (validate only)
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout repository

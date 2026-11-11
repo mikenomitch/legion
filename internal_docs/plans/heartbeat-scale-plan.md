@@ -21,7 +21,7 @@ from.
 
 At 10k workers on the default 2s cadence, the manager fields 5,000
 heartbeats/second. Today each one costs, unconditionally
-(`src/manager/server.rs:4548`, `src/storage/store.rs:3897`):
+(`crates/manager/src/manager/server.rs:4548`, `crates/manager/src/storage/store.rs:3897`):
 
 - **One raft consensus round** (a `client_write` through a single-threaded
   per-lane pipeline behind a global capture mutex) *per heartbeat* — plus
@@ -36,16 +36,16 @@ heartbeats/second. Today each one costs, unconditionally
 - An unconditional `volumes_to_destroy_for_node` query whose
   `OR`-disjunction shape scans the volume table even when no volume is
   being destroyed.
-- Liveness scanning (`src/manager/daemon.rs:668`): a full
+- Liveness scanning (`crates/manager/src/manager/daemon.rs:668`): a full
   `node ⟕ node_health` scan every 2s plus an RFC3339 **string parse per
   node per tick** (10k parses every 2s), and `recheck_lost_nodes` re-runs
   a per-lost-node eval-existence query every tick forever.
-- Worker side (`src/worker/daemon.rs:408`): fixed 2s sleep, **no
+- Worker side (`crates/worker/src/worker/daemon.rs:408`): fixed 2s sleep, **no
   jitter** — a fleet restarted together stays phase-locked forever — and
   the cadence is a hard-coded constant, not configurable.
 
 Nothing measures any of this: there is no heartbeat benchmark
-(`tests/raft_perf_smoke.rs` floods heartbeats only as background load
+(`tests/integration/raft_perf_smoke.rs` floods heartbeats only as background load
 for a scheduler-lane isolation A/B).
 
 ## Prior art
@@ -107,16 +107,16 @@ where liveness is stored yet (see non-goals).
 
 See problem statement; the load-bearing code:
 
-- Handler: `src/manager/server.rs:4548-4605`; store op:
+- Handler: `crates/manager/src/manager/server.rs:4548-4605`; store op:
   `Store::update_node_heartbeat` → `update_node_heartbeat_apply`
-  (`src/storage/store.rs:3897-3949`), a `replicated(Lane::Status, ..)`
+  (`crates/manager/src/storage/store.rs:3897-3949`), a `replicated(Lane::Status, ..)`
   single-row upsert + `get_node` + `cache_node`.
-- Liveness: `src/manager/daemon.rs:668-751` (tick),
+- Liveness: `crates/manager/src/manager/daemon.rs:668-751` (tick),
   `nodes_to_mark_lost` (`:929`), `Node::last_heartbeat_too_slow`
-  (`src/structs/node.rs:68` — RFC3339 parse per call),
+  (`crates/common/src/structs/node.rs:68` — RFC3339 parse per call),
   `recheck_lost_nodes` (`store.rs:3635`).
-- Worker loop: `src/worker/daemon.rs:408-468`;
-  `WORKER_HEARTBEAT_DURATION_SEC = 2` (`src/constants.rs:41`).
+- Worker loop: `crates/worker/src/worker/daemon.rs:408-468`;
+  `WORKER_HEARTBEAT_DURATION_SEC = 2` (`crates/common/src/constants.rs:41`).
 - Batching precedent: `mark_nodes_as_lost_apply` batches N nodes into
   one `IN (...)` statement in one replicated op (`store.rs:3499`).
 - The raft driver skips proposing entirely when a mutation captures an
@@ -126,7 +126,7 @@ See problem statement; the load-bearing code:
 
 ### 1. Heartbeat scale benchmark (first, so before/after exists)
 
-`tests/heartbeat_scale_benchmark.rs`, `#[ignore]`, mirroring the
+`tests/integration/heartbeat_scale_benchmark.rs`, `#[ignore]`, mirroring the
 scheduler scale benchmark's shape: fleet sizes {1k, 5k, 10k} × backends
 {local_disk, raft1, raft3} × driver threads {4, 16}, each thread
 heartbeating a partition of the fleet as fast as the store allows for a

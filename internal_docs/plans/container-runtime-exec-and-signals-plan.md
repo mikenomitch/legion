@@ -78,7 +78,7 @@ namespaces, NUMA/SMT-aware core placement, alloc-dir sharing between tasks.
 **Exec.** On macOS, `legion exec --job web -it -- /bin/sh` into a container
 task drops you into a shell. On Linux — with youki/runc/crun — the same command
 fails with `this container runtime does not support exec yet`
-(`src/task_plugins/container.rs:351`). Because *actions* ride the same
+(`crates/worker/src/task_plugins/container.rs:351`). Because *actions* ride the same
 worker-side exec path (the manager renders argv and forwards it to
 `worker.ExecTask`), a curated `legion action run web flush-cache` fails on
 Linux container tasks too, as does the UI's Exec & Actions panel and the MCP
@@ -91,17 +91,17 @@ inverted capability sets.
 
 - A job that declares an identity with `changeMode: signal` is rejected at
   admission for container tasks
-  (`src/task_plugins/mod.rs:506`, test `container_task_rejects_signal_change_mode`
-  at `src/task_plugins/mod.rs:1365`). The only refresh option is
+  (`crates/worker/src/task_plugins/mod.rs:506`, test `container_task_rejects_signal_change_mode`
+  at `crates/worker/src/task_plugins/mod.rs:1365`). The only refresh option is
   `changeMode: restart` — a full container restart to pick up a token.
 - Stopping a container task on Linux is `<runtime> delete --force` — SIGKILL,
-  immediately (`src/task_plugins/container.rs:540`). A service never sees
+  immediately (`crates/worker/src/task_plugins/container.rs:540`). A service never sees
   SIGTERM, never drains connections, never flushes. For the stateful workloads
   Legion explicitly targets, every reschedule is a crash. (macOS is better only
   by accident: Apple `container stop` signals init and waits.)
 
 The root cause is the same for both: the worker's signal path is a raw
-`kill(2)` on the tracked PID (`src/worker/task_manager.rs:340`), and for
+`kill(2)` on the tracked PID (`crates/worker/src/worker/task_manager.rs:340`), and for
 container tasks the tracked PID is the **runtime CLI supervisor** (`container
 run` / `<runtime> run`), not the workload. Signaling it kills the supervisor
 and leaves the container running — so the runtime honestly reports
@@ -110,7 +110,7 @@ and leaves the container running — so the runtime honestly reports
 **Resource limits.** A job declaring `resources: { memory: 256, cores: 2 }`
 gets exactly that guest VM on macOS — and *nothing* on Linux: the generated
 bundle's `linux.resources` carries only the device cgroup rule
-(`src/task_plugins/oci_bundle.rs:481`). The scheduler subtracts the
+(`crates/worker/src/task_plugins/oci_bundle.rs:481`). The scheduler subtracts the
 declaration from the node's capacity, but the kernel enforces nothing, so one
 leaking container can consume the whole node and take every co-scheduled
 allocation down with it. `resources.cpu` (MHz) is worse still — it is
@@ -125,7 +125,7 @@ container cannot see any of it: the runtime mounts only declared `volumes[]`,
 and worker-injected env (`LEGION_TASK_DIR`, `LEGION_ARTIFACT_*`) names host
 paths that are meaningless inside, so it is deliberately not applied. The
 result is two admission-time rejections for container tasks
-(`kv_injections.files`, identity `file` delivery — `src/task_plugins/mod.rs:537`,
+(`kv_injections.files`, identity `file` delivery — `crates/worker/src/task_plugins/mod.rs:537`,
 `:498`) plus file/tree artifacts that are *accepted* and then stage to a
 directory the workload can never read. Today's workaround is baking config into the image or abusing a
 volume — both of which bypass the refresh machinery (KV re-render, identity
@@ -362,26 +362,26 @@ rotation) that file delivery exists to provide.
 ## 5. Background — what exists today
 
 - **The exec seam.** `TaskPlugin::exec_support()` / `exec()`
-  (`src/task_plugins/mod.rs:337`) return an `ExecSession` pumped by the worker
-  server; `spawn_pty` / `spawn_pipe` (`src/task_plugins/exec_session.rs:88`,
+  (`crates/worker/src/task_plugins/mod.rs:337`) return an `ExecSession` pumped by the worker
+  server; `spawn_pty` / `spawn_pipe` (`crates/worker/src/task_plugins/exec_session.rs:88`,
   `:133`) wrap portable-pty and plain pipes. The container plugin already
   builds a runtime-specific argv in `build_exec_command`
-  (`src/task_plugins/container.rs:261`) — including an `Oci` arm — but
+  (`crates/worker/src/task_plugins/container.rs:261`) — including an `Oci` arm — but
   `ContainerRuntime::supports_exec()` (`container.rs:94`) hard-codes
   `AppleContainer` only, so the Linux arm is dead code. Note the dead arm
   emits `exec --tty --interactive` — `--interactive` is a Docker/Apple flag
   that runc/crun/youki do not have; enabling it as-is would fail.
 - **ACLs need nothing.** Container exec is sandboxed (`host_level: false`,
-  `runtime_is_host_level` at `src/task_plugins/mod.rs:224`); an `exec:write`
+  `runtime_is_host_level` at `crates/worker/src/task_plugins/mod.rs:224`); an `exec:write`
   rule without `host` already covers it on both platforms.
 - **The signal path bypasses plugins.** `WorkerTaskManager::signal_allocation`
-  (`src/worker/task_manager.rs:340`) resolves the tracked PID and calls
+  (`crates/worker/src/worker/task_manager.rs:340`) resolves the tracked PID and calls
   `kill(2)` directly (`send_signal`, `task_manager.rs:1107`). There is no
   `TaskPlugin` method for signals — only the boolean `supports_signal()` gate
-  (`src/task_plugins/mod.rs:291`), consumed at admission for
+  (`crates/worker/src/task_plugins/mod.rs:291`), consumed at admission for
   `changeMode: signal` identities and true only for the `exec` runtime
-  (`src/task_plugins/exec.rs:250`). The one caller is the identity refresher
-  (`src/worker/identity.rs:645`).
+  (`crates/worker/src/task_plugins/exec.rs:250`). The one caller is the identity refresher
+  (`crates/worker/src/worker/identity.rs:645`).
 - **Stop today.** `container.rs:523` tears down by name — Apple
   `container stop` (signals + waits) on macOS, `<runtime> delete --force`
   (SIGKILL) on Linux — then reaps the supervisor child via
@@ -390,7 +390,7 @@ rotation) that file delivery exists to provide.
   `legion-<alloc-id>` (`container.rs:141`) on both platforms, so any runtime
   subcommand can address it without new state.
 - **The bundle spec is Legion's to extend.** `build_spec`
-  (`src/task_plugins/oci_bundle.rs:428`) generates the whole OCI runtime
+  (`crates/worker/src/task_plugins/oci_bundle.rs:428`) generates the whole OCI runtime
   `config.json`; its `linux.resources` today holds only the device-cgroup
   deny rule (`oci_bundle.rs:481`). The runtime (runc/crun/youki) creates the
   cgroup and applies whatever resources the spec declares — no new process
@@ -403,7 +403,7 @@ rotation) that file delivery exists to provide.
 - **Volumes are the template for the task-dir mount.** The worker resolves
   volume env to *in-task destinations* for isolating runtimes — the
   `in_task_view` match in `mount_allocation_volumes`
-  (`src/worker/task_manager.rs:911`) and `TaskInstance::volume_env`
+  (`crates/worker/src/worker/task_manager.rs:911`) and `TaskInstance::volume_env`
   (`mod.rs:184`) — and the plugin turns `instance.volumes` into
   `--volume host:dest` args (macOS, `container.rs:230`) or `rbind` mount
   entries (`volume_mounts`, `oci_bundle.rs:409`). The task-dir mount is one
@@ -415,10 +415,10 @@ rotation) that file delivery exists to provide.
   interpolation into the runtime config is also host-path substitution
   (`substitute_artifact_tokens`, `task_manager.rs:874`).
 - **File destinations are free-form paths today.** `kv_injections.files[]`
-  declares a `path` (`src/structs/job.rs:1703`); identity `file` delivery
+  declares a `path` (`crates/common/src/structs/job.rs:1703`); identity `file` delivery
   declares one too, absolute by convention (e.g.
   `/var/run/legion/identity/<name>/token`,
-  `src/structs/workload_identity.rs:829`) — sensible for the exec runtime's
+  `crates/common/src/structs/workload_identity.rs:829`) — sensible for the exec runtime's
   host filesystem, unreachable inside a container. Identity naming already
   enforces a traversal-safe charset at admission *and* re-checks on the worker
   (`workload_identity.rs:266`) — the precedent §6.5's path rule follows.

@@ -117,6 +117,7 @@ pub fn config() -> Command {
                         .arg(json_flag()),
                 ),
         )
+        .subcommand(crate::cmd::net_plugin::config())
         .subcommand(
             job_scope(Command::new("doctor"))
                 .about("Walk a task's network layers — policy, mode, datapath, handlers, TLS, gate — and name the first one that is wrong")
@@ -141,7 +142,7 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("ca")
-                .about("The cluster CA: the worker plane, the worker-to-manager channel, and certFrom = \"legion\"")
+                .about("The cluster CA: the worker plane, the worker-to-manager channel, and service.mesh")
                 .subcommand_required(true)
                 .subcommand(
                     Command::new("show")
@@ -150,8 +151,66 @@ pub fn config() -> Command {
                 )
                 .subcommand(
                     Command::new("rotate")
-                        .about("Rotate the cluster CA in two steps: the new CA signs now, the old one stays trusted for 24h")
+                        .about("Rotate the built-in cluster CA in two steps: the new CA signs now, the old one stays trusted for 24h")
                         .arg(json_flag()),
+                )
+                .subcommand(
+                    Command::new("provider")
+                        .about("Work with cluster CA providers (an operator CA on disk, or an external signer)")
+                        .subcommand_required(true)
+                        .arg_required_else_help(true)
+                        .subcommand(
+                            Command::new("test")
+                                .about("Check a cluster CA provider before pointing a manager at it")
+                                .long_about(
+                                    "Run a candidate `clusterCa` provider the way a manager will and report \
+                                     each check: an `exec` signer command (everything after `--`), or \
+                                     `file` material (--cert-path, --key-path, optional --bundle-path). \
+                                     It reads the trust bundle, has a node, a manager server, and a \
+                                     manager client certificate signed, verifies each one exactly as a \
+                                     manager would before handing it out, and checks that the names \
+                                     Legion asks for win over the names a CSR asks for. Runs locally; no \
+                                     manager is involved. An exec signer really issues the test \
+                                     certificates (for `conformance-node` and the manager id \
+                                     `conformance`), valid for 24 hours.",
+                                )
+                                .arg(
+                                    Arg::new("cert-path")
+                                        .long("cert-path")
+                                        .value_name("PATH")
+                                        .help("file: the signing CA certificate (then any intermediates)"),
+                                )
+                                .arg(
+                                    Arg::new("key-path")
+                                        .long("key-path")
+                                        .value_name("PATH")
+                                        .requires("cert-path")
+                                        .help("file: the signing CA's PKCS#8 private key"),
+                                )
+                                .arg(
+                                    Arg::new("bundle-path")
+                                        .long("bundle-path")
+                                        .value_name("PATH")
+                                        .requires("cert-path")
+                                        .help("file: the trust bundle (default: the signing CA itself)"),
+                                )
+                                .arg(
+                                    Arg::new("timeout")
+                                        .long("timeout")
+                                        .value_name("DURATION")
+                                        .default_value("10s")
+                                        .help("exec: how long one provider call may take"),
+                                )
+                                .arg(
+                                    Arg::new("command")
+                                        .value_name("COMMAND")
+                                        .num_args(1..)
+                                        .trailing_var_arg(true)
+                                        .conflicts_with("cert-path")
+                                        .help("exec: the signer command and its arguments"),
+                                )
+                                .arg(json_flag()),
+                        ),
                 ),
         )
 }
@@ -167,6 +226,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             Some(("test", sub)) => test(sub).await,
             _ => unreachable!(),
         },
+        Some(("plugin", plugin)) => crate::cmd::net_plugin::handle(plugin).await,
         Some(("doctor", sub)) => doctor(sub).await,
         Some(("handler", handler)) => match handler.subcommand() {
             Some(("test", sub)) => handler_test(sub).await,
@@ -175,6 +235,10 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("ca", ca)) => match ca.subcommand() {
             Some(("show", sub)) => ca_show(sub).await,
             Some(("rotate", sub)) => ca_rotate(sub).await,
+            Some(("provider", provider)) => match provider.subcommand() {
+                Some(("test", sub)) => ca_provider_test(sub),
+                _ => unreachable!(),
+            },
             _ => unreachable!(),
         },
         _ => unreachable!(),
@@ -433,35 +497,172 @@ async fn ca_show(matches: &ArgMatches) -> R<()> {
     .into_inner();
     if format.is_json() {
         output::print_success(&json!({
+            "provider": reply.provider,
+            "providerLocation": reply.provider_location,
             "certPem": reply.cert_pem,
             "bundlePem": reply.bundle_pem,
+            "chainPem": reply.chain_pem,
             "pin": reply.pin,
             "phase": reply.phase,
             "overlapUntil": reply.overlap_until,
             "previousCertPem": reply.previous_cert_pem,
             "createdAt": reply.created_at,
             "exists": !reply.cert_pem.is_empty(),
+            "problem": reply.problem,
         }));
-        return Ok(());
-    }
-    if reply.cert_pem.is_empty() {
-        println!("no cluster CA yet: it is created with the first join token or node certificate");
         return Ok(());
     }
     // Human output goes to stderr so `legion net ca show > ca.pem` writes a
     // bundle a client can trust as is.
-    eprintln!("Pin:     {}", reply.pin);
+    let provider = if reply.provider_location.is_empty() {
+        reply.provider.clone()
+    } else {
+        format!("{}  ({})", reply.provider, reply.provider_location)
+    };
+    if reply.cert_pem.is_empty() {
+        eprintln!("Provider: {provider}");
+        if reply.problem.is_empty() {
+            println!(
+                "no cluster CA yet: it is created with the first join token or node certificate"
+            );
+        } else {
+            eprintln!("Problem:  {}", reply.problem);
+        }
+        return Ok(());
+    }
+    eprintln!("Provider: {provider}");
+    eprintln!("Pin:      {}", reply.pin);
     if reply.phase == "overlap" {
         eprintln!(
-            "Phase:   rotating. The new CA signs; the previous CA stays trusted until {}",
+            "Phase:    rotating. The new CA signs; the previous CA stays trusted until {}",
             reply.overlap_until
         );
-        eprintln!("Bundle:  2 CAs (the signing CA first, then the previous one)");
+        eprintln!("Bundle:   2 CAs (the signing CA first, then the previous one)");
+    } else if reply.provider == "builtin" {
+        eprintln!("Phase:    stable (one CA)");
     } else {
-        eprintln!("Phase:   stable (one CA)");
+        let bundle = crate::cluster_tls::bundle_pins(&reply.bundle_pem).len();
+        let chain = crate::cluster_tls::bundle_pins(&reply.chain_pem).len();
+        eprintln!(
+            "Bundle:   {bundle} CA(s), the anchor first{}",
+            if chain == 0 {
+                ". Holders trust the signing CA itself.".to_string()
+            } else {
+                format!(". Leaves carry {chain} intermediate(s) after them.")
+            }
+        );
+    }
+    if !reply.problem.is_empty() {
+        eprintln!("Problem:  {}", reply.problem);
     }
     print!("{}", reply.bundle_pem);
     Ok(())
+}
+
+/// `legion net ca provider test`: the conformance harness
+/// (`crate::manager::cluster_ca::conformance`). Local only.
+fn ca_provider_test(matches: &ArgMatches) -> R<()> {
+    use crate::manager::cluster_ca::conformance::{test_provider, Candidate};
+    let format = OutputFormat::from_matches(matches);
+    let command: Vec<String> = matches
+        .get_many::<String>("command")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    let candidate = match matches.get_one::<String>("cert-path") {
+        Some(cert_path) => {
+            let key_path = matches.get_one::<String>("key-path").ok_or_else(|| {
+                output::fail_local(
+                    format,
+                    CliError::local(
+                        "InvalidArgument",
+                        "--cert-path needs --key-path (the signing CA's PKCS#8 key)",
+                        Some("pass both, or an exec command after `--`"),
+                    ),
+                )
+            })?;
+            Candidate::File {
+                cert_path: cert_path.into(),
+                key_path: key_path.into(),
+                bundle_path: matches.get_one::<String>("bundle-path").map(Into::into),
+            }
+        }
+        None if !command.is_empty() => Candidate::Exec {
+            command,
+            timeout: matches
+                .get_one::<String>("timeout")
+                .map(|value| humantime::parse_duration(value))
+                .transpose()
+                .context("--timeout is not a duration")?
+                .unwrap_or(std::time::Duration::from_secs(10)),
+        },
+        None => {
+            return Err(output::fail_local(
+                format,
+                CliError::local(
+                    "InvalidArgument",
+                    "nothing to test: pass an exec signer after `--`, or --cert-path and --key-path",
+                    Some(
+                        "legion net ca provider test -- legion-ca-vault --mount pki_legion --role legion",
+                    ),
+                ),
+            ))
+        }
+    };
+    let checks = test_provider(&candidate);
+    let passed = checks.iter().all(|check| check.passed);
+    let failed: Vec<_> = checks.iter().filter(|check| !check.passed).collect();
+    if format.is_json() {
+        let data = json!({
+            "provider": match candidate { Candidate::Exec { .. } => "exec", Candidate::File { .. } => "file" },
+            "candidate": candidate.describe(),
+            "passed": passed,
+            "config": if passed { candidate.config_line() } else { String::new() },
+            "checks": checks.iter().map(|check| json!({
+                "name": check.name,
+                "passed": check.passed,
+                "detail": check.detail,
+            })).collect::<Vec<_>>(),
+        });
+        if passed {
+            output::print_success(&data);
+            return Ok(());
+        }
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "FailedPrecondition",
+                format!(
+                    "provider failed {} check(s): {}",
+                    failed.len(),
+                    failed
+                        .iter()
+                        .map(|c| format!("{} ({})", c.name, c.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                Some("fix the provider and run `legion net ca provider test` again"),
+            ),
+        ));
+    }
+    println!("Testing cluster CA provider: {}", candidate.describe());
+    for check in &checks {
+        println!(
+            "  [{}] {:<28} {}",
+            if check.passed { "ok" } else { "FAIL" },
+            check.name,
+            check.detail
+        );
+    }
+    if passed {
+        println!("\nProvider is usable. Configure it with:");
+        println!("  {}", candidate.config_line());
+        Ok(())
+    } else {
+        bail!(
+            "provider failed {} check(s); do not point a manager at it yet",
+            failed.len()
+        )
+    }
 }
 
 async fn ca_rotate(matches: &ArgMatches) -> R<()> {
@@ -485,7 +686,7 @@ async fn ca_rotate(matches: &ArgMatches) -> R<()> {
     println!(
         "Rotated the cluster CA. The new CA (pin {}) signs every certificate from now on.\n\
          The previous CA stays trusted until {}, so no worker-plane or mesh connection breaks;\n\
-         nodes re-issue their certificates within one heartbeat. Join tokens minted before\n\
+         nodes re-issue their certificates within their rotation splay (at most 10 minutes). Join tokens minted before\n\
          the rotation work until then; mint new ones after.",
         reply.pin, reply.overlap_until
     );
@@ -624,6 +825,7 @@ async fn apply(matches: &ArgMatches) -> R<()> {
             "dryRun": dry_run,
             "policy": policy_json(&policy),
             "affectedAllocations": reply.affected_allocations,
+            "warnings": reply.warnings,
         }));
         return Ok(());
     }
@@ -647,6 +849,9 @@ async fn apply(matches: &ArgMatches) -> R<()> {
         for entry in &reply.affected_allocations {
             println!("  {entry}");
         }
+    }
+    for warning in &reply.warnings {
+        println!("warning: {warning}");
     }
     Ok(())
 }
@@ -724,9 +929,9 @@ async fn delete(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-fn job_scope_args(matches: &ArgMatches) -> (String, String, String) {
-    (
-        matches.get_one::<String>("job").expect("required").clone(),
+fn job_scope_args(matches: &ArgMatches) -> R<(String, String, String)> {
+    Ok((
+        crate::cmd::helpers::required_job_arg(matches, "job")?,
         matches
             .get_one::<String>("task")
             .cloned()
@@ -735,12 +940,12 @@ fn job_scope_args(matches: &ArgMatches) -> (String, String, String) {
             .get_one::<String>("pool")
             .cloned()
             .unwrap_or_default(),
-    )
+    ))
 }
 
 async fn show(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches)?;
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
@@ -775,6 +980,24 @@ async fn show(matches: &ArgMatches) -> R<()> {
         &reply.matched_policies,
         &effective,
     );
+    // Where the egress chain runs in the kernel (plan §6.A).
+    let statuses: Vec<NodeStatus> = reply
+        .node_status_json
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    if effective.egress.is_some() && !statuses.is_empty() {
+        let enforced = statuses
+            .iter()
+            .filter(|status| status.kernel.as_ref().is_some_and(|k| k.enforced))
+            .count();
+        if enforced > 0 {
+            println!(
+                "  egress enforced in the kernel on {enforced}/{} running allocations; allowed flows connect directly",
+                statuses.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -797,6 +1020,9 @@ fn print_effective(
     } else {
         println!("  mode: {effective_mode} (task declared {declared_mode})");
     }
+    if let Some(mesh) = effective.mesh {
+        println!("  mesh: {}", if mesh { "on" } else { "off" });
+    }
     if matched.is_empty() {
         println!("  stored policies: none matched");
     } else {
@@ -814,18 +1040,21 @@ fn print_effective(
             continue;
         };
         println!(
-            "  {direction}: protocol {} · fallthrough {} · onError {}{}",
+            "  {direction}: protocol {} · fallthrough {}{}",
             chain.protocol,
             chain.policy,
-            chain.on_error,
             if chain.access_log {
                 " · accessLog"
             } else {
                 ""
             }
         );
-        if let Some(tls) = chain.tls.as_ref() {
-            println!("    tls: {}", tls.mode);
+        if let Some(callers) = chain.callers.as_ref() {
+            println!(
+                "    0. deny callers not in [{}] ({}; the mesh port only)",
+                callers.allow.join(", "),
+                callers.source
+            );
         }
         for (index, rule) in chain.rules.iter().enumerate() {
             let m = &rule.rule.matcher;
@@ -870,19 +1099,19 @@ fn print_effective(
         }
         for handler in &chain.handlers {
             let h = &handler.handler;
-            let target = h
-                .url
-                .clone()
-                .or(h.service.clone().map(|s| format!("service {s}")))
-                .or(h.port.clone().map(|p| format!("port {p}")))
-                .or(h.node.clone().map(|n| format!("node {n}")))
-                .unwrap_or_default();
+            let entry = h.kind.entry();
             println!(
-                "    handler {} {}  timeout {} onError {}  [{}]",
-                h.handler,
-                target,
-                h.timeout.as_deref().unwrap_or("2s"),
-                h.on_error.as_deref().unwrap_or(&chain.on_error),
+                "    handler {} {}  {}  stage {}  timeout {} onError {}  [{}]",
+                entry.name,
+                h.kind.target(),
+                entry.placement.as_str(),
+                entry.stage_names(),
+                h.timeout
+                    .as_deref()
+                    .unwrap_or(crate::structs::hops::DEFAULT_HOP_TIMEOUT),
+                h.on_error
+                    .as_deref()
+                    .unwrap_or(crate::structs::netpolicy::ON_ERROR_DENY),
                 handler.source
             );
         }
@@ -892,7 +1121,7 @@ fn print_effective(
 
 async fn test(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches)?;
     let get = |key: &str| matches.get_one::<String>(key).cloned().unwrap_or_default();
     let (to, from) = (get("to"), get("from"));
     if to.is_empty() && from.is_empty() {
@@ -994,6 +1223,29 @@ struct NodeStatus {
     tls_error: String,
     #[serde(default)]
     mesh_identity: bool,
+    /// The kernel classifier's view, on a node that runs it.
+    #[serde(default)]
+    kernel: Option<NodeKernelStatus>,
+}
+
+/// `NetAllocStatus.kernel`, as the node reports it.
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NodeKernelStatus {
+    #[serde(default)]
+    enforced: bool,
+    #[serde(default)]
+    capture: bool,
+    #[serde(default)]
+    rules: u32,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    passed: u64,
+    #[serde(default)]
+    redirected: u64,
+    #[serde(default)]
+    denied: u64,
 }
 
 fn default_true() -> bool {
@@ -1166,7 +1418,7 @@ pub(crate) fn diagnose_network(
                 layer: "datapath",
                 status: if status.mode == "gated" { "fail" } else { "warn" },
                 detail: format!("allocation {alloc}: the node has not received the policy body yet (fail-closed while gated)"),
-                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchNetPolicy — check manager logs".into()),
+                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchDatapathMaterial — check manager logs".into()),
             });
             return steps;
         }
@@ -1189,18 +1441,18 @@ pub(crate) fn diagnose_network(
                 hint: Some("normal for a `boot`-gated provisional start; see docs/edge-boot.md".into()),
             });
         }
-        // TLS material: an ingress chain that terminates TLS needs its
-        // files (or the mesh certificate) before it accepts anything.
-        let kv_cert = effective
-            .ingress
-            .as_ref()
-            .and_then(|c| c.tls.as_ref())
-            .and_then(|t| t.cert_kv_path())
+        // TLS material: a port that terminates TLS needs its certificate
+        // (from KV or files, or the mesh certificate) before it accepts
+        // anything. A KV problem names its key: `kv <path> ...`.
+        let kv_cert = status
+            .tls_error
+            .split_once("kv ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
             .map(str::to_string);
         if !status.tls_ready {
             let hint = match &kv_cert {
-                Some(path) => format!("put the chain followed by the private key, as one PEM value: legion kv put {path} \"$(cat fullchain.pem privkey.pem)\""),
-                None => "for certPath/keyPath, put the files on the node (or stage them as artifacts); for certFrom = \"legion\", the node issues its certificate on its next heartbeat".into(),
+                Some(path) => format!("put the PEM value at {path} (a certificate: the chain followed by the private key, e.g. legion kv put {path} \"$(cat fullchain.pem privkey.pem)\"; a CA: the CA certificates)"),
+                None => "for tls.cert = { file }, put the files on the node (or stage them as artifacts); for service.mesh, the node issues its certificate on its next heartbeat".into(),
             };
             steps.push(DoctorStep {
                 layer: "tls",
@@ -1223,11 +1475,7 @@ pub(crate) fn diagnose_network(
                 hint: Some(format!("fix the value at {path}; the node picks it up on its next heartbeat")),
             });
         }
-        let wants_mesh = effective
-            .ingress
-            .as_ref()
-            .and_then(|c| c.tls.as_ref())
-            .is_some_and(|t| t.cert_from_mesh());
+        let wants_mesh = effective.mesh == Some(true);
         if wants_mesh && !status.mesh_identity {
             steps.push(DoctorStep {
                 layer: "tls",
@@ -1236,15 +1484,43 @@ pub(crate) fn diagnose_network(
                 hint: Some("issued on the node's next heartbeat (IssueNodeCertificate); persistent means the manager could not create the mesh CA — check manager logs".into()),
             });
         }
+        // The kernel classifier: whether the chain is enforced at connect().
+        if let Some(kernel) = &status.kernel {
+            if kernel.enforced {
+                steps.push(DoctorStep {
+                    layer: "kernel",
+                    status: "ok",
+                    detail: format!(
+                        "allocation {alloc}: egress chain enforced in the kernel ({} rules{}); last beat: {} passed, {} redirected, {} refused",
+                        kernel.rules,
+                        if kernel.capture { ", capture on" } else { "" },
+                        kernel.passed,
+                        kernel.redirected,
+                        kernel.denied
+                    ),
+                    hint: None,
+                });
+            } else if !kernel.reason.is_empty() {
+                steps.push(DoctorStep {
+                    layer: "kernel",
+                    status: "info",
+                    detail: format!("allocation {alloc}: {}", kernel.reason),
+                    hint: None,
+                });
+            }
+        }
         // External handlers: each hop the datapath has run, with its health.
         for hop in &status.handlers {
             steps.push(DoctorStep {
                 layer: "handler",
                 status: if hop.healthy { "ok" } else { "warn" },
                 detail: format!(
-                    "allocation {alloc}: {} {} → {} ({} calls, {} errors){}",
+                    "allocation {alloc}: {} {} [{}] → {} ({} calls, {} errors){}",
                     hop.source,
                     hop.handler,
+                    crate::structs::hops::handler_entry(&hop.handler)
+                        .map(|entry| entry.placement.as_str())
+                        .unwrap_or("?"),
                     hop.target,
                     hop.calls,
                     hop.errors,
@@ -1293,7 +1569,7 @@ pub(crate) fn doctor_verdict(steps: &[DoctorStep]) -> &'static str {
 
 async fn doctor(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches)?;
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,

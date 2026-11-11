@@ -156,3 +156,20 @@ UI steps.
 **Why (ease).** With values hidden, an upsert from "+ New" overwrites a value
 the operator never saw. The old key-field edit silently forked entries rather
 than renaming them.
+
+## 9. `kv get --json` puts `references` beside the entry's fields
+
+*Follow-up, 2026-10-19.*
+
+**The call.** `legion kv get -j` prints `data` as the entry's own fields with
+a `references` array added (`[]` when nothing reads the key), the same list
+the text output prints as `used by:`.
+
+**Alternatives.** Nest the entry (`data.entry`, `data.references`), mirroring
+`GetKvReply`.
+
+**Trade-off.** `data` is no longer exactly a `KvEntry`, the shape `kv put -j`
+prints.
+
+**Why.** Ease. Every script reading `data.value` or `data.version` keeps
+working; a nested shape would have broken all of them for one new field.

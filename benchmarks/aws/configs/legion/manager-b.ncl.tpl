@@ -3,7 +3,7 @@
 # docs/persistence-streaming.md. All three control-plane instances run
 # this same config; whoever wins the lease is primary, the others stand
 # by. Rendered by scripts/install-legion-b.sh with envsubst:
-# BUCKET, REGION.
+# BUCKET, REGION, PRIVATE_IP, SCHEDULING_POLICY.
 {
   server = {
     port = 4747,
@@ -16,7 +16,12 @@
   storePath = "/var/lib/legion/store",
   workerConfigPath = "/opt/legion/configs/workers/",
   evalThreads = 4,
-  schedulingPolicy = "bin_pack",
+  # The scenario's own `scheduling_policy` (bin_pack|spread), rendered by
+  # the installer from LEGION_SCHEDULING_POLICY, which run-campaign.sh
+  # sets from the scenario (or --scheduling-policy). It is a manager
+  # setting, not a jobspec field, so a campaign runs one policy and
+  # run-step.sh refuses a cell whose scenario asks for the other.
+  schedulingPolicy = "${SCHEDULING_POLICY}",
   defaultPriority = 50,
   artifacts = {},
 

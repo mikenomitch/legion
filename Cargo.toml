@@ -14,7 +14,6 @@ categories = ["command-line-utilities", "virtualization"]
 # benchmarks, and the example plugins stay in the repo.
 include = [
     "/src/**",
-    "/proto/**",
     "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -25,18 +24,54 @@ include = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-# The workspace is this crate plus `guest/`, the in-guest agent that ships as
-# its own static binary (docs/task-runtime-sandbox.md, "The guest agent").
+# The workspace is this crate (the `legion` binary: CLI, MCP server, and the
+# bundled apps) on top of the three library crates it is split into, lowest
+# first (docs/codebase-conventions.md, "Crates"):
+#   crates/common   legion-common   domain types, config language, policy
+#   crates/worker   legion-worker   the worker, task runtimes, the datapath
+#   crates/manager  legion-manager  the manager, scheduler, and state store
+# plus `proto/`, the generated wire types (`legion-proto`), `guest/`, the
+# in-guest agent that ships as its own static binary
+# (docs/task-runtime-sandbox.md, "The guest agent"), `crates/isolate`, the
+# isolate host that ships as its own binary, `legion-isolate`, and is the
+# only crate that links wasmtime (docs/task-runtime-isolate.md, "The host
+# process"),
+# and the scaling-plugin SDK (`legion-scaling-plugin`,
+# docs/autoscaling-plugins.md), so `cargo test --all` builds and tests it.
 # The example plugins under `plugins/` are separate crates built by build.rs
 # with their own lockfiles, so they stay out of it.
 [workspace]
-members = [".", "guest"]
+# Not ".": the root package is a member of its own workspace anyway, and
+# listing it makes every path under the root an explicit member, which
+# overrides `exclude` and breaks every plugin build.
+members = [
+    "guest",
+    "proto",
+    "crates/common",
+    "crates/worker",
+    "crates/manager",
+    "crates/isolate",
+    "examples/scaling-plugins/rust",
+]
+# What a bare `cargo build` / `cargo test` / `cargo test --lib <filter>`
+# covers: the binary crate and the library crates under it, which is what
+# those commands covered when Legion was one crate. Without this they would
+# stop at the root package and skip most of the unit tests. `legion-guest`
+# and the plugin SDK are reached with `-p` or `--all`.
+default-members = [".", "proto", "crates/common", "crates/worker", "crates/manager"]
 exclude = ["plugins"]
 
-[dependencies]
-# The guest agent, resume handler, and identity disk format, shared with the
-# static `legion-guest` binary built from the same crate.
+# One version of every dependency for the whole workspace: each crate
+# lists the ones it uses as `name.workspace = true`.
+[workspace.dependencies]
+# Legion's own crates, lowest layer first
+# (internal_docs/plans/workspace-crate-split-plan.md). `legion-guest` is the
+# in-guest agent, also shipped as its own static binary.
 legion-guest = { path = "guest", version = "0.1.0" }
+legion-proto = { path = "proto", version = "0.1.0" }
+legion-common = { path = "crates/common", version = "0.1.0" }
+legion-worker = { path = "crates/worker", version = "0.1.0" }
+legion-manager = { path = "crates/manager", version = "0.1.0" }
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
 # Persistent (HAMT) maps for the scheduler's read model: a plan's capacity
@@ -86,6 +121,9 @@ rustls-pemfile = "2"
 webpki-roots = "1"
 # Reads the SANs off a verified mesh peer certificate (docs/network-handlers.md).
 x509-parser = "0.16"
+# DNS messages for the per-allocation resolvers (src/worker/netd/dns.rs):
+# parsing and building only; the resolvers forward to the host's own.
+hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
 tonic-web = "0.12.3"
 tower-http = { version = "0.5.2", features = ["cors"] }
 tower = "0.4"
@@ -95,14 +133,23 @@ bytes = "1"
 json-patch = "3.0.1"
 rusqlite_migration = "1.0.2"
 humantime = "2.1.0"
-serde_rusqlite = "0.36.0"
-jsonschema = "0.17.1"
+# No default features: they are a CLI and resolvers that fetch a remote or
+# on-disk `$ref`. Legion only allows local refs (`"#/..."`), and the HTTP
+# resolver alone linked a second, older HTTP stack (reqwest 0.11, hyper 0.14,
+# h2 0.3) into the binary.
+jsonschema = { version = "0.17.1", default-features = false }
+# CEL validation `rules` on app object kinds (src/structs/object_rules.rs,
+# docs/app-objects.md "Validation rules"). No default features: no regex,
+# chrono, or encoders; `parser_pratt` is the recursion-limited parser.
+cel = { version = "=0.15.0", default-features = false, features = ["parser_pratt"] }
+# Did-you-mean suggestions for unknown jobspec fields (src/structs/spec_fields.rs).
+# Already in the tree through clap and nickel; same version.
+strsim = "0.11.1"
 rand = "0.8.5"
 argon2 = "0.5.3"
 base64 = "0.22"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
-tracing-futures = "0.2.5"
 tracing-appender = "0.2.3"
 # OpenTelemetry trace export for Legion's own spans (OTLP/HTTP, opt-in via env).
 # HTTP exporter avoids a second tonic/prost version in the dependency tree.
@@ -110,22 +157,59 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
 opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "metrics"] }
-opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
 sha2 = "0.10.8"
 # KV encryption at rest (docs/kv-encryption.md): AES-256-GCM for values and
 # for wrapping data keys, HKDF for the raft-join root key bundle. `ring` is
 # already in the tree via jsonwebtoken/rustls/rcgen — no new crate.
 ring = "0.17"
+# Network plugins (docs/network-plugins.md): an interpreter keeps the
+# shipping binary small; fuel bounds every callback.
+# No `wat` here: plugins ship as binary `.wasm`, and the text-format parser
+# is only for tests (legion-worker turns it on in its dev-dependencies).
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"] }
+# Only to name `LimiterError` in the plugin memory cap; wasmi does not
+# re-export it.
+wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] }
+# The isolate runtime's engine (docs/task-runtime-isolate.md). Only
+# `legion-isolate` (crates/isolate) depends on these: the worker supervises
+# that binary and never links the engine itself. Pinned exactly, because a
+# compiled module is only loadable by the engine version that compiled it and
+# an engine upgrade is a deliberate, reviewed change (it re-runs the
+# guest-escape regression corpus). No default features: no Winch, no Pulley,
+# no profiling, no on-disk cache.
+wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "cranelift", "pooling-allocator", "component-model", "async", "std", "anyhow", "memory-protection-keys", "parallel-compilation"] }
+# WASI 0.2 only: the host has no WASI 0.3 world yet, and `p3` would pull in
+# the engine's component-model-async machinery the host turns off.
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "=50.0.1" }
+# No default features: the isolate host sends every outbound request to its
+# worker (`WasiHttpHooks::send_request`), so it links no HTTP/TLS client.
+wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2"] }
+# The compiler validates every component with the newest parser before
+# Cranelift sees it (docs/task-runtime-isolate.md, "Compilation").
+wasmparser = "0.263.0"
+# The isolate host's seccomp allowlist (crates/isolate/src/confine).
+seccompiler = "0.5.0"
+# The RNG traits wasmtime-wasi 50 takes (rand 0.10), for a per-instance,
+# kernel-seeded generator in the isolate host.
+rand_010 = { package = "rand", version = "0.10.3", default-features = false, features = ["std", "std_rng", "sys_rng"] }
+# WebAssembly text, for the isolate host's guest-escape regression corpus.
+wat = "1.263.0"
 # Key material is wiped from memory when dropped.
 zeroize = "1"
 tabled = "0.16.0"
 lazy_static = "1.4.0"
 anyhow = "1.0.100"
+async-trait = "0.1"
 regex = "1.11.1"
 semver = "1.0.25"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 cron = "0.15.0"
+# IANA time zones for autoscaling schedules (`schedule = [{ cron, timezone }]`,
+# src/autoscaler/schedule.rs), so a business-hours floor follows DST. The
+# zone table is pre-generated (phf only): no build script, no new C code.
+chrono-tz = "0.10.4"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
 url = "2.5.4"
 tempfile = "3"
@@ -151,19 +235,76 @@ portable-pty = "0.8.1"
 # does not enable HTTP upgrades, so exec-over-WS needs its own hyper listener).
 tokio-tungstenite = "0.24"
 hyper-tungstenite = "0.15"
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
+# `http2` and `server-auto`/`server-graceful`: the bundled ingress serves
+# HTTP/1.1 and HTTP/2 to clients on one listener and drains on stop
+# (src/apps/ingress/proxy.rs). `h2` is already in the tree through tonic.
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1", "http2", "server-auto", "server-graceful"] }
 # CLI interactive terminal: raw mode + window size for `legion exec -it`.
 crossterm = "0.28"
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# Linux only.
 landlock = "0.4.1"
-
-[dev-dependencies]
+# The kernel classifier's loader (the worker's netd/kernel): pure Rust over
+# the bpf syscall, no libbpf. The programs themselves are a checked-in
+# object (bpf/legion_net.bpf.o).
+aya = "0.14.0"
 criterion = "0.5.1"
 
-[build-dependencies]
-tonic-build = "0.12.3"
+[dependencies]
+# The layers under the CLI, re-exported from `src/lib.rs` so `legion::manager`,
+# `legion::worker`, `legion::structs` and the rest are the paths they always
+# were.
+legion-common.workspace = true
+legion-worker.workspace = true
+legion-manager.workspace = true
+# `legion guest-agent` runs the in-guest agent from this binary too.
+legion-guest.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+humantime.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+jsonschema.workspace = true
+jsonwebtoken.workspace = true
+libc.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+url.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+flate2.workspace = true
+prost.workspace = true
+rusqlite.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
+tracing-subscriber.workspace = true
 
 # Benchmarks all live under `benchmarks/` — the Criterion targets below in
 # `benchmarks/micro/`, alongside the scenario-driven scheduler harness
@@ -180,6 +321,16 @@ name = "eval_critical_path_bench"
 path = "benchmarks/micro/eval_critical_path_bench.rs"
 harness = false
 
+[[bench]]
+name = "net_bench"
+path = "benchmarks/micro/net_bench.rs"
+harness = false
+
+[[bench]]
+name = "scaling_rollup_bench"
+path = "benchmarks/micro/scaling_rollup_bench.rs"
+harness = false
+
 # The AWS rig's native job submitter. Not part of the product: it exists
 # because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
 # jobs/sec and was being reported as Legion's throughput. It links against this
@@ -191,10 +342,18 @@ harness = false
 # `build-and-upload.sh` build it explicitly.
 [lib]
 name = "legion"
+# The library has no doc tests. Leaving the pass on still runs rustdoc over the
+# whole crate on every `cargo test` to find none. Set this back to `true` when
+# the first runnable example lands in a doc comment.
+doctest = false
 
 [[bin]]
 name = "legion"
 path = "src/main.rs"
+# `src/main.rs` only dispatches into the library and has no tests of its own;
+# without this, `cargo test` links a second full copy of the binary to run
+# zero tests. Integration tests still get `CARGO_BIN_EXE_legion`.
+test = false
 
 [[bin]]
 name = "legion-loadgen"
@@ -205,23 +364,71 @@ required-features = ["loadgen"]
 # Builds the `legion-loadgen` bin above. No effect on the `legion` binary.
 loadgen = []
 
+# Local and test builds. At full debuginfo every test binary carries DWARF for
+# all ~490 crates in the tree, and the target dir grows by gigabytes per
+# binary. Line tables keep file:line in panic backtraces for Legion's own
+# code; dependencies get none. To step through with variables in a debugger,
+# build with `CARGO_PROFILE_DEV_DEBUG=2`. The test profile inherits all of
+# this from dev.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The bundled SQLite is C code that every store-backed test runs through:
+# each one opens a fresh store and applies every migration. At -O0 that
+# setup dominated the unit-test suite; optimizing this one crate cuts about a
+# quarter of the suite's CPU time, for one slower compile of a single C file.
+# Optimizing every dependency bought ~10% more and doubled the clean
+# dependency build, so the rest stay at -O0.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+# Workers hash their own executable at startup for their build id
+# (docs/apps.md, "Upgrades"). A debug binary is ~400 MB, which SHA-256 at
+# -O0 takes tens of seconds over; optimized, well under one.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP
-# server, and it is expected to land on small and edge machines, so binary size
-# is a feature. The stock `--release` profile leaves ~18 MB on the table:
+# server, so binary size is a feature. The stock `--release` profile leaves
+# ~70 MB on the table (linux/amd64, ~470 crates, 2026-11-10):
 #
-#   --release            43.7 MB
-#   --profile dist       26.0 MB   (-41%)
+#   --release           159.6 MB
+#   --profile dist       89.1 MB   (-44%)
 #
-# Roughly half of that is `strip` dropping the symbol tables (__LINKEDIT: 8.9 MB
-# -> 0.3 MB); the other half is fat LTO collapsing dead code and cross-crate
-# duplication across the ~520-crate tree (__TEXT: 33.5 MB -> 24.8 MB).
+# A little over half of that is `strip` dropping the symbol tables (41 MB);
+# the rest is fat LTO with one codegen unit collapsing dead code and
+# cross-crate duplication (loaded sections 118.7 MB -> 89.1 MB, `.text`
+# 89.7 -> 71.6 MB).
 #
-# The cost is build time — fat LTO with a single codegen unit cannot parallelize
-# the final link, taking several minutes against about one for `--release`. That
-# is why this is a separate profile: `--release` stays fast for local work, and
-# only release artifacts pay for the smaller binary. Debug builds are unaffected.
+# Two more things keep the binary small in every optimized profile: the
+# size-optimized crates under `[profile.release.package.*]` below, and the
+# packed relocations `build.rs` asks the linker for. Without them the `dist`
+# binary was 97.3 MB (internal_docs/development.md, "What else keeps the
+# binary small").
+#
+# The cost is build time. A clean `dist` build takes ~24 minutes on 4 vCPU
+# against ~11 for `--release`: one codegen unit cannot parallelize LLVM
+# within a crate, and the fat-LTO link alone is ~16 minutes. That is why
+# this is a separate profile: `--release` stays fast for local work, and
+# only release artifacts pay for the smaller binary. Debug builds are
+# unaffected. It needs ~10 GB at its peak (Legion's crates in LLVM at once),
+# and the link itself 7.8 GB (internal_docs/plans/workspace-crate-split-plan.md,
+# § 5.4).
+[profile.dist]
+inherits = "release"
+# Collapse dead code and duplicated generics across every crate in the tree.
+lto = "fat"
+# One codegen unit per crate graph: less parallelism, more inlining, smaller code.
+codegen-units = 1
+# Drop symbol tables. Backtraces lose function names; keep the unstripped
+# artifact if you need to symbolize a crash from a shipped build.
+strip = "symbols"
+
 # Same optimizations as `dist` minus the parts that dominate LINK time:
 # `fat` LTO with one codegen unit takes ~25 minutes on the benchmark
 # operator box, which is longer than some measurement windows allow. Thin
@@ -235,15 +442,27 @@ lto = "thin"
 codegen-units = 16
 strip = "symbols"
 
-[profile.dist]
-inherits = "release"
-# Collapse dead code and duplicated generics across every crate in the tree.
-lto = "fat"
-# One codegen unit per crate graph: less parallelism, more inlining, smaller code.
-codegen-units = 1
-# Drop symbol tables. Backtraces lose function names; keep the unstripped
-# artifact if you need to symbolize a crash from a shipped build.
-strip = "symbols"
+# Crates that only run when a config file or a validation rule is read are
+# built for size, in every optimized profile (`dist` and `distfast` inherit
+# these from `release`). They are large and cold: the Nickel evaluator and
+# its bignum library parse a jobspec once per submission, and CEL runs an app
+# object's rules once per write. Nothing here is on the scheduler, storage, or
+# network path. Measured on the `dist` binary: 3.3 MB smaller, and
+# `legion job validate configs/jobs/maximal.ncl` goes from 25 ms to 26 ms.
+[profile.release.package.nickel-lang-core]
+opt-level = "s"
+[profile.release.package.nickel-lang-parser]
+opt-level = "s"
+[profile.release.package.malachite-base]
+opt-level = "s"
+[profile.release.package.malachite-nz]
+opt-level = "s"
+[profile.release.package.malachite-q]
+opt-level = "s"
+[profile.release.package.cel]
+opt-level = "s"
+[profile.release.package.antlr4rust]
+opt-level = "s"
 
 # [[bin]] # Bin to run the HelloWorld gRPC server
 # name = "legion"

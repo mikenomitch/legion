@@ -169,8 +169,10 @@ This sits next to the worker's `worker_state.json`, for example
 - The directories above it, the worker state dir and `allocs/`, are
   traverse-only (`0711`). A task's own user can reach its allocation
   directory by path, but nothing can list a node's allocations. Every other
-  entry in the state dir guards itself: the state files are `0600`, and
-  `logs/`, `content/`, `volumes/`, and `identity/` are owner-only.
+  entry in the state dir guards itself: the state files are `0600`;
+  `logs/`, `content/`, `volumes/`, and `identity/` are owner-only; and
+  `local-volumes/` is traverse-only with an owner-only directory per volume
+  (see [volumes.md](volumes.md#local-dir-the-default)).
 - It is exposed to the task as the `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR`
   env vars, for runtimes that apply worker-injected env (see the
   [capability matrix](#task-runtime-support)).
@@ -221,10 +223,10 @@ expand to the destination directory.
 
 | Scheme | Fetcher notes |
 | --- | --- |
-| `https://` / `http://` | Streaming download (no whole-body buffering), basic/bearer/headers credentials, redirect limit (5), Content-Length checked against the size cap before streaming. Plain `http` is **not** in the default scheme allowlist. |
-| `file://` | Copies a local file or directory tree. For dev workflows and artifacts pre-provisioned on the node. |
-| `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1). `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped, so tasks get a clean worktree. Credentials are injected through `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
-| `s3://` | Backed by `object_store`. Works with any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region and endpoint come from the credential object or from query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`). Query params win. Anonymous fetches skip request signing (public buckets). |
+| `https://` / `http://` | Streaming download (no whole-body buffering), basic/bearer/headers credentials, redirect limit (5), Content-Length checked against the size cap before streaming. Every address the fetch connects to, redirects included, is checked by the worker's host guard ([below](#what-the-host-guard-checks)). Credentials are sent to the source's own origin only, never along a redirect to another one, and an `https` source may not redirect to plain `http`. Plain `http` is **not** in the default scheme allowlist. |
+| `file://` | Copies a local file or directory tree. For dev workflows and artifacts pre-provisioned on the node. The worker reads it as root, so a task with a `file://` artifact (or a `file://` `image`) is [host-level](auth-and-acls.md#host-level-jobs): submitting it needs a `job:write` rule with `host = true`. |
+| `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1). `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped, so tasks get a clean worktree. Credentials are injected through `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. Git may speak only the source URL's own transport (`https`, `http`, `ssh`, `git`, or `file`); `ext::` and `fd::` are refused. A `git::file://` repository is host-level, like `file://`. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
+| `s3://` | Backed by `object_store`. Works with any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region and endpoint come from the credential object or from query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`). Query params win. With neither naming a region, the bucket is addressed in `us-east-1`, whatever the worker's `AWS_REGION` says, so a jobspec artifact resolves the same on every node. Anonymous fetches skip request signing (public buckets). A KV credential signs exactly as written: the worker's own `AWS_*` key variables (an `AWS_SESSION_TOKEN` included) never mix into it. The worker's other `AWS_*` store settings (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, server-side encryption, proxy options) do apply. |
 | `oci://` | Built on the `oci-client` crate. Anonymous, basic, or bearer registry auth. Tags resolve to manifest digests for pinning. Without `mediaType`, the image is written to disk as an **OCI layout**, which is what image-consuming runtimes pass to their OCI runtime. It is staged under `.oci/<name>/` unless `dest` is set. With `mediaType`, only matching ORAS layers are pulled. Each is named by its `org.opencontainers.image.title` annotation (sanitized to a basename, with the digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` enables plain-HTTP registries for dev and test. |
 
 Additional schemes can be served by [fetcher plugins](#fetcher-plugins).
@@ -269,6 +271,11 @@ Cluster matchers may use `kv` or `nodeIdentity`, which are both
 cluster-scoped. They can never use a task identity. Task identities are a
 per-task security boundary, and attaching one cluster-wide would weaken it.
 
+A spec that names `auth.kv` itself needs `kv:read` on that path, and one that
+names `auth.nodeIdentity` itself is [host-level](auth-and-acls.md#host-level-jobs)
+(below). Matchers need neither: they are the operator's choice of which
+sources get which credential.
+
 > **Matchers are applied at admission.** The manager evaluates
 > `artifacts.auth` when a job is submitted and stores the effective auth on
 > the normalized artifact list (annotated `authOrigin = "cluster"`). So
@@ -301,16 +308,21 @@ single `legion kv put`. The next fetch picks up the new value, including
 restarts and reschedules of existing jobs. You don't need to edit or
 re-submit the job.
 
-> **⚠️ KV ACL caveat.** KV ACLs (`kv` rules scoped by `paths`, see
-> [auth-and-acls.md](auth-and-acls.md)) govern the KV RPCs, but they do not
-> apply to artifact credentials. Admission does not check the submitter's
-> `kv` read rights for `auth.kv`, and `GetArtifactCredential` is a
-> worker-plane RPC that serves any path to an authenticated worker. So any
-> job may point `auth.kv` at **any** KV path, or use a cluster matcher that
-> does. Anyone with job-submit access can read every credential stored in
-> KV by staging an artifact with it. This matches the trust model for
-> `$path/key` jobspec references. Plan your KV namespace and job-write
-> grants with this in mind.
+**Who can use a credential.** Naming a KV path in `auth.kv` is reading it:
+the fetch sends the value to the source, so `job run`, `job plan`, and
+template runs need `kv:read` on the path, on top of `job:write`:
+
+```console
+$ legion job run fetch.ncl
+error: permission denied: ... (task fetch artifact https://example.com/tool.tgz names auth.kv secrets/ci-pull; the submitter needs kv read on it)
+```
+
+A path a cluster matcher fills in needs no grant. On the worker side,
+`GetArtifactCredential` gives a node only the paths named by an allocation
+placed on it, by the task of a live [boot ticket](edge-boot.md) for its pool
+(a node stages those before the allocation exists), or by its pool's
+`contentStore`. A node asking for any other path gets `NotFound`, decided
+before the value is read, so it learns nothing about which paths exist.
 
 ### Workload-identity auth (pending)
 
@@ -329,6 +341,11 @@ token to stores that trust Legion's issuer. It says either "Legion task
 >   credential. This works for sources that accept bearer auth (`https`,
 >   `oci`, `git`). `s3://` sources reject it, because the S3 fetcher needs an
 >   AWS credential and Legion does not exchange tokens for STS credentials.
+>   The token is the worker node's own credential, sent to whatever source
+>   the artifact names, so a task that sets `auth.nodeIdentity` itself is
+>   [host-level](auth-and-acls.md#host-level-jobs). Route sources to a node
+>   identity with a cluster matcher instead to make it available to every
+>   job.
 > - **Task `identity` does not work yet.** The spec field and admission
 >   validation exist, but the worker does not request task tokens for
 >   artifact fetches. A fetch using `identity` fails with an error
@@ -353,6 +370,82 @@ token to stores that trust Legion's issuer. It says either "Legion task
   argv.
 - `allowedSchemes` is enforced at admission **and** on the worker
   (`artifacts.fetch.allowedSchemes`).
+
+### What the host guard checks
+
+The worker fetches an artifact as root, from a source the job chose, and the
+response lands in the task directory. So an `http(s)` fetch is checked by the
+worker's [host guard](network-handlers.md#the-host-guard), the same one the
+datapath uses: each hop's host is resolved, every address is judged, and the
+connection goes only to addresses that pass. Loopback, link-local (which
+includes `169.254.169.254`), cloud metadata, this node's own addresses, and
+`hostGuard.deny` ranges are refused unless a `hostGuard.allow` entry opens
+that address and port:
+
+```console
+staging failed: http://169.254.169.254/latest/meta-data/: the host guard refuses 169.254.169.254 (link-local); an artifact may not be fetched from it unless the worker's hostGuard.allow opens 169.254.169.254:80
+```
+
+To serve artifacts from the node itself (a dev setup on `localhost`), add an
+allow entry for that port to the worker type's `hostGuard.allow`.
+
+Every other scheme is checked too, as far as its client lets the worker
+hold it to what was judged:
+
+| Source | What is judged | Held to it? |
+| --- | --- | --- |
+| `http(s)://` | every hop's host | Yes: each hop is pinned to the judged addresses, and each redirect is judged again |
+| `git::https://`, `git::http://` | the remote's host | Yes: git is pinned to the judged addresses (`http.curloptResolve`, git 2.37 or later) and may not follow redirects (`http.followRedirects=false`) |
+| `git::ssh://` | the remote's host | Yes: ssh connects to the first judged address and checks the host key under the remote's name |
+| `git::git://` | — | Refused on a guarded worker: nothing can pin it. Use `https://` or `ssh://` |
+| `git::file://` | — | No network |
+| `oci://` | the registry's host | No: the registry client resolves the name again, and follows a blob's or token's redirect on its own |
+| A runtime's own image pull (a `container` or `sandbox` `image` with no staged image artifact) | the registry's host, as `oci://` | No, as `oci://` |
+| `s3://` | the custom endpoint: the `endpoint` query parameter, else the one the KV credential names | No: the S3 client resolves it again and follows redirects |
+
+A guarded `git` fetch also sets `GIT_LFS_SKIP_SMUDGE=1`: a repository's own
+`.lfsconfig` names the LFS host, which nobody judged, so LFS files stage as
+their pointer files. An older git fails the fetch rather than resolving the
+host again unjudged:
+
+```console
+staging failed: git::https://git.internal/acme/tools: this node's git cannot pin a fetch to the addresses the host guard judged (that needs git 2.37 or later); upgrade git
+```
+
+An `s3://` source's `region` (the query parameter or the credential's) must
+be lowercase letters, digits, and hyphens, because it becomes part of the
+default AWS endpoint's host name.
+
+**What is not held.** An `oci://` registry and an `s3://` endpoint are judged
+before the fetch, but their clients resolve the name again and follow
+redirects, and neither the second lookup nor a redirect's target is judged.
+For OCI, every blob is checked against the manifest's digest, so a redirect
+cannot put anything but the image's own bytes in the task directory. An S3
+endpoint that passes the check and answers with a redirect to a guarded
+address is followed.
+
+**The manager's pin lookups.** The tag and branch lookups the manager makes
+at submit (`resolve = "pin"`, below) also go to a host the job chose, from
+the manager, so they are judged the same way: `git ls-remote` is held to
+the judged addresses as in the table above, and an OCI registry is judged
+before the tag's `HEAD`. The manager judges with the guard's built-in
+classes (loopback, the unspecified address, link-local, cloud metadata) and
+its own interface addresses. It has no `hostGuard.allow` or `hostGuard.deny`
+(those are worker settings), so nothing opens a guarded address for a pin
+lookup:
+
+```console
+resolve artifact git::https://127.0.0.1:3000/acme/tools?ref=main at submit failed; fix the reference or set resolve: "always" to re-resolve at staging instead: the source refused the reference: the manager will not look up git::https://127.0.0.1:3000/acme/tools?ref=main at submit: its host guard refuses loopback, link-local and cloud metadata addresses, and the manager's own, and no setting opens them for a pin lookup. Pin the digest or commit yourself, or set resolve: "always" so the worker resolves it, where hostGuard.allow applies: ...
+```
+
+A source on the manager's own machine (a dev registry on `localhost`) takes
+an explicit digest or commit, or `resolve = "always"`, which resolves it on
+the worker at staging, under that worker's `hostGuard.allow`. A `git://`
+source cannot be pinned by the manager, for the reason a guarded worker
+refuses it. Private ranges (`10.0.0.0/8` and the like) are not a guarded
+class, on the manager or a worker. The same limit as the worker's applies to
+OCI: the registry client resolves the name again for the `HEAD`, which is
+not judged.
 
 ## Pinning: `resolve = "pin"` vs `'always'`
 
@@ -403,9 +496,11 @@ plugin's `prepare()`/`start()`:
    bytes and fails the attempt, so corrupt bytes never reach the task
    directory.
 4. Archives unpack with path-traversal protection and a decompressed-size
-   budget. Absolute entry paths, `..` escapes, and symlink or hardlink
-   targets that escape the extraction root are all rejected. Recognized
-   formats: `.tar.gz`, `.tgz`, `.tar`, and bare `.gz`.
+   budget. Absolute entry paths, `..` escapes, and symlink targets that
+   escape the extraction root are rejected, every entry is resolved inside
+   the root on disk (so an earlier entry cannot redirect a later one), and
+   hard links are refused outright. Recognized formats: `.tar.gz`, `.tgz`,
+   `.tar`, and bare `.gz`.
 5. Content moves into `dest`. A collision with an existing file is an error,
    not an overwrite. The temp area is always cleaned up.
 6. The task starts with `${artifact.<name>}` interpolated and
@@ -425,8 +520,8 @@ type:
     fetch = {
       parallelism = 4,           # concurrent fetches per worker
       attempts = 3,              # per-artifact tries before the allocation fails
-      timeout = "10m",           # overall fetch deadline per artifact
-      maxArtifactSize = "50GiB", # per-artifact cap; also bounds decompression
+      timeout = "2h",            # overall fetch deadline per artifact
+      maxArtifactSize = "1TiB",  # per-artifact cap; also bounds decompression
       # allowedSchemes = [...]  # worker-side allowlist (defaults to the cluster default)
     },
   },
@@ -436,14 +531,21 @@ type:
 Workers without an `artifacts` block get these defaults. The settings are
 delivered through the existing worker pre-registration config flow.
 
-> **Failure semantics: fetch failures use up your `on_unhealthy` budgets.**
+The defaults are sized for model weights: a 70B checkpoint is around 140 GB,
+which takes about 19 minutes over a 1 Gbps link, so the deadline is two hours
+and the size cap one tebibyte. `maxArtifactSize` also caps how much an
+archive may expand to, so lower it on nodes that fetch from sources you do
+not trust. The deadline is a whole-fetch deadline, not a stall timeout: a
+download that stalls holds its allocation until the deadline passes.
+
+> **Failure semantics: fetch failures use up your `onUnhealthy` budgets.**
 > A staging failure (404 after retries, checksum mismatch, timeout, oversize,
 > missing credential) is an **allocation failure**. It is reported through
 > the same heartbeat path as a crashed task, and the manager handles it with
-> the existing `on_unhealthy` restart/move logic. So a flaky registry or
+> the existing `onUnhealthy` restart/move logic. So a flaky registry or
 > object store uses up the task's restart and move budget, the same way an
 > unhealthy task does. For jobs that pull from less reliable origins, size
-> `on_unhealthy.restart_count`/`move_count` with that in mind. There is no
+> `onUnhealthy.restartCount`/`moveCount` with that in mind. There is no
 > separate `onFetchFailure` policy yet to treat a registry outage
 > differently from an unhealthy task.
 
@@ -502,7 +604,154 @@ needs no registry request; a tag costs one `HEAD` to check where it points,
 and a moved tag downloads only the layers the node lacks. The details, and
 how a registry outage is handled, are in
 [docs/task-runtime-container.md](task-runtime-container.md#image-cache).
-ORAS artifacts (`oci://` with a `mediaType`) are not cached yet.
+
+The store has three budget classes, each with its own byte budget and its own
+least-recently-used order, so one kind of content cannot evict another:
+
+| Class | Holds | Default budget (`content.budgets.<class>`) |
+| --- | --- | --- |
+| `artifacts` | fetched artifacts and image blobs | 50% of the disk, at least 1 GiB |
+| `snapshots` | checkpoint parts | 20% of the disk, clamped to 2 GiB..200 GiB |
+| `derived` | what Legion builds on the node ([derived content](#derived-content)) | 10% of the disk, clamped to 1 GiB..20 GiB |
+
+All three share `content.ttl` (an unpinned entry unused for 72 hours is
+removed), `content.minFreeDisk` (5 GiB), pinning, and a garbage collection
+pass every 10 minutes.
+
+A worker with a metrics listener exports what each class holds, holds
+pinned, and may hold as `legion_content_store_bytes{class}`,
+`legion_content_store_pinned_bytes{class}`, and
+`legion_content_store_budget_bytes{class}` ([metrics.md](metrics.md#worker)).
+
+### Derived content
+
+Some of what a worker needs it does not fetch: it builds it, from content it
+has already fetched and verified. A sandbox's base root disk is built from
+its image's layers. Such a thing is expensive to build, the same for every
+unit of its inputs on the node, and safe to throw away, because the node can
+build it again. Legion keeps all of it in one place, the `derived` class of
+the node content store, so there is one budget to size and one order in which
+rebuildable things leave a full disk.
+
+What is kept there today:
+
+| Kind | Built from | Used by |
+| --- | --- | --- |
+| `rootfs` | an image's layers, the guest binary, and the task's `rootfs_headroom_mib` | [sandbox starts](task-runtime-sandbox.md#the-root-disk-cache) |
+| `cwasm` | a WebAssembly component's digest and the `legion-isolate` engine's compatibility key, compiled by a `legion-isolate compile` child process | [isolate tasks](task-runtime-isolate.md#compilation): every host process on the node maps it read-only |
+
+The class also defines the kinds `preinit-image`, `preinit-entry`, and
+`vm-base`. Nothing builds them yet.
+
+When the class cannot keep a `cwasm` entry (its budget is `"0"`, or there
+is no room), the worker compiles into an `isolates/cwasm/` directory beside
+its state file instead, which the isolate hosts can also read.
+
+How it behaves:
+
+- **An entry is named by what it was built from.** Its key is a hash of the
+  kind, every input, and the version of the code that built it (its
+  *recipe*), not of its bytes. Two starts with the same inputs share an
+  entry. A new input, or a new builder, is a new entry.
+- **A burst builds once.** Starts that need an entry while it is being built
+  wait for that build.
+- **A half-built entry never exists.** A build fills a directory under
+  `content/derived/tmp/` and is moved into place with one rename. A crash
+  mid-build leaves only a temp directory, which the worker clears when it
+  starts.
+- **One budget, one order.** The class keeps at most `content.budgets.derived`
+  bytes, counted in disk blocks actually used, and evicts the least recently
+  used unpinned entry first, whatever its kind. An entry larger than the
+  whole budget is built for the start that needs it and never kept.
+- **Rebuildable content goes first.** When the disk is below
+  `content.minFreeDisk`, nothing derived is kept, and a write that needs the
+  room evicts derived entries before it evicts an artifact or a checkpoint
+  part.
+- **Nothing of one allocation is in an entry.** A recipe's inputs are content
+  digests, numbers, and SHA-256 fingerprints, never raw text, so an entry
+  cannot hold an env value, a hostname, or an identity. Whatever is specific
+  to one allocation is written into that allocation's own copy.
+- **It is built here and stays here.** A derived entry is produced on its
+  node by Legion's own builder, from inputs the node verified against their
+  digests. No API puts one, reads one off a node, or publishes one, and
+  derived entries are left out of what a node advertises for
+  [content locality](#content-locality), so no node fetches one from another.
+  A new node builds its own.
+
+Set the budget in the worker type's `content` block:
+
+```nickel
+content = {
+  budgets = {
+    derived = "15%",   # a share of the disk, a size such as "40GiB", or "0"
+  },
+},
+```
+
+| Value | Meaning |
+| --- | --- |
+| unset (default) | 10% of the filesystem holding the content store, clamped to 1 GiB..20 GiB |
+| a size, such as `"40GiB"` | that many bytes |
+| a share, such as `"15%"` | that share of the filesystem, with no clamp |
+| `"0"` or `"off"` | the class is off: nothing derived is kept, and every start builds what it needs |
+
+A share you set counts toward the rule that `artifacts`, `snapshots`, and
+`derived` shares add up to at most 100%. The clamped default does not.
+
+The entries live at `<worker state dir>/content/derived/<kind>/<key>/`, on
+the same filesystem as the allocation directories, so a sandbox's disk can be
+a reflink of its base.
+
+`legion node content <node>` lists a node's derived entries with the class
+budget and bytes used, as do `GetNodeContent`, the MCP tool
+`legion_node_content`, and the worker page's "Content and locality" card:
+
+```console
+$ legion node content w-17
+Node w-17  publish: yes  checkpoint: yes
+Advertises 0 entries, 0 MiB (epoch 3)
+
+Derived content: 2 entries, 1300 of 20480 MiB
+ KIND    KEY           MiB   BUILDER                 PINNED
+ rootfs  7c1e5a0b9d3f  940   legion-0.1.0+rootfs.1   no
+ rootfs  0b9d3f42687c  360   legion-0.1.0+rootfs.1   no
+```
+
+`-j` adds each entry's inputs and its created and last-used times. The
+worker's metrics endpoint has `legion_derived_builds_total{kind,outcome}`,
+`legion_derived_build_seconds{kind}`, `legion_derived_hits_total{kind}`, and
+`legion_derived_bytes` ([metrics](metrics.md)).
+
+What to expect when something is off:
+
+| What you see | Why | What to do |
+| --- | --- | --- |
+| `Sandbox root disk ready ... root_disk=built, not cached: the base is larger than the cache budget` | The entry is larger than `content.budgets.derived` | Raise the budget |
+| `... built, not cached: the disk is below minFreeDisk` | The disk is below `content.minFreeDisk` | Free disk, or lower the floor |
+| `Sandbox root disk cache off (content.budgets.derived is 0)` at worker start | The class is turned off | Remove the `"0"` |
+| `Sandbox root disk cache off (this node has no content store)` | `content.enabled = false`, or the store could not open | Enable the content store |
+| `Derived content` missing from `legion node content` | The node's worker has no content store, or its report has not reached this manager | Check the worker log and `indexReported` |
+| `legion_derived_builds_total{outcome="no_room"}` rising | Pinned entries fill the budget | Raise the budget |
+
+### ORAS layers
+
+**ORAS artifacts** (`oci://` with a `mediaType`, how model weights usually
+ship) go through the store per layer, by the layer's digest: a layer the node
+holds is copied into the task's `layers/` directory instead of downloaded,
+even under a new tag or a new manifest that reuses it. A new model version
+that changed two of thirty shards downloads two. The copy is a local,
+in-kernel copy (a reflink on filesystems that offer one), so a task can
+write to its layer files without changing what the next allocation gets; on
+the first pull the layer is downloaded once and a copy kept. The manifest is
+still read from the registry on every stage, with the job's credential, so a
+tag that moved is noticed and a credential the registry refuses fails the
+stage. A layer is served from the store only to a pull from the repository
+it was downloaded and verified in, as for a cached image (see [Who a cached
+image is served to](#who-a-cached-image-is-served-to)): a manifest in
+another repository that lists the same digest gets its layers from its own
+registry, never the node's copy. The worker logs
+`ORAS layers ready (node content store)` with `layers_cached` and
+`layers_pulled`.
 
 Tasks always get their own copy. A task that writes to its staged file cannot
 change what the next allocation receives. A blob that fails digest
@@ -539,6 +788,7 @@ Configure the store per worker type:
     budgets = {
       artifacts = "10%",     # cached artifacts: a share of the disk or a size
       snapshots = "50GiB",   # checkpoint parts
+      derived = "15%",       # what Legion builds on the node (root disk bases). "0" turns it off
     },
     ttl = "72h",             # unpinned content unused this long is removed. "0s" disables
     minFreeDisk = "5GiB",    # evict, then refuse, rather than drop below this
@@ -553,29 +803,50 @@ filesystem's total size, and logs the result (`Sized node content store
 budgets`). A disk that grows or shrinks takes effect at the next worker
 start.
 
-Without a `budgets` entry, a class takes its default share, clamped so that
+Without a `budgets` entry, a class takes its default share, bounded so that
 very small and very large disks still get a sensible budget:
 
-| Class | Default | Clamp | 8 GiB disk | 100 GiB disk | 1 TiB disk |
+| Class | Default | Bounds | 8 GiB disk | 100 GiB disk | 1 TiB disk |
 | --- | --- | --- | --- | --- | --- |
-| `artifacts` | 10% | 1 GiB to 20 GiB | 1 GiB | 10 GiB | 20 GiB |
+| `artifacts` | 50% | at least 1 GiB, no ceiling | 4 GiB | 50 GiB | 512 GiB |
 | `snapshots` | 20% | 2 GiB to 200 GiB | 2 GiB | 20 GiB | 200 GiB |
+| `derived` | 10% | 1 GiB to 20 GiB | 1 GiB | 10 GiB | 20 GiB |
 
-The artifact cache caps at 20 GiB because a miss costs one refetch, so a
-bigger cache buys little. The snapshot budget caps at 200 GiB so a node with
-a multi-terabyte data disk keeps most of it for volumes unless you ask for
-more. A share you set yourself (`snapshots = "40%"`) is not clamped. On a
-small disk the floors can add up to more than 30% of it, and then
-`minFreeDisk` is what protects the node: the store evicts unpinned content,
-then refuses new content, before free space drops below it, and the
-scheduler counts it when it checks a node's
+The artifact cache has no ceiling because model weights are the largest
+artifacts a node pulls: one 70B checkpoint is around 140 GB, and a miss costs
+a download of that size. (It used to be 10% capped at 20 GiB, which held no
+large model at all.) The [derived](#derived-content) budget caps at 20 GiB
+because everything in it can be rebuilt and it only has to hold what is in
+use: that is a dozen or more typical sandbox images. The snapshot budget caps at 200 GiB so a node with a
+multi-terabyte data disk keeps most of it for volumes unless you ask for
+more. A share you set yourself (`snapshots = "40%"`) is not bounded, unless
+you write it as an object with bounds:
+
+```nickel
+budgets = {
+  artifacts = { share = "50%", max = "2TiB", min = "10GiB" },   # both bounds optional
+  snapshots = "15%",
+},
+```
+
+The floors add up to 4 GiB. On a disk too small for them, they give way
+until the budgets fit the filesystem: each budget a floor lifted above its
+plain share is lowered toward that share, in proportion to how far its floor
+lifted it, and none drops below its share. On a 1.2 GB disk the defaults
+come to about 634 MB for artifacts, 377 MB for snapshots, and 189 MB for
+derived content, 1.2 GB together. A fixed size is never lowered, and a disk
+the floors fit (8 GiB and up with the defaults) keeps the table above.
+`minFreeDisk` still protects the node on top of the budgets: the store
+evicts unpinned content, then refuses new content, before free space drops
+below it, and the scheduler counts it when it checks a node's
 [checkpoint room](suspend-and-resume.md#the-checkpoint-disk-budget).
 
 Every field is optional. A malformed size, percentage, or duration fails
 manager startup, not the worker. So do shares that add up past the disk:
 `artifacts = "90%"` beside the default 20% for snapshots fails with
 `content.budgets.artifacts (90%) and content.budgets.snapshots (20%, the
-default) together claim 110% of the disk`. If a worker cannot read the size
+default) together claim 110% of the disk`. A `derived` share you set counts
+toward that sum, and the capped default does not. If a worker cannot read the size
 of its content filesystem, it cannot size a share, so it logs `Cannot size
 the node content store` and runs without a store. Set fixed sizes on such a
 platform. The worker runs garbage collection every 10 minutes (TTL
@@ -669,8 +940,11 @@ node's pool, and snapshot rows also need `snapshot:read` on their job.
 Because the index is soft state, the reply says `index_reported: false`
 when this manager holds no report from the node (it just started, the node
 has no store or an older worker, or the node reports to another manager).
-It lists entries of 1 MiB and up only, and carries no per-class budgets:
-the index records digests and sizes, not classes.
+It lists entries of 1 MiB and up only, and carries no budgets for the
+`artifacts` and `snapshots` classes: the index records digests and sizes,
+not classes. [Derived content](#derived-content) is the exception. It is
+never advertised by digest, so the node reports the class whole and the
+reply carries it in `derived`, with its budget and bytes used.
 
 ### Publishing content
 
@@ -687,29 +961,80 @@ published part is sealed (encrypted) first. Configure it per worker type with
     # Takes the same ?region= and ?endpoint= query parameters as s3 artifacts.
     url = "s3://legion-content-usw2/",
     # Optional. Omit it to use the node's ambient AWS credentials (the AWS_*
-    # environment variables, then the instance profile). Or read an AWS
-    # credential object from KV, the same shape artifact `auth.kv` takes:
+    # key variables, web identity, an ECS task role, then the instance
+    # profile). Or read an AWS credential object from KV, the same shape
+    # artifact `auth.kv` takes:
     auth = { kv = "legion/content-store" },
+    # Optional. The size published parts are cut into, and how long chunks
+    # are shared between publishes (see "How published parts are stored").
+    chunkSize = "1MiB",
+    dedupWindow = "24h",
   },
 }
 ```
 
-Published content lands at `<url>/sealed/<name>`, encrypted with
-AES-256-GCM under a key the manager derives for that part from the cluster's
-checkpoint key (see
-[published checkpoint encryption](suspend-and-resume.md#published-checkpoint-encryption)).
-The key and the name are both a keyed function of the content's digest, so
-publishing is idempotent: publishing bytes the destination already holds
-uploads nothing. The worker hashes the bytes as it seals them, so corrupt
-bytes are never published, and it records the published URL per digest in
-its store's index. Sealing and S3 uploads both stream (1 MiB chunks, 16 MiB
-upload parts), so a multi-gigabyte file never sits in memory. There is no
-plaintext mode.
+The example keeps the credential under the reserved `legion/` KV prefix,
+which suits a cluster-wide secret: a tenant's `paths = ["*"]` rule cannot
+read or overwrite it, and writing it takes a management token or a rule
+whose `paths` starts with `legion/` ([KV store](kv-store.md#data-model)).
 
-Reads never use the publisher. Any worker fetches published content with the
-ordinary `s3://` or `file://` fetcher, opens it in place with the key the
-manager sent along with the work, and checks the plaintext against the
-digest before it lands in that worker's own store. Pointing each region's
+**Ambient credentials.** With no `auth`, every client of the store (the
+publisher, [session manifests](session-mode.md), a restoring node's fetches,
+and the manager's [archive](suspend-and-resume.md#archiving-idle-instances) reads)
+signs as the node, resolved in the order
+[streaming persistence](persistence-streaming.md#credentials) uses: the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`)
+variables, then web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` +
+`AWS_ROLE_ARN`, which EKS IRSA injects), then an ECS task role
+(`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`), then the instance profile. Half
+a key pair fails the operation. A configuration that is ambiguous — one of
+the two web-identity variables without the other, or EKS Pod Identity
+(`AWS_CONTAINER_CREDENTIALS_FULL_URI`), which is not supported — continues
+down the chain, usually to the instance profile, and the process logs a
+warning once that names the variable:
+
+```text
+WARN Object storage continues down the AWS credential chain problem="AWS_WEB_IDENTITY_TOKEN_FILE is set but AWS_ROLE_ARN is not; web identity needs both, and without them object storage would fall back to instance metadata"
+```
+
+Streaming persistence refuses the same configurations instead
+([Credentials](persistence-streaming.md#credentials)), so a backup never signs
+as a broader principal than the one configured.
+
+**Region.** An `s3://` store's region is the URL's `?region=`, then the KV
+credential's `region`, then the node's `AWS_REGION` (or `AWS_DEFAULT_REGION`),
+then `us-east-1`. Publishing and reading resolve it the same way, so a part is
+read in the region it was published to. The node's other `AWS_*` store
+settings (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, server-side encryption, proxy
+options) apply too. A KV credential's keys are used as written: the node's
+own `AWS_*` key variables never mix into them.
+
+A `file://` store is written through `object_store`'s local filesystem: each
+object is written beside its final name as `<name>#<n>` and renamed into
+place, so a reader never sees a partial object. An interrupted write can
+leave a `#<n>` file behind. It is never read or listed as an object.
+
+Published content is cut into chunks (`chunkSize`, 1 MiB by default), and
+each distinct, non-zero chunk lands once at `<url>/sealed/<name>`, beside a
+sealed index per part that lists them. Every object is encrypted with
+AES-256-GCM under keys derived from the cluster's checkpoint key (see
+[published checkpoint encryption](suspend-and-resume.md#published-checkpoint-encryption)).
+A chunk's key and name are a keyed function of its digest, its job, and
+the current dedup window (`dedupWindow`, 24 hours by default), so
+publishing is idempotent and incremental: chunks the destination already
+holds in the window are not uploaded again, and zero chunks never are (see
+[How published parts are stored](suspend-and-resume.md#how-published-parts-are-stored)).
+The worker hashes the bytes as it reads them, so corrupt bytes are never
+published, and it records the published URL per digest in its store's
+index. Chunks upload 16 at a time, so a multi-gigabyte part never sits in
+memory. There is no plaintext mode. A `chunkSize` outside 64 KiB to
+16 MiB, or not a multiple of 4 KiB, and a `dedupWindow` under a minute, fail
+manager startup like any malformed `contentStore`.
+
+Reads never use the publisher. Any worker reads a part's index from its
+`s3://` or `file://` URL, opens it with the key the manager sent along with
+the work, fetches and opens the chunks it lists, and checks the reassembled
+plaintext against the digest before it lands in that worker's own store. Pointing each region's
 workers at their own bucket is how region locality works: Legion does not
 replicate between buckets.
 
@@ -732,15 +1057,18 @@ submission):
   a restoring node signs part fetches only for URLs under its own
   contentStore.url (here: s3://legion-content-usw2/), so this fetch was
   anonymous. Give this node the same contentStore url and auth as the node
-  that published the snapshot: fetching s3://legion-content-use1/sealed/…
-  after 3 attempt(s): … 403 Forbidden
+  that published the snapshot: fetching s3://legion-content-use1/sealed/…:
+  fetching part index … after 3 attempt(s): … 403 Forbidden
   ```
 
 So every node that may restore a snapshot needs the same `contentStore` (url
 and auth) as the node that published it. A node reads only its own store, so
 a snapshot published to one region's bucket cannot be restored on a node
-configured for another region's bucket. Constrain the resume to the
-publishing region instead.
+configured for another region's bucket. The scheduler prefers a node whose
+`contentStore` holds every part: each worker advertises its store's URL as
+the `contentStore` node attribute. It falls back to the other candidates
+only when no such node is eligible, so constrain the resume to the
+publishing region when those others cannot read the store.
 
 A malformed `contentStore` (an unsupported scheme, a bucket-less URL, `auth`
 on a `file://` store) fails manager startup. A worker whose content store is
@@ -749,8 +1077,8 @@ disabled logs that it cannot publish and carries on.
 **What publishes today: durable checkpoints.** A suspend with
 `suspend.durability = "store"`, and `legion snapshot create --publish`, have
 the capturing worker publish each memory part of the checkpoint here once it
-is captured. Another node then restores it by fetching the parts through its
-ordinary fetchers, verified by digest, into its own content store (see
+is captured. Another node then restores it by fetching each part's index and
+chunks, verified by digest, into its own content store (see
 [suspend and resume](suspend-and-resume.md#durability-surviving-the-node)).
 A worker with a usable `contentStore` advertises the `content-publish`
 capability when it registers, and `instance suspend` with `durability =
@@ -760,8 +1088,11 @@ content store, so `content.enabled = false` turns publishing off too.
 Published parts hold guest memory, secrets included, so they are only ever
 stored sealed. Restricting the bucket to your workers is still good practice,
 since object sizes are visible to anyone who can list it. Legion never
-deletes from the store, because one object can belong to more than one
-snapshot. Expire objects with bucket lifecycle rules.
+deletes from the store, because one chunk can belong to many checkpoints.
+Expire objects under `sealed/` with a bucket lifecycle rule older than your
+longest-lived checkpoint plus `dedupWindow`: a publish reuses only chunks
+uploaded in its own window, so that rule never removes a chunk a live
+checkpoint needs.
 
 **Warming.** `legion snapshot warm <snapshot> --constraint key=value` asks
 matching nodes to fetch a published snapshot's parts into their stores ahead
@@ -851,12 +1182,49 @@ staged OCI layout into the local runtime:
   with `<runtime> run --bundle`. See
   [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).
 
-The flag defaults to **off** until the
-[node content store](#the-node-content-store) caches images. It caches only
-single files today, so Legion-managed pulls download the image again for
-every allocation. That
-would be a step backward for runtimes that cache images themselves. With the
-flag off, container behavior is unchanged.
+The flag defaults to **off**. On Linux it does not change how often an image
+is downloaded: with it on or off, the worker pulls through the
+[node content store](#the-node-content-store), so a node downloads each
+layer once and a tag costs one `HEAD` request per start (Apple `container`
+pulls for itself when the flag is off). What the flag adds is the artifact
+pipeline's auth matchers, digest pinning, and status rows.
+
+### Who a cached image is served to
+
+The node content store is shared by every job on the node, and a cached blob
+says nothing about who may read it. So the worker records, for each image,
+the repository (`registry/repo`) it pulled and verified it from, and whether
+that registry served it with no credential. A pull is served from the cache
+only when:
+
+- the image came from **this same repository** (another registry answering
+  for the same digest proves nothing), and
+- it was **public** there, or the registry **accepts this job's credential**
+  for it: a successful lookup of the tag or the digest with that credential
+  in the last 10 minutes, or one manifest `HEAD` by digest now.
+
+A registry that refuses the job's credential fails the pull, with the cache
+never consulted:
+
+```console
+staging failed: oci://ghcr.io/acme/api@sha256:4f…: the registry refused this job's credentials for an image this node holds; a cached private image is served only to jobs its registry lets pull it
+```
+
+When the registry cannot answer (down, rate limited, unreachable), a tag
+falls back to the digest it last resolved to on this node only for a public
+image, or for a credential the registry accepted in the last 10 minutes.
+Otherwise the registry's error stands. A worker restart forgets those
+acceptances, so a private image's first start after a restart needs its
+registry. A pull the cache is not authorized for fetches its manifests from
+the registry, which so checks the credential, and reuses only the layers the
+node already verified from that same repository, so a moved tag still
+downloads only the layers that changed. An image cached before the worker
+recorded provenance is pulled from its registry once more, on its next start.
+
+Layer digests still act as names: a job that gets its own registry to serve a
+manifest listing another image's layers, in its own repository, does not get
+those layers from this cache, because they were never verified from that
+repository.
 
 ## Fetcher plugins
 
@@ -866,13 +1234,13 @@ dylib pattern as task-runtime plugins (see
 
 ```
 plugins/artifacts/<scheme>/
-  plugin.json                              # {"kind":"artifacts","name":"<scheme>","legionApiVersion":2}
+  plugin.json                              # {"kind":"artifacts","name":"<scheme>","legionApiVersion":3}
   Cargo.toml                               # cdylib depending on the legion crate
-  src/lib.rs                               # exports get()
+  src/lib.rs                               # legion::export_artifact_fetcher!(...)
 ```
 
 The plugin implements the blocking `ArtifactFetcher` trait
-(`src/artifacts/fetcher.rs`) and exports a `get` constructor:
+(`crates/worker/src/artifacts/fetcher.rs`) and exports it with `legion::export_artifact_fetcher!`:
 
 ```rust
 use legion::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};
@@ -890,13 +1258,10 @@ impl ArtifactFetcher for MyFetcher {
     }
 }
 
-// Required: lets the host refuse a mismatched build (docs/plugin-system.md).
-legion::declare_plugin_abi!();
-
-#[no_mangle]
-pub extern "C" fn get() -> Box<dyn ArtifactFetcher> {
-    Box::new(MyFetcher)
-}
+// Required: the build fingerprint (the host refuses a mismatched build), the
+// panic probe, and a constructor whose fetcher contains its own panics
+// (docs/plugin-system.md, "Panics and quarantine").
+legion::export_artifact_fetcher!(MyFetcher);
 ```
 
 Resolution order is **built-ins first, then plugins**. When no built-in
@@ -920,17 +1285,33 @@ Remember the allowlists. Add a custom scheme to the cluster's
 
 ## Limitations
 
-- **The node content store caches digest-pinned single files and container
-  images.** A file artifact needs a `checksum` and an `http(s)`, `s3`, or
-  `file` source; an `oci://` image is cached per blob. Git trees, `file://`
-  directories, ORAS layers, and artifacts without a `checksum` fetch from
-  origin for every new allocation. There is
+- **The node content store caches digest-pinned single files, container
+  images, and ORAS layers.** A file artifact needs a `checksum` and an
+  `http(s)`, `s3`, or `file` source; an `oci://` image or ORAS artifact is
+  cached per blob. Git trees, `file://` directories, and artifacts without a
+  `checksum` fetch from origin for every new allocation. There is
   no TTL-based revalidation of mutable URLs, so a plain URL without a
   checksum is never served from the store. Add a `checksum` to opt in.
+- **Derived content is never shared between nodes.** Each node builds its
+  own entries, and there is no way to fetch one built elsewhere or to publish
+  one. A node that joins builds each base on its first start of that image.
+- **The derived class has one budget for every kind.** There is no per-kind
+  floor, so a kind with large entries can evict another kind's.
+- **Derived content needs the content store.** With `content.enabled = false`
+  nothing derived is kept, and every sandbox start builds its root disk.
+- **At most 256 derived entries are listed per node.** `entryCount` carries
+  the real number.
 - **No pre-warming for artifacts.** The store fills only when an allocation
   stages, or when `snapshot warm` pulls a published snapshot's parts. There
   is no artifact pre-pull and no way to list or clear the store from the CLI.
   Each node's store is its own: a new node always fetches from origin.
+- **No peer-to-peer distribution or lazy loading.** A hundred nodes starting
+  the same model each download it from the registry (nothing like Dragonfly
+  or Spegel shares it between nodes), and a task starts only once every
+  selected layer is on disk (nothing like SOCI or Nydus streams it on
+  demand). A registry or object store close to the nodes is the workaround.
+- **Fetches are not resumable.** A download that fails partway starts over on
+  the next attempt.
 - **Locality covers digest-pinned artifacts only.** Container image layers
   are not in the content store, so images do not count toward a placement's
   content set.
@@ -941,6 +1322,12 @@ Remember the allowlists. Add a custom scheme to the cluster's
 - **`contentStore.auth.nodeIdentity` is rejected.** S3 uploads need an AWS
   credential, and node identity tokens are not exchanged for one. Use
   `auth.kv` or the node's ambient credentials.
+- **EKS Pod Identity, `~/.aws/credentials` profiles and SSO are not
+  ambient sources.** `object_store`'s AWS chain stops at the four sources
+  above. With Pod Identity set, a `contentStore` signs as the node's
+  instance role (with a warning); on EKS use IRSA, or `auth.kv`.
+- **`s3://` is the only object-store backend.** There is no GCS-native or
+  Azure path; S3-compatible endpoints (R2, MinIO, GCS interop) work.
 - **Checksums verify single-file payloads** (and, for OCI, the manifest
   digest). Declaring a `checksum` on a source that produces a tree (git,
   `file://` directories) is a staging error, not a silent skip.
@@ -964,7 +1351,7 @@ Remember the allowlists. Add a custom scheme to the cluster's
   pointing at a host path the container can't see.
 - **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`. `zip` and `zstd`
   are not recognized yet. Use `unpack = "file"` to stage such files as-is.
-- **Fetch failures use up `on_unhealthy` budgets** (see
+- **Fetch failures use up `onUnhealthy` budgets** (see
   [Failure semantics](#staging-mechanics)). There is no dedicated
   `onFetchFailure` policy yet.
 - **Windows staging** has not been specifically tested.

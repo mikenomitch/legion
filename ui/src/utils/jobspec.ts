@@ -442,7 +442,7 @@ const normalizeTask = (value: unknown): JobTask | null => {
 }
 
 // Every submission gets the rendered spec under this path (submit_rendered_job
-// in src/manager/server.rs); it is the one submission that is always the spec.
+// in crates/manager/src/manager/server.rs); it is the one submission that is always the spec.
 export const RENDERED_SPEC_SUBMISSION = 'job.rendered.json'
 
 const parseSubmissionContent = (content: string): JobSpecData | null => {

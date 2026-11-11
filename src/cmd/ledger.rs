@@ -1,6 +1,8 @@
-use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag};
+use crate::cmd::helpers::{connect_manager_client, job_arg, json_flag, namespace_flag};
+use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
-use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, Node};
+use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, LedgerNodeExt, Node};
+use clap::Arg;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -22,6 +24,10 @@ struct LedgerJsonAllocation {
     job_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     instance_id: Option<String>,
+    /// The resize override on the allocation (docs/resize.md): what
+    /// differs from its task's spec, who set it, and why. Absent at spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources_override: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -50,6 +56,7 @@ impl From<&Allocation> for LedgerJsonAllocation {
             task_config_id: allocation.task_config_id,
             job_id: allocation.job_id.clone(),
             instance_id: allocation.instance_id.clone(),
+            resources_override: None,
         }
     }
 }
@@ -69,33 +76,76 @@ impl From<&LedgerEntry> for LedgerJsonEntry {
 
 pub fn config() -> Command {
     Command::new("ledger")
-        .about("Shows the current state of the ledger")
+        .about(
+            "\
+            Shows the current state of the ledger: every node and the allocations on it\n\
+            \n\
+            With --job, only that job's allocations, and only the nodes that run one.\n\
+            \n\
+            Examples:\n\
+              legion ledger\n\
+              legion ledger --job web -j\n\
+              legion ledger --job payments/api\
+            ",
+        )
+        .arg(
+            Arg::new("job")
+                .long("job")
+                .value_name("JOB")
+                .help("Only this job's allocations (`name`, or `namespace/name`)"),
+        )
+        .arg(namespace_flag())
         .arg(json_flag())
 }
 
 #[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let job = job_arg(matches, "job")?;
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetLedgerRequest {});
-    let response = client
-        .get_ledger(request)
-        .await
-        .map_err(|status| friendly_status("failed to request ledger state", status))?;
+    let response = output::resolve(
+        format,
+        "failed to request ledger state",
+        client.get_ledger(request).await,
+    )?;
     let ledger_nodes = response.into_inner().nodes;
+    // The override rides on the wire allocation only; keep it by id before
+    // the rows are decoded into the core type, which carries none.
+    let overrides: std::collections::HashMap<i64, Value> = ledger_nodes
+        .iter()
+        .flat_map(|node| node.allocations.iter())
+        .filter(|allocation| !allocation.resources_override.trim().is_empty())
+        .filter_map(|allocation| {
+            serde_json::from_str(&allocation.resources_override)
+                .ok()
+                .map(|record| (allocation.id, record))
+        })
+        .collect();
 
-    let ledger: Vec<LedgerEntry> = ledger_nodes
+    let mut ledger: Vec<LedgerEntry> = ledger_nodes
         .into_iter()
         .map(|node| node.into_entry())
         .collect::<R<Vec<_>>>()?;
+    if let Some(job) = job.as_deref() {
+        filter_to_job(&mut ledger, job);
+    }
 
-    if matches.get_flag("json") {
-        let json_entries: Vec<LedgerJsonEntry> = ledger.iter().map(LedgerJsonEntry::from).collect();
-        println!(
-            "{}",
-            serde_json::to_string(&json_entries).context("failed to serialize ledger to JSON")?
-        );
+    if format.is_json() {
+        let mut json_entries: Vec<LedgerJsonEntry> =
+            ledger.iter().map(LedgerJsonEntry::from).collect();
+        for allocation in json_entries
+            .iter_mut()
+            .flat_map(|entry| entry.allocations.iter_mut())
+        {
+            allocation.resources_override = overrides.get(&allocation.id).cloned();
+        }
+        output::print_success(&json_entries);
     } else if ledger.is_empty() {
-        println!("No nodes registered in the ledger.");
+        match job.as_deref() {
+            Some(job) => println!("No allocations for job {job}."),
+            None => println!("No nodes registered in the ledger."),
+        }
     } else {
         println!("Ledger:");
         for entry in ledger {
@@ -113,12 +163,85 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
                 let resources = serde_json::to_string_pretty(&alloc.resources)
                     .unwrap_or_else(|_| "{}".to_string());
                 println!(
-                    "  • Allocation {} (task {}, job {}): status {}\n    Resources: {}\n",
-                    alloc.id, alloc.task_config_id, alloc.job_id, alloc.status, resources
+                    "  • Allocation {} (task {}, job {}): status {}\n    Resources: {}{}\n",
+                    alloc.id,
+                    alloc.task_config_id,
+                    alloc.job_id,
+                    alloc.status,
+                    resources,
+                    overrides
+                        .get(&alloc.id)
+                        .map(|record| format!("\n    Resized (override over the spec): {record}"))
+                        .unwrap_or_default()
                 );
             }
         }
     }
 
     Ok(())
+}
+
+/// Keeps only `job`'s allocations, and only the nodes that hold one.
+fn filter_to_job(ledger: &mut Vec<LedgerEntry>, job: &str) {
+    for entry in ledger.iter_mut() {
+        entry
+            .allocations
+            .retain(|allocation| allocation.job_id == job);
+    }
+    ledger.retain(|entry| !entry.allocations.is_empty());
+}
+
+#[cfg(test)]
+mod ledger_filter_test {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(node: &str, jobs: &[(i64, &str)]) -> LedgerEntry {
+        let node: Node = serde_json::from_value(json!({
+            "id": node, "status": "ready", "pool": "default", "availability": "eligible",
+            "lastHeartbeat": "", "configAttrs": {}, "fingerprintAttrs": {},
+            "dynamicAttrs": {}, "healthChecks": {},
+        }))
+        .expect("node");
+        let allocations = jobs
+            .iter()
+            .map(|(id, job)| Allocation {
+                id: *id,
+                status: "running".into(),
+                resources: json!({}),
+                node_id: node.id.clone(),
+                job_config_id: "1".into(),
+                task_config_id: 1,
+                job_id: (*job).into(),
+                instance_id: None,
+                network: None,
+            })
+            .collect();
+        LedgerEntry { node, allocations }
+    }
+
+    #[test]
+    fn job_filter_keeps_only_that_jobs_allocations_and_their_nodes_test() {
+        let mut ledger = vec![
+            entry("a", &[(1, "web"), (2, "db")]),
+            entry("b", &[(3, "db")]),
+            entry("c", &[]),
+            entry("d", &[(4, "payments/web"), (5, "web")]),
+        ];
+        filter_to_job(&mut ledger, "web");
+        let kept: Vec<(String, Vec<i64>)> = ledger
+            .iter()
+            .map(|e| {
+                (
+                    e.node.id.clone(),
+                    e.allocations.iter().map(|a| a.id).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("a".to_string(), vec![1]), ("d".to_string(), vec![5])],
+            "a namespaced job of the same name is a different job"
+        );
+    }
 }

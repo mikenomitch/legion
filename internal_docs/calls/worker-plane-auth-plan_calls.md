@@ -312,7 +312,7 @@ worker extracts layers itself, shifting ownership costs nothing extra.
 The worker generates its key and sends a CSR. The manager no longer returns
 private keys to anyone.
 
-**Alternative.** Keep the current design (`src/manager/mesh_ca.rs:72-75`):
+**Alternative.** Keep the current design (`crates/common/src/mesh_ca.rs:72-75`):
 the manager generates both halves, which its own comment justifies as "a CSR
 flow is more ceremony than a 24-hour credential warrants."
 
@@ -647,7 +647,7 @@ Found while implementing Phase 1. The plan's integration test runs two
 workers in one process on `127.0.0.2` and `127.0.0.3`, relying on
 auto-detection. On Linux the source address of the route to any `127/8`
 manager is `127.0.0.1`, so both would advertise `127.0.0.1`. The end-to-end
-test (`tests/worker_plane_e2e.rs`) runs one real worker through the binary
+test (`tests/integration/worker_plane_e2e.rs`) runs one real worker through the binary
 instead, and the docs say co-located workers need their own port and, to be
 distinguished by address, `--advertise-addr`.
 
@@ -1166,7 +1166,7 @@ won.**
 `main` shipped a first cut of Phase 1 in
 [#17](https://github.com/mikenomitch/legion/pull/17) while this branch built
 all nine phases from the same plan. The two touched the same files
-(`src/manager/worker_plane.rs`, `src/worker/plane.rs`, `mesh_ca.rs`, the
+(`crates/manager/src/manager/worker_plane.rs`, `crates/worker/src/worker/plane.rs`, `mesh_ca.rs`, the
 simulator) with different APIs. The merge keeps this branch's modules and
 ports #17's other work onto them.
 
@@ -1197,7 +1197,7 @@ ulimits, blocked evals, the work stream).
 **Trade-off.** Users of #17's surface see two changes:
 `legion sandbox start --ca-cert` is `--ca` (with `--node-name`), and a
 simulated node carries `workerFleet` instead of `workerPlaneName`.
-`tests/worker_plane.rs` is gone; `tests/worker_plane_classes.rs` covers the
+`tests/worker_plane.rs` is gone; `tests/integration/worker_plane_classes.rs` covers the
 same cases (classification, a request per class, foreign CA, wrong node).
 
 **Why.** Every call #17 deferred is built here, on one set of modules. Two
@@ -1207,7 +1207,7 @@ porting nine phases onto #17's API is more code, and more risk, than porting
 
 ## 48. Worker failover dials through one TLS connector, not a balanced channel
 
-`main`'s manager failover (`src/worker/managers.rs`) kept a balanced tonic
+`main`'s manager failover (`crates/worker/src/worker/managers.rs`) kept a balanced tonic
 channel and swapped its endpoints on failover, all plaintext. Phase 4 needs
 every worker-to-manager connection to be TLS naming `manager.legion`,
 verified against the token's pin or the cluster bundle. The merge keeps

@@ -114,6 +114,29 @@ pub fn config() -> Command {
                 .help("Task group, when the keyed task is ambiguous"),
         )
         .arg(
+            Arg::new("owner")
+                .long("owner")
+                .value_name("ID")
+                .conflicts_with_all(["count", "from-snapshot"])
+                .help(
+                    "Create the unit as a child of this running unit of the same job \
+                     (docs/child-sessions.md): a session, instance, or allocation id whose \
+                     task names this task in children.tasks. A session task without --id \
+                     starts a session child; a keyed task (or --id) creates a keyed child, \
+                     which an instance or allocation may own and a session may not. The child \
+                     ends when its owner ends. Inside a task, `self` names the calling \
+                     workload and needs no token: `legion instance create <TASK> --owner self`",
+                ),
+        )
+        .arg(
+            Arg::new("owner-kind")
+                .long("owner-kind")
+                .value_name("KIND")
+                .value_parser(["session", "instance", "allocation"])
+                .requires("owner")
+                .help("What --owner names. Default: worked out from the id"),
+        )
+        .arg(
             Arg::new("task")
                 .long("task")
                 .short('t')
@@ -445,15 +468,27 @@ pub fn config() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(create_cmd)
-        .subcommand(stop_cmd)
-        .subcommand(start_cmd)
-        .subcommand(suspend_cmd)
-        .subcommand(fork_cmd)
-        .subcommand(destroy_cmd)
+        .subcommand(names_instance(stop_cmd))
+        .subcommand(names_instance(start_cmd))
+        .subcommand(names_instance(suspend_cmd))
+        .subcommand(names_instance(fork_cmd))
+        .subcommand(names_instance(destroy_cmd))
         .subcommand(promote_cmd)
-        .subcommand(replace_cmd)
+        .subcommand(crate::cmd::resize::instance_resize_command())
+        .subcommand(names_instance(replace_cmd))
         .subcommand(list_cmd)
-        .subcommand(get_cmd)
+        .subcommand(names_instance(get_cmd))
+}
+
+/// `-n` for a subcommand that names an existing instance by `id`, which
+/// resolves in it (`user-42 -n payments` is `payments/user-42`). Where `-n`
+/// is taken (`fork --count`), only `--namespace`.
+fn names_instance(command: Command) -> Command {
+    let short_taken = command
+        .get_arguments()
+        .any(|arg| arg.get_short() == Some('n'));
+    let flag = crate::cmd::helpers::namespace_flag();
+    command.arg(if short_taken { flag.short(None) } else { flag })
 }
 
 #[instrument(skip_all)]
@@ -466,10 +501,75 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("fork", arg_matches)) => fork_instance(arg_matches).await,
         Some(("destroy", arg_matches)) => destroy_instance(arg_matches).await,
         Some(("promote", arg_matches)) => promote_instance(arg_matches).await,
+        Some(("resize", arg_matches)) => crate::cmd::resize::resize_instance(arg_matches).await,
         Some(("replace", arg_matches)) => replace_instance(arg_matches).await,
         Some(("list", arg_matches)) => list_instances(arg_matches).await,
         Some(("get", arg_matches)) => get_instance(arg_matches).await,
         _ => unreachable!(),
+    }
+}
+
+/// Print one created instance or started session.
+fn print_created(format: OutputFormat, reply: &crate::structs::CreateInstanceReply) {
+    if format.is_json() {
+        output::print_success(&json!({
+            "instanceIds": [reply.instance_id],
+            "restoringFrom": (!reply.restoring_from.is_empty()).then_some(&reply.restoring_from),
+            "mode": reply.mode,
+            "durable": reply.durable,
+            "node": (!reply.node_id.is_empty()).then_some(&reply.node_id),
+            "state": (!reply.state.is_empty()).then_some(&reply.state),
+            "deduplicated": reply.deduplicated,
+            "owner": reply.owner.as_ref().map(|owner| json!({
+                "kind": owner.kind,
+                "id": owner.id,
+            })),
+        }));
+    } else if let Some(owner) = reply.owner.as_ref().filter(|_| reply.durable) {
+        println!(
+            "{} instance {}, a child of {} {} (stopped when its owner is stopped, destroyed \
+             when it is destroyed)",
+            if reply.deduplicated {
+                "Found"
+            } else {
+                "Created"
+            },
+            reply.instance_id,
+            owner.kind,
+            owner.id
+        );
+    } else if let Some(owner) = reply.owner.as_ref().filter(|_| !reply.durable) {
+        println!(
+            "{} session {} on {}, a child of {} {} (it ends when its owner does)",
+            if reply.deduplicated {
+                "Found"
+            } else {
+                "Started"
+            },
+            reply.instance_id,
+            reply.node_id,
+            owner.kind,
+            owner.id
+        );
+    } else if !reply.durable {
+        println!(
+            "{} session {} on {} (not durable; `legion instance promote {}` keeps it)",
+            if reply.deduplicated {
+                "Found"
+            } else {
+                "Started"
+            },
+            reply.instance_id,
+            reply.node_id,
+            reply.instance_id
+        );
+    } else if reply.restoring_from.is_empty() {
+        println!("Created instance {}", reply.instance_id);
+    } else {
+        println!(
+            "Created instance {}, restoring from {}",
+            reply.instance_id, reply.restoring_from
+        );
     }
 }
 
@@ -478,8 +578,9 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .context("Must provide job")?
-        .clone();
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
+        .context("Must provide job")?;
     let group = arg_matches.get_one::<String>("group").cloned();
     let task = arg_matches.get_one::<String>("task").cloned();
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
@@ -489,6 +590,33 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
         .unwrap_or_default();
     let count = arg_matches.get_one::<u32>("count").copied().unwrap_or(0);
     let from_snapshot = arg_matches.get_one::<String>("from-snapshot").cloned();
+
+    // `--owner self`, inside a task: the node's worker vouches for the
+    // caller over the allocation's API socket; no token is read.
+    if arg_matches.get_one::<String>("owner").map(String::as_str)
+        == Some(crate::structs::children::OWNER_SELF)
+    {
+        // `legion instance create workspace --owner self`: the positional
+        // is the task, the job is the caller's own.
+        let task_name = task
+            .or_else(|| arg_matches.get_one::<String>("job").cloned())
+            .unwrap_or_default();
+        let mut workload = crate::cmd::session::workload_client(format, "--owner self")?;
+        let reply = output::resolve(
+            format,
+            "failed to create the child instance",
+            workload
+                .create_child_instance(crate::structs::WorkloadCreateChildInstanceRequest {
+                    task_name,
+                    instance_id: ids.into_iter().next().unwrap_or_default(),
+                    idempotency_key: idempotency_key.unwrap_or_default(),
+                })
+                .await,
+        )?
+        .into_inner();
+        print_created(format, &reply);
+        return Ok(());
+    }
 
     let mut client = connect_manager_client().await?;
 
@@ -503,6 +631,15 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
             instance_id: ids.into_iter().next(),
             idempotency_key,
             from_snapshot,
+            owner: arg_matches
+                .get_one::<String>("owner")
+                .map(|id| crate::structs::OwnerRef {
+                    kind: arg_matches
+                        .get_one::<String>("owner-kind")
+                        .cloned()
+                        .unwrap_or_default(),
+                    id: id.clone(),
+                }),
         });
         let reply = output::resolve(
             format,
@@ -511,36 +648,7 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
         )?
         .into_inner();
 
-        if format.is_json() {
-            output::print_success(&json!({
-                "instanceIds": [reply.instance_id],
-                "restoringFrom": (!reply.restoring_from.is_empty()).then_some(&reply.restoring_from),
-                "mode": reply.mode,
-                "durable": reply.durable,
-                "node": (!reply.node_id.is_empty()).then_some(&reply.node_id),
-                "state": (!reply.state.is_empty()).then_some(&reply.state),
-                "deduplicated": reply.deduplicated,
-            }));
-        } else if !reply.durable {
-            println!(
-                "{} session {} on {} (not durable; `legion instance promote {}` keeps it)",
-                if reply.deduplicated {
-                    "Found"
-                } else {
-                    "Started"
-                },
-                reply.instance_id,
-                reply.node_id,
-                reply.instance_id
-            );
-        } else if reply.restoring_from.is_empty() {
-            println!("Created instance {}", reply.instance_id);
-        } else {
-            println!(
-                "Created instance {}, restoring from {}",
-                reply.instance_id, reply.restoring_from
-            );
-        }
+        print_created(format, &reply);
         return Ok(());
     }
 
@@ -582,10 +690,7 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(ForkInstanceRequest {
         instance_id: id.clone(),
         count: arg_matches.get_one::<u32>("count").copied().unwrap_or(1),
@@ -741,10 +846,7 @@ async fn promote_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(StopInstanceRequest {
         instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -772,10 +874,7 @@ async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(StartInstanceRequest {
         instance_id: id.clone(),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -867,10 +966,7 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn suspend_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(SuspendInstanceRequest {
         instance_id: id.clone(),
         checkpoint: arg_matches.get_one::<String>("checkpoint").cloned(),
@@ -975,6 +1071,7 @@ fn timeout_error(
             ),
             hint: Some("check it later with `legion instance get`, or raise --timeout".into()),
             retryable: true,
+            details: None,
         },
     )
 }
@@ -1014,10 +1111,7 @@ async fn wait_for_instance(
 #[instrument(skip_all)]
 async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(DestroyInstanceRequest {
         instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -1045,10 +1139,7 @@ async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn replace_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(ReplaceInstanceRequest {
         instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -1078,8 +1169,9 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .context("Must provide job")?
-        .clone();
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
+        .context("Must provide job")?;
     let include_idle = arg_matches.get_flag("include-idle");
     let request = tonic::Request::new(ListInstancesRequest {
         job_id: job,
@@ -1159,12 +1251,30 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
 }
 
 #[instrument(skip_all)]
+/// What owns this unit and what it owns (docs/child-sessions.md).
+fn ownership_lines(instance: &InstanceInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(owner) = instance.owner.as_ref() {
+        lines.push(format!(
+            "\nowner: {} {} (this session ends when its owner does)",
+            owner.kind, owner.id
+        ));
+    }
+    if !instance.children.is_empty() {
+        lines.push(format!("\nchildren ({}):", instance.children.len()));
+        for child in &instance.children {
+            lines.push(format!(
+                "  {}  {}  {}  {}",
+                child.session_id, child.task_name, child.node_id, child.state
+            ));
+        }
+    }
+    lines
+}
+
 async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(GetInstanceRequest { instance_id: id });
 
     let mut client = connect_manager_client().await?;
@@ -1213,6 +1323,15 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
                     );
                 }
                 for line in suspend_lines(&instance) {
+                    println!("{line}");
+                }
+                for line in ownership_lines(&instance) {
+                    println!("{line}");
+                }
+                for line in crate::cmd::resize::resource_lines(
+                    &instance.resources,
+                    &instance.resources_override,
+                ) {
                     println!("{line}");
                 }
             }

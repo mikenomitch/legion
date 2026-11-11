@@ -149,18 +149,18 @@ that the manager knows when a node joined.
 
 - **Delivery is built.** `artifacts` (http/file/git/S3/OCI, checksums, digest
   pinning, KV-backed auth — `docs/artifacts.md`); `exec`'s `config.files[]`
-  writes host files with modes before start (`src/task_plugins/exec.rs:349`); KV
+  writes host files with modes before start (`crates/worker/src/task_plugins/exec.rs:349`); KV
   `env`/`files` render server-side from templates with `watch`/`onChange`/
   `onDelete` policies (`docs/kv-store.md`).
 - **Facts exist.** `fingerprint_node` + node-check plugins produce fingerprint
   attrs; `config_attrs` and `update_node_dynamic` carry operator- and
-  runtime-supplied attributes (`src/worker/node_check.rs`,
+  runtime-supplied attributes (`crates/worker/src/worker/node_check.rs`,
   `docs/jobs-tasks-and-scheduling.md`).
 - **Scheduling primitives exist.** `count: {num, per}` groups nodes by attribute
   (`per: "id"` is per-node); constraints/permits/affinities filter and score;
   `lifecycle: "batch"` + `schedule` gives interval runs.
 - **Plugins are the extension mechanism.** Task runtimes are dylibs loaded by
-  name (`src/task_plugins/mod.rs:770`), with a declared capability surface
+  name (`crates/worker/src/task_plugins/mod.rs:770`), with a declared capability surface
   (`supports_artifacts`, `exec_support`, volume modes, …).
 - **Dry runs exist.** `legion job plan` / `job validate` / `job schema`, all
   emitting the standard `output::` envelope (`docs/agent-readiness.md`).
@@ -314,13 +314,13 @@ Host mutation is a genuinely new power and gets its own vocabulary:
   (allocation id, node, per-resource results); a `converge_reports` field on
   `HeartbeatRequest`; a `PlanConverge` RPC for why-run; `nodeConfig` fields on the
   job message.
-- `src/structs/job.rs`: `JobConfig.node_config`, and the `converge` task config
+- `crates/common/src/structs/job.rs`: `JobConfig.node_config`, and the `converge` task config
   schema (typed per resource kind, so `job validate` and `job schema` cover it).
-- `src/structs/config.rs`: worker `hostConverge { enabled, allowedResourceTypes }`.
-- New `src/task_plugins/converge/` (runtime, resource types, providers).
+- `crates/common/src/structs/config.rs`: worker `hostConverge { enabled, allowedResourceTypes }`.
+- New `crates/worker/src/task_plugins/converge/` (runtime, resource types, providers).
 - Storage: `converge_result` table keyed by allocation + resource; node
   `availability` gains `configuring`.
-- ACL: `AclResource::Host`, pool-scoped, plus `tests/acl_endpoints.rs` entries for
+- ACL: `AclResource::Host`, pool-scoped, plus `tests/integration/acl_endpoints.rs` entries for
   the new RPC.
 - `configs/jobs/maximal.jsonnet`: `nodeConfig` block and a `converge` task.
 
@@ -360,7 +360,7 @@ nothing is enabled by accident; the full ACL resource lands here.
 - Why-run parity: for every resource type, why-run's verdict must match what a
   real run then does — a property test with the fixture from the idempotence
   suite.
-- ACL: `tests/acl_endpoints.rs` entry for `PlanConverge`; a test that a converge
+- ACL: `tests/integration/acl_endpoints.rs` entry for `PlanConverge`; a test that a converge
   job is rejected without `host:write`, and on a worker that has not opted in.
 - Failure semantics: `onError: abort` stops at the first failure and reports the
   rest as `skipped`; `continue` reports all.

@@ -172,7 +172,7 @@ the stream the one RPC that has to find the leader, and a leader failover
 would resync every worker in the fleet at once, which is the burst entry 4
 accepted. With the log on every replica, a failover disturbs only the
 streams attached to the manager that died
-(`tests/work_stream.rs::a_leader_kill_resyncs_only_the_workers_that_lost_their_manager`:
+(`tests/integration/work_stream.rs::a_leader_kill_resyncs_only_the_workers_that_lost_their_manager`:
 the surviving manager's worker saw zero resyncs, the orphaned one exactly
 one). The raft term would also not be a valid epoch on a follower, and a
 process-random epoch costs nothing. (b) puts a write on every delivery,
@@ -689,7 +689,7 @@ key string cannot express `>` or `matches`), so the index would only have
 narrowed which rows to test. (b) adds a raft write per stop. (c) turns
 every election into a re-plan of every blocked job; the replay window is
 exact for the window that matters
-(`tests/blocked_evals.rs::a_new_leader_rebuilds_from_rows_and_replays_a_missed_wake`).
+(`tests/integration/blocked_evals.rs::a_new_leader_rebuilds_from_rows_and_replays_a_missed_wake`).
 
 ## 22. Every phase carries p50 and p99 latency targets, measured first in Phase 0
 
@@ -719,6 +719,9 @@ throughput-only bar.
 duplicates its claim subsumed, and records `eval.completed` in its own
 entry. Today only `job_reschedule` without a scheduled batch follow-up
 arms it, which is the placement path every keyed create and resume takes.
+(2026-10-13: `job_submit`, `job_update`, and `job_scale` arm it too, and a
+partial plan never settles. See
+[multi-eval-plans calls](multi-eval-plans-plan_calls.md) #4 and #5.)
 
 **Alternatives.**
 - (a) A deferred settle piggybacked on the next write the scheduler lane
@@ -914,7 +917,7 @@ start on two lanes. One entry is what the plan's Phase 1 target asks for
 (an edge start is one scheduler-lane entry plus the status projection),
 and the double-spend refusal still holds because the spend is a
 conditional update inside the same transaction
-(`tests/edge_boot_integration.rs::a_ticket_is_spent_only_by_a_ratification_that_commits`).
+(`tests/integration/edge_boot_integration.rs::a_ticket_is_spent_only_by_a_ratification_that_commits`).
 (b) costs a create and its placement eval per start, the very writes edge
 boot was meant to skip.
 
@@ -1027,7 +1030,7 @@ restart record.
 about.
 
 **Why (performance).** `WorkerStateStore::save` rewrites the whole file
-on every change (`src/worker/state.rs:151`). At 10,000 sessions per node
+on every change (`crates/worker/src/worker/state.rs:151`). At 10,000 sessions per node
 with churn that is quadratic I/O. Fly's `flyd` and Nomad's client state
 both use an embedded database for this reason.
 
@@ -1242,12 +1245,12 @@ jobs.
 
 ## 48. The raft seam test still parses only `store.rs` and `acl_store.rs`
 
-**Call.** `tests/raft_seam.rs` was updated for the ops this work removed
+**Call.** `tests/integration/raft_seam.rs` was updated for the ops this work removed
 (`claim_eval{,s}`, the `complete_*_and_claim_next` pair) and added
 (`complete_evals`), but its file list was left alone, so the new
 `unblock_evals` op in `store/blocked_evals.rs` is not classified there.
 
-**Alternative.** Extend the test to every file under `src/storage/store/`.
+**Alternative.** Extend the test to every file under `crates/manager/src/storage/store/`.
 
 **Trade-off.** Ops in the store's submodules (`fork_ops`, `keyring_ops`,
 `snapshot_ops`, `suspend_ops`, and now `blocked_evals`) escape the
@@ -1436,7 +1439,7 @@ does not fit starts that fail node by node.
 
 ## 58. Phase 6 is tested with fake nodes on real gRPC, not the planned 10^4-session `raft_lanes` run
 
-**Call.** `tests/session_integration.rs` runs a real raft-backed manager
+**Call.** `tests/integration/session_integration.rs` runs a real raft-backed manager
 against fake worker gRPC servers that admit, refuse, adopt, and report
 sessions, and counts raft entries as the applied index summed over lanes:
 zero for unnamed starts, one for a promotion. An ignored
@@ -1521,3 +1524,39 @@ separate number (Phase 8 measures density per node). (c) would leave the
 owner to extrapolate by hand, which is where unlabelled numbers come from;
 the report does it once, with the basis printed beside every figure. Open
 in TODO.md: run it on AWS.
+
+## 61. `legion_sessions_envelope_free{job}` counts sessions, per manager, summed by the reader
+
+*Follow-up to §15's capacity-planning note, implementation.*
+
+**Call.** The gauge is the number of sessions of the task's size that still
+fit the job's envelopes: per envelope, its room less what its sessions hold,
+divided by one session's `resources` on the tightest key, summed over the
+job's nodes and session tasks. Each manager reports only the nodes whose
+heartbeats it holds (its session index's covered nodes), from its own index
+plus its own unreported starts, every 10 seconds; the docs say to sum across
+managers.
+
+```promql
+sum by (job) (legion_sessions_envelope_free)
+```
+
+**Alternatives.** (a) Free amounts per resource,
+`legion_sessions_envelope_free{job,resource}`. (b) A cluster-wide number on
+every manager, from the merged view the router uses (`QuerySessions` to
+every peer). (c) Export it from the router's cached view only, refreshed by
+starts.
+
+**Trade-off.** Slots hide which key is tight, and a task whose sessions size
+nothing counts as `u32::MAX` per node. Summing is the reader's job, and a
+node that moves between managers can count on both for up to its report
+staleness window (2 minutes) after the move.
+
+**Why (simplicity, performance).** A session count is what "can I absorb
+this burst" asks, it is the unit of `legion session nodes`' `weight`, and it
+alerts with one threshold whatever the envelope's shape; the per-key amounts
+are in `legion session nodes`. (b) makes a gauge refresh fan out a peer RPC
+per session task every tick, on every manager, for a number the reader can
+sum. (c) goes stale on a manager that routes nothing, and never sees stops.
+The per-manager split is the same one `legion_node_memory_used_bytes` and the
+usage gauges already document.

@@ -80,7 +80,7 @@ rather than a hidden assumption.
 eval is released back to pending with a delay (reusing
 `release_eval_for_retry`, built for foreign-lane `NotRaftLeader`
 rejections) instead of being marked `failed` — a state that is never
-retried (`src/storage/store.rs:9525`). Terminal failure remains for
+retried (`crates/manager/src/storage/store.rs:9525`). Terminal failure remains for
 non-conflict errors.
 
 **Alternatives.** (a) Keep terminal failure but raise the default retry
@@ -425,7 +425,7 @@ keeps the recheck's cost proportional to the skips actually taken.
 coalescer as `submit_and_apply_plan`: `PlanApplyRequest` carries a
 `PlanPlacements` enum (format-1 nodes or format-2 candidate lists), and
 the batch body dispatches per format. Each format keeps its own
-replicated-op name, so the raft log and `tests/raft_seam.rs` still say
+replicated-op name, so the raft log and `tests/integration/raft_seam.rs` still say
 which walk ran.
 
 **Alternatives.** Leave the candidate path on the single-plan replicated

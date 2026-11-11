@@ -5,6 +5,7 @@ import { managerClient } from '../grpcClient'
 import type { ResourceEntry } from '../utils/allocationDetail'
 import { ENVELOPE_COPY, SESSION_NODE_REASONS, countMap, formatCount, formatRoom, jobInstancesHref } from '../utils/sessions'
 import { Badge, Button, Note, RelativeTime, SectionCard, linkClass } from './ui'
+import { jobPath } from '../utils/namespaces'
 
 /*
  * What an envelope allocation is (docs/session-mode.md): a placeholder that
@@ -93,7 +94,7 @@ export default function EnvelopeCard(props: {
           </Show>{' '}
           for task{' '}
           <Show when={props.jobId} fallback={<span class="font-mono text-xs">{props.servedTask}</span>}>
-            <A href={`/jobs/${encodeURIComponent(props.jobId!)}/tasks/${encodeURIComponent(props.servedTask)}`} class={linkClass}>
+            <A href={`${jobPath(props.jobId!)}/tasks/${encodeURIComponent(props.servedTask)}`} class={linkClass}>
               {props.servedTask}
             </A>
           </Show>

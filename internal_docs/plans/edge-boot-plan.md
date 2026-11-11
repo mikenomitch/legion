@@ -39,8 +39,8 @@ Legion's start path is strictly commit-then-run. A submit becomes an eval, the
 eval plans, `plan_and_apply_*` submits the plan, the store applies it — which
 under `persistence.mode = "raft"` means proposing on the scheduler lane and
 waiting for the entry to commit — and only then does
-`dispatch_allocations` (`src/structs/eval.rs:309`,
-`src/manager/dispatcher.rs:11`) open a connection to the worker and hand it the
+`dispatch_allocations` (`crates/manager/src/manager/eval.rs:309`,
+`crates/manager/src/manager/dispatcher.rs:11`) open a connection to the worker and hand it the
 payload. The worker builds the root disk and boots.
 
 For a service that runs one long-lived job this ordering costs nothing. For the
@@ -113,7 +113,7 @@ own.**
   shared state, where a rejected transaction is replanned.
   - **Take:** optimism is the right default and the conflict path must be
     cheap and explicit. Legion already implements this at the apply
-    (`src/storage/store.rs:2552`).
+    (`crates/manager/src/storage/store.rs:2552`).
 - **Nomad** — allocations are written to raft by the plan applier and pulled by
   the client on its next `Node.GetClientAllocs`. No pre-commit execution.
 - **Firecracker/microVM platforms** generally solve the same latency problem
@@ -128,8 +128,8 @@ own.**
   participant that loses contact kills itself before anyone can replace it.
   - **Take:** this is exactly the mechanism an unratified start needs, and
     Legion already ships the worker half of it
-    (`self_terminate_after_seconds`, `src/manager/dispatcher.rs:150`; the
-    watchdog in `src/worker/daemon.rs:496`).
+    (`self_terminate_after_seconds`, `crates/manager/src/manager/dispatcher.rs:150`; the
+    watchdog in `crates/worker/src/worker/daemon.rs:496`).
 
 Nobody in this list lets a node start a workload optimistically *and* converge
 it to a single global owner. That combination is what this plan adds, and the
@@ -220,7 +220,7 @@ their experience of this feature is that starts are faster.
 - Nothing changes for jobs that do not opt in, byte for byte, including the
   wire payloads (`speculativeStart` absent ⇒ no new fields on the dispatch).
 - The at-most-one-live-allocation invariant for keyed instances
-  (`assign_stateful_instance_tx`, `src/storage/store.rs:7488`) holds unmodified,
+  (`assign_stateful_instance_tx`, `crates/manager/src/storage/store.rs:7488`) holds unmodified,
   with its existing tests unchanged and green.
 
 ## Non-Goals
@@ -250,20 +250,20 @@ their experience of this feature is that starts are faster.
 ## Background — What Exists Today
 
 - **Dispatch is post-commit and synchronous.** `Eval::schedule_job_allocations`
-  plans, applies, then dispatches (`src/structs/eval.rs:299-311`).
-  `dispatch_allocations` (`src/manager/dispatcher.rs:11`) resolves task config,
+  plans, applies, then dispatches (`crates/manager/src/manager/eval.rs:299-311`).
+  `dispatch_allocations` (`crates/manager/src/manager/dispatcher.rs:11`) resolves task config,
   node address, instance, and volume mounts from the store, builds a
   `TaskAllocation` (`:124`) and calls `PostWork` per allocation over a lazy
   channel. There is no pre-commit path and no batching.
 - **Apply is the fencing point.** `apply_plan_submission_apply`
-  (`src/storage/store.rs:2552`) compares the version vector, re-validates
+  (`crates/manager/src/storage/store.rs:2552`) compares the version vector, re-validates
   availability/constraints/permit on the fresh node row, assigns networks,
   inserts allocations, and bumps node and job-config epochs. Stateful instance
   binding — the at-most-one-live-allocation guarantee — happens inside that
   transaction (`assign_stateful_instance_tx`, `:7488`). Under raft this is a
   replicated scheduler-lane op, so "applied" means "committed".
 - **The worker reconciles against the manager's desired set.**
-  `TaskManager::reconcile_allocations` (`src/worker/task_manager.rs:762`) stops
+  `TaskManager::reconcile_allocations` (`crates/worker/src/worker/task_manager.rs:762`) stops
   every local allocation whose id is not in the heartbeat reply's
   `desired_allocations` and starts every desired id it does not have. **An
   allocation the manager does not know about is killed on the next heartbeat.**
@@ -271,31 +271,31 @@ their experience of this feature is that starts are faster.
   *protect* a provisional start for the length of its lease, not to build a
   reaper.
 - **The worker already self-fences.** Stateful tasks carry
-  `self_terminate_after_seconds` (`src/manager/dispatcher.rs:150`) and a
+  `self_terminate_after_seconds` (`crates/manager/src/manager/dispatcher.rs:150`) and a
   watchdog kills them when contact with the manager lapses
-  (`src/worker/daemon.rs:293,496`). A provisional start is the same mechanism
+  (`crates/worker/src/worker/daemon.rs:293,496`). A provisional start is the same mechanism
   with a much shorter clock.
 - **Task runtimes already split prepare from start.** `TaskPlugin::prepare`
-  (`src/task_plugins/mod.rs:389`) and `TaskPlugin::start` (`:398`) are separate
+  (`crates/worker/src/task_plugins/mod.rs:389`) and `TaskPlugin::start` (`:398`) are separate
   calls, and the worker already runs prepare before start
-  (`src/worker/daemon.rs:703-729`). The `stage` gate is a pause between two
+  (`crates/worker/src/worker/daemon.rs:703-729`). The `stage` gate is a pause between two
   calls that already exist. The `sandbox` runtime does its expensive work —
   OCI layout, root-disk build, `mkfs.ext4 -d` — in that prepare half
   (`docs/task-runtime-sandbox.md` § "How a microVM Boots").
 - **Workers hold a per-node credential, not a user credential.**
   Registration verifies a join secret (`verify_join_for_registration`,
-  `src/manager/server.rs:1410`) and mints a node token used on
+  `crates/manager/src/manager/server.rs:1410`) and mints a node token used on
   `Heartbeat`/`HealthCheck`; node tokens grant nothing on the user-facing API
   (`docs/auth-and-acls.md` § "Worker nodes"). Workers have no way to verify a
   *caller's* credential.
 - **The manager already runs an OIDC signer and publishes a JWKS.**
-  `src/manager/workload_identity.rs` signs task and node identity tokens with
-  rotation, and `src/manager/oidc_http.rs:93` serves
+  `crates/manager/src/manager/workload_identity.rs` signs task and node identity tokens with
+  rotation, and `crates/manager/src/manager/oidc_http.rs:93` serves
   `/.well-known/jwks.json`. Workers fetch identity tokens from the manager
-  (`src/worker/identity.rs`) but **do not** verify anything themselves — there
+  (`crates/worker/src/worker/identity.rs`) but **do not** verify anything themselves — there
   is no JWKS client on the worker today.
 - **Idempotency records exist** (`Store::idempotency_lookup` /
-  `idempotency_record`, `src/storage/store.rs:11932`) and are the mechanism
+  `idempotency_record`, `crates/manager/src/storage/store.rs:11932`) and are the mechanism
   RunJob/StopJob/DestroyJob use for retry safety. Single-use tickets ride them.
 - **Sandbox networking is minimal.** `mode: 'none'` (loopback only) is the
   default; `mode: 'tap'` attaches an operator-precreated device
@@ -337,7 +337,7 @@ Its lifecycle has exactly one linearization point:
 **Ratification is not a new consistency mechanism.** It is the existing plan
 apply with the node already chosen: a plan submission with one placement and a
 one-element candidate list, applied through `apply_plan_submission_apply`
-(`src/storage/store.rs:2552`) with its epoch checks, its constraint
+(`crates/manager/src/storage/store.rs:2552`) with its epoch checks, its constraint
 re-validation, and — critically — its `assign_stateful_instance_tx` call. If
 another allocation already owns `user-42`, this apply fails exactly the way it
 fails today, and that failure *is* the refusal. No new invariant, no second
@@ -459,7 +459,7 @@ agent-readiness rules apply to this surface like any other.
 ### 6.4 Boot tickets: how a node authorizes a start without the manager
 
 A **boot ticket** is a short-lived JWT signed by the manager's existing
-workload-identity signer (`src/manager/workload_identity.rs`) and verified by
+workload-identity signer (`crates/manager/src/manager/workload_identity.rs`) and verified by
 the worker against the cluster's JWKS — the same key material, rotation, and
 `kid` discipline that already ships, with a new consumer.
 
@@ -485,7 +485,7 @@ the worker against the cluster's JWKS — the same key material, rotation, and
 (`boot:write`, scoped by job name), following the `scale` precedent: a platform's
 ticket minter should be able to authorize starts without holding `job:write`,
 because `job:write` means "redeploy the fleet". `boot:read` lists outstanding
-tickets. Both go in `tests/acl_endpoints.rs` (`endpoint_table` + a request
+tickets. Both go in `tests/integration/acl_endpoints.rs` (`endpoint_table` + a request
 builder) — the classification test fails the build otherwise.
 
 **Verification on the worker** is entirely offline:
@@ -504,7 +504,7 @@ builder) — the classification test fails the build otherwise.
 nodes presented the same ticket both boot, and the second is refused
 (`InstanceClaimed`) and killed. Globally-single-use is enforced *at the
 manager* by recording `jti` through the existing idempotency table
-(`Store::idempotency_record`, `src/storage/store.rs:11954`) when
+(`Store::idempotency_record`, `crates/manager/src/storage/store.rs:11954`) when
 `legion.io/uses = 1` — the second ratification for that `jti` is refused even
 if the first has since exited. Nodes are honest but not trusted to be the only
 holder.
@@ -565,7 +565,7 @@ Every failure mode ends in the same place: the node kills the work.
 | Manager forgot about it | existing heartbeat reconcile | one heartbeat |
 
 The last row is the important one: `reconcile_allocations`
-(`src/worker/task_manager.rs:762`) already stops anything the manager does not
+(`crates/worker/src/worker/task_manager.rs:762`) already stops anything the manager does not
 list. The change is to give provisional work a **protection window** — it is
 exempt from reconcile-driven stops until its lease expires, and after that it
 is stopped by the existing code with no new reaper. The failure mode of a bug
@@ -589,7 +589,7 @@ ratification opens it. Mechanically, per runtime:
   filter. Both operations need `CAP_NET_ADMIN`, which `mode: 'tap'` already
   requires of the operator.
 - **`container` / `exec`.** The gate is the loopback upstream listeners
-  (`src/worker/forwarder.rs`) plus service registration: neither is created
+  (`crates/worker/src/worker/forwarder.rs`) plus service registration: neither is created
   until ratification. Host-level egress filtering for these runtimes is left to
   the operator and documented as a gap — a `boot`-gated `exec` task can still
   reach the network through the host's own stack.
@@ -642,11 +642,11 @@ new authorization surface and must be an explicit operator decision.
 
 **Worker config:** `edgeBoot { acceptClaims: false, jwksRefresh: '5m',
 clockSkew: '30s' }`, plus the listener the `StartClaim` RPC is served on
-(reusing the existing worker server, `src/worker/server.rs`).
+(reusing the existing worker server, `crates/worker/src/worker/server.rs`).
 
-**ACL:** new resource `boot` in `AclResource` (`src/structs/acl.rs:19`) with
+**ACL:** new resource `boot` in `AclResource` (`crates/common/src/structs/acl.rs:19`) with
 `read`/`write`, scoped by job name; `ListBootTickets`/`IssueBootTicket` entries
-in `tests/acl_endpoints.rs`; `RatifyClaim` classified worker-plane via
+in `tests/integration/acl_endpoints.rs`; `RatifyClaim` classified worker-plane via
 `acl::enforce_worker_plane`. Documented in `docs/auth-and-acls.md`.
 
 **Store:** a `boot_ticket` table (`jti` PK, job, task, job_config_id, instance
@@ -723,7 +723,7 @@ risk appetite — `stage` needs the least new machinery, `boot` the most.
   allocation, node-loss fencing, `concurrent_plans_cannot_oversubscribe_a_node`
   — run **unmodified** with `speculativeStart` on and off. Any change to those
   files is a design failure, not a test update.
-- **ACL:** `cargo test --test acl_endpoints` covers the new manager RPCs;
+- **ACL:** `cargo test --test integration acl_endpoints::` covers the new manager RPCs;
   `RatifyClaim` is classified worker-plane; a node token cannot mint a ticket
   and a boot ticket cannot call anything else.
 - **Raft:** ratification is a scheduler-lane op — replay determinism across

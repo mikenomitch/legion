@@ -134,7 +134,7 @@ credential ──authenticate──▶ AclIdentity ──enforce──▶ allow 
   login-minted tokens always expire.
 - **Identity sources**, all converging on the same identity. Everything that
   is not an opaque ACL token goes through one trait, `AuthMethod`
-  (`src/manager/auth_method.rs`): verify a credential, return a principal
+  (`crates/manager/src/manager/auth_method.rs`): verify a credential, return a principal
   plus policy names. The trait is deliberately shaped like Legion's other
   plugin entry traits (`TaskPlugin`, `SchedulingPolicy`,
   `RolloutStrategyPlugin`) — object-safe, `Send + Sync`, built-ins
@@ -235,15 +235,15 @@ replaced:
 
 ## 3. What is implemented (Phase 1)
 
-- **Policy engine** `src/structs/acl.rs`: rules, globs, scopes, default-deny
+- **Policy engine** `crates/common/src/structs/acl.rs`: rules, globs, scopes, default-deny
   evaluation, deny-wins, list-gating semantics; exhaustively unit-tested.
-- **Storage** `src/storage/acl_store.rs` + migrations: `acl_policy`,
+- **Storage** `crates/manager/src/storage/acl_store.rs` + migrations: `acl_policy`,
   `acl_token` (hashed secrets, unique accessor), `acl_user` (argon2id PHC).
   One-shot transactional bootstrap.
-- **Authenticator** `src/manager/acl.rs`: bearer extraction, token
+- **Authenticator** `crates/manager/src/manager/acl.rs`: bearer extraction, token
   resolution, login dispatch, token minting, audit-only mode, structured
   denial audit.
-- **Auth methods** `src/manager/auth_method.rs`: the `AuthMethod` trait plus
+- **Auth methods** `crates/manager/src/manager/auth_method.rs`: the `AuthMethod` trait plus
   built-ins — `UserpassMethod` and `JwtAuthMethod` (RS256/384/512, PS*,
   ES256/384 via JWKS URL / inline JWKS / OIDC discovery; HS256 via shared
   secret for dev; binding rules → policies; per-method JWKS cache with
@@ -265,7 +265,7 @@ replaced:
 - **Config**: `acl { enabled, auditOnly, loginTtl, jwksRefreshInterval,
   authMethods[] }` following the `Config`/`ConfigFull` pattern; example in
   `configs/manager.jsonnet`.
-- **Tests**: `tests/acl_endpoints.rs` — a table classifying **every** Manager
+- **Tests**: `tests/integration/acl_endpoints.rs` — a table classifying **every** Manager
   RPC, a proto-parsing guard that fails when a new RPC lacks coverage, a
   deny/allow matrix over all endpoints (anonymous denied / management passes
   / disabled passes), and end-to-end scenarios (job-name scoping, KV path

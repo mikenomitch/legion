@@ -54,7 +54,7 @@ documents, delivering tokens into running tasks, and rotating signing keys.
 
 - **Authorization / policy engine.** This plan issues *identity*; it does not decide
   what that identity may do inside Legion. (ACLs are a separate effort.)
-- **Replacing the worker join-token flow.** Join tokens ([src/structs/token.rs](../../src/structs/token.rs))
+- **Replacing the worker join-token flow.** Join tokens ([crates/common/src/structs/token.rs](../../crates/common/src/structs/token.rs))
   keep their own path for now; we *may* later migrate them onto the same asymmetric
   signer, but that is out of scope here.
 - **Being a generic secret store.** We don't store provider credentials; we issue a
@@ -71,14 +71,14 @@ Grounding the design in current code so we extend rather than reinvent:
 | Concern | Where | Notes |
 | --- | --- | --- |
 | JWT encode/decode | `jsonwebtoken = "9.1.0"` (Cargo.toml) | Already a dependency; supports RS256/ES256. |
-| Existing token + claims | [src/structs/token.rs](../../src/structs/token.rs), [src/manager/join_server.rs](../../src/manager/join_server.rs) | `JoinTokenClaims`, `generate_join_token`. Uses `HS512` + `TMP_SECRET_KEY` — a placeholder, **not** suitable for OIDC. |
-| Signing key placeholder | [src/constants.rs:1](../../src/constants.rs:1) | `TMP_SECRET_KEY = b"secret"`. To be superseded by a managed asymmetric keypair. |
-| CA / key generation | [src/certs.rs](../../src/certs.rs) | `rcgen`-based CA + leaf signing; a good model for key provenance/storage layout. |
-| Task launch + env/file injection | [src/task_plugins/exec.rs](../../src/task_plugins/exec.rs), [container.rs](../../src/task_plugins/container.rs) | Env via `cmd.envs`/`--env`; exec already supports injected files. Token delivery rides this path. |
-| Capability gating | `TaskPlugin` trait ([src/task_plugins/mod.rs:77](../../src/task_plugins/mod.rs)) | `supports_kv_env_injection`, `supports_kv_file_injection`, `supports_live_restart`. We add identity capability flags here. |
-| KV injection model | `TaskKvInjections` ([src/structs/job.rs:849](../../src/structs/job.rs)) | Proven spec→materialization pattern to mirror for identity. |
+| Existing token + claims | [crates/common/src/structs/token.rs](../../crates/common/src/structs/token.rs), [crates/manager/src/manager/join_server.rs](../../crates/manager/src/manager/join_server.rs) | `JoinTokenClaims`, `generate_join_token`. Uses `HS512` + `TMP_SECRET_KEY` — a placeholder, **not** suitable for OIDC. |
+| Signing key placeholder | [crates/common/src/constants.rs:1](../../crates/common/src/constants.rs:1) | `TMP_SECRET_KEY = b"secret"`. To be superseded by a managed asymmetric keypair. |
+| CA / key generation | [crates/common/src/certs.rs](../../crates/common/src/certs.rs) | `rcgen`-based CA + leaf signing; a good model for key provenance/storage layout. |
+| Task launch + env/file injection | [crates/worker/src/task_plugins/exec.rs](../../crates/worker/src/task_plugins/exec.rs), [container.rs](../../crates/worker/src/task_plugins/container.rs) | Env via `cmd.envs`/`--env`; exec already supports injected files. Token delivery rides this path. |
+| Capability gating | `TaskPlugin` trait ([crates/worker/src/task_plugins/mod.rs:77](../../crates/worker/src/task_plugins/mod.rs)) | `supports_kv_env_injection`, `supports_kv_file_injection`, `supports_live_restart`. We add identity capability flags here. |
+| KV injection model | `TaskKvInjections` ([crates/common/src/structs/job.rs:849](../../crates/common/src/structs/job.rs)) | Proven spec→materialization pattern to mirror for identity. |
 | Manager gRPC API | `proto/legion.proto` `service Manager` | Add token-issuance RPC here. |
-| State / migrations | [src/storage/migrations.rs](../../src/storage/migrations.rs), SQLite | Signing-key metadata persisted here. |
+| State / migrations | [crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs), SQLite | Signing-key metadata persisted here. |
 
 **Key architectural insight:** OIDC discovery (`/.well-known/openid-configuration`)
 and JWKS must be served over **plain HTTPS**, because AWS/GCP/Vault fetch them with
@@ -110,7 +110,7 @@ providers that can match arbitrary claims don't have to parse `sub`:
   mode), defined by the
   [Stateful Workloads & Instance Identity plan](stateful-workloads-and-instance-identity-plan.md).
 
-  (Legion has no `namespace` concept today — [src/structs/config.rs:204](../../src/structs/config.rs)
+  (Legion has no `namespace` concept today — [crates/common/src/structs/config.rs:204](../../crates/common/src/structs/config.rs)
   defines `region` as the top-level scope. If namespaces are introduced later, they
   slot into the `sub` exactly where Nomad puts them; see below.)
 
@@ -170,7 +170,7 @@ sandbox's `sub` can never be re-minted for a different instance.
 first draft, I now recommend a concrete default (matching Nomad's rationale) rather
 than leaving it blank — but the format should be operator-overridable via cluster
 config, since it's a trust boundary your org owns. Drop this into
-`src/structs/workload_identity.rs` in Phase 1:
+`crates/common/src/structs/workload_identity.rs` in Phase 1:
 
 ```rust
 /// Claims describing a workload's verifiable identity.
@@ -265,27 +265,27 @@ injection surface).
 - **Signing keypair.** On first boot (or migration), the manager generates an
   asymmetric keypair (recommend **ES256** — small JWKS, fast verify; RS256 is the
   safer default if a relying party rejects EC keys). Reuse the file-layout and
-  atomic-write conventions from [src/certs.rs](../../src/certs.rs) (`configs/tls/…`,
+  atomic-write conventions from [crates/common/src/certs.rs](../../crates/common/src/certs.rs) (`configs/tls/…`,
   temp-file + rename). Private key stays on the manager; never serialized into a
   token or RPC reply.
 - **Key metadata in SQLite.** Persist `{ kid, alg, public_jwk, created_at,
-  not_after, state }` via a new migration in [src/storage/migrations.rs](../../src/storage/migrations.rs).
+  not_after, state }` via a new migration in [crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs).
   `state ∈ {active, retiring, expired}`.
 - **Discovery + JWKS over HTTP.** These are plain HTTP/1.1 `GET` routes returning
   JSON — external providers (AWS STS, GCP, Vault) use generic HTTP clients and never
   speak gRPC/grpc-web, so a gRPC method won't do. A new module (e.g.
-  `src/manager/oidc_http.rs`) mounts an `axum` router serving exactly two
+  `crates/manager/src/manager/oidc_http.rs`) mounts an `axum` router serving exactly two
   unauthenticated routes:
   - `GET /.well-known/openid-configuration` → issuer, `jwks_uri`,
     `id_token_signing_alg_values_supported`, `response_types_supported`, etc.
   - `GET /<jwks_path>` → all non-expired public keys as a JWKS.
 
   **Where to host it — and why not the join server.** The join server
-  ([src/manager/daemon.rs:48-57](../../src/manager/daemon.rs)) is the manager's
+  ([crates/manager/src/manager/daemon.rs:48-57](../../crates/manager/src/manager/daemon.rs)) is the manager's
   existing *unauthenticated* surface, which is conceptually the right kind of place.
   But it is a **non-TLS `tonic` gRPC** listener, and AWS/GCP require the `iss` to be
   reachable over **publicly-trusted HTTPS**. The main manager listener
-  ([src/manager/daemon.rs:90-95](../../src/manager/daemon.rs)) already has TLS *and*
+  ([crates/manager/src/manager/daemon.rs:90-95](../../crates/manager/src/manager/daemon.rs)) already has TLS *and*
   `accept_http1(true)` + CORS, so it is the better home: mount the axum routes there
   as an HTTP fallback alongside the gRPC `Manager` service. (Dev / Vault-with-CA-bundle
   setups can tolerate the non-TLS join port behind a proxy, but the default should be
@@ -316,7 +316,7 @@ the spec already declared.
 
 ### 4) Job Spec API + Delivery
 
-Add an `identities` list to `TaskConfig` ([src/structs/job.rs:815](../../src/structs/job.rs)),
+Add an `identities` list to `TaskConfig` ([crates/common/src/structs/job.rs:815](../../crates/common/src/structs/job.rs)),
 mirroring the `TaskKvInjections` shape. Each entry is an independent named identity —
 this matches Nomad's `identity` blocks and lets one task federate into multiple
 providers at once:
@@ -369,7 +369,7 @@ reusing the existing reconcile-action vocabulary rather than inventing a new one
 (cf. `KvInjectionAction`):
 
 - `noop` (default): just rewrite the delivered value. For `file` delivery the worker
-  atomically rewrites in place (temp + rename, like [src/certs.rs](../../src/certs.rs));
+  atomically rewrites in place (temp + rename, like [crates/common/src/certs.rs](../../crates/common/src/certs.rs));
   most cloud SDKs re-read the token file on each call, so no reload is needed.
 - `signal`: rewrite, then send `change_signal` (e.g. `SIGHUP`) to the task so a
   long-running process reloads the token without restarting. This is the only way to
@@ -383,7 +383,7 @@ or `restart`. **File + `noop` is the documented default.**
 
 ### 5) Task-Kind Capability Reporting
 
-Extend the `TaskPlugin` trait ([src/task_plugins/mod.rs:57](../../src/task_plugins/mod.rs))
+Extend the `TaskPlugin` trait ([crates/worker/src/task_plugins/mod.rs:57](../../crates/worker/src/task_plugins/mod.rs))
 alongside the existing capability methods:
 
 ```rust
@@ -391,7 +391,7 @@ fn supports_identity_env(&self) -> bool { false }
 fn supports_identity_file(&self) -> bool { false }
 ```
 
-Validation in `validate_job_config` ([src/task_plugins/mod.rs:185](../../src/task_plugins/mod.rs))
+Validation in `validate_job_config` ([crates/worker/src/task_plugins/mod.rs:185](../../crates/worker/src/task_plugins/mod.rs))
 rejects a spec whose delivery mode the task kind can't satisfy — same pattern already
 used for KV injections. `exec` and `container` implement both; `noop` neither.
 
@@ -443,18 +443,18 @@ control-plane identity later is a config + authz change, not a re-architecture.
    with request `{ string alloc_id; string identity_name; }` (audience is **not**
    worker-supplied — the manager reads it from the named identity in the spec) and
    reply `{ string token; int64 expires_at; }`. Regenerate structs via `build.rs`.
-2. **`src/structs/`** — new `workload_identity.rs`: `WorkloadIdentityClaims`,
+2. **`crates/common/src/structs/`** — new `workload_identity.rs`: `WorkloadIdentityClaims`,
    `WorkloadIdentity` (one named identity: `name`, `audience`, `ttl`, `env`, `file`,
    `change_mode`, `change_signal`, `extra_claims`, optional `sub_template`), and a
    `ChangeMode` enum (`noop`/`signal`/`restart`). Add `identities: Vec<WorkloadIdentity>`
    to `TaskConfig`. The `sub` template renderer (dumb `{field}` substitution over the
    stable-field allow-list, with admission validation) lives here too.
-3. **Manager config** ([src/structs/config.rs](../../src/structs/config.rs)) — new block:
+3. **Manager config** ([crates/common/src/structs/config.rs](../../crates/common/src/structs/config.rs)) — new block:
    issuer URL, OIDC HTTP route placement (TLS listener by default), JWKS path, signing
    alg, token default TTL, key `rotation_age`, default audience, **and the cluster-default
    `sub_template`** (defaults to `{region}:{job}:{group}:{task}`) that per-identity
    `sub_template` overrides.
-4. **Migration** — signing-key table in [src/storage/migrations.rs](../../src/storage/migrations.rs).
+4. **Migration** — signing-key table in [crates/manager/src/storage/migrations.rs](../../crates/manager/src/storage/migrations.rs).
 5. **Related plan** — stable instance keys for the stateful `sub` variant come from the
    [Stateful Workloads & Instance Identity plan](stateful-workloads-and-instance-identity-plan.md)
    (at least its instance primitive + alloc→instance mapping must land first).
@@ -551,7 +551,7 @@ control-plane identity later is a config + authz change, not a re-architecture.
 
 ### Regression
 - Jobs without `identities` are unchanged.
-- Existing join-token flow ([src/manager/join_server.rs](../../src/manager/join_server.rs)) untouched.
+- Existing join-token flow ([crates/manager/src/manager/join_server.rs](../../crates/manager/src/manager/join_server.rs)) untouched.
 
 ---
 
@@ -576,7 +576,7 @@ control-plane identity later is a config + authz change, not a re-architecture.
    compatibility). Lead with which?
 3. **Issuer URL & TLS** — relying parties require the issuer to be HTTPS with a
    publicly-trusted cert. How does this interact with the self-signed dev CA in
-   [src/certs.rs](../../src/certs.rs)? (Likely: dev = self-signed + insecure flag;
+   [crates/common/src/certs.rs](../../crates/common/src/certs.rs)? (Likely: dev = self-signed + insecure flag;
    prod = operator-provided cert.)
 4. **Revocation** — short TTL is the primary mitigation, but do we want an explicit
    `jti` denylist for emergency revocation before natural expiry?

@@ -13,11 +13,17 @@ services:
     image: prom/prometheus:v2.53.1
     network_mode: host # scrapes private-IP targets directly
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The DIRECTORY, not ./prometheus.yml. A single-file bind mount pins
+      # the file's inode, and every edit-in-place (`sed -i`, install-k8s.sh
+      # appending its scrape jobs) writes a new one, so Prometheus kept
+      # reading the original and reloads silently changed nothing. That is
+      # how every K8s campaign through 2026-10-14 ran without scheduler or
+      # apiserver metrics.
+      - .:/etc/prometheus/rig:ro
       - ./targets:/etc/prometheus/targets:ro
       - prometheus-data:/prometheus
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
+      - --config.file=/etc/prometheus/rig/prometheus.yml
       - --storage.tsdb.path=/prometheus
       # A campaign spans days at most; keep everything until teardown.
       - --storage.tsdb.retention.time=30d

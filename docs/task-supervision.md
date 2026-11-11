@@ -41,7 +41,7 @@ Supervision is separate from health checks ([Jobs, Tasks, and
 Scheduling](jobs-tasks-and-scheduling.md#health-checks-restarting-and-rescheduling)),
 which probe a task that is still running. You don't need a health check to
 notice that a task died. The two paths share one restart budget, so a flapping
-task gets `on_unhealthy.restart_count` local restarts in total across both.
+task gets `onUnhealthy.restartCount` local restarts in total across both.
 
 ## The `restart` block
 
@@ -55,7 +55,7 @@ task gets `on_unhealthy.restart_count` local restarts in total across both.
   restart = {
     # always | onFailure | never
     policy = "always",
-    # Wait before relaunching. Defaults to on_unhealthy.restart_delay.
+    # Wait before relaunching. Defaults to onUnhealthy.restartDelay.
     delay = "5s",
     # Exit codes counted as success. Default [0].
     successExitCodes = [0],
@@ -63,9 +63,9 @@ task gets `on_unhealthy.restart_count` local restarts in total across both.
 
   # The shared budget: how many local restarts, over what window, before the
   # allocation is failed and the manager moves it elsewhere.
-  on_unhealthy = {
-    restart_count = 3, restart_period = "30m", restart_delay = "30s",
-    move_count = 3, move_period = "30m", move_delay = "30s",
+  onUnhealthy = {
+    restartCount = 3, restartPeriod = "30m", restartDelay = "30s",
+    moveCount = 3, movePeriod = "30m", moveDelay = "30s",
   },
 }
 ```
@@ -83,9 +83,9 @@ What happens on an exit:
 | Situation | Outcome |
 | --- | --- |
 | policy wants a restart, budget available | wait `delay`, relaunch in place |
-| policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per consecutive failure, capped at 30 minutes (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `move_count` is set and spent |
+| policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per consecutive failure, capped at 30 minutes (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `moveCount` is set and spent |
 | policy does not want a restart, exit was a success | allocation is complete |
-| policy does not want a restart, exit was not a success | allocation fails, as above |
+| policy is `never`, exit was not a success | allocation ends as failed: the task's status is `Failed`, and it is neither restarted nor moved |
 
 While a replacement waits out its backoff, nothing places it, whichever eval
 runs for the job. Each deferral emits an `allocation.reschedule_deferred`
@@ -93,12 +93,17 @@ event. `legion instance get` (for a stateful instance) and `legion job info`
 say which attempt failed, why, and when the next one is. `legion job run
 <spec> --force-reschedule` retries every waiting replacement now, and
 `legion instance start <id>` retries one stateful instance. The backoff
-doubles from `move_delay` up to 30 minutes and starts over once a
-replacement survives `move_period`. Raise `move_delay` to back off harder,
-and set `move_count` to fail the job instead of retrying forever.
+doubles from `moveDelay` up to 30 minutes and starts over once a
+replacement survives `movePeriod`. Raise `moveDelay` to back off harder,
+and set `moveCount` to fail the job instead of retrying forever.
 
 A process killed by a signal has no exit code and never counts as a success.
-With `policy = "never"`, a `SIGKILL` is a failure.
+With `policy = "never"`, a `SIGKILL` ends the allocation as failed.
+
+`never` means run once. An unsuccessful exit is final: the allocation keeps
+its row with status `failed`, `success` dependents stay held, and `complete`
+dependents start. To retry a failing task, use `onFailure` (the batch
+default) instead.
 
 Restarts happen in place on the same node. The allocation keeps its id, its
 directory, its staged artifacts, and its volumes. The work moves to another
@@ -149,13 +154,24 @@ Know two things before you upgrade:
   status message.
 
 The worker reports the exit on its next heartbeat, and keeps reporting it
-until a manager records it. That heartbeat can land on any manager. When the
+until a manager records it. The outcome is written to the worker's state file
+the moment it is decided, so a worker restarted before the report lands
+re-sends it after the restart and does not run the finished task again. That heartbeat can land on any manager. When the
 manager can't record the exit yet (it hasn't applied the placement, or the
 write can't reach the raft leader), it asks the worker to send the report
 again on the next beat. A report from a node that doesn't own the allocation
 is ignored. The worker stops re-sending once it no longer holds the
 allocation. If a `success` dependent stays held after its dependency exited,
 look in the manager logs for `asking the worker to report it again`.
+
+Failure reports (a task that crashed, failed a health check, or failed
+staging) travel the same way. When the manager can't read the allocation or
+record the failure (the write can't reach the raft leader, say), it asks the
+worker to send the report again (`HeartbeatReply.retry_failed_allocations`),
+and the allocation is moved once the report lands. A report for an
+allocation the manager has no row for, or has already removed, is not asked
+for again. Before this, such a report was logged and lost, and the
+allocation stayed placed on a node that had already torn it down.
 
 A completed allocation keeps its row and its slot, and Legion never dispatches
 it to a worker again. It no longer counts against the node's resources or
@@ -194,7 +210,7 @@ With this on, a Linux worker partitions the node into `legion/share` and
 | --- | --- |
 | `resources.memory` (MiB) | a hard `memory.max`, with swap pinned equal to it |
 | `resources.cores` (whole CPUs) | exclusive pinned CPUs (`cpuset.cpus`), removed from every other governed task's set |
-| `resources.cpu` (MHz, alias `cpus`) | proportional `cpu.weight` under contention |
+| `resources.cpu` (MHz) | proportional `cpu.weight` under contention |
 
 Enforcement is on by default, so declare `resources.memory` as what the task
 really needs: a task that uses more is OOM-killed. Set
@@ -261,10 +277,35 @@ config = {
 - `capabilities.drop` takes capability names with or without the `CAP_` prefix
   (`CAP_NET_RAW`, `net_raw`), case-insensitively, or the single entry `all`.
   Unknown names are rejected at submit by `legion job validate`.
+- `capabilities.add` keeps one capability across the switch to `user`:
+  `net_bind_service`, so a task that is not root can bind ports below 1024.
+  It is the only name `add` takes, because every other capability is a path
+  to root, and it may not be combined with a drop that removes it
+  (`drop = ["all"]` included):
+
+  ```nickel
+  config = {
+    command = ["/usr/local/bin/proxy"],
+    user = "proxy",
+    hardening = { capabilities = { add = ["net_bind_service"] } },
+  }
+  ```
+
+  ```text
+  Error: exec hardening: capabilities.add may name only net_bind_service, which lets a task bind ports below 1024 without root; "sys_admin" would make it root-equivalent
+  ```
+
+  Legion keeps the permitted set through the user switch, cuts every set to
+  exactly the kept capability, and raises it as ambient, so the program the
+  task runs holds `CAP_NET_BIND_SERVICE` and nothing else. If any step
+  fails, the task fails to start. The [ingress](ingress.md) uses it to bind
+  ports 80 and 443 as its own unprivileged user. A task that runs as root
+  already holds every capability, so `add` changes nothing for it. On macOS,
+  any user may bind those ports, and `add` is accepted and ignored.
 - `privateTmp` and capability drops need privileges the task must not keep,
   so they run before Legion switches to `user`. The order is: join cgroup →
-  private `/tmp` → drop capabilities → switch user → `no_new_privs` → `umask`
-  and `nice` → Landlock → `exec`.
+  private `/tmp` → drop capabilities → switch user (keeping `add`) →
+  `no_new_privs` → `umask` and `nice` → Landlock → `exec`.
 - A worker without `CAP_SYS_ADMIN` or `CAP_SETPCAP` can't do the privileged
   steps. In that case the task fails to start instead of running with less
   confinement than you asked for.
@@ -296,7 +337,7 @@ config = {
 - Exit status is unknown after a worker restart. An allocation re-adopted by
   pid has no parent to reap it. When it later exits, the worker only sees that
   the process is gone. That never counts as a success, so a `never`-policy task
-  in this state ends as a failure.
+  in this state ends as failed.
 - Re-adoption checks identity, not just liveness. The worker persists each
   task's pid together with the process start time, and after a restart it
   re-adopts a pid only when the live process with that pid started at the

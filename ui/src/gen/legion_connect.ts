@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyObjectReply, ApplyObjectRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateChildInstanceRequest, CreateChildTokenReply, CreateChildTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DecideApprovalReply, DecideApprovalRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteObjectReply, DeleteObjectRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetApprovalReply, GetApprovalRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCallerCapabilitiesReply, GetCallerCapabilitiesRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetIsolateReply, GetIsolateRequest, GetIsolateStatsReply, GetIsolateStatsRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObjectReply, GetObjectRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUsageReply, GetUsageRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListApprovalsReply, ListApprovalsRequest, ListAppsReply, ListAppsRequest, ListAuditEventsReply, ListAuditEventsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListChildrenReply, ListChildrenRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListObjectKindsReply, ListObjectKindsRequest, ListObjectsReply, ListObjectsRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListRuntimeStatesReply, ListRuntimeStatesRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, ObjectEvent, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, ReleaseObjectReply, ReleaseObjectRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResizeAllocationRequest, ResizeChildSessionRequest, ResizeInstanceRequest, ResizeReply, ResizeSessionReply, ResizeSessionRequest, ResizeTaskReply, ResizeTaskRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, RunSessionRequest, RunSessionResponse, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetRuntimeEnabledReply, SetRuntimeEnabledRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartChildSessionRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopChildSessionReply, StopChildSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchEvent, WatchObjectsRequest, WatchRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest, WorkloadCreateChildInstanceRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -42,6 +42,17 @@ export const Manager = {
      * further registrations queue nothing. Failing to queue the pass does not
      * fail the registration.
      *
+     * A join token may introduce a new node or rejoin one that has gone `lost`,
+     * but registering under the name of a node that is still live is
+     * PERMISSION_DENIED unless the request also carries that node's own token
+     * (a restart). See docs/auth-and-acls.md, "Worker nodes".
+     *
+     * A registration whose `config_attrs` claim a `workerFleet` (the worker
+     * simulator) is PERMISSION_DENIED unless the join token's worker type
+     * grants that fleet in its `workerFleet` attribute (a name, or a `*`
+     * glob), or, for a node-token re-registration, the node already belongs
+     * to that fleet. See docs/worker-simulation.md, "One fleet certificate".
+     *
      * @generated from rpc legion.Manager.WorkerRegister
      */
     workerRegister: {
@@ -55,6 +66,43 @@ export const Manager = {
      *
      * Depending on current state, this may create a new job config, create a rollout,
      * and enqueue reconciliation work.
+     *
+     * KV references (docs/auth-and-acls.md, "KV references in a job"): every
+     * `$path/key` string anywhere in the jobspec (a core field, an extension
+     * value, a pending key) and every key a task's `kvInjections` read needs
+     * `kv:read` on the key, checked before any of them is resolved; a miss is
+     * PERMISSION_DENIED naming the key, and nothing resolved reaches an error
+     * message, an app's validate call, or the stored job.
+     *
+     * Jobspec extensions (docs/apps.md, "Jobspec extensions"): a key an
+     * installed app declares at an extension point (the job, a group written
+     * on one of its tasks, a task, a volume, a port, a service), or written
+     * `apps.<app>` there, is checked against the key's JSON Schema with its
+     * defaults filled, and stored as written, by app. A value that fails the
+     * schema is INVALID_ARGUMENT naming its full path, `allow_unknown_fields`
+     * or not. A value that is new or changed since the job's previous version,
+     * for a key that declares `requires`, needs that permission as the caller
+     * on the job (PERMISSION_DENIED otherwise). A key that declares `validate`
+     * makes the manager ask its app first (`POST
+     * /legion/v1/extensions/validate`, 2 seconds per app): the app's errors
+     * are INVALID_ARGUMENT, its warnings land in `RunJobReply.warnings`, and
+     * an app that cannot answer lets the submit through with a warning. A
+     * resubmit whose only differences are extension values (or pending keys)
+     * creates a version but no rollout: the running allocations move to it in
+     * place. Apps are asked on the Control lane's leader: a follower refuses
+     * such a submit before asking any app, and the leader-forward layer
+     * replays it there, so each app is asked once per submit.
+     *
+     * Artifact pins (`resolve: "pin"`) resolve at submit: a source that could
+     * not be reached (connection refused, a timeout, a 5xx or 429 answer) is
+     * UNAVAILABLE, retryable as is; a reference that does not resolve (a tag
+     * that does not exist, refused credentials) is INVALID_ARGUMENT.
+     *
+     * An installed app's job (`legion-system/<app>` while the app is
+     * installed) is the app reconciler's: a direct submit of it is refused
+     * (FAILED_PRECONDITION naming `legion app set|config set|disable|
+     * uninstall`), for every caller, management tokens included
+     * (docs/apps.md, "Editing an app's job").
      *
      * @generated from rpc legion.Manager.RunJob
      */
@@ -98,7 +146,14 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Returns metadata for one job (status, creation time, etc).
+     * Returns metadata for one job (status, creation time, etc), what a
+     * blocked job waits for (`Job.blocked`), and the replacements of failed
+     * allocations still waiting out their reschedule backoff
+     * (`Job.reschedule_backoffs`).
+     *
+     * Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+     * `x-legion-consistency` request headers and returns `revision` (see
+     * "Blocking reads" above `WatchKind`).
      *
      * @generated from rpc legion.Manager.GetJobInfo
      */
@@ -165,6 +220,9 @@ export const Manager = {
     },
     /**
      * Stops an in-flight rollout and optionally reverts to the previous config.
+     * Refused (FAILED_PRECONDITION) for a rollout of an installed app's job,
+     * which the app reconciler owns; AdvanceRollout, which moves toward the
+     * version the reconciler submitted, is allowed.
      *
      * @generated from rpc legion.Manager.StopRollout
      */
@@ -176,6 +234,10 @@ export const Manager = {
     },
     /**
      * Computes a placement plan for a jobspec without mutating cluster state.
+     * Requires `job:read` on the job, and `kv:read` on every KV key the
+     * jobspec references, checked before any is resolved, as RunJob does (the
+     * plan shows the rendered values). A plan of an installed app's job is
+     * refused as RunJob would refuse the submit (FAILED_PRECONDITION).
      *
      * @generated from rpc legion.Manager.PlanJob
      */
@@ -186,7 +248,37 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Marks a job as stopped and enqueues stop reconciliation.
+     * Returns this cluster's jobspec schema (JSON Schema, draft 7): the
+     * compiled-in core schema plus each key an installed app adds to the
+     * jobspec (docs/apps.md, "Jobspec extensions"), as a property at its
+     * extension point, described as "From the backup app, 0.3.1: …", and
+     * under that point's `apps` record in its qualified spelling
+     * (`apps.<app>`). `legion job schema`, `legion job validate`, and the
+     * `legion_job_schema` MCP tool use it when a manager is reachable, so an
+     * agent authoring a jobspec sees exactly what this cluster accepts;
+     * offline they fall back to the compiled-in schema and say that installed
+     * keys were not included.
+     *
+     * `extensions` lists the same keys structurally, with each key's own
+     * schema, so a client can check values against them the way a submit
+     * does (`legion job validate` does).
+     *
+     * Requires `job:read` (any scope): the schema says what a jobspec may
+     * contain, nothing about any job. Disabled apps' keys are included: a
+     * disabled app's keys are still validated at submit.
+     *
+     * @generated from rpc legion.Manager.GetJobSchema
+     */
+    getJobSchema: {
+      name: "GetJobSchema",
+      I: GetJobSchemaRequest,
+      O: GetJobSchemaReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Marks a job as stopped and enqueues stop reconciliation. Refused
+     * (FAILED_PRECONDITION) for an installed app's job: `legion app disable`
+     * stops it (docs/apps.md, "Editing an app's job").
      *
      * @generated from rpc legion.Manager.StopJob
      */
@@ -207,6 +299,23 @@ export const Manager = {
      * requested while a rollout is in flight is recorded as pending and
      * applied when the rollout finishes (scale-out applies immediately).
      * Guarded by `scale:write`, deliberately separate from `job:write`.
+     *
+     * On an autoscaled task (one with `autoscale` in its spec) the policy owns
+     * the count, so a person's write is a time-boxed pin: `count` with
+     * `pin_for_seconds` holds the count there until the pin expires, `min` or
+     * `max` with `pin_for_seconds` holds a floor or a ceiling, and `release`
+     * ends a pin early. A `count` without `pin_for_seconds` is refused with
+     * FAILED_PRECONDITION and a hint. The autoscaler itself writes with
+     * `source = "autoscaler"`, `expected_version` (compare-and-set: a stale
+     * writer gets FAILED_PRECONDITION and re-reads), and the `decision` that
+     * made the change; its writes to a paused or count-pinned task are
+     * refused. When the autoscaled task shares its group with other tasks,
+     * every task of the group moves to the count in one write. Every applied
+     * or deferred write is recorded in the task's scale history.
+     *
+     * Refused (FAILED_PRECONDITION) for an installed app's job: its count is
+     * the app's `replicas` (`legion app set --replicas`), and an override
+     * would outlive every resubmit the reconciler makes.
      *
      * @generated from rpc legion.Manager.ScaleTask
      */
@@ -230,7 +339,352 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Permanently removes a stopped job and related records.
+     * Reads what a scaling decision needs about a batch of tasks, cluster-wide,
+     * in one call (docs/autoscaling.md, "Scaling inputs"): replica counts and
+     * readiness, measured CPU and memory against the reservations, request
+     * rate, errors, and latency for a service the task backs, replicas the
+     * scheduler has not placed, whether a rollout is active, and how fresh the
+     * measurements are.
+     *
+     * Measured usage never touches the state store. Each manager rolls up the
+     * usage reports and service-graph samples its own workers send, per
+     * (node, task), and every 10 seconds ships the rollups that changed to the
+     * manager that leads the status lane, on the liveness digest. That manager
+     * merges them (the newest rollup per (node, task) wins, so a node that
+     * moves between managers is never counted twice), keeps one hour of
+     * 10-second totals in memory, and answers this RPC. Any other manager
+     * forwards the request to it, so every manager returns the same answer.
+     * Replica counts, the desired count, and rollouts come from the replicated
+     * state store.
+     *
+     * After the status lane changes hands, the new leader starts empty and
+     * asks every peer for a full resync on its first digest. Until that lands
+     * (about one 10-second interval), targets read
+     * `freshness.state = "resyncing"` and their usage is partial.
+     *
+     * ACL: `scale:read`. The request is gated coarsely before anything is
+     * looked up. A request that names targets is refused whole with
+     * PERMISSION_DENIED when any named job is outside the caller's grant; a
+     * namespace listing (no targets) silently leaves such jobs out.
+     *
+     * @generated from rpc legion.Manager.GetScalingInputs
+     */
+    getScalingInputs: {
+      name: "GetScalingInputs",
+      I: GetScalingInputsRequest,
+      O: GetScalingInputsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Streams the effective scaling policy of every autoscaled task the
+     * caller may read (`scale:read`), resolved live against the layered
+     * defaults and the plugins installed in the autoscaler's app config.
+     * Standalone policies and node groups are not here: they are the
+     * autoscaler's objects (`autoscaler/ScalingPolicy`, `autoscaler/NodeGroup`),
+     * which it reads over WatchObjects.
+     *
+     * To the autoscaler's own identity (or a management token) the stream
+     * also carries what the app needs to run those objects and that only the
+     * manager holds: the layered defaults and the cluster-wide pause
+     * (`context`, on the first message and whenever it changes), so it
+     * resolves a ScalingPolicy exactly as a task's `autoscale` resolves; and
+     * each object target's own pause and action row (`objects`, keyed
+     * `object:<uid>`). Any other caller gets task policies only.
+     *
+     * The first message is the full set. Another follows whenever any input
+     * changes: a job with `autoscale` is submitted, stopped, or destroyed; an
+     * object target's pause or action row changes; the cluster's scaling
+     * defaults change; a namespace policy's `autoscale` changes; the
+     * autoscaler's plugins change. Without `deltas`
+     * each message is the full set again and replaces the previous one. With
+     * `deltas`, every later message carries only what changed (`full =
+     * false`): new or changed policies, and the keys of removed ones in
+     * `removed`; the consumer merges them into what it holds. With `deltas`,
+     * a change of more than 1,000 policies (the first set of a large
+     * cluster) is split into messages of at most 1,000, all but the last
+     * marked `more`, so no message nears gRPC's 4 MiB default limit. The manager
+     * checks for changes about once a second and sends nothing while nothing
+     * changed, so an idle stream costs one small read per second on the
+     * answering manager. Any manager answers: policies are computed from
+     * replicated state.
+     *
+     * With `shard_count` and `shards`, only the policies in those shards are
+     * sent (docs/autoscaling.md, "Replicas"): a task policy's shard is FNV-1a
+     * (64-bit) of `<job id>/<group>/<task>` modulo `shard_count`. An
+     * autoscaler replica watches the shards it holds a lease on, and starts a
+     * new watch when they change. `objects` are not sharded: every replica
+     * gets every object target's pause and action row, and uses those of the
+     * objects it runs.
+     *
+     * A policy that no longer resolves (a defaults change applied with
+     * `force`, two namespace policies that disagree, or a plugin it names
+     * that was removed or closed to its namespace) is still sent, with
+     * `state = "invalid"` and the reason in `error`: the autoscaler holds it
+     * and reports it, rather than dropping it silently.
+     *
+     * ACL: `scale:read`, gated before anything is read; policies of jobs
+     * outside the caller's grant are left out, and `context` and `objects` go
+     * only to the autoscaler's own identity (or a management token).
+     * Re-checks the caller's credential periodically, like StreamEvents.
+     *
+     * @generated from rpc legion.Manager.WatchScalingPolicies
+     */
+    watchScalingPolicies: {
+      name: "WatchScalingPolicies",
+      I: WatchScalingPoliciesRequest,
+      O: ScalingPolicySet,
+      kind: MethodKind.ServerStreaming,
+    },
+    /**
+     * Sets the cluster's scaling defaults: the record every autoscaled task
+     * inherits for the fields it, and its namespace policies, leave unset
+     * (`legion scaling defaults apply`). The record has the jobspec
+     * `autoscale` shape without `checks`, and an inherited `min` must be a
+     * multiple of `count` of at least "1x".
+     *
+     * Every autoscaled task's effective policy, and every
+     * `autoscaler/ScalingPolicy` object's (which inherit the same layers), is
+     * re-resolved first. When the change would leave any of them invalid (a
+     * cluster `min` above a task's own `max`, say), the apply is refused with
+     * FAILED_PRECONDITION listing them, unless `force` is set; then those
+     * policies are held `invalid` until fixed. `dry_run` returns the same
+     * report and writes nothing.
+     * Inheriting tasks pick the change up live, with no resubmit.
+     *
+     * ACL: `operator:write`. Retry-safe with `idempotency_key`.
+     *
+     * @generated from rpc legion.Manager.ApplyScalingDefaults
+     */
+    applyScalingDefaults: {
+      name: "ApplyScalingDefaults",
+      I: ApplyScalingDefaultsRequest,
+      O: ApplyScalingDefaultsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reads the cluster's scaling defaults as written, and the effective
+     * defaults for one namespace with the origin of every field (built-in,
+     * cluster defaults, or a namespace policy): what a task with
+     * `autoscale = true` in that namespace would get.
+     *
+     * ACL: `scale:read` on the namespace.
+     *
+     * @generated from rpc legion.Manager.GetScalingDefaults
+     */
+    getScalingDefaults: {
+      name: "GetScalingDefaults",
+      I: GetScalingDefaultsRequest,
+      O: GetScalingDefaultsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * The autoscaler app's heartbeat: one call per evaluation tick, carrying
+     * the last evaluation of every target it evaluated. Held in the memory of
+     * the manager that leads the status lane (other managers forward it), and
+     * read back by GetScalingStatus, which reports the app NOT RUNNING once no
+     * report has arrived for three of the app's intervals. Also the channel
+     * for the app's state-change events (`scale.limited`, `scale.flapping`,
+     * `scale.check_failed`), which the manager records.
+     *
+     * ACL: app-plane. Only the bundled autoscaler's own workload identity (a
+     * token whose job grant belongs to an allocation of
+     * `legion-system/autoscaler`) or a management token may call it, so a
+     * caller with `scale:write` cannot forge the app's status. The app acting
+     * as a viewer (`legion-on-behalf-of`) is PermissionDenied, in audit-only
+     * mode too. With ACLs disabled every caller is trusted, as everywhere
+     * else.
+     *
+     * @generated from rpc legion.Manager.ReportScalingStatus
+     */
+    reportScalingStatus: {
+      name: "ReportScalingStatus",
+      I: ReportScalingStatusRequest,
+      O: ReportScalingStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Records an autoscaler action that is not a task's count write:
+     *
+     * - a `dry-run` policy's "would" decision (`kind = "would"`): a
+     *   `scale_history` row with `applied = false`, so `legion scaling
+     *   history` shows what the policy would have done;
+     * - an **action intent** on an object target (an
+     *   `autoscaler/ScalingPolicy` or `autoscaler/NodeGroup`, `kind =
+     *   "intent"`), written before the app acts on a target outside Legion
+     *   (calls `target/scale` or `target/terminate`, drains or forgets a
+     *   node-group member), and its **outcome** (`kind = "outcome"`) once it
+     *   has. The object must exist with the uid named, or the call is
+     *   NOT_FOUND. Both are compare-and-set on the object's action version,
+     *   so when two autoscaler
+     *   replicas' shard leases overlap, exactly one of them acts on each
+     *   decision (docs/autoscaling.md, "No duplicate actions"). The reply says
+     *   whether the write won, and carries the policy's action row either
+     *   way.
+     *
+     * ACL: app-plane, like ReportScalingStatus.
+     *
+     * @generated from rpc legion.Manager.RecordScalingAction
+     */
+    recordScalingAction: {
+      name: "RecordScalingAction",
+      I: RecordScalingActionRequest,
+      O: RecordScalingActionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports every autoscaled task's live state: its effective count, bounds
+     * and mode, the autoscaler's last evaluation of it (what it wants, the
+     * state, the one-line summary), pins and pauses, and the last recorded
+     * change; and whether the autoscaler app is running at all. With
+     * `detail`, also the last evaluation's full stage-by-stage decision and
+     * the effective policy with the origin of every field
+     * (`legion scaling explain`).
+     *
+     * Answered by the status-lane leader, which holds the app's reports (other
+     * managers forward). Works with the app down, and says so.
+     *
+     * The autoscaler's objects are listed after the tasks: every
+     * `autoscaler/ScalingPolicy` in the namespaces asked for (kind
+     * `external`), and every `autoscaler/NodeGroup` (kind `nodes`) whatever
+     * namespaces are asked for, since they have none. The manager reads them
+     * from the object store and resolves each as the app does, for its mode,
+     * bounds, and effective policy; their state is the app's last report.
+     * `object` names one instead. With several autoscaler replicas
+     * (docs/autoscaling.md, "Replicas"), each target's entry is the newest
+     * report of it, from the replica that owns it.
+     *
+     * ACL: `scale:read`, gated before any lookup; targets of jobs outside the
+     * caller's grant are left out (a request naming such a job is refused).
+     * An object is read with its kind's access: `scale:read` in its
+     * namespace for a ScalingPolicy, `node:read` for a NodeGroup; a request
+     * naming one is gated before the lookup, so a caller cannot probe for
+     * objects.
+     *
+     * @generated from rpc legion.Manager.GetScalingStatus
+     */
+    getScalingStatus: {
+      name: "GetScalingStatus",
+      I: GetScalingStatusRequest,
+      O: GetScalingStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the durable record of scaling changes for a job, newest first:
+     * every count write (by people and by the autoscaler, applied or
+     * deferred), pins and releases, and a `dry-run` policy's "would" rows.
+     * History is capped at 200 rows per task. An object target's history
+     * (`object`: an `autoscaler/ScalingPolicy` or `autoscaler/NodeGroup`)
+     * also has its action intents' rows: `scaled`, `failed`, and for a node
+     * group `drain`, `terminate`, `forget`, and `uncordon`. It is the current
+     * object's (its uid's): a deleted and recreated object starts a new
+     * history, and a deleted object's history is swept with it.
+     *
+     * ACL: `scale:read` on the job; an object's with its kind's read access
+     * (`scale:read` in its namespace, `node:read` for a node group), checked
+     * before the lookup.
+     *
+     * @generated from rpc legion.Manager.GetScaleHistory
+     */
+    getScaleHistory: {
+      name: "GetScaleHistory",
+      I: GetScaleHistoryRequest,
+      O: GetScaleHistoryReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Pauses autoscaling for one task, every autoscaled task of one job, one
+     * of the autoscaler's objects (`object`: an `autoscaler/ScalingPolicy` or
+     * `autoscaler/NodeGroup`), or the whole cluster (`all`), optionally for a
+     * duration; or resumes it (`resume`). A pause is replicated state,
+     * enforced in two places: the autoscaler skips paused targets, and
+     * ScaleTask (or, for an object, RecordScalingAction's intent) refuses the
+     * autoscaler's writes to them, so a pause holds even against a
+     * misbehaving app. People can still scale a paused task by hand.
+     *
+     * A node group is paused like a scaling policy: its count holds, no drain
+     * starts, and drains that have not reached terminate are abandoned (their
+     * nodes uncordoned). An object's pause is keyed by its uid: deleting the
+     * object ends it, and a recreated object is not paused.
+     *
+     * ACL: `scale:write` on the job; an object needs what writing it needs
+     * (its kind's access and `requires`: `scale:write` in its namespace for a
+     * ScalingPolicy, `node:write` and `operator:write` for a NodeGroup),
+     * checked before the lookup, so a caller cannot probe for objects; `all`
+     * needs `operator:write`. Retry-safe with `idempotency_key`.
+     *
+     * @generated from rpc legion.Manager.PauseScaling
+     */
+    pauseScaling: {
+      name: "PauseScaling",
+      I: PauseScalingRequest,
+      O: PauseScalingReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * How many nodes of each node-group template the pending work needs
+     * (docs/autoscaling.md, "Capacity demand"; the `nodegroup.pending` input
+     * of node autoscaling).
+     *
+     * Pending work is every task of an active job that is short of its
+     * effective count (the count `legion job scale` and the autoscaler set),
+     * counted against its allocations across config versions, plus keyed
+     * instances that have no allocation. Left out: `count.per` tasks (they
+     * follow nodes rather than ask for them), cron tasks, finished batch
+     * tasks, and jobs whose eval is still pending or in flight (the scheduler
+     * has not tried the capacity that exists yet; they are listed in
+     * `awaiting_scheduler`). A blocked eval is exactly what this is for.
+     *
+     * For each template the manager builds a synthetic node (the worker
+     * type's pool, namespaces, attributes and resources, then the shape, or a
+     * copy of an existing member) and packs the pending replicas onto copies
+     * of it, first fit decreasing, with the scheduler's own feasibility
+     * functions: the permit and pool, the node's namespaces, constraints,
+     * volume drivers, resources (with `reservedResources`, `capacity` and
+     * oversubscription), `distinct`, static ports, and a gang's quorum, which
+     * places together or not at all. A task group's tasks pack as one unit.
+     * Nodes already on their way (`upcoming`) absorb pending work first,
+     * across all templates. Each template is then answered on its own: "if
+     * only this group grew, how many nodes would the work it can host need?"
+     * Replicas no template can host are `unfittable`, with each template's
+     * failing rule: a jobspec or policy problem, not a capacity problem.
+     *
+     * The answer is approximate, on the safe side: first fit is not the
+     * scheduler's scoring, and preemption, node-local disk, and the free room
+     * on existing nodes are not modelled, so it can over-ask by a node. It is
+     * a point-in-time read on whichever manager answers, computed off the
+     * scheduler's path; nothing is written.
+     *
+     * With a template's `members`, the reply also describes the group's
+     * current members for node scale-in: each node's provider id, its
+     * `legion.scale-in` tag, its reserved share, and its allocations with
+     * what makes a node never a victim (a `legion-system` job, node-local
+     * storage, a `disruption.minAvailable` the drain would break), and with
+     * `fit_check` whether an underutilized member's work fits on the others.
+     *
+     * ACL: `node:read`, gated before anything is read, then on each
+     * template's pool. Node counts cover all pending work, but a pending or
+     * unfittable entry names its job only when the caller has `job:read` on
+     * it; entries for other jobs keep their counts and rules and leave the
+     * job, group and task names empty (`redacted = true`).
+     *
+     * Errors:
+     * - InvalidArgument: no templates, a template without a name, two with
+     *   the same name, an invalid shape, or more than 64 templates.
+     * - NotFound: `like_node` names a node that does not exist.
+     * - PermissionDenied: `node:read` missing for a template's pool.
+     *
+     * @generated from rpc legion.Manager.GetCapacityDemand
+     */
+    getCapacityDemand: {
+      name: "GetCapacityDemand",
+      I: GetCapacityDemandRequest,
+      O: GetCapacityDemandReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Permanently removes a stopped job and related records. Refused
+     * (FAILED_PRECONDITION) for an installed app's job; once the app is
+     * uninstalled, its stopped job is an ordinary job and can be destroyed.
      *
      * @generated from rpc legion.Manager.DestroyJob
      */
@@ -243,12 +697,203 @@ export const Manager = {
     /**
      * Lists jobs known by the manager.
      *
+     * Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+     * `x-legion-consistency` request headers and returns `revision` (see
+     * "Blocking reads" above `WatchKind`).
+     *
      * @generated from rpc legion.Manager.ListJobs
      */
     listJobs: {
       name: "ListJobs",
       I: ListJobsRequest,
       O: ListJobsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the namespaces the caller can see: those where it holds any allow
+     * (`namespace:read`, or a read or write on any namespaced resource there).
+     * A caller that can see none receives an empty list, not an error.
+     *
+     * ACL: per-item; the list itself is open to any authenticated caller.
+     *
+     * @generated from rpc legion.Manager.ListNamespaces
+     */
+    listNamespaces: {
+      name: "ListNamespaces",
+      I: ListNamespacesRequest,
+      O: ListNamespacesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one namespace with what it holds, by kind. NOT_FOUND when it
+     * does not exist.
+     *
+     * ACL: `namespace:read` on the namespace.
+     *
+     * @generated from rpc legion.Manager.GetNamespace
+     */
+    getNamespace: {
+      name: "GetNamespace",
+      I: GetNamespaceRequest,
+      O: GetNamespaceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a namespace, or updates an existing one's description and meta.
+     * The name is a DNS label (lowercase letters, digits and `-`, starting and
+     * ending alphanumeric, at most 63 characters); the `legion-` prefix is
+     * reserved. Namespaces cannot be renamed. With `dry_run`, validates and
+     * reports which ACL policies would reach the namespace without writing.
+     *
+     * ACL: `namespace:write` on the namespace's name, so a rule with
+     * `namespaces = ["payments-*"]` lets its holder create payments
+     * environments and nothing else.
+     *
+     * @generated from rpc legion.Manager.ApplyNamespace
+     */
+    applyNamespace: {
+      name: "ApplyNamespace",
+      I: ApplyNamespaceRequest,
+      O: ApplyNamespaceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a namespace. Refused with FAILED_PRECONDITION while it holds
+     * anything (jobs in any state, volumes, snapshots, objects of
+     * app-declared kinds), naming what is in the way by kind. With `cascade`,
+     * deletes its objects (a kind with a bounded `cleanup` starts it; such an
+     * object no longer holds the namespace), stops and destroys every job,
+     * then deletes its volumes and snapshots, then the namespace —
+     * synchronously, in that order, reporting each step. There is no `Terminating` state: a cascade
+     * that fails halfway leaves the namespace present and the call re-runnable,
+     * and the final delete is one conditional write, so a submit that races in
+     * makes it refuse rather than succeed falsely. `default` cannot be deleted.
+     *
+     * ACL: `namespace:write` on the namespace; a cascade additionally needs
+     * `job:write` there (and `snapshot:write` when it holds snapshots, and,
+     * for each object, `write` on its kind's access resource and the
+     * object's `requires`), so the right to delete an environment is never a
+     * back door to destroying workloads the caller could not otherwise touch.
+     *
+     * @generated from rpc legion.Manager.DeleteNamespace
+     */
+    deleteNamespace: {
+      name: "DeleteNamespace",
+      I: DeleteNamespaceRequest,
+      O: DeleteNamespaceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists every namespace policy.
+     *
+     * ACL: `acl:read`.
+     *
+     * @generated from rpc legion.Manager.ListNamespacePolicies
+     */
+    listNamespacePolicies: {
+      name: "ListNamespacePolicies",
+      I: ListNamespacePoliciesRequest,
+      O: ListNamespacePoliciesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one namespace policy, with each matching namespace's charged
+     * usage. NOT_FOUND when none has the name.
+     *
+     * ACL: `acl:read`.
+     *
+     * @generated from rpc legion.Manager.GetNamespacePolicy
+     */
+    getNamespacePolicy: {
+      name: "GetNamespacePolicy",
+      I: GetNamespacePolicyRequest,
+      O: GetNamespacePolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or replaces a namespace policy. The object is validated
+     * (namespace globs, band names, non-negative limits, a default pool
+     * inside the allowed pools) and stored normalized. With `dry_run`, writes
+     * nothing and reports, as `violations`, every existing job and count the
+     * policy would have refused had it been in force: the preview of what it
+     * will refuse next. A stored policy never evicts or rejects a job already
+     * admitted.
+     *
+     * ACL: `acl:write`.
+     *
+     * @generated from rpc legion.Manager.ApplyNamespacePolicy
+     */
+    applyNamespacePolicy: {
+      name: "ApplyNamespacePolicy",
+      I: ApplyNamespacePolicyRequest,
+      O: ApplyNamespacePolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a namespace policy. NOT_FOUND when none has the name.
+     *
+     * ACL: `acl:write`.
+     *
+     * @generated from rpc legion.Manager.DeleteNamespacePolicy
+     */
+    deleteNamespacePolicy: {
+      name: "DeleteNamespacePolicy",
+      I: DeleteNamespacePolicyRequest,
+      O: DeleteNamespacePolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Disables or enables a task runtime, cluster-wide or for the namespaces
+     * matching `namespaces`.
+     *
+     * Disabling (`enabled = false`) writes the record for `runtime`, or widens
+     * the one that exists: a scoped disable adds its globs to a scoped record,
+     * and a cluster-wide disable replaces any scope. `since` is kept from the
+     * first disable; `reason` and `drain` take the newest call's values. With
+     * `drain`, running work of the runtime in scope is also taken off it:
+     * keyed instances whose task has a `suspend` block are suspended (their
+     * checkpoints kept), every other allocation gets a graceful stop, and each
+     * node suspends its sessions that can be suspended and stops the rest.
+     *
+     * Enabling (`enabled = true`) deletes the record, or removes the named
+     * globs from a scoped one (deleting it when none are left). Blocked evals
+     * wake and place without a resubmit, and callers that were refused succeed
+     * on retry. Instances a drain suspended stay suspended until something
+     * resumes them, as any suspended instance does. Enabling a runtime that is
+     * not disabled succeeds and changes nothing (`changed = false`).
+     *
+     * ACL: `operator:write`.
+     *
+     * Errors:
+     * - InvalidArgument: `runtime` is empty or not a runtime name, a glob in
+     *   `namespaces` is not a namespace glob, `runtime` is `envelope` (disable
+     *   the session task's own runtime instead), or `drain` is set on an
+     *   enable.
+     * - FailedPrecondition: an enable names namespaces while the runtime is
+     *   disabled cluster-wide (enable it cluster-wide, then disable the
+     *   namespaces that should stay off), or names a glob the record does not
+     *   hold.
+     *
+     * @generated from rpc legion.Manager.SetRuntimeEnabled
+     */
+    setRuntimeEnabled: {
+      name: "SetRuntimeEnabled",
+      I: SetRuntimeEnabledRequest,
+      O: SetRuntimeEnabledReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists every runtime disable in force, each with what is waiting on it.
+     * Any manager answers from its own replica.
+     *
+     * ACL: `operator:read`.
+     *
+     * @generated from rpc legion.Manager.ListRuntimeStates
+     */
+    listRuntimeStates: {
+      name: "ListRuntimeStates",
+      I: ListRuntimeStatesRequest,
+      O: ListRuntimeStatesReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -346,6 +991,9 @@ export const Manager = {
      * `job:write` on that job name (this stops a template-only identity from
      * hijacking unrelated jobs when the rendered name is user-influenced).
      *
+     * A render that names an installed app's job is refused, as RunJob's
+     * submit is (FAILED_PRECONDITION).
+     *
      * @generated from rpc legion.Manager.RunJobTemplate
      */
     runJobTemplate: {
@@ -413,11 +1061,64 @@ export const Manager = {
      *   once sessions end or envelopes are added.
      * - FailedPrecondition: no node holds an envelope for the task yet.
      *
+     * On a task of the `isolate` runtime (docs/task-runtime-isolate.md) a
+     * create starts a session isolate, and only for a task whose
+     * `config.lifetime` is `session`. The node's answer is the confirmation:
+     * a session isolate is never recorded in the managers' session index, so
+     * it does not appear in `ListInstances`, and later calls reach it by the
+     * node tag in its id. Isolate-specific errors:
+     * - InvalidArgument: `instance_id` on an isolate task (an isolate is
+     *   never a keyed instance).
+     * - FailedPrecondition: the task's `config.lifetime` is `request` or
+     *   `tenant`, whose isolates live for one run or one tenant and cannot
+     *   be started; run code in them with `RunSession`.
+     *
+     * With `owner` the new unit is a child (docs/child-sessions.md): a
+     * session child of a session task, or a keyed child of a keyed task,
+     * whose row carries the owner reference and which the owner's stop or
+     * destroy ends in the same replicated entry. See
+     * `CreateInstanceRequest.owner`.
+     *
      * @generated from rpc legion.Manager.CreateInstance
      */
     createInstance: {
       name: "CreateInstance",
       I: CreateInstanceRequest,
+      O: CreateInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a keyed instance as a child of a unit running on the calling
+     * node: what `Workload.CreateChildInstance` on an allocation's API socket
+     * becomes once the worker has attributed the caller (`legion instance
+     * create <task> --owner self` inside a task; docs/child-sessions.md).
+     *
+     * The node vouches for which of its allocations asked; the manager
+     * checks that the allocation runs on that node, works out the owner (the
+     * allocation's instance when it has one, the allocation otherwise), and
+     * applies the jobspec's rules exactly as `CreateInstance` with `owner`
+     * does: the owner's task must name the child task in `children.tasks`,
+     * the child task must be keyed, and the owner must have fewer than
+     * `children.max` children. The row, its owner reference, and the
+     * placement eval are one scheduler-lane entry.
+     *
+     * ACL: worker-plane. The caller is a registered worker (its node
+     * certificate or join credentials), and `node_id` must be the node the
+     * owning allocation is placed on. No operator token is involved: the
+     * authority is the jobspec's `children` block.
+     *
+     * Errors: NotFound when the allocation does not run on the calling node;
+     * FailedPrecondition when its task does not declare the child task, the
+     * child task is not keyed, or the owner is itself a child (depth 1
+     * only); ResourceExhausted (retryable) at `children.max`; AlreadyExists
+     * when `instance_id` names an existing instance; InvalidArgument for a
+     * malformed `instance_id`.
+     *
+     * @generated from rpc legion.Manager.CreateChildInstance
+     */
+    createChildInstance: {
+      name: "CreateChildInstance",
+      I: CreateChildInstanceRequest,
       O: CreateInstanceReply,
       kind: MethodKind.Unary,
     },
@@ -619,7 +1320,10 @@ export const Manager = {
      *
      * Starting an instance that is already live (pending, active, or
      * rescheduling) succeeds as a no-op, so the call is safe to retry even
-     * without an idempotency key.
+     * without an idempotency key. The one exception is a `rescheduling`
+     * instance whose replacement waits out its task's reschedule backoff
+     * (`InstanceInfo.reschedule_backoff`): the backoff is lifted and the
+     * replacement placed now. A repeat finds no backoff and is the no-op.
      *
      * A running session (docs/session-mode.md) is live too, and answers the
      * same no-op. A suspended session resumes on the node its id is tagged
@@ -641,8 +1345,10 @@ export const Manager = {
      *   retry, or pass `force_move`).
      * - Aborted: a `store` session's resume lost its generation claim to a
      *   racing resume (`superseded`, naming the winner).
-     * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
-     *   by the scheduler via `count.num`, not this API).
+     * - InvalidArgument: the instance is slot-mode and not `rescheduling` (slot
+     *   lifecycles are owned by the scheduler via `count.num`, not this API;
+     *   lifting a slot instance's reschedule backoff is the one start it
+     *   takes).
      * - FailedPrecondition: the instance is Terminated (destroyed ids are
      *   tombstoned forever — create a NEW id instead), the owning job is
      *   stopped (run the job first; a stopped job schedules nothing), or a
@@ -880,6 +1586,10 @@ export const Manager = {
      * false`, `mode = "session"`. `complete` says whether every node that can
      * run sessions has reported, and `as_of` when the index was read.
      *
+     * Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+     * `x-legion-consistency` request headers and returns `revision` (see
+     * "Blocking reads" above `WatchKind`).
+     *
      * @generated from rpc legion.Manager.ListInstances
      */
     listInstances: {
@@ -921,6 +1631,12 @@ export const Manager = {
      * replacement placed after node loss reserves the task's full resources,
      * like any keyed placement.
      *
+     * Ownership (docs/child-sessions.md): promoting an owner re-keys its
+     * children's references to the new instance. Promoting a child whose
+     * owner is an `instance` or an `allocation` writes the reference into the
+     * new row in this entry, so it stays that owner's (keyed) child;
+     * promoting a child of a `session` detaches it.
+     *
      * ACL: `job:write` on the session's job, checked coarsely before the
      * session lookup and precisely after it.
      *
@@ -946,6 +1662,113 @@ export const Manager = {
       name: "PromoteInstance",
       I: PromoteInstanceRequest,
       O: PromoteInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one running top-level allocation in place: its `memory`
+     * (reservation), `memoryMax` (ceiling), and `cpu`, as an override over the
+     * task's spec (docs/resize.md). No new job version and no rollout.
+     *
+     * One scheduler-lane compare-and-set on the allocation's row commits the
+     * new size (`from` is the effective size this manager read, `to` the new
+     * one), and the allocation's node applies it through the task runtime. A
+     * grow (a larger `memory` or `cpu`) is reserved first and takes only free
+     * room on the node; it never preempts. A shrink is applied on the node
+     * first and released after. A runtime that cannot make the change live
+     * answers `needs_restart` or `not_supported` and nothing changes: Legion
+     * never restarts a unit to resize it.
+     *
+     * The reply always reports an `outcome`; only `applied` changed anything.
+     * A resize back to the spec's own amounts removes the override. The
+     * override ends with the allocation: a replacement starts at the spec.
+     *
+     * ACL: `scale:write` on the allocation's job (the caller needs
+     * `scale:write` on some job before the allocation is looked up, so its
+     * existence is not probeable).
+     *
+     * Errors:
+     * - NotFound: no live allocation has this id.
+     * - InvalidArgument: no amount given, a non-positive amount, or a ceiling
+     *   below the reservation.
+     * - FailedPrecondition: the allocation is a session envelope (it resizes
+     *   through `stateful.envelope`), is not running, or its row changed under
+     *   this call (`stale`; read it again).
+     * - Unavailable: the allocation's node could not be reached. Nothing was
+     *   committed for a shrink; a grow's reservation is rolled back.
+     *
+     * @generated from rpc legion.Manager.ResizeAllocation
+     */
+    resizeAllocation: {
+      name: "ResizeAllocation",
+      I: ResizeAllocationRequest,
+      O: ResizeReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one instance in place: a keyed or slot instance (its current
+     * allocation, exactly as `ResizeAllocation`) or a running session, named
+     * by its id (docs/resize.md).
+     *
+     * A session's resize is node-local and writes nothing to the replicated
+     * store: the manager routes it to the node the session id's tag names
+     * (`Worker.ResizeSession`), which admits a grow against the session
+     * task's envelope and tells the runtime. A grow the envelope has no room
+     * for answers `refused` with the room it has, or `deferred` when the
+     * envelope is elastic and is growing to make room.
+     *
+     * ACL: `scale:write` on the instance's job, checked after a coarse
+     * `scale:write` gate.
+     *
+     * Errors: as `ResizeAllocation`, plus FailedPrecondition when a keyed
+     * instance is suspended or stopped (it has no running allocation), and
+     * Unavailable when a session's node cannot be reached.
+     *
+     * @generated from rpc legion.Manager.ResizeInstance
+     */
+    resizeInstance: {
+      name: "ResizeInstance",
+      I: ResizeInstanceRequest,
+      O: ResizeReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes a task: sets (or, with `reset`, removes) a task-level size
+     * override laid over the task's `resources`, the way `ScaleTask` lays a
+     * count override over `count` (docs/resize.md, "Resizing a task").
+     *
+     * The override is one record per task. While it stands, every new
+     * allocation of the task is placed at the overridden size, and this call
+     * also brings the task's running allocations to it: each one is resized
+     * in place exactly as `ResizeAllocation` would, and the reply lists the
+     * answer for each. An allocation that cannot change in place (no room on
+     * its node, or a runtime that answers `needs_restart` or
+     * `not_supported`) keeps running at its old size and takes the new one
+     * when it is next replaced; with `replace` it is stopped now so the
+     * scheduler places its replacement at the new size. Nothing is ever
+     * restarted without `replace`.
+     *
+     * No job version is created and no rollout starts. A later submit whose
+     * spec changes the task's `resources` drops the override (the author's
+     * new spec wins, the arbitration count overrides follow); a submit that
+     * leaves them alone keeps it. Session tasks are refused: a session's
+     * room is its envelope (`stateful.envelope`), and each session is resized
+     * on its own with `ResizeInstance`.
+     *
+     * ACL: `scale:write` on the job.
+     *
+     * Errors:
+     * - NotFound: the job or task does not exist.
+     * - InvalidArgument: no amount given without `reset`, amounts given with
+     *   `reset`, a non-positive amount, a ceiling below the reservation, or
+     *   `task_name` left empty on a job with more than one task.
+     * - FailedPrecondition: the task is a session task or a session envelope.
+     *
+     * @generated from rpc legion.Manager.ResizeTask
+     */
+    resizeTask: {
+      name: "ResizeTask",
+      I: ResizeTaskRequest,
+      O: ResizeTaskReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -979,6 +1802,139 @@ export const Manager = {
       name: "ListSessionNodes",
       I: ListSessionNodesRequest,
       O: ListSessionNodesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Runs once in a fresh, single-use session of a session task and returns
+     * the outcome (docs/session-runs.md): the session router picks a node
+     * with envelope room exactly as it does for an unnamed session start,
+     * and that node starts the session, stages the caller's `files` and
+     * `input` under the run directory, executes the task's `run.command`
+     * once under `run.wall`, collects stdout, stderr, the exit status,
+     * `result.json`, and the files named in `get`, ends the session, and
+     * answers. Nothing is written to the replicated store, and the session
+     * is ended on every path, including a failure in any step.
+     *
+     * A command that ran is a successful call, whatever it exited with: the
+     * reply carries `exit`. A run stopped by a limit is also a successful
+     * call, with `stopped` set and no `exit`. Only a run that could not start
+     * or could not finish is an error.
+     *
+     * Idempotency is per node. With `idempotency_key`, the node derives the
+     * run's id from the key and keeps the reply for 10 minutes, so a retry
+     * that reaches the same node is answered from it (`deduplicated`) without
+     * running again, and a retry that arrives while the first is still
+     * running waits for it. A manager remembers which node it sent a key to
+     * for the same 10 minutes, and `node_id` pins a retry sent through
+     * another manager. A retry that lands on another node runs again.
+     *
+     * ACL: `job:write` on the job runs the task's own `run.command`. A
+     * request that sets `command` also needs `exec:write` on the job, the
+     * permission `ExecAllocation` needs, and `run.allowCommand = true` on the
+     * task.
+     *
+     * Errors:
+     * - InvalidArgument: no `job_id`; a file or `get` path outside the run
+     *   directory; `input` that is not JSON; more than 3 MiB staged.
+     * - NotFound: no such job, or `node_id` names no node.
+     * - PermissionDenied: `command` without `exec:write` ("--command needs
+     *   exec:write on job <job> (running the task's own run.command needs
+     *   only job:write)").
+     * - FailedPrecondition: `task_name` names no session task of the job (or
+     *   is empty and the job has several); the task has no `run` block; the
+     *   task does not allow `command`; no node holds an envelope for the
+     *   task; the pinned node holds none.
+     * - ResourceExhausted: every envelope is full. Retryable.
+     * - Unavailable: the task's runtime is disabled (`runtime_disabled`), the
+     *   node could not be reached, or the session was lost mid-run.
+     *   Retryable; with an idempotency key, a retry to the same node does
+     *   not run the command twice unless the first attempt never finished.
+     * - DeadlineExceeded: the session did not reach `running` within
+     *   `wait_timeout_seconds`. It is ended; nothing ran.
+     *
+     * On a task of the `isolate` runtime (docs/task-runtime-isolate.md) the
+     * run needs no `run` block and no session of its own: the node runs the
+     * caller's code in an isolate (tens of microseconds to start for a
+     * small component, one to three milliseconds for a language image),
+     * under the task's `config.limits`. Four request fields apply only
+     * there. `tier` picks where the run happens (`isolate`, `vm`, or `auto`,
+     * the default, which decides before anything runs); `tenant` says who
+     * the run is for; `session_id` runs in an existing session isolate;
+     * `args` are arguments for the code. The reply then says
+     * where the code ran and why (`tier`, `tier_reason`) and which tier to
+     * ask for next time (`next_tier`). A run happens in exactly one place:
+     * Legion never moves a run between tiers and never runs one twice. A
+     * run stopped in an isolate by a limit or by a call isolates do not
+     * support is a successful reply with `stopped` set and, when the task
+     * has a VM task, `next_tier = "vm"`; rerunning it is the caller's
+     * decision and a second request. Isolate-only errors:
+     * - InvalidArgument: `tier`, `tenant`, `session_id`, or `args` on a task
+     *   of another runtime; an unknown `tier`; a `tenant` that is not a
+     *   valid tenant key; more than 64 `args` or 64 KiB of them; `command`
+     *   on an isolate task.
+     * - FailedPrecondition: `tier = "vm"` on a task with no `config.vm`;
+     *   `session_id` on a task whose `config.lifetime` is not `session`; the
+     *   task's module does not export what a run needs, or failed to
+     *   compile on the node (the message is the compiler's).
+     * - NotFound: `session_id` names no session isolate of the task.
+     * - Unavailable: the node is still compiling the task's module, or its
+     *   isolate host is restarting. Retryable.
+     *
+     * @generated from rpc legion.Manager.RunSession
+     */
+    runSession: {
+      name: "RunSession",
+      I: RunSessionRequest,
+      O: RunSessionResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports how many isolates each node holds for a job's `isolate` tasks
+     * and what they are doing (docs/task-runtime-isolate.md, "Observing").
+     * Isolates are never listed one by one: a node reports one aggregate per
+     * isolate task on its heartbeat, and this RPC returns the latest from
+     * every node with an envelope for the task. Counters are cumulative
+     * since each node's isolate host started; rates are computed by the node
+     * over its last reporting interval.
+     *
+     * ACL: `job:read` on the job.
+     *
+     * Errors:
+     * - InvalidArgument: no `job_id`.
+     * - NotFound: no such job.
+     * - FailedPrecondition: `task_name` names no `isolate` task of the job.
+     *
+     * @generated from rpc legion.Manager.GetIsolateStats
+     */
+    getIsolateStats: {
+      name: "GetIsolateStats",
+      I: GetIsolateStatsRequest,
+      O: GetIsolateStatsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Describes one session isolate by asking the node its id names (an
+     * unnamed session's id carries a tag of its node; see
+     * docs/session-mode.md). Managers keep no record of isolates, so this is
+     * a forwarded read, not an index lookup, and a session isolate whose
+     * node is unreachable answers Unavailable rather than NotFound.
+     *
+     * ACL: `job:read`, checked coarsely before the node is asked and against
+     * the session's own job once the node answers.
+     *
+     * Errors:
+     * - InvalidArgument: no `session_id`, or an id that carries no node tag
+     *   and no `node_id` to go with it.
+     * - NotFound: no node matches the id's tag, or the node holds no such
+     *   session isolate.
+     * - Unavailable: the node could not be reached. Retryable.
+     *
+     * @generated from rpc legion.Manager.GetIsolate
+     */
+    getIsolate: {
+      name: "GetIsolate",
+      I: GetIsolateRequest,
+      O: GetIsolateReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -1261,8 +2217,10 @@ export const Manager = {
     },
     /**
      * Lists volumes, optionally filtered by job, node, driver, instance, or
-     * state. Includes `destroyed` tombstones so an operator can still see where
-     * a job's storage went after it was reclaimed.
+     * state. Live volumes only by default: `destroyed` tombstones are left out
+     * unless the request sets `include_destroyed` or filters on
+     * `state = "destroyed"`, so an operator can still see where a job's storage
+     * went after it was reclaimed.
      *
      * A volume is the concrete storage behind an instance's opaque
      * `{driver}/{volume_id}` storage handle: which driver owns it, which node it
@@ -1381,6 +2339,9 @@ export const Manager = {
      *   task does not declare an identity named `identity_name`.
      * - PermissionDenied: the allocation exists but is not placed on
      *   `node_id` (a worker may only request tokens for its own allocations).
+     * - Unavailable: this manager has no signing key yet. It is a raft
+     *   follower that started before the leader's key replicated to it, and
+     *   adopts the key within seconds. Retry.
      * - Internal: signing failed.
      *
      * @generated from rpc legion.Manager.IssueWorkloadIdentityToken
@@ -1413,6 +2374,8 @@ export const Manager = {
      * - NotFound: no node with `node_id` is registered, or no node identity
      *   named `identity_name` is configured.
      * - PermissionDenied: `node_id` does not match the caller's credential.
+     * - Unavailable: this manager has no signing key yet (see
+     *   IssueWorkloadIdentityToken). Retry.
      * - Internal: signing failed.
      *
      * @generated from rpc legion.Manager.IssueNodeIdentityToken
@@ -1428,23 +2391,35 @@ export const Manager = {
      * the node's identity on every plane Legion runs between its own
      * processes: the mTLS worker plane listener (what a manager verifies when
      * it dials the node, docs/auth-and-acls.md, "The worker plane") and the
-     * mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
+     * mesh (`service.mesh = true`, docs/network-handlers.md, "The mesh").
      *
      * The worker generates its key pair locally and sends only a CSR; the
-     * private key never crosses the network. The manager signs the CSR's
-     * public key with the cluster CA and SANs it chooses itself,
+     * private key never crosses the network. The manager has the CSR's public
+     * key signed by the cluster CA with SANs it chooses itself,
      * `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
      * extension, and subject the CSR requests. Valid for 24 hours. Workers call
      * it right after registration (the listener needs it), again after a third
-     * of the lifetime, and at once when a heartbeat reply names a CA their
-     * bundle lacks (a rotation). The first call creates the cluster CA
-     * (replicated with the control lane).
+     * of the lifetime, and at once when a heartbeat reply's
+     * `cluster_ca_pins` differ from the bundle they hold (a rotation, or a CA
+     * added to or removed from the bundle).
+     *
+     * Who signs is the manager's `clusterCa.provider` (docs/cluster-ca.md):
+     * the built-in CA (the default; the first call creates it, replicated with
+     * the control lane), an operator-provided CA on the manager's disk
+     * (`file`), or an external signer such as Vault PKI (`exec`). Whatever a
+     * `file` or `exec` provider returns is verified before it is handed out:
+     * it must chain to the trust bundle, carry the CSR's public key, carry
+     * exactly the SANs above, carry serverAuth and clientAuth and no other
+     * extended key usage, not be a CA, and be valid for between 2 hours and
+     * the requested 24 hours plus 10 minutes.
      *
      * `fleet` is for the simulator only (`legion start worker --simulate`),
      * which serves every simulated node from one listener: the certificate
      * then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
      * instead of the node, and the caller's node must have registered with the
-     * `workerFleet` config attribute set to the same name.
+     * `workerFleet` config attribute set to the same name. Registration admits
+     * that attribute only when the node's worker type grants the fleet
+     * (WorkerRegister), so the fleet is the operator's choice, not the node's.
      *
      * The node's *workload* identities are never certificates: a dialing node
      * names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -1460,7 +2435,14 @@ export const Manager = {
      *   `fleet` does not match the node's registered `workerFleet`.
      * - NotFound: no node with `node_id` is registered.
      * - PermissionDenied: `node_id` does not match the caller's credential.
-     * - Internal: the CA could not be created or signing failed.
+     * - Unavailable: the cluster CA is not available on this manager yet (the
+     *   built-in CA has not replicated, or an `exec` provider could not be
+     *   run or did not answer). The worker keeps its certificate and retries.
+     * - FailedPrecondition: the CA needs an operator: the provider returned a
+     *   certificate Legion refuses (the message names the provider and the
+     *   mismatch), its CA files are unusable, or this manager's CA disagrees
+     *   with the cluster's (`GetMeshCa.problem` says why).
+     * - Internal: the built-in CA could not be created or signing failed.
      *
      * @generated from rpc legion.Manager.IssueNodeCertificate
      */
@@ -1471,96 +2453,66 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Fetch the KV-held certificates behind `certFrom = { kv = "<path>" }`
-     * ingress chains (docs/network-handlers.md, "Certificates from KV").
+     * Fetch the material a node's datapath needs for the allocations placed
+     * on it, in one call per heartbeat: network-policy bodies by hash, the
+     * KV-held certificates and CA bundles behind `network.ports[].tls` and
+     * `connect.upstreams[].ca`, and the values behind
+     * `connect.upstreams[].credentials` (docs/network-handlers.md). One call
+     * serves every kind, so a new kind of material (or a new place a value
+     * comes from) is a provider on the manager, not a new call.
      *
-     * The worker names allocations, never KV paths. For each allocation the
-     * manager checks that it is placed on the calling node, recomputes its
-     * effective ingress chain (inline chain merged with any policy objects),
-     * takes the KV path from that chain, and reads the entry. So a node can
-     * only ever read a certificate that a job or policy on it declares, and a
-     * job can only declare one its submitter could read (RunJob and
-     * UpsertNetPolicy require `kv:read` on the path).
+     * Each `MaterialRef` names a kind and what it is for, never where the
+     * value lives:
+     * - `policy`: `key` is a content hash from `HeartbeatReply.net_policies`;
+     *   `value` is the `EffectivePolicy` as JSON. Policies are
+     *   content-addressed, so a node running a thousand identical sandboxes
+     *   fetches one body once.
+     * - `port_cert`: `allocation_id` and `key` (a port label) name a port whose
+     *   `tls.cert = { kv }`; `value` is the PEM bundle (chain, leaf first,
+     *   then the private key), validated by the manager first.
+     * - `client_ca`: the same, for the port's `tls.clients.ca = { kv }`;
+     *   `value` is a PEM CA bundle.
+     * - `upstream_ca`: `allocation_id` and `key` (an upstream key) name an
+     *   external upstream whose `ca = { kv }`; `value` is a PEM CA bundle.
+     * - `credential`: `allocation_id`, `key` (the upstream's key), and `part`
+     *   (the header, lower-cased) name one injected header; `value` is the KV
+     *   value or a freshly minted workload-identity token.
      *
-     * Workers call it on their heartbeat loop, only while some allocation on
-     * the node has a KV-backed chain, passing the KV version they already
-     * hold so an unchanged certificate costs no material on the wire. The
-     * worker keeps the material in memory only.
+     * The manager derives every KV path and identity itself, from the
+     * allocation's own declaration (its ports, as placed, and its task's
+     * `connect` block), after checking the allocation is placed on the
+     * calling node. So a node can only ever read material that a job on it
+     * declares, and a job can only declare a KV path its submitter could read
+     * (RunJob and template runs require `kv:read` on it).
      *
-     * Per-allocation problems (not placed here, no KV-backed chain, key
-     * missing, bundle invalid) come back in that allocation's `error` rather
-     * than failing the call, so one broken certificate never blocks the
-     * others.
-     *
-     * Called by the worker for its own node: the caller's authenticated
-     * per-node principal (`node:<node_id>`) must match the request's
-     * `node_id`.
-     *
-     * Errors:
-     * - PermissionDenied: `node_id` does not match the caller's credential.
-     * - Internal: the node's allocations could not be loaded.
-     *
-     * @generated from rpc legion.Manager.GetIngressCertificates
-     */
-    getIngressCertificates: {
-      name: "GetIngressCertificates",
-      I: GetIngressCertificatesRequest,
-      O: GetIngressCertificatesReply,
-      kind: MethodKind.Unary,
-    },
-    /**
-     * Fetch the values behind `connect.upstreams[].credentials`
-     * (docs/network-handlers.md, "Credential injection"): headers the node's
-     * forwarder sets on every request it sends to an external `https://`
-     * upstream, so the task (and anything captured from it: a sandbox's
-     * memory checkpoints, forks, published snapshots) never holds the secret.
-     *
-     * Each credential names one provider:
-     * - `from = { kv = "<path>" }`: the KV value at that path.
-     * - `from = { identity = "<name>" }`: a workload-identity token
-     *   (docs/workload-identity.md) the manager mints for the allocation
-     *   under the task's identity of that name, with that identity's
-     *   audience, TTL, `sub` template, and extra claims.
-     *
-     * The worker names (allocation, upstream, header) triples, never KV paths
-     * or identities. For each one the manager checks that the allocation is
-     * placed on the calling node, reads the allocation's own task `connect`
-     * declaration, finds the upstream and the credential for that header, and
-     * takes the provider from it. So a node can only ever read a secret that a
-     * job placed on it declares, and a job can only declare one its submitter
-     * could read (RunJob and template runs require `kv:read` on every
-     * credential path).
-     *
-     * Workers call it on their heartbeat loop, only while some allocation on
-     * the node declares credentials, passing the version they already hold so
-     * an unchanged value costs no material on the wire. For a KV value the
-     * version is the KV entry's; for an identity token it is the token's
-     * expiry, and the manager mints a new token once less than half the
-     * identity's TTL remains. The worker keeps values in memory only: never in
+     * Workers pass the version they already hold (`MaterialRef.version`): the
+     * KV entry's version, or for an identity token its expiry in unix
+     * seconds, which the manager re-mints once less than half the identity's
+     * TTL remains. An unchanged value comes back `unchanged` with no material
+     * on the wire. Material is held in memory only on the worker: never in
      * its state files, never in a log line.
      *
-     * Per-entry problems (not placed here, no such credential, key missing,
-     * workload identity disabled on the manager) come back in that entry's
-     * `error` rather than failing the call, so one missing secret never blocks
-     * the others. `absent` marks the problems that are authoritative (the key
-     * or the declaration is gone): the worker drops any value it holds and
-     * fails requests on that upstream closed. Any other error, and a failed
-     * call, keeps the last good value.
+     * Per-ref problems (not placed here, no such declaration, key missing,
+     * bundle invalid, workload identity disabled) come back in that ref's
+     * `error` rather than failing the call, so one broken certificate or
+     * missing secret never blocks the others. `absent` marks the
+     * authoritative ones (the key or the declaration is gone): the worker
+     * drops what it holds, so requests that need it fail closed. Any other
+     * error, and a failed call, keeps the last good value (fail-static).
      *
-     * Called by the worker for its own node: the caller's authenticated
-     * per-node principal (`node:<node_id>`) must match the request's
-     * `node_id`.
+     * ACL: worker plane. The caller's authenticated per-node principal
+     * (`node:<node_id>`) must match the request's `node_id`.
      *
      * Errors:
      * - PermissionDenied: `node_id` does not match the caller's credential.
      * - Internal: the node's allocations could not be loaded.
      *
-     * @generated from rpc legion.Manager.GetUpstreamCredentials
+     * @generated from rpc legion.Manager.FetchDatapathMaterial
      */
-    getUpstreamCredentials: {
-      name: "GetUpstreamCredentials",
-      I: GetUpstreamCredentialsRequest,
-      O: GetUpstreamCredentialsReply,
+    fetchDatapathMaterial: {
+      name: "FetchDatapathMaterial",
+      I: FetchDatapathMaterialRequest,
+      O: FetchDatapathMaterialReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -1598,20 +2550,36 @@ export const Manager = {
      *   allocations that left the desired set with why. A placement reaches the
      *   worker one network round trip after it commits, whatever the heartbeat
      *   cadence.
+     * - **Resume.** A worker whose last message came from another epoch (this
+     *   manager process is not the one it last streamed from, as after a
+     *   failover or a restart) sends the `revision` of that message as
+     *   `open.last_revision`. When this manager's journal still covers it for
+     *   the node, the first message has `resumed_from` set and carries only the
+     *   allocations that changed on the node since that revision, as upserts
+     *   and stops, instead of the whole set (revisions-and-watches plan, ST3).
      * - **Full resync.** A message with `resync = true` carries the node's whole
      *   desired set and replaces what the worker holds. It is the first message
-     *   on a stream that cannot resume: a new `epoch` (this manager process is
-     *   not the one the worker last streamed from, as after a failover or a
-     *   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
-     *   than the messages the manager still keeps. It also follows a heartbeat
-     *   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+     *   on a stream that can neither replay nor resume: a new `epoch` with no
+     *   `last_revision`, or one older than the journal (a manager restarted,
+     *   or more than 256 changes on the node since), a `last_seq` ahead of the
+     *   manager's, or a `last_seq` older than the messages the manager still
+     *   keeps. It also follows a heartbeat whose digest disagreed with the
+     *   manager's (`HeartbeatReply.work_resync`).
+     * - **Checkpoint work.** A snapshot of the node entering a state that is
+     *   work for it (a capture, a delete, a publish), or a warm queued for it,
+     *   is pushed in `checkpoint_requests` on the next message, so the node
+     *   starts it one round trip after it commits instead of at its next
+     *   heartbeat. Each piece of work is pushed once per stream; a new stream
+     *   gets every piece still outstanding.
      *
      * A worker that reconnects with the same `epoch` and a `last_seq` the
      * manager still holds gets the messages after it replayed, then live
-     * deltas: nothing is lost and nothing is applied twice. Acked messages
-     * are pruned. The log is held in the manager's memory only: the
-     * committed allocation rows are the durable record, so a new manager
-     * process resyncs instead of replaying.
+     * deltas: nothing is lost and nothing is applied twice. A replayed message
+     * carries its allocation changes only, never its `checkpoint_requests`.
+     * Acked messages are pruned. The log is held in the manager's memory
+     * only: the committed allocation rows are the durable record, so a new
+     * manager process resumes from the worker's revision (or resyncs) instead
+     * of replaying.
      *
      * Any manager serves the stream, leader or follower, from its own
      * replica of the store.
@@ -1779,8 +2747,10 @@ export const Manager = {
      * it, and says so with `index_reported = false`. Only entries of at least
      * 1 MiB are advertised, so small artifacts never appear.
      *
-     * The content store's byte budgets and per-class totals are not part of
-     * this reply: the index carries digests, not classes.
+     * The byte budgets and totals of the `artifacts` and `snapshots` classes
+     * are not part of this reply: the index carries digests, not classes. The
+     * `derived` class is reported whole in `derived`, because its entries are
+     * never advertised by digest.
      *
      * ACL: node:read, scoped to the node's pool (checked unscoped before the
      * lookup, so a caller with no node access cannot probe which nodes exist).
@@ -1859,6 +2829,54 @@ export const Manager = {
       name: "SetNodeAvailability",
       I: SetNodeAvailabilityRequest,
       O: SetNodeAvailabilityReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Removes a node's record and revokes its node token, in one write
+     * (docs/architecture-managers-workers.md, "Forgetting a node"). For dead
+     * records (a machine that is gone and will not come back), and the last
+     * step of node-group scale-in (drain, terminate, forget).
+     *
+     * A forgotten node is gone from `legion node list` and from scheduling.
+     * Its node token no longer authenticates, so a worker still running there
+     * cannot heartbeat or re-register under its old identity: it would have
+     * to join again with a join token, which a node group's spent
+     * `max_uses` token refuses. Its allocations, if any (only with `force`),
+     * are removed and replaced elsewhere, snapshots stored on it are marked
+     * lost, and its liveness row is swept by the next orphan pass.
+     *
+     * The guard, unless `force` is set, refuses (FailedPrecondition, naming
+     * what to do) a node that:
+     * - still has allocations, including stateful ones held by their
+     *   `stateful.onLost` policy: drain it first, or wait for the policy;
+     * - is live and schedulable: its status is `active` and it is not
+     *   cordoned. Cordon or drain it first, or wait until it is marked lost
+     *   (a cordoned, empty node may be forgotten while it still heartbeats:
+     *   that is the scale-in flow, which terminates the machine first);
+     * - holds node-local volumes, whose data lives on that machine.
+     *
+     * `force` asserts the machine is gone for good: the record is removed
+     * whatever its state, its allocations are released for replacement at
+     * once (stateful instances included, without waiting for
+     * `onLost.replaceAfter`), and node-local volumes stay pinned to the
+     * missing node until an operator replaces their instances.
+     *
+     * Retry-safe: with an `idempotency_key`, a repeat of a request that
+     * succeeded replays its result with `deduplicated = true` instead of
+     * answering NotFound.
+     *
+     * Errors:
+     * - InvalidArgument: `node_id` is empty.
+     * - NotFound: no node with `node_id` exists.
+     * - FailedPrecondition: the guard refused (see above).
+     * - PermissionDenied: caller lacks `node:write` for the node's pool.
+     *
+     * @generated from rpc legion.Manager.ForgetNode
+     */
+    forgetNode: {
+      name: "ForgetNode",
+      I: ForgetNodeRequest,
+      O: ForgetNodeReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -2056,6 +3074,10 @@ export const Manager = {
     },
     /**
      * Returns node + allocation view of cluster state (the "ledger").
+     *
+     * Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+     * `x-legion-consistency` request headers and returns `revision` (see
+     * "Blocking reads" above `WatchKind`).
      *
      * @generated from rpc legion.Manager.GetLedger
      */
@@ -2351,6 +3373,10 @@ export const Manager = {
     /**
      * Gets one KV entry by key.
      *
+     * Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+     * `x-legion-consistency` request headers and returns `revision` (see
+     * "Blocking reads" above `WatchKind`).
+     *
      * @generated from rpc legion.Manager.GetKv
      */
     getKv: {
@@ -2360,7 +3386,15 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Lists KV entries by prefix.
+     * Lists KV entries by prefix, and with `include_locks` the unexpired
+     * locks under it (owners and expiries, never their lock ids).
+     *
+     * ACL: `kv:read`, gated before anything is read; entries and locks whose
+     * keys the caller cannot read are left out.
+     *
+     * Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+     * `x-legion-consistency` request headers and returns `revision` (see
+     * "Blocking reads" above `WatchKind`).
      *
      * @generated from rpc legion.Manager.ListKv
      */
@@ -2591,13 +3625,107 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * The cluster CA — what an operator hands a non-Legion client that must
-     * reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
-     * `legion exec --direct`), or verifies a node certificate against. Returns
-     * the signing CA, the full trust bundle (both CAs during a rotation), the
-     * pin new join tokens carry, and where a rotation stands. Never a key.
-     * Empty `cert_pem` when no CA exists yet (it is created on first use: the
-     * first join token or node certificate). ACL: `net:read`.
+     * Creates or replaces a network plugin object: a WASM module on the
+     * proxy-wasm ABI that runs inside the node datapath as one more handler
+     * (docs/network-plugins.md). The object names the module (a `.wasm` URL
+     * pinned by `sha256:` checksum), the stages it acts at, who may reference
+     * it (`usableBy`), the node pools it may run on, its limits, the JSON
+     * Schema every reference's `config` must satisfy, the HTTP targets it may
+     * call, and the KV-held keys it may sign with. Validated on write; a
+     * plugin that a stored policy references must keep stages that policy can
+     * run and a schema its config still satisfies, or the write is refused
+     * (FailedPrecondition). The same holds for every job that is not stopped
+     * and whose latest config references the plugin: the write is refused if
+     * that job could no longer be submitted (a dropped stage, a config the new
+     * schema rejects, or `usableBy` no longer `jobs`). The error names the job
+     * when the caller may read it. A stopped job is checked when it is next
+     * run.
+     * Nodes running the plugin pick up the new revision on their next
+     * heartbeat and fetch the module once per node.
+     *
+     * ACL: `net:write`. A `usableBy = "policies"` plugin with `nodePools`
+     * needs it on each pool; one without pools, and every `usableBy = "jobs"`
+     * plugin, and any plugin whose module is a `file://` node path, needs it
+     * unscoped (cluster-wide). Naming a `credentials` KV path also needs
+     * `kv:read` on that path.
+     *
+     * @generated from rpc legion.Manager.UpsertNetPlugin
+     */
+    upsertNetPlugin: {
+      name: "UpsertNetPlugin",
+      I: UpsertNetPluginRequest,
+      O: UpsertNetPluginReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Fetches one stored plugin object by name, with the policy objects that
+     * reference it. ACL: `net:read`.
+     *
+     * @generated from rpc legion.Manager.GetNetPlugin
+     */
+    getNetPlugin: {
+      name: "GetNetPlugin",
+      I: GetNetPluginRequest,
+      O: GetNetPluginReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists stored plugin objects by name. ACL: `net:read`.
+     *
+     * @generated from rpc legion.Manager.ListNetPlugins
+     */
+    listNetPlugins: {
+      name: "ListNetPlugins",
+      I: ListNetPluginsRequest,
+      O: ListNetPluginsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a stored plugin object. Refused with `FAILED_PRECONDITION`
+     * while a stored policy object references it, or while a job that is not
+     * stopped references it in its latest config. The error names the
+     * policies, and the jobs the caller may read; the rest are counted ("2
+     * job(s) you cannot read"). A stopped job does not block the delete; its
+     * next run is refused at submit. ACL: `net:write`, as for UpsertNetPlugin.
+     *
+     * @generated from rpc legion.Manager.DeleteNetPlugin
+     */
+    deleteNetPlugin: {
+      name: "DeleteNetPlugin",
+      I: DeleteNetPluginRequest,
+      O: DeleteNetPluginReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Where a plugin runs and how it is doing, as each node last reported it
+     * on its heartbeat: the revision and module the node holds, whether the
+     * module is fetched and instantiated, calls, errors, the last error, and
+     * the p99 callback time. ACL: `net:read`.
+     *
+     * @generated from rpc legion.Manager.GetNetPluginStatus
+     */
+    getNetPluginStatus: {
+      name: "GetNetPluginStatus",
+      I: GetNetPluginStatusRequest,
+      O: GetNetPluginStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * The cluster CA as the answering manager sees it — what an operator
+     * hands a non-Legion client that must reach a mesh-TLS port or the worker
+     * plane (`legion sandbox start --node`, `legion exec --direct`), or
+     * verifies a node certificate against. Returns the signing CA, the full
+     * trust bundle (both CAs during a built-in rotation), the chain leaves
+     * carry, the pin new join tokens carry, where a rotation stands, which
+     * provider supplies the CA (`builtin`, `file`, or `exec`;
+     * docs/cluster-ca.md), and anything wrong with it on this manager. Never
+     * a key.
+     *
+     * Never fails for a CA problem: an unusable provider or a manager that
+     * disagrees with the cluster is reported in `problem`, so this is the
+     * call to diagnose one with. Empty `cert_pem` when no CA exists yet (the
+     * built-in CA is created on first use: the first join token or node
+     * certificate). ACL: `net:read`.
      *
      * @generated from rpc legion.Manager.GetMeshCa
      */
@@ -2608,15 +3736,23 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Rotate the cluster CA in two steps, without breaking any connection
-     * (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
-     * the current one, and signs every certificate from now on; the previous
-     * CA stays in every holder's trust bundle for one certificate lifetime (24
-     * hours), and chains carry the cross-signed certificate meanwhile, so a
-     * holder that has not refreshed its bundle yet keeps verifying. Nodes
-     * re-issue their certificates within one heartbeat (the reply names the
-     * new CA). Join tokens minted before the rotation keep working during the
-     * overlap; after it, mint new ones. ACL: `net:write` (unscoped).
+     * Rotate the built-in cluster CA in two steps, without breaking any
+     * connection (worker-plane-auth plan §6.9). The new CA is generated,
+     * cross-signed by the current one, and signs every certificate from now
+     * on; the previous CA stays in every holder's trust bundle for one
+     * certificate lifetime (24 hours), and chains carry the cross-signed
+     * certificate meanwhile, so a holder that has not refreshed its bundle
+     * yet keeps verifying. Nodes re-issue their certificates within one
+     * heartbeat (the reply names the new CA). Join tokens minted before the
+     * rotation keep working during the overlap; after it, mint new ones.
+     * ACL: `net:write` (unscoped).
+     *
+     * Errors:
+     * - FailedPrecondition: the manager's `clusterCa.provider` is `file` or
+     *   `exec`. Legion does not hold that CA's key, so it cannot rotate it;
+     *   the message names the provider and the procedure (add the new CA to
+     *   the trust bundle, wait a heartbeat, switch the signing CA, drop the
+     *   old CA a day later; docs/cluster-ca.md#rotation).
      *
      * @generated from rpc legion.Manager.RotateMeshCa
      */
@@ -2627,22 +3763,6 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Worker plane: fetches the merged policy body for a hash the heartbeat
-     * reply named. Policies are content-addressed so a node running a thousand
-     * identical sandboxes fetches one body once; the worker caches by hash and
-     * keeps the last known good body if a fetch fails (fail-static).
-     *
-     * ACL: worker plane (node token).
-     *
-     * @generated from rpc legion.Manager.FetchNetPolicy
-     */
-    fetchNetPolicy: {
-      name: "FetchNetPolicy",
-      I: FetchNetPolicyRequest,
-      O: FetchNetPolicyReply,
-      kind: MethodKind.Unary,
-    },
-    /**
      * Resolves an artifact credential stored in KV for a worker about to fetch.
      *
      * Called by workers over their existing authenticated manager channel
@@ -2650,9 +3770,18 @@ export const Manager = {
      * names a KV credential path. The credential value is returned to the
      * worker and is never persisted on allocations, logged, or traced.
      *
-     * SECURITY: KV ACLs do not exist yet, so any task spec may reference any
-     * KV path via `auth.kv`. When the ACL system lands, this RPC is the
-     * enforcement point for artifact credential reads (see docs/artifacts.md).
+     * A node is served only paths its own work names: an artifact `auth.kv` of
+     * an allocation placed on it, of the task of a live boot ticket for its
+     * pool (edge starts stage before the allocation exists), or its pool's
+     * `contentStore.auth.kv`. Any other path is NOT_FOUND, decided before the
+     * value is read, so a node cannot probe which paths exist. A spec that
+     * names `auth.kv` itself needed `kv:read` on the path to be admitted (see
+     * docs/artifacts.md).
+     *
+     * Errors:
+     * - PermissionDenied: `node_id` does not match the caller's credential.
+     * - NotFound: no work on the node names `kv_path`, or the KV entry is
+     *   missing.
      *
      * @generated from rpc legion.Manager.GetArtifactCredential
      */
@@ -2668,7 +3797,9 @@ export const Manager = {
      * Read-only mode is the default safety behavior and rejects write statements
      * unless explicitly enabled in the request.
      *
-     * Private key material and password hashes always read as NULL, in any
+     * Private key material, password hashes, and recorded idempotency replies
+     * (`idempotency_record.response_message`, which can hold a live boot
+     * ticket) always read as NULL, in any
      * statement and however the query reaches them: `signing_key.private_key_pem`,
      * `net_mesh_ca.key_pem`, and `acl_user.password_hash`. Predicates on those
      * columns match nothing, and `INSERT ... SELECT` copies NULL.
@@ -2702,6 +3833,13 @@ export const Manager = {
      * changes, and rollout activity. Results are ordered oldest-to-newest and
      * support cursor-based polling via `after_id`.
      *
+     * ACL: `operator:read` sees every event. A caller without it but with
+     * `job:read` somewhere (a namespace tenant) sees only the events of jobs
+     * it may read, plus the lifecycle events of namespaces it reaches
+     * (docs/namespaces.md); cluster events (nodes, raft, the scheduler) and
+     * other tenants' events are left out, so a page may hold fewer than
+     * `limit` events. Neither kind of caller can widen this with a filter.
+     *
      * @generated from rpc legion.Manager.ListEvents
      */
     listEvents: {
@@ -2717,9 +3855,12 @@ export const Manager = {
      * replayed first, then the live feed continues seamlessly. Clients that
      * disconnect can resume without gaps by passing the last event ID they saw.
      *
-     * ACL: `operator:read`, re-checked every 30 seconds while the stream runs.
-     * Once the token is revoked or expired, or its policies no longer grant
-     * `operator:read`, the stream ends with that auth error.
+     * ACL: as ListEvents — `operator:read` for the whole feed, or `job:read`
+     * for the events of the jobs the caller may read — re-checked every 30
+     * seconds while the stream runs, against the same filter every event
+     * passes. Once the token is revoked or expired, or its policies no longer
+     * grant what the stream was opened with, the stream ends with that auth
+     * error.
      *
      * @generated from rpc legion.Manager.StreamEvents
      */
@@ -2785,6 +3926,11 @@ export const Manager = {
      * on the manager (`method` = the configured method name, `jwt` = the
      * externally issued token). The reply contains the token secret exactly
      * once; the manager stores only a hash of it.
+     *
+     * A token minted through the `legion` method (a workload's identity token)
+     * expires no later than that identity token does, whatever `ttl` asks for:
+     * a fork or snapshot retires the identity token, and a login token copied
+     * with it must not outlive it.
      *
      * @generated from rpc legion.Manager.Login
      */
@@ -2918,6 +4064,944 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Lists job grants: what each job config version's `legion` identities
+     * were granted at submit, and by whom (docs/workload-identity.md,
+     * "Permissions"). Requires `acl:read`.
+     *
+     * A job asks for access to Legion itself with `permissions` (inline ACL
+     * rules) and `policies` (policy names) on the reserved `legion` identity
+     * of a task. Every path that stores a job config (RunJob, RunJobTemplate)
+     * grants them only when the submitting token holds every one, and records
+     * the grant with the version, in the submitter's name. A workload's
+     * `legion` token then carries the grant of the version its allocation
+     * runs, resolved when the token is verified. Versions that ask for nothing
+     * have no grant and are not listed.
+     *
+     * Revoked grants are left out unless `include_revoked` is set.
+     *
+     * @generated from rpc legion.Manager.ListGrants
+     */
+    listGrants: {
+      name: "ListGrants",
+      I: ListGrantsRequest,
+      O: ListGrantsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Revokes a job's grants: every version's, or one version's. Requires
+     * `acl:write`.
+     *
+     * A workload token resolves its grant every time it is verified, so the
+     * job's tokens (and ACL tokens minted from them with `legion login
+     * --method legion`) lose the access at their next request; tokens keep
+     * whatever `controlPlaneBindings` give them. Allocations keep running.
+     * Revocation does not stick to the job: the next submit of the job by
+     * someone who holds the access grants it again, as a submit always does.
+     *
+     * Retry-safe: a repeated `idempotency_key` returns the first reply with
+     * `deduplicated` set. Revoking a job with no live grants succeeds and
+     * revokes nothing (`revoked = 0`).
+     *
+     * Errors:
+     * - InvalidArgument: `job` is empty.
+     *
+     * @generated from rpc legion.Manager.RevokeGrant
+     */
+    revokeGrant: {
+      name: "RevokeGrant",
+      I: RevokeGrantRequest,
+      O: RevokeGrantReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists installed apps (docs/apps.md): each app's record, settings, grant,
+     * status, and where it runs. Requires `app:read`; the list is filtered to
+     * the apps the caller may read (`names` selector).
+     *
+     * An app is a job in the reserved `legion-system` namespace, a grant (what
+     * that job's `legion` identity may do), and registrations. Its status is
+     * derived when it is read: `stopped` (disabled), `degraded` (the
+     * reconciler's last pass failed, or fewer replicas run than asked for),
+     * `pending` (nothing runs yet, with why), or `running`.
+     *
+     * @generated from rpc legion.Manager.ListApps
+     */
+    listApps: {
+      name: "ListApps",
+      I: ListAppsRequest,
+      O: ListAppsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Shows one app: everything ListApps reports, plus its manifest, config,
+     * and the reconciler's last action, error, and build marker. Requires
+     * `app:read` on the app.
+     *
+     * Errors:
+     * - NotFound: no app of that name is installed.
+     *
+     * @generated from rpc legion.Manager.GetApp
+     */
+    getApp: {
+      name: "GetApp",
+      I: GetAppRequest,
+      O: GetAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Installs an app from a manifest (`legion app install <file|url>`).
+     * Requires `app:write` on the app's name, and every permission the
+     * manifest asks for: the same grant check a job submit runs (docs/
+     * workload-identity.md, "Permissions"), against the installer. The grant
+     * is recorded on the app record in the installer's name, and the app
+     * reconciler then submits the app's job in `legion-system`.
+     *
+     * What else installing takes (docs/apps.md, "Trust model"):
+     * - every permission behind each RPC a sandboxed page lists in `rpcs`,
+     *   everywhere the RPC reaches, reserved scopes included (a page runs its
+     *   RPCs as whoever views it, so it can never make a viewer do what its
+     *   installer could not);
+     * - `operator:write`, when the manifest's `placement` is not `managers`
+     *   (where an app runs is where its token lands).
+     *
+     * The app's job, as rendered, may hold nothing host-level besides its
+     * own `exec` tasks, which run as the app's own uid (assigned here, from
+     * 1900000000 up, and never shared): no `exec` health check, `file://`
+     * artifact, `auth.nodeIdentity`, file at an absolute host path, cgroup of
+     * its own, or negative OOM score, whoever installs it. A manifest may not
+     * name an exec task's `user`.
+     *
+     * The rendered job then goes through the submit's admission chain as the
+     * reconciler would submit it (its recorded grant, the namespace's
+     * policies and quota, `kv:read` on every KV key it references, artifacts
+     * and pins, volumes, capabilities), writing nothing: an app whose job the
+     * reconciler would be refused is refused here, with the reason, instead
+     * of installing and sitting in `reconcile refused`.
+     *
+     * KV keys under `legion/apps/<name>/` left by an earlier app of the same
+     * name (uninstalled without `purge`) are reported in the prompt: the new
+     * app's grant may reach them.
+     *
+     * `dry_run` validates the manifest and the installer's coverage and
+     * returns the prompt (`prompt`) without installing, which is how the CLI
+     * shows what the app runs, where, as whom, and with what grant before it
+     * asks. A dry run that the grant check would refuse still answers, with
+     * the refusal in `uncovered`; one the admission chain refuses is that
+     * error.
+     *
+     * Retry-safe: a repeated `idempotency_key` returns the first reply with
+     * `deduplicated` set.
+     *
+     * Jobspec keys (`extensions`; docs/apps.md, "Jobspec extensions"): each
+     * declaration is checked (one key per point, `task` and `group` as one; an
+     * object schema of at most 64 KiB with only local `$ref`s, compiled with a
+     * resolver that refuses every other ref, so nothing is fetched; examples
+     * that pass it), and so are the collision rules: a key that is a core
+     * field at its point is refused, and so is one another installed app
+     * declares there (`keys` installs it under another name). The prompt
+     * reports what the app's keys would do to stored values: the pending
+     * values (kept under `allow_unknown_fields`) it adopts, and how they fare
+     * against its schemas.
+     *
+     * Object kinds (`kinds`; docs/app-objects.md): each declaration is checked
+     * (a PascalCase name that is not a Legion noun, an object schema under
+     * the extension rules, examples that pass it, an `access` resource whose
+     * scope fits the kind's, `writeRequires` that name permissions, columns
+     * that point into an object), and a kind another installed app or a
+     * bundled manifest declares (ignoring case and plurals) is refused. The
+     * prompt shows each kind and who may write it, and reports objects an
+     * earlier install of the same app left orphaned, which it adopts.
+     *
+     * Errors:
+     * - InvalidArgument: the manifest does not parse or validate (unknown
+     *   fields, a bad name, a missing `version`, a config schema that does
+     *   not compile, has a remote `$ref`, or applies itself to the same
+     *   value again (`allOf: [{ "$ref": "#" }]`), a default that fails it, a
+     *   job fragment that does not parse or names an exec task's `user`, a
+     *   job with something host-level in it, an extension declaration that
+     *   breaks a rule above, a key that is a core field, a page RPC that is
+     *   not page-callable), `config_json` fails the schema, or `keys` names a
+     *   key the manifest does not declare.
+     * - PermissionDenied: the caller lacks `app:write`, a permission the
+     *   manifest asks for, a permission behind a page's `rpcs`, or
+     *   `operator:write` for a placement other than `managers`.
+     * - AlreadyExists: an app of that name is installed (use UpgradeApp).
+     * - Any code of the admission chain (`app <name>'s job would be refused
+     *   when the reconciler submits it: …`): INVALID_ARGUMENT,
+     *   PERMISSION_DENIED (a KV key the grant does not cover),
+     *   RESOURCE_EXHAUSTED (a quota), UNAVAILABLE (a pin's source could not be
+     *   reached; retry).
+     * - FailedPrecondition: the name is a bundled app's, a job
+     *   `legion-system/<name>` exists that is not this app's (no `managedBy`
+     *   stamp for it: install never takes a job over), or one of its jobspec
+     *   keys is another installed app's at that point (the message names the
+     *   owner and the `--key` rename).
+     *
+     * @generated from rpc legion.Manager.InstallApp
+     */
+    installApp: {
+      name: "InstallApp",
+      I: InstallAppRequest,
+      O: InstallAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Replaces an installed app's manifest (`legion app upgrade`). Requires
+     * `app:write` and, because a new manifest changes the code the app runs,
+     * every permission the new manifest asks for, checked against the caller
+     * as at install, and so are the permissions behind its pages' `rpcs`.
+     * The new job is held to the install rules too: nothing host-level
+     * besides the app's own `exec` tasks, and no `user`.
+     *
+     * The reply carries the permission diff. When the new manifest asks for a
+     * permission the recorded grant does not hold, nothing changes unless
+     * `approve` is set: the reply has `upgraded = false` and the diff, so the
+     * CLI can ask. A manifest that only keeps or drops permissions upgrades
+     * without `approve`. The stored config is checked against the new
+     * schema; a config that no longer matches refuses the upgrade.
+     *
+     * The new manifest's jobspec keys replace the installed ones, with the
+     * install-time checks (a key the installed version already declared may
+     * stay even if a newer Legion made it a core field). The prompt reports
+     * every stored value of the app's keys checked against the new schemas;
+     * values that fail stay stored and read as `invalid`. A point the new
+     * manifest no longer declares orphans the values jobs set there: the
+     * upgrade is then refused unless `force` is set, and `orphaned_jobs`
+     * lists them (on a dry run too).
+     *
+     * The new job goes through the submit's admission chain, as at install.
+     * The operator's settings (replicas, placement, pool, resources) are kept;
+     * the prompt says so where the new manifest's defaults differ.
+     *
+     * Upgrading to the manifest that is already installed is still a write:
+     * when the app's job does not run healthy at the version the record
+     * renders (its rollout failed or rolled back), the reconciler resubmits it
+     * with a forced reschedule, which is how a failed upgrade is retried.
+     * There is no rollback verb: upgrade again with the previous manifest.
+     *
+     * Object kinds: the new manifest may add kinds (checked as at install)
+     * and change existing ones. Every stored object of the app's kinds is
+     * checked against the new schemas and reported in the prompt; objects
+     * that fail stay stored and read as `invalid`. Dropping a kind that still
+     * has objects needs `force`, and leaves them `orphaned`. Changing a
+     * kind's scope while it has objects is refused.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - NotFound: no app of that name.
+     * - InvalidArgument: the manifest is invalid (as at install), names
+     *   another app, or the stored config fails its schema.
+     * - PermissionDenied: the caller lacks `app:write`, a permission, or a
+     *   permission behind a page's `rpcs`.
+     * - FailedPrecondition: the app is bundled (bundled apps upgrade with the
+     *   binary), the new manifest drops an extension point jobs use or a
+     *   kind that has objects and `force` is not set (the message lists
+     *   them), or it changes the scope of a kind that has objects.
+     * - Any code of the admission chain, as at install.
+     *
+     * @generated from rpc legion.Manager.UpgradeApp
+     */
+    upgradeApp: {
+      name: "UpgradeApp",
+      I: UpgradeAppRequest,
+      O: UpgradeAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Uninstalls an app (`legion app uninstall`): disables the record (so a
+     * reconciler submit already in flight loses its compare-and-set), stops
+     * its job, revokes the job's grants, and deletes the record. The stopped
+     * job stays in `legion-system`, an ordinary job now, until someone
+     * destroys it. Requires `app:write`. A record this manager cannot decode
+     * (`status = corrupt`) is removed by name the same way, a bundled app's
+     * included (the reconciler seeds it again from this build).
+     *
+     * While any job sets the app's jobspec keys, uninstalling needs `force`;
+     * the values stay stored, read as `orphaned`, and are listed in
+     * `orphaned_jobs`.
+     *
+     * Likewise while objects of the app's kinds exist: they stay stored,
+     * read as `orphaned` (readable and deletable, not writable), and are
+     * counted in `orphaned_objects`. Installing the app again adopts them.
+     *
+     * The app's KV under `legion/apps/<name>/` stays unless `purge` is set
+     * (which also needs `kv:write` there); `kv_keys` says how many keys were
+     * left or deleted. `dry_run` reports all of this and changes nothing.
+     *
+     * Retry-safe with `idempotency_key`: the record's deletion, the purge, and
+     * the key are one replicated entry, and a retry gets the first reply back
+     * whole, with `deduplicated`. Uninstalling an app that is not installed is
+     * NotFound.
+     *
+     * Errors:
+     * - FailedPrecondition: the app is bundled (disable it instead), or jobs
+     *   set its jobspec keys or objects of its kinds exist, and `force` is
+     *   not set (the message lists them).
+     * - PermissionDenied: `purge` without `kv:write` on the app's prefix.
+     *
+     * @generated from rpc legion.Manager.UninstallApp
+     */
+    uninstallApp: {
+      name: "UninstallApp",
+      I: UninstallAppRequest,
+      O: UninstallAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Enables or disables an app (`legion app enable|disable`). Disabling
+     * stops the app's job and keeps its record, config, and grant; enabling
+     * runs it again. Requires `app:write`. Setting the state an app already
+     * has is a write too: it retries a reconcile the last failure parked, and
+     * resubmits (with a forced reschedule) a job that does not run healthy at
+     * the version the record renders. `dry_run` says what would change.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * @generated from rpc legion.Manager.SetAppEnabled
+     */
+    setAppEnabled: {
+      name: "SetAppEnabled",
+      I: SetAppEnabledRequest,
+      O: SetAppEnabledReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Changes an app's settings (`legion app set`): replicas (a count, or one
+     * per node with `per_node`), placement, the pool for worker placement,
+     * and CPU and memory per task. The reconciler
+     * re-renders the job and rolls it. Requires `app:write`; a change of
+     * placement or pool also requires `operator:write`, because it decides
+     * which nodes hold the app's token and run its code with its grant. The
+     * re-rendered job goes through the submit's admission chain first (a
+     * quota, a pool policy). `dry_run` validates and says what would change.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - InvalidArgument: replicas outside 1-32, `replicas` and `per_node`
+     *   both set, `per_node = false` without `replicas`, an unknown
+     *   placement, a pool with `managers` placement, a zero resource.
+     * - PermissionDenied: the caller lacks `app:write`, or `operator:write`
+     *   for a placement or pool change.
+     *
+     * @generated from rpc legion.Manager.UpdateAppSettings
+     */
+    updateAppSettings: {
+      name: "UpdateAppSettings",
+      I: UpdateAppSettingsRequest,
+      O: UpdateAppSettingsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Replaces an app's config (`legion app config set`), validated against
+     * the manifest's config schema. The reconciler renders it into the job as
+     * a file (`$LEGION_APP_CONFIG`) and rolls the job: the job's version
+     * history is the config's history. Requires `app:write`; a change to any
+     * of the manifest's `codeFields` (plugin sources, endpoints the app runs)
+     * also requires every permission of the app's recorded grant, as install
+     * does, so `app:write` is never a path to the app's grant.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * The job the new config renders is held to the install rules: a config
+     * that would add something host-level (an artifact code field set to a
+     * `file://` source) is refused, whoever sets it; and it goes through the
+     * submit's admission chain. `dry_run` validates and says what would
+     * change.
+     *
+     * A bundled app whose new build is held because the stored config does
+     * not match that build's config schema (`upgrade held: …`) accepts a
+     * config that matches the new schema even where the stored manifest's
+     * refuses it: that config is what lets the upgrade through.
+     *
+     * Errors:
+     * - InvalidArgument: `config_json` is not JSON, fails the schema, or
+     *   renders a job with something host-level in it.
+     * - PermissionDenied: a code field changed and the caller does not hold
+     *   the app's grant.
+     *
+     * @generated from rpc legion.Manager.SetAppConfig
+     */
+    setAppConfig: {
+      name: "SetAppConfig",
+      I: SetAppConfigRequest,
+      O: SetAppConfigReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Streams the calling app's jobspec extension values (docs/apps.md,
+     * "Jobspec extensions"; apps plan §6.6, "How values reach the app"): every
+     * value, in every job, that the app's keys own, wherever in the job it is
+     * written, with the effective value (the app's current schema defaults
+     * filled) and its validity against that schema.
+     *
+     * The first message has `snapshot` set and carries every current value.
+     * Each later message carries what changed since the previous one: upserts
+     * (a new value, a changed value, a new job version, a value whose
+     * validity changed after an app upgrade) and deletes (a value removed by
+     * a resubmit, or its job destroyed). The manager checks for changes about
+     * once a second and sends nothing while nothing changed. Any manager
+     * answers: values are read from replicated state.
+     *
+     * A value is included whatever its job's status (`job_status` says it);
+     * `invalid` values are included too, flagged, and the app decides whether
+     * to act on them. A pending value (kept under `--allow-unknown-fields`
+     * before the app was installed) that the app's key claims is included
+     * with `adopted` set, unless the key declares `requires`: then it stays
+     * pending until a submit by someone holding the permission.
+     *
+     * `shard_count` and `shards` split the values across an app's replicas:
+     * a value belongs to shard `shard_of(job_id, shard_count)` (the first
+     * eight bytes of SHA-256 of the canonical job id, big-endian, modulo the
+     * count), the same key hash the autoscaler shards its policies by.
+     *
+     * ACL: app-plane. Only an app's own workload identity may call it (its
+     * `legion` token, through the API socket or as a bearer token, or an ACL
+     * token minted from it with `legion login --method legion`), and it
+     * returns only that app's values: `app` must be empty or name the caller.
+     * A management token may name any installed `app`. An app acting as a
+     * viewer (`legion-on-behalf-of`) is refused. Re-checks the caller's
+     * credential periodically, like StreamEvents.
+     *
+     * Errors:
+     * - Unauthenticated: no credential.
+     * - PermissionDenied: the caller is not an app's workload identity (or
+     *   names another app).
+     * - InvalidArgument: a shard outside `shard_count`, or a management
+     *   caller that names no app.
+     * - NotFound: `app` is not installed.
+     *
+     * @generated from rpc legion.Manager.WatchAppExtensions
+     */
+    watchAppExtensions: {
+      name: "WatchAppExtensions",
+      I: WatchAppExtensionsRequest,
+      O: AppExtensionEvent,
+      kind: MethodKind.ServerStreaming,
+    },
+    /**
+     * Lists object kinds (docs/app-objects.md; `legion object kinds`,
+     * `legion object explain`): the kinds installed apps declare, and the
+     * kinds left `orphaned` by an app uninstalled (or upgraded to drop them)
+     * with `force` while objects of them remained. Each kind is
+     * `<app>/<Kind>` and comes with its scope, the ACL resource that governs
+     * its objects (`access`), what writing one requires (`requires`), its
+     * immutable fields, cleanup window, `maxObjects`, the spec and status
+     * JSON Schemas, examples, and the columns `legion object list` shows.
+     * This is what an agent authors objects against.
+     *
+     * ACL: filtered per kind. A kind is listed when the caller holds `read`
+     * on its access resource somewhere (for the `object` resource, on that
+     * kind). A caller that may read no kind is refused with the
+     * `object:read` denial. Answers from the stored kind declarations alone.
+     *
+     * Errors:
+     * - Unauthenticated / PermissionDenied: the caller may read no kind.
+     *
+     * @generated from rpc legion.Manager.ListObjectKinds
+     */
+    listObjectKinds: {
+      name: "ListObjectKinds",
+      I: ListObjectKindsRequest,
+      O: ListObjectKindsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or updates one object of an app-declared kind (`legion object
+     * apply -f FILE`). `object_json` is the object as a person writes it:
+     * `{ kind, name, namespace?, labels?, spec }`, where `kind` is qualified
+     * with its app (`gitops/Repo`; the app's part exactly, the kind's in any
+     * case, plural optional). `status` is the app's and is refused here.
+     *
+     * In order, the manager:
+     * 1. resolves the kind among active kinds (an unqualified kind is
+     *    refused, naming the qualified one; an orphaned kind cannot be
+     *    written);
+     * 2. works out the scope: a namespaced object's namespace is the one the
+     *    object names, else the request's `namespace`, else `default`; a
+     *    cluster kind's object has none (a namespace in the object is an
+     *    error; the request's default is ignored with a warning);
+     * 3. checks `write` on the kind's access resource on the object's scope
+     *    before reading anything: for `object`, the namespace (`*` for a
+     *    cluster kind), name, and the `kinds` attribute `<app>/<Kind>`; for
+     *    `job` and `scale`, the namespace with name `*` (namespace-wide);
+     *    for `node`, no instance attributes;
+     * 4. checks the name, the labels, that the namespace exists, and the spec
+     *    against the kind's schema, closed by default, with its defaults
+     *    filled (errors name the path: `spec.brnach: unknown field (did you
+     *    mean branch?)`); a spec over 64 KiB after defaults is refused;
+     * 5. resolves the kind's `requires` against the effective spec and
+     *    checks each, as the caller, with the scope the corresponding core
+     *    RPC builds (`job:write in team-b (from spec.targetNamespace)`,
+     *    `kv:read` on a key the spec names, `host` and `band` as a submit
+     *    carries them), fail-closed;
+     * 6. refuses a change to an `immutable` field, an update of an object
+     *    whose bounded cleanup is running, and, without `force`, a person's
+     *    update of an object an app manages (`managed_by`);
+     * 7. for a kind with `validate`, asks the app (`POST
+     *    /legion/v1/objects/validate` to one allocation, with a viewer
+     *    assertion naming the caller, two seconds). Advisory: its errors
+     *    refuse the apply and its warnings come back in `warnings`, but an
+     *    app that is disabled, unreachable, slow, or answers anything but 200
+     *    lets the write through with a warning (fail open). It is never a
+     *    security check;
+     * 8. writes the spec with its defaults, the labels, and the `authority`
+     *    (the permissions step 5 verified, and who and when). Applying what
+     *    is stored writes nothing. A spec change bumps `generation`; every
+     *    write gets a new `spec_version`; a create gets a `uid` and counts
+     *    against the kind's `max_objects` inside the write. A write by an
+     *    app's own identity stamps `managed_by` with the app.
+     *
+     * `dry_run` runs every step but the write (the app is asked too) and
+     * returns the object as it would be, with `diff`: one line per changed
+     * field (`spec.branch: "main" → "release"`; a `writeOnly` field as
+     * `changed (redacted)`). `expected_version` is a compare-and-set on the
+     * stored `spec_version` (`0` means "create only"); status writes never
+     * move it. Emits `object.applied`.
+     *
+     * Retry-safe: a repeated `idempotency_key` returns the first reply with
+     * `deduplicated` set.
+     *
+     * Errors:
+     * - InvalidArgument: the object does not parse (unknown fields, a
+     *   `status`, a missing `spec`), an unqualified or unknown kind (with a
+     *   did-you-mean), a bad name or labels, a namespace on a cluster kind, a
+     *   spec failing the schema or too large, an immutable change, a pointer
+     *   in `requires` naming something other than strings, or the app
+     *   refused it.
+     * - PermissionDenied: the caller lacks the access resource's `write` or a
+     *   resolved `requires` permission.
+     * - NotFound: the namespace does not exist.
+     * - Unavailable, with error code `KIND_NOT_INSTALLED`: no installed app
+     *   declares a kind of that name; retryable (an app and its objects
+     *   applied together converge on retry).
+     * - Aborted: `expected_version` does not match (the object changed since
+     *   it was read; read it again and apply on top).
+     * - FailedPrecondition: the kind is orphaned; the object is being
+     *   deleted; it is managed by an app and `force` is not set.
+     * - ResourceExhausted: the kind already holds `max_objects` objects.
+     *
+     * @generated from rpc legion.Manager.ApplyObject
+     */
+    applyObject: {
+      name: "ApplyObject",
+      I: ApplyObjectRequest,
+      O: ApplyObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Shows one object (`legion object get KIND NAME`): its spec (stored,
+     * with defaults) and effective spec (plus defaults of fields an upgrade
+     * added), the status its app reported, the derived `summary` (`Ready`,
+     * `NotReady: <reason>`, `Pending`, …), its `uid`, `generation`,
+     * `spec_version`, labels, `authority`, `managed_by`, who wrote it and
+     * when, and its state: `valid`, `invalid` (the spec fails the kind's
+     * current schema), or `orphaned`. `writeOnly` values read as
+     * `<redacted>`. `kind` may be a short name (`repo`, `repos`) when exactly
+     * one kind has it, else qualified.
+     *
+     * ACL: `read` on the kind's access resource on the object's scope,
+     * checked before the object is looked up, so a caller without it gets
+     * PermissionDenied whether or not the object exists. An orphaned kind's
+     * objects keep its recorded access.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown or ambiguous kind (the message lists the
+     *   qualified names).
+     * - PermissionDenied: the caller may not read objects of the kind there.
+     * - NotFound: no such object.
+     *
+     * @generated from rpc legion.Manager.GetObject
+     */
+    getObject: {
+      name: "GetObject",
+      I: GetObjectRequest,
+      O: GetObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists objects (`legion object list [KIND]`): of one kind, or of every
+     * kind when `kind` is empty, in the selected namespaces (names or
+     * `*`-globs; empty means `default`; `*` every namespace). Cluster-scoped
+     * kinds' objects are listed whatever namespaces are asked for. `labels`
+     * keeps only objects carrying every given label value. Each object comes
+     * with its summary; the reply also carries the listed objects' kinds, for
+     * their columns.
+     *
+     * ACL: gated on `read` on the kind's access resource anywhere (any
+     * kind's, or `object`, when no kind is named), then filtered per object
+     * on its scope.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown or ambiguous kind, or a bad namespace
+     *   selector.
+     * - PermissionDenied: the caller may not read the kind anywhere.
+     *
+     * @generated from rpc legion.Manager.ListObjects
+     */
+    listObjects: {
+      name: "ListObjects",
+      I: ListObjectsRequest,
+      O: ListObjectsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes one object (`legion object delete KIND NAME`). Needs what an
+     * apply needs: `write` on the kind's access resource on the object's
+     * scope (checked before the lookup), then the object's `requires`
+     * resolved against its spec, and `force` for a person deleting an object
+     * an app manages. `expected_version` is a compare-and-set on the stored
+     * `spec_version`.
+     *
+     * For a kind with a bounded `cleanup`, the delete marks the object
+     * deleting (`deleted = false`, `deleting = true`): its spec freezes, its
+     * app sees it on its watch and calls ReleaseObject when it has cleaned
+     * up, and at the kind's deadline (or at once if the kind is orphaned) the
+     * manager removes it anyway (`object.cleanup_abandoned`). `now` skips the
+     * cleanup and removes the object at once, with the same rights. The app's
+     * validate call is never asked. Emits `object.deleting` or
+     * `object.deleted`.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown or ambiguous kind.
+     * - PermissionDenied: the caller may not write objects of the kind there,
+     *   or lacks a resolved `requires` permission.
+     * - NotFound: no such object.
+     * - Aborted: `expected_version` does not match.
+     * - FailedPrecondition: the object is managed by an app and `force` is not
+     *   set.
+     *
+     * @generated from rpc legion.Manager.DeleteObject
+     */
+    deleteObject: {
+      name: "DeleteObject",
+      I: DeleteObjectRequest,
+      O: DeleteObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Streams the calling app's objects (docs/app-objects.md, "Inside the
+     * app"): every object of every active kind the app declares, or of
+     * `kinds`, with its uid, spec (with `writeOnly` values: the owning app is
+     * the only reader that sees them), effective spec, generation,
+     * spec version, the stored status at the time it was read, whether it is
+     * being deleted and the cleanup deadline, its state, and its shard.
+     *
+     * The snapshot comes first, in messages of at most 1,000 objects: the
+     * first has `snapshot` set, the last `snapshot_done`. Later messages carry
+     * upserts (any write of an object: spec, labels, authority, the deleting
+     * mark; or a state that changed with its kind) and tombstones (`deletes`,
+     * with each object's uid). Status writes do not wake the watch. Every
+     * message's `sequence` increases by one. `invalid` objects are included,
+     * flagged; orphaned kinds' objects are not. A reconnect starts with a
+     * fresh snapshot; a uid the app held but the snapshot lacks was deleted.
+     * The manager checks a fingerprint of the app's objects and kinds about
+     * once a second; any manager answers.
+     *
+     * `shard_count` and `shards` split the objects across an app's replicas:
+     * an object belongs to shard FNV-1a-64(`<app>/<Kind>:<namespace>/<name>`,
+     * or `<app>/<Kind>:<name>` for a cluster kind) modulo `shard_count`, the
+     * hash the autoscaler's shard leases use; with 64 shards the filter runs
+     * in the query.
+     *
+     * ACL: app-plane. Only an app's own workload identity may call it (its
+     * `legion` token, through the API socket or as a bearer token, or an ACL
+     * token minted from it), and it returns only that app's objects: `app`
+     * must be empty or name the caller. A management token may name any
+     * installed `app`. An app acting as a viewer (`legion-on-behalf-of`) is
+     * refused. Re-checks the caller's credential periodically.
+     *
+     * Errors:
+     * - Unauthenticated: no credential.
+     * - PermissionDenied: the caller is not an app's workload identity, or
+     *   names another app.
+     * - InvalidArgument: a shard outside `shard_count`, a kind the app does
+     *   not declare, or a management caller that names no app.
+     * - NotFound: `app` is not installed.
+     *
+     * @generated from rpc legion.Manager.WatchObjects
+     */
+    watchObjects: {
+      name: "WatchObjects",
+      I: WatchObjectsRequest,
+      O: ObjectEvent,
+      kind: MethodKind.ServerStreaming,
+    },
+    /**
+     * Reports one object's status: what the app that owns its kind says
+     * about it (docs/app-objects.md, "Status"). The status is
+     * `{ observed_generation, conditions, fields }`: standard conditions are
+     * `Accepted` (the app understood and accepted the spec) and `Ready`
+     * (reconciled and working); `fields` is the app's own payload, checked
+     * against the kind's status schema. Limits: `fields` at most 16 KiB, at
+     * most 16 conditions, a message at most 1 KiB. Each condition's `since` is
+     * kept by the manager.
+     *
+     * Status is stored on the Status lane, keyed by the object's `uid`, apart
+     * from the spec: it never changes `spec_version`, `generation`, or the
+     * spec, and never wakes a watch. The write is refused unless `uid` is the
+     * current object's, `observed_generation` is not ahead of the generation
+     * this manager sees, and not behind the stored one (it never goes
+     * backwards). Because the Status lane may lag the Control lane, readers
+     * compare `observed_generation` with `generation`. An identical report is
+     * dropped without a write (`written = false`). An `Accepted` or `Ready`
+     * transition emits `object.status_changed`. Status is for facts that
+     * change when the world changes, not per-tick telemetry.
+     *
+     * ACL: app-plane. Only the workload identity of the app that owns the
+     * kind (`kind` is the app's kind name, or qualified), or a management
+     * token. Never a delegated identity, and never a person. Retry-safe with
+     * `idempotency_key`.
+     *
+     * Errors:
+     * - Unauthenticated / PermissionDenied: not the owning app.
+     * - InvalidArgument: a bad condition, `fields` failing the status schema
+     *   or too large; an unknown kind.
+     * - NotFound: no object of that name with that `uid`.
+     * - Aborted: `observed_generation` is ahead of the object, or behind the
+     *   stored status.
+     *
+     * @generated from rpc legion.Manager.UpdateObjectStatus
+     */
+    updateObjectStatus: {
+      name: "UpdateObjectStatus",
+      I: UpdateObjectStatusRequest,
+      O: UpdateObjectStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Ends a deleting object's bounded cleanup (docs/app-objects.md,
+     * "Deleting"): the app that owns the kind has released what it held for
+     * the object, and the object is removed (`object.deleted`). `uid` must be
+     * the deleting object's, so a release never removes an object recreated
+     * under the same name.
+     *
+     * ACL: app-plane, like UpdateObjectStatus: the owning app's workload
+     * identity, or a management token. Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - Unauthenticated / PermissionDenied: not the owning app.
+     * - NotFound: no object of that name with that `uid`.
+     * - FailedPrecondition: the object is not being deleted.
+     *
+     * @generated from rpc legion.Manager.ReleaseObject
+     */
+    releaseObject: {
+      name: "ReleaseObject",
+      I: ReleaseObjectRequest,
+      O: ReleaseObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the UI extensions installed apps register (docs/apps.md, "Views
+     * and actions"; docs/ui-architecture.md, "App extensions"): the pages,
+     * overview cards, job and node panels, and task badges the SPA draws from
+     * apps' declarative views, and the apps' sandboxed pages (`ui.pages`,
+     * listed in the `nav` slot with `page` set). Requires `app:read`; the
+     * list is filtered to the apps the caller may read (`names` selector),
+     * and to enabled apps.
+     *
+     * Each entry the manifest declares with a `permission` is filtered by it,
+     * checked as the caller:
+     * - with `context` set, on that context's scope (the job's namespace and
+     *   name for `job` and `task` slots; the node's pool for `node`), exactly
+     *   as GetAppView will check it, so the SPA shows a panel only to viewers
+     *   who may see it;
+     * - without `context`, on any scope ("does the caller hold it
+     *   anywhere?"), which is what the sidebar and overview need at login.
+     *   A sandboxed page's permission is always checked this way, as
+     *   GetAppPage checks it.
+     *
+     * An entry without a permission needs only `app:read` on its app.
+     *
+     * Nothing is forwarded to any app: this answers from the installed
+     * manifests alone.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown `slot`, or a `context` whose slot is not
+     *   `slot` or that does not fit its slot (see AppViewContext).
+     *
+     * @generated from rpc legion.Manager.ListUiExtensions
+     */
+    listUiExtensions: {
+      name: "ListUiExtensions",
+      I: ListUiExtensionsRequest,
+      O: ListUiExtensionsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Renders one of an app's declarative views (`legion app view`, the
+     * `legion_app_view` MCP tool, and every app panel in the SPA). The one
+     * data path for all three (apps plan §6.5).
+     *
+     * The manager authorizes before anything reaches the app:
+     * 1. `app:read` on the app;
+     * 2. the view must be registered in the context's slot;
+     * 3. the entry's declared `permission`, checked as the caller on the
+     *    context's scope (on any scope for `nav` and `overview`). A caller
+     *    without it is refused here, and the app sees no request at all.
+     *
+     * Only then does it forward `GET /legion/v1/views/<view>?<context>` to
+     * one running allocation of the app's job, over the worker plane
+     * (`Worker.ForwardAppRequest`), to the port the manifest's `ui.port`
+     * names. The request carries a **viewer assertion** in the
+     * `Legion-Viewer` header: a JWT signed with the cluster's
+     * workload-identity key, `aud = app:<name>`, living 60 seconds, whose
+     * `legion.io/viewer` claim names the caller (principal, accessor id), the
+     * permission checked and where, and the context exactly as the query
+     * carries it. Apps must refuse a request whose assertion is missing,
+     * expired, for another audience, or for another context; the app
+     * framework does (docs/apps.md, "The viewer assertion").
+     *
+     * The answer is validated against the view schema (`legion-view/1`: the
+     * closed block set, no unknown fields, no raw HTML, links only to
+     * `http(s)` or in-app routes) before it is returned. A view may answer
+     * `{ "hidden": true }`: nothing to show for this context.
+     *
+     * Errors:
+     * - InvalidArgument: a context that does not fit its slot.
+     * - PermissionDenied: the caller lacks `app:read` or the entry's
+     *   permission on the context.
+     * - NotFound: no such app, or the app registers no such view in that
+     *   slot (or the app answered 404 for it).
+     * - FailedPrecondition: the app is disabled; workload identity is off on
+     *   this manager (`workloadIdentity.enabled`), so no assertion can be
+     *   signed; or the app answered with a view that fails the schema, or
+     *   refused the assertion (the message names which).
+     * - Unavailable: no allocation of the app's job is running, or its node
+     *   or port cannot be reached (retryable).
+     * - DeadlineExceeded: the app did not answer within 10 seconds.
+     *
+     * @generated from rpc legion.Manager.GetAppView
+     */
+    getAppView: {
+      name: "GetAppView",
+      I: GetAppViewRequest,
+      O: GetAppViewReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Invokes an action an app declares (`ui.actions`), the button in a
+     * view's `actions` block. Mutating, retry-safe with `idempotency_key`,
+     * and audited: every invocation that passes `app:read` records an
+     * `app.action` event (app, action, caller, context, outcome `ok`,
+     * `failed`, or `denied`).
+     *
+     * Authorization, before anything reaches the app:
+     * 1. `app:read` on the app;
+     * 2. the action must be declared, and the context must have a scope
+     *    (`job`, `task`, or `node`): actions are never pressed on the
+     *    sidebar or the overview;
+     * 3. the action's declared `permission` (required on every action),
+     *    checked as the caller on the context's scope. `app:write` is not
+     *    needed: the declared permission is what the button may do, and
+     *    `app:write` would let every operator who presses it reconfigure the
+     *    app.
+     *
+     * `inputs_json` is checked against the action's typed inputs (string,
+     * number, duration, enum, boolean); unknown inputs are refused and
+     * defaults filled in. The manager then forwards `POST
+     * /legion/v1/actions/<action>` with `{ "context": {...}, "inputs":
+     * {...} }` and a viewer assertion that also carries the SHA-256 of the
+     * inputs' canonical JSON, so an app acts only on the context and inputs
+     * the manager authorized.
+     *
+     * The action's assertion also carries a `delegation`: the declared
+     * resource, the declared action (then `read` on the same resource when
+     * the caller holds it there), and exactly the scope checked (`namespace`
+     * and `name`, plus `template` when the job came from one, for job and
+     * task slots; `pool` for a node slot's `node` permission). The app may
+     * present the assertion back in the `legion-on-behalf-of` metadata, beside
+     * its own credential, to make its calls as `<caller> via app <app>`,
+     * holding only that delegation within its own grant, for the assertion's
+     * 60 seconds; the pause or pin it makes is then recorded by that
+     * principal, not by the app (docs/auth-and-acls.md, "Delegated
+     * identities"). A context whose job, namespace, or pool has a `*` in its
+     * name cannot be delegated: InvalidArgument.
+     *
+     * The app answers `{ "message": "...", "view": {...} }`; `view`, when
+     * present, is a refreshed view, validated like GetAppView's.
+     *
+     * Actions run on the Control lane's leader. A follower refuses an action
+     * before anything reaches the app (the typed not-the-leader rejection),
+     * and the leader-forward layer replays it on the leader, so a press that
+     * lands on a follower runs once. With `idempotency_key`, the reply is
+     * recorded when the app answers; a call with the same key that arrives
+     * while the first still runs (a retry after a client timeout, a double
+     * press) waits for it, up to 45 seconds, and returns its reply with
+     * `deduplicated` (ABORTED, retryable with the same key, if it is still
+     * running then). A failure to record the key after the app ran the action
+     * is logged, never returned: returning it would run the action again.
+     * A leadership change while an action runs can still let a retry with the
+     * same key run it again on the new leader.
+     *
+     * Errors: as GetAppView, plus InvalidArgument for inputs that fail their
+     * declaration, FailedPrecondition carrying the app's own message when the
+     * app reports the action failed (HTTP 4xx other than 401, 403, 404), and
+     * Aborted when a call with the same key is still running.
+     *
+     * @generated from rpc legion.Manager.InvokeAppAction
+     */
+    invokeAppAction: {
+      name: "InvokeAppAction",
+      I: InvokeAppActionRequest,
+      O: InvokeAppActionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Fetches one of an app's sandboxed pages (`ui.pages`; docs/apps.md,
+     * "Sandboxed pages"; apps plan §6.5, tier 2): the single-file HTML bundle
+     * the SPA mounts in an `<iframe sandbox="allow-scripts" srcdoc=...>`
+     * under a strict Content-Security-Policy, and the Manager RPCs the page
+     * may call through the SPA's bridge as the viewer.
+     *
+     * Authorized exactly like GetAppView, before anything reaches the app:
+     * 1. `app:read` on the app;
+     * 2. the page must be declared in the app's manifest;
+     * 3. the page's declared `permission`, if any, checked as the caller on
+     *    any scope (pages live in the sidebar, like a `nav` view).
+     *
+     * Only then does the manager forward `GET <bundle>` (default
+     * `/legion/v1/pages/<page>`) to one running allocation of the app's job,
+     * with a viewer assertion whose `legion.io/viewer` claim has `kind =
+     * "page"`, the page's name, and the `nav` slot's empty context. The answer
+     * must be `200` with a `text/html` content type, UTF-8, and at most 1 MiB;
+     * the manager does not sanitize it (a page is code, confined by the SPA's
+     * sandbox and CSP, not by the manager).
+     *
+     * The SPA stamps every call it makes for the page `legion-app-page:
+     * <app>/<page>`, and the manager refuses (PermissionDenied) a stamped call
+     * whose RPC the page's current manifest does not list, or whose app is
+     * not installed or enabled. That check runs before authentication, so
+     * every such refusal reads the same and names none of the page's `rpcs`.
+     * The RPCs a page may list never include ACL, token, grant, or app
+     * writes, or key rotations, and installing a page takes holding every
+     * permission behind its `rpcs` (InstallApp).
+     *
+     * Errors:
+     * - PermissionDenied: the caller lacks `app:read` or the page's
+     *   permission.
+     * - NotFound: no such app, or the app declares no such page (or answered
+     *   404 for it).
+     * - FailedPrecondition: the app is disabled; workload identity is off on
+     *   this manager; the app refused the viewer assertion; or the answer is
+     *   not UTF-8 HTML within 1 MiB (the message names which).
+     * - Unavailable: no allocation of the app's job is running, or its node
+     *   or port cannot be reached (retryable).
+     * - DeadlineExceeded: the app did not answer within 10 seconds.
+     *
+     * @generated from rpc legion.Manager.GetAppPage
+     */
+    getAppPage: {
+      name: "GetAppPage",
+      I: GetAppPageRequest,
+      O: GetAppPageReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Lists the auth methods clients may log in with.
      *
      * Open endpoint: login UIs need this before any credential exists. Only
@@ -2938,6 +5022,17 @@ export const Manager = {
      * The reply contains a self-describing composite token (manager address +
      * secret + worker type) that introduces a worker in one command:
      * `legion join <TOKEN>`. The manager stores only a hash of the secret.
+     * The token also pins the cluster CA (`caHash`): the trust-bundle CA the
+     * signing CA chains to, whichever `clusterCa.provider` supplies it
+     * (docs/cluster-ca.md). A joining worker refuses a manager whose chain
+     * does not lead to it.
+     *
+     * Errors:
+     * - Unavailable: the cluster CA is not available on this manager yet (the
+     *   built-in CA has not replicated, or an `exec` provider did not answer).
+     * - FailedPrecondition: the cluster CA needs an operator (unusable CA
+     *   files, or this manager disagrees with the cluster's CA;
+     *   `GetMeshCa.problem` says why).
      *
      * @generated from rpc legion.Manager.CreateJoinToken
      */
@@ -3022,14 +5117,24 @@ export const Manager = {
      * with its node token. The manager turns the claim into an ordinary plan
      * submission with a single placement on the calling node and applies it
      * through the same transaction every other placement goes through, with
-     * the same epoch compare-and-set, the same constraint re-validation, and
-     * the same at-most-one-live-allocation instance binding. A refusal here is
-     * that apply failing; there is no second code path for correctness.
+     * the same constraint and capacity re-validation against committed rows
+     * and the same at-most-one-live-allocation instance binding. It skips the
+     * plan epoch compare-and-set, because it never planned against a
+     * snapshot, so concurrent ratifications of one job do not refuse each
+     * other. A refusal here is that apply failing. There is no second code
+     * path for correctness.
      *
      * The reply is the verdict: `confirmed` carries the manager-minted
      * allocation id (the worker opens the network and the work becomes a normal
      * allocation), `refused` carries a machine-readable reason the worker kills
      * the work with.
+     *
+     * Only the raft leader ratifies. A follower that knows the leader replays
+     * the request there and returns the leader's verdict. One that does not
+     * (an election is under way) answers `FAILED_PRECONDITION` ("this manager
+     * is not the raft leader…") instead of a verdict. It wrote nothing and the
+     * ticket is unspent, so the caller sends the same request to another
+     * manager.
      *
      * @generated from rpc legion.Manager.RatifyClaim
      */
@@ -3038,6 +5143,191 @@ export const Manager = {
       I: RatifyClaimRequest,
       O: RatifyClaimReply,
       kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the durable audit journal: one record per mutating RPC, per ACL
+     * denial, and per always-audited RPC (`Login`, token minting, approval
+     * decisions), newest first.
+     *
+     * Requires `audit:read` (cluster-scoped). Records never carry request
+     * bodies or secrets: the request is identified by its digest, the caller
+     * by its accessor ID and principal. Every manager serves the journal; a
+     * record is written asynchronously by the manager that handled the
+     * request, typically within 250 ms of the reply (see
+     * docs/audit-journal.md, "Durability").
+     *
+     * @generated from rpc legion.Manager.ListAuditEvents
+     */
+    listAuditEvents: {
+      name: "ListAuditEvents",
+      I: ListAuditEventsRequest,
+      O: ListAuditEventsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Mints a child token: a client token whose policies are a subset of the
+     * caller's own, that expires no later than the caller's token and no later
+     * than `acl.childTokenMaxTtl`, and that is revoked when its parent is.
+     *
+     * ACL: any caller presenting a Legion ACL token (no `acl:write` needed —
+     * this is how an agent hands a sub-agent a narrower credential).
+     * Anonymous, JWT-bearer, delegated (`legion-on-behalf-of`) and
+     * acting-for-object callers are refused. A child token is evaluated at
+     * request time as its own policies plus every deny rule of its root
+     * ancestor's policies, and every ancestor must still exist and be
+     * unexpired, so it is never wider than its parent even after policies
+     * are edited. With ACLs disabled the RPC fails with FAILED_PRECONDITION.
+     *
+     * Not idempotent by design: the secret is returned exactly once and never
+     * stored, so a replay cannot return it; a retried call mints a second
+     * child, and the unused one expires on its own.
+     *
+     * @generated from rpc legion.Manager.CreateChildToken
+     */
+    createChildToken: {
+      name: "CreateChildToken",
+      I: CreateChildTokenRequest,
+      O: CreateChildTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists approval requests filed by `governance.approvals` gates, newest
+     * first.
+     *
+     * Requires `approval:read` to see every request; any authenticated caller
+     * may list its own (`mine = true`), which is how an agent polls for the
+     * decision on the request it filed.
+     *
+     * @generated from rpc legion.Manager.ListApprovals
+     */
+    listApprovals: {
+      name: "ListApprovals",
+      I: ListApprovalsRequest,
+      O: ListApprovalsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one approval request. Requires `approval:read`, or being the
+     * caller that filed it. Check-before-fetch: a caller without
+     * `approval:read` gets NOT_FOUND for any request it did not file.
+     *
+     * @generated from rpc legion.Manager.GetApproval
+     */
+    getApproval: {
+      name: "GetApproval",
+      I: GetApprovalRequest,
+      O: GetApprovalReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Approves or denies a pending approval request.
+     *
+     * Requires `approval:write`. The approver may not be the requester, nor a
+     * token in the requester's lineage (its parent, children, or siblings
+     * under the same root): a caller cannot approve its own request. Only a
+     * pending, unexpired request can be decided. An approval is usable once,
+     * by the requester, for the exact request it was filed for (same
+     * operation and request digest), until `governance.approvals.ttl` after
+     * the decision. Never gated itself. Accepts `idempotency_key`.
+     *
+     * @generated from rpc legion.Manager.DecideApproval
+     */
+    decideApproval: {
+      name: "DecideApproval",
+      I: DecideApprovalRequest,
+      O: DecideApprovalReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * The caller-aware capability catalog: for every Manager RPC, the
+     * permission it needs and whether the caller holds it everywhere
+     * (`allowed`), in some namespaces or targets only (`partial`, with the
+     * namespaces when the resource is namespaced), or not at all (`denied`).
+     * Open and worker-plane RPCs are marked as such. `legion capabilities
+     * --mine` and the MCP `legion_capabilities` tool merge this into the
+     * catalog.
+     *
+     * ACL: open endpoint. It reports only on the presented credential, which
+     * `WhoAmI` already exposes; anonymous callers see the anonymous policy's
+     * reach.
+     *
+     * @generated from rpc legion.Manager.GetCallerCapabilities
+     */
+    getCallerCapabilities: {
+      name: "GetCallerCapabilities",
+      I: GetCallerCapabilitiesRequest,
+      O: GetCallerCapabilitiesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Time-integrated usage: reserved CPU, memory, cores, allocations and
+     * every other numeric resource dimension, integrated over time into hourly
+     * buckets per namespace, job and submitter (docs/usage-accounting.md).
+     *
+     * ACL: `namespace:read` on each namespace in the reply; rows for
+     * namespaces the caller cannot read are left out (a caller that reaches
+     * none gets PERMISSION_DENIED). Grouping by job or submitter additionally
+     * needs `job:read` on each job. Usage integrates reservations, not
+     * measured consumption, and is accumulated by the status-lane leader
+     * every `governance.usage.interval`; the current hour is partial.
+     *
+     * @generated from rpc legion.Manager.GetUsage
+     */
+    getUsage: {
+      name: "GetUsage",
+      I: GetUsageRequest,
+      O: GetUsageReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Watches jobs, allocations, or KV keys for changes
+     * (docs/watches-and-blocking-queries.md).
+     *
+     * The first message is always a progress event (`progress = true`)
+     * carrying the revision the watch starts from. After that, each message
+     * carries the changes that committed since the last one (`changes`), and
+     * the `revision` to resume from: a client that reconnects with
+     * `from_revision` set to the last `revision` it received gets every change
+     * after it and nothing before it. With no change for 30 seconds, another
+     * progress event carries the current revision.
+     *
+     * Each change names the object (`kind`, `key`, and for jobs and
+     * allocations the job and namespace), whether it was deleted, the revision
+     * it changed at, and the object as it reads when the message is sent:
+     * `Job` (with the derived status) for jobs, `KvEntry` (value included) for
+     * KV, `WatchAllocation` for allocations. Several changes to one object
+     * between two messages are sent once. A job counts as changed when its
+     * row, its versions, its allocations, or its task outcomes change: what
+     * `GetJobInfo` reads.
+     *
+     * Resuming: when `from_revision` is older than this manager's journal (it
+     * keeps the newest 65,536 changes, in memory, from when the process
+     * started), the first and only message has `resync_required = true` and
+     * `oldest_revision`, and the stream ends. The client lists again (the
+     * list's `revision` is where to watch from) and watches from there, like a
+     * Kubernetes watch answered `410 Gone`. A raft snapshot install on the
+     * serving manager, or a projection failure, ends every open watch the same
+     * way.
+     *
+     * Any manager serves a watch from its own replica; revisions mean the same
+     * thing on every manager, so a watch can resume on another one.
+     *
+     * ACL: `job:read` (jobs, allocations) or `kv:read` (KV) with any scope to
+     * open; each change is then filtered to what the caller may read (the
+     * job's scope, or the key's path), so a narrow token sees only its own
+     * objects.
+     *
+     * Errors:
+     * - InvalidArgument: `kind` is unset; `from_revision` is not a revision.
+     * - PermissionDenied: the caller holds no read on the kind.
+     *
+     * @generated from rpc legion.Manager.Watch
+     */
+    watch: {
+      name: "Watch",
+      I: WatchRequest,
+      O: WatchEvent,
+      kind: MethodKind.ServerStreaming,
     },
   }
 } as const;
@@ -3080,7 +5370,7 @@ export const Manager = {
  *   verifies offline.
  * A request that presents a certificate other than a manager's is refused
  * with Unauthenticated, never treated as a ticket holder.
- * `tests/worker_plane_classes.rs` fails the build when an RPC here has no
+ * `tests/integration/worker_plane_classes.rs` fails the build when an RPC here has no
  * class.
  *
  * @generated from service legion.Worker
@@ -3162,6 +5452,44 @@ export const Worker = {
       kind: MethodKind.BiDiStreaming,
     },
     /**
+     * Delivers one HTTP request to an app allocation's UI port and returns
+     * the answer: the unary subset of a worker-plane tunnel that app views
+     * and actions need (docs/apps.md, "Views and actions";
+     * Manager.GetAppView). Caller class: manager. The manager has already
+     * authorized the viewer and put a signed viewer assertion in the
+     * request's `legion-viewer` header; the worker adds nothing and checks
+     * nothing about the viewer.
+     *
+     * What the worker does check, so this is not a general proxy:
+     * - the allocation runs on this node, now, and its job is the request's
+     *   `job_id`, in the reserved `legion-system` namespace (apps only);
+     * - the allocation declares the port label `port`;
+     * - the method is GET or POST, the path starts with `/legion/v1/`, only
+     *   the `legion-viewer`, `content-type`, and `accept` headers pass, and
+     *   the body is at most 256 KiB.
+     *
+     * It then dials the port the way the ingress datapath does (loopback,
+     * inside the task's network namespace when it is gated; a sandbox guest
+     * over vsock or its bridge address), never a caller-named address, sends
+     * one HTTP/1.1 request, and reads at most 1 MiB of answer within 10
+     * seconds.
+     *
+     * Errors: Unauthenticated without a manager certificate; InvalidArgument
+     * for a request outside the limits above; NotFound when the allocation
+     * does not run here or runs another job; FailedPrecondition when the job
+     * is not an app's or the port is not declared; Unavailable when the port
+     * cannot be dialed; DeadlineExceeded when the app does not answer in
+     * time.
+     *
+     * @generated from rpc legion.Worker.ForwardAppRequest
+     */
+    forwardAppRequest: {
+      name: "ForwardAppRequest",
+      I: ForwardAppRequestRequest,
+      O: ForwardAppRequestReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Starts work on this node from a boot ticket, without any call to a
      * manager on the critical path (docs/edge-boot.md). Caller class: ticket.
      *
@@ -3177,6 +5505,17 @@ export const Worker = {
      *
      * Rejected with FailedPrecondition unless the worker was configured with
      * `edgeBoot.acceptClaims: true`.
+     *
+     * Rejected with ResourceExhausted, carrying the stable error code
+     * `OVERLOADED` in the `legion-error-code` response metadata, when the
+     * node's claim window stayed full for `edgeBoot.queueTimeout`
+     * (docs/edge-boot.md, "Overload"). The window bounds the unratified edge
+     * claims a node holds (`edgeBoot.maxProvisionalPerNode`) and halves when
+     * ratifications come back later than `edgeBoot.overloadThreshold` of their
+     * lease. Such a refusal happens before admission: nothing is held, booted,
+     * or spent, so a retry may present the same ticket. Retry with backoff.
+     * A message that says recent ratifications were slow means the managers
+     * are behind, which other nodes of the pool share.
      *
      * Caller class: `ticket`. Callers are authorized by the boot ticket
      * alone; no client certificate is needed and one that is presented is
@@ -3336,6 +5675,29 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
+     * Resizes one unit this node runs, in place (docs/resize.md): a session,
+     * admitted against its task's envelope with nothing written to the
+     * replicated store, or a top-level allocation whose new size a manager
+     * has already committed. The node tells the task runtime, which changes
+     * what it can live and answers `needs_restart` or `not_supported` for
+     * the rest; nothing is restarted.
+     *
+     * Caller class: `manager`. `Manager.ResizeInstance` and
+     * `Manager.ResizeAllocation` are the only callers.
+     *
+     * Errors: NotFound when the node runs no such session or allocation
+     * (with `wrong_node` in the message when a session id's tag names
+     * another node); InvalidArgument for a malformed request.
+     *
+     * @generated from rpc legion.Worker.ResizeSession
+     */
+    resizeSession: {
+      name: "ResizeSession",
+      I: ResizeSessionRequest,
+      O: ResizeSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Suspends sessions on this node (session durability plan §6.6,
      * docs/session-mode.md "Idle sessions"). A manager calls it to route
      * `legion instance suspend <session>` to the node the session id's tag
@@ -3440,6 +5802,218 @@ export const Worker = {
       O: ResumeSessionReply,
       kind: MethodKind.Unary,
     },
+    /**
+     * Runs once in a fresh, single-use session of a session task on this
+     * node and returns the outcome: the edge form of `Manager.RunSession`,
+     * with no manager on the path and nothing written to raft (see that RPC
+     * for the steps, the reply, and idempotency; docs/session-runs.md).
+     *
+     * Caller classes: `ticket` (a session ticket for the job and task, in
+     * `ticket`) and `manager` (a manager's certificate, which routed a
+     * `Manager.RunSession` here after enforcing its ACL).
+     *
+     * A ticket runs the task's own `run.command`. `command` is refused for
+     * the ticket class with PermissionDenied: replacing the command needs
+     * `exec:write`, which only a manager can check.
+     *
+     * Errors: as `Manager.RunSession`, plus Unauthenticated for a missing or
+     * unverifiable ticket, and PermissionDenied when the ticket does not
+     * cover the job and task. ResourceExhausted (`envelope_full`,
+     * `no_envelope`, `overloaded`) is retryable on another node.
+     *
+     * @generated from rpc legion.Worker.RunSession
+     */
+    runSession: {
+      name: "RunSession",
+      I: RunSessionRequest,
+      O: RunSessionResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports this node's isolate aggregates: one entry per `isolate` task
+     * it holds an envelope for, plus its isolate host processes. The same
+     * numbers the node sends on its heartbeat, read now rather than at the
+     * last interval (docs/task-runtime-isolate.md, "Observing").
+     *
+     * Caller class: manager.
+     *
+     * Errors: Unauthenticated without a manager certificate.
+     *
+     * @generated from rpc legion.Worker.GetIsolateStats
+     */
+    getIsolateStats: {
+      name: "GetIsolateStats",
+      I: GetIsolateStatsRequest,
+      O: GetIsolateStatsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Describes one session isolate this node holds, resident or
+     * hibernated, with the child sessions it owns.
+     *
+     * Caller classes: `manager`, and `ticket` (a session ticket for the
+     * session's job and task, in `ticket`).
+     *
+     * Errors: NotFound when this node holds no such session isolate;
+     * Unauthenticated or PermissionDenied as for `Worker.GetSession`.
+     *
+     * @generated from rpc legion.Worker.GetIsolate
+     */
+    getIsolate: {
+      name: "GetIsolate",
+      I: GetIsolateRequest,
+      O: GetIsolateReply,
+      kind: MethodKind.Unary,
+    },
+  }
+} as const;
+
+/**
+ * The workload channel: what a workload asks its own node's worker, over
+ * the per-allocation API socket (`$LEGION_SECRETS_DIR/legion.sock`,
+ * docs/workload-identity.md, "The API socket"). The same socket proxies the
+ * `Manager` service to the managers with the allocation's identity token;
+ * calls to this service never leave the node and carry no token. The worker
+ * attributes every connection to the socket's allocation (by cgroup where
+ * every task has a leaf, by the directory's modes otherwise), so a caller
+ * acts for its own allocation and no other.
+ *
+ * One workload-channel call is not gRPC, because it passes a file
+ * descriptor: connection handoff, on `legion-handoff.sock` beside this
+ * socket (docs/child-sessions.md, "Connection handoff").
+ *
+ * @generated from service legion.Workload
+ */
+export const Workload = {
+  typeName: "legion.Workload",
+  methods: {
+    /**
+     * Runs once in a fresh, single-use session of a session task of the
+     * caller's own job, on the caller's node (see `Manager.RunSession` for
+     * the steps and the reply; docs/session-runs.md).
+     *
+     * Authorization is the jobspec's, not a credential's: the worker admits
+     * the run only when the calling allocation's task is allowed to start
+     * the target task. `job_id` may be empty and must be the caller's job
+     * when set; `ticket`, `node_id`, and `command` are refused (replacing the
+     * command needs `exec:write`, which only a manager checks).
+     *
+     * Errors: as `Worker.RunSession`, plus PermissionDenied for another job,
+     * a `command`, or a task the caller's task may not run, and NotFound when
+     * the socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.RunSession
+     */
+    runSession: {
+      name: "RunSession",
+      I: RunSessionRequest,
+      O: RunSessionResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Starts a session of a sibling session task as a child of the calling
+     * allocation (docs/child-sessions.md): `legion session start <task>
+     * --owner self` inside a task. The child ends when the caller's unit
+     * ends, is charged to its own task's envelope, and runs under its own
+     * task's resources, network policy, and identity.
+     *
+     * Authorization is the jobspec's: the caller's task must name the task
+     * in `children.tasks`. No credential is read. The owner is the caller,
+     * whatever the request says: its session when it is a session, its
+     * instance when it is a keyed or slot instance, its allocation otherwise.
+     * The child starts on the caller's node; when that node has no room for
+     * it the call is refused, and a start through a manager
+     * (`CreateInstanceRequest.owner`) can place it elsewhere.
+     *
+     * Errors: FailedPrecondition when the caller's task does not declare the
+     * task, the caller is itself a child (depth 1 only), or the node holds
+     * no envelope for the task; ResourceExhausted (retryable) when the
+     * caller already owns `children.max` children or the envelope is full;
+     * Unavailable when the task's runtime is disabled; NotFound when the
+     * socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.StartChildSession
+     */
+    startChildSession: {
+      name: "StartChildSession",
+      I: StartChildSessionRequest,
+      O: StartSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the children the calling allocation's unit owns on this node:
+     * running and suspended ones, and the ones that ended in the last ten
+     * minutes (`state = "gone"`, with the reason: `stopped`, `evicted`,
+     * `exited`, `owner ended`). This is how an owner learns a child is gone.
+     *
+     * Errors: NotFound when the socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.ListChildren
+     */
+    listChildren: {
+      name: "ListChildren",
+      I: ListChildrenRequest,
+      O: ListChildrenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Ends one child of the calling allocation's unit. Only the caller's own
+     * children are reachable: any other id answers NotFound, so the existence
+     * of other units cannot be probed.
+     *
+     * Errors: NotFound when the id is not a child of the caller on this node.
+     *
+     * @generated from rpc legion.Workload.StopChildSession
+     */
+    stopChildSession: {
+      name: "StopChildSession",
+      I: StopChildSessionRequest,
+      O: StopChildSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a keyed instance of a sibling keyed task as a child of the
+     * calling allocation's unit: `legion instance create <task> --owner self`
+     * inside a task (docs/child-sessions.md). The worker attributes the call
+     * to the socket's allocation and asks a manager
+     * (`Manager.CreateChildInstance`), since a keyed instance is a replicated
+     * row; no credential is read from the caller.
+     *
+     * The owner is the caller's instance when it is a keyed or slot
+     * instance and its allocation otherwise. A session cannot own a keyed
+     * child, so a caller that is a session is refused.
+     *
+     * Errors: as `Manager.CreateChildInstance`, plus FailedPrecondition when
+     * the caller is a session, Unavailable when no manager can be reached,
+     * and NotFound when the socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.CreateChildInstance
+     */
+    createChildInstance: {
+      name: "CreateChildInstance",
+      I: WorkloadCreateChildInstanceRequest,
+      O: CreateInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one of the caller's own child sessions in place
+     * (docs/resize.md): how a child grows after it starts. Admitted against
+     * the child task's envelope on this node, exactly as
+     * `Manager.ResizeInstance` on a session, with no token: the socket's
+     * attribution names the owner, and only its own children are reachable.
+     *
+     * Errors: NotFound when the session is not a child of the caller (so
+     * another owner's child is not probeable); FailedPrecondition when the
+     * child runs on another node (resize it through a manager).
+     *
+     * @generated from rpc legion.Workload.ResizeChildSession
+     */
+    resizeChildSession: {
+      name: "ResizeChildSession",
+      I: ResizeChildSessionRequest,
+      O: ResizeSessionReply,
+      kind: MethodKind.Unary,
+    },
   }
 } as const;
 
@@ -3448,21 +6022,21 @@ export const Worker = {
  * replicated state store (docs/plans/durability-and-ops-execution-plan.md §2).
  *
  * This service is NOT part of the public Legion API and is NOT covered by the
- * Manager-service ACL system (`tests/acl_endpoints.rs` classifies Manager
+ * Manager-service ACL system (`tests/integration/acl_endpoints.rs` classifies Manager
  * RPCs only). It is called exclusively by other managers in the same cluster —
  * never by workers, CLIs, or UIs.
  *
  * Wire contract:
  * - `payload` fields carry opaque, serde-encoded openraft 0.9 protocol types
- *   (serialized with serde_json — see `src/storage/raft/network.rs` /
- *   `src/storage/raft/server.rs` for the exact types on each RPC). Their
+ *   (serialized with serde_json — see `crates/manager/src/storage/raft/network.rs` /
+ *   `crates/manager/src/storage/raft/server.rs` for the exact types on each RPC). Their
  *   layout is an internal detail of the openraft version compiled into the
  *   manager binary and is versioned by `PROTOCOL_VERSION`
- *   (`src/constants.rs`) together with the rest of the manager plane:
+ *   (`crates/common/src/constants.rs`) together with the rest of the manager plane:
  *   managers with incompatible protocol versions must not be mixed in one
  *   cluster (docs/upgrades.md — managers upgrade first).
  * - `group_id` selects the raft group ("lane"). Values are the lane wire
- *   names defined by `Lane` in `src/storage/raft/mod.rs`: "control",
+ *   names defined by `Lane` in `crates/manager/src/storage/raft/mod.rs`: "control",
  *   "scheduler", "status". In the default `single` topology one group
  *   (the control lane) carries all tables.
  * - Every RPC must carry the cluster secret in request metadata under
@@ -3535,7 +6109,7 @@ export const RaftTransport = {
      * `legion raft join-token` (which embeds the cluster id, the leader's
      * advertise address, and the cluster secret) plus its own identity. The
      * leader validates the token, derives the joiner's deterministic raft id
-     * (`fnv1a64(node_id)` — see `src/storage/raft/types.rs`), adds it as a
+     * (`fnv1a64(node_id)` — see `crates/manager/src/storage/raft/types.rs`), adds it as a
      * learner to every configured group so it catches up via snapshot install,
      * and later promotes it to voter. The reply reports the assigned raft id
      * and the current membership of every group so the joiner can seed its
@@ -3608,9 +6182,15 @@ export const RaftTransport = {
      * decide liveness at `digestInterval` resolution, and it keeps the message
      * small and the merge trivial.
      *
+     * The same RPC carries the sender's scaling-input rollups (`rollups`,
+     * docs/autoscaling.md "Scaling inputs") every 10 seconds, on a digest of
+     * their own with no node ids, so the liveness digest itself stays as small
+     * and as frequent as it was. Delta-encoded; the reply's `rollup_resync`
+     * asks for a full set.
+     *
      * ACL: manager-plane internal, authenticated by cluster secret metadata —
      * it is not a `Manager` RPC, so it takes no ACL row and
-     * `tests/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
+     * `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
      * it. See docs/node-liveness.md.
      *
      * @generated from rpc legion.RaftTransport.ReportNodeLiveness

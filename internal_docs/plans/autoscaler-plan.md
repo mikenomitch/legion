@@ -1,6 +1,17 @@
 # Built-In Autoscaler Plan
 
-**Status: IN EXECUTION.** Phase 1 (`legion job scale` + count overrides —
+> **SUPERSEDED (2026-10-19) by [autoscaler-v2-plan.md](autoscaler-v2-plan.md)**
+> and its substrate, [legion-apps-plan.md](legion-apps-plan.md). Phase 1 below
+> shipped and is still accurate; v2 treats it as its Phase 0. Phases 2-7 are
+> replaced. The autoscaler now runs as a Legion app (a job hosted on the
+> managers' system workers), not as an in-core loop, and it gains
+> JSON-RPC plugins, UI extensions, and a different `autoscale` default. Which
+> of this plan's calls stand is tabled in
+> the ledger at the end of
+> [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md#ledger-what-stands-from-the-superseded-plans-calls).
+> The text below is kept unedited as history.
+
+**Status (historical): IN EXECUTION.** Phase 1 (`legion job scale` + count overrides —
 §6.1/§6.2/§8.1) shipped 2026-07-30 with docs in
 [docs/autoscaling.md](../../docs/autoscaling.md); deviations from this plan
 are recorded in the [calls doc](../calls/autoscaler-plan_calls.md) (notably:
@@ -23,8 +34,8 @@ jobspec and resubmitting. That single gap causes three distinct pains:
 
 1. **Manual scaling is a deploy.** Changing `count: 2` to `count: 6` creates a
    new job config version (`JobConfig::is_same_as` treats count like any other
-   field, `src/structs/job.rs:2006`), cancels any in-flight rollout
-   (`cancel_active_rollouts_for_job`, `src/manager/server.rs:1419`), and starts
+   field, `crates/common/src/structs/job.rs:2006`), cancels any in-flight rollout
+   (`cancel_active_rollouts_for_job`, `crates/manager/src/manager/server.rs:1419`), and starts
    a fresh rollout. An operator who just wants two more replicas during a
    traffic spike gets version-history churn and a deployment.
 2. **Automatic scaling is impossible.** There is no policy surface, no
@@ -32,12 +43,12 @@ jobspec and resubmitting. That single gap causes three distinct pains:
    worker heartbeat carries allocation IDs and health booleans only
    (`proto/legion.proto:1978-2007`), and the only CPU/memory numbers in the
    state store are a boot-time fingerprint snapshot that never refreshes
-   (`src/worker/node_check/node_checkers/kitchen_sink.rs:50,118`).
+   (`crates/worker/src/worker/node_check/node_checkers/kitchen_sink.rs:50,118`).
 3. **Cluster capacity is static.** Nodes join when an operator runs
    `legion join` somewhere. Nothing can notice unplaceable work and provision a
    node, or notice an idle node and retire it. Scale-in has no RPC to even
    remove a node record (`Store::remove_node` exists at
-   `src/storage/store.rs:2868` but no endpoint calls it).
+   `crates/manager/src/storage/store.rs:2868` but no endpoint calls it).
 
 The TODO already frames the destination: the autoscaler is the first "ecosystem
 app" — *"run inside the core binary and be splittable into its own job, so day 1
@@ -218,43 +229,43 @@ Overnight, empty nodes are drained, terminated, and forgotten.
 Code recon the design leans on (details verified against the tree):
 
 - **Count is per-task.** `TaskConfig.count: TaskCount { num, per }`
-  (`src/structs/job.rs:189,1312`). Keyed stateful tasks reject an explicit
+  (`crates/common/src/structs/job.rs:189,1312`). Keyed stateful tasks reject an explicit
   count; desired comes from live instances (`count_live_keyed_instances`).
 - **Any spec change is a new version.** `handle_job_submit_apply` compares with
   `JobConfig::is_same_as` (structural equality including count,
-  `src/storage/store.rs:4047`, `src/structs/job.rs:2006`) and bumps
+  `crates/manager/src/storage/store.rs:4047`, `crates/common/src/structs/job.rs:2006`) and bumps
   `version`; `job_config_id = "{name}-{version}"`. A resubmit cancels active
-  rollouts (`src/manager/server.rs:1419,1482`).
+  rollouts (`crates/manager/src/manager/server.rs:1419,1482`).
 - **There is already a "count is schedule-level, not template-level" seam.**
-  `task_schedule_equivalent` (`src/storage/store.rs:10476`) migrates
+  `task_schedule_equivalent` (`crates/manager/src/storage/store.rs:10476`) migrates
   allocations across config versions when only non-schedule fields changed —
   count is deliberately in the schedule-relevant set.
 - **The scheduler cannot exceed the stored count.** Desired comes from
   `tasks_for_plan_from_store` reading `config.count.num`
-  (`src/manager/scheduler.rs:1598`); the rollout's target channel *clamps*
+  (`crates/manager/src/manager/scheduler.rs:1598`); the rollout's target channel *clamps*
   (`*desired = (*target).min(*desired)`, `scheduler.rs:669`). `Reschedule`
   mode only adds (`required = desired − placed`, `scheduler.rs:819`); scale-in
   happens via `Fresh` re-plans or rollout retirement
-  (`retire_old_allocations`, `src/manager/rollout.rs:1357`). Slot scale-in
+  (`retire_old_allocations`, `crates/manager/src/manager/rollout.rs:1357`). Slot scale-in
   reads count straight from SQL by `version DESC`
-  (`slot_still_desired_tx`, `src/storage/store.rs:6125`) — every place that
+  (`slot_still_desired_tx`, `crates/manager/src/storage/store.rs:6125`) — every place that
   answers "what is desired?" must learn about overrides (§6.1).
 - **No usage anywhere.** Heartbeats carry IDs + health booleans
   (`proto/legion.proto:1978-2007`); `allocation_health` is a last-value table
   written per heartbeat on the Status lane; `/metrics` is manager-only,
-  cluster-level, cardinality-capped (`src/manager/telemetry.rs`); no
+  cluster-level, cardinality-capped (`crates/manager/src/manager/telemetry.rs`); no
   time-series retention of any kind; Legion has no Prometheus *client*.
 - **The manager background-loop pattern is established.**
-  `start_node_status_checker` (`src/manager/daemon.rs:667`) ticks on an
+  `start_node_status_checker` (`crates/manager/src/manager/daemon.rs:667`) ticks on an
   interval and gates mutations on `Store::is_raft_leader(lane)`
-  (`src/storage/store.rs:465`); the leadership-acquisition watcher
+  (`crates/manager/src/storage/store.rs:465`); the leadership-acquisition watcher
   (`daemon.rs:120-158`) re-runs leader-only work after elections; eval workers
   restart on exit. The autoscaler loop copies this shape exactly.
 - **The split-out mode is nearly unblocked already.** Control-plane workload
   identity lets a task authenticate to the manager as `legion:<sub>` with
   policies attached via `workloadIdentity.controlPlaneBindings`
   (`docs/workload-identity.md` §control-plane identity,
-  `src/manager/auth_method.rs`). Read surface is strong: `GetLedger`,
+  `crates/manager/src/manager/auth_method.rs`). Read surface is strong: `GetLedger`,
   `GetNodes`, `ListInstances`, `StreamEvents`, and `QueryStateStore` (raw
   read-only SQL, `proto/legion.proto:569`). KV locks
   (`AcquireKvLock`/`RenewKvLock`, `proto/legion.proto:525-534`) are a
@@ -264,11 +275,11 @@ Code recon the design leans on (details verified against the tree):
   `proto/legion.proto:693` — the natural provisioning hook); drain shipped
   (`SetNodeAvailability`, cordon/drain/uncordon CLI, `node_drain` evals); the
   scheduler filters to `availability == "available"`
-  (`src/manager/scheduler.rs:885`). **No node-removal RPC exists.** Node
+  (`crates/manager/src/manager/scheduler.rs:885`). **No node-removal RPC exists.** Node
   `pool` is ACL/config-only; nothing scheduling-side consumes it
   (`internal_docs/TODO.md` § Scheduling: worker groups).
 - **Plugin system**: six kinds; five dylib, volumes use an exec ABI (JSON on
-  stdin, op as argv, timeout — `src/volumes/exec.rs`) chosen precisely for
+  stdin, op as argv, timeout — `crates/common/src/volumes/exec.rs`) chosen precisely for
   process isolation around untrusted/external work. Dylibs are fully trusted;
   there is no sandboxing; the manager loads rollout/task plugins for
   validation. No registry exists.
@@ -277,8 +288,8 @@ Code recon the design leans on (details verified against the tree):
   visible nav (`App.tsx:105-163`). The UI already computes request-based node
   utilization client-side (`NodeDeepView.tsx` `buildResourceUsage`).
 - **ACLs**: 8 closed resources (`job|node|kv|state|operator|acl|exec|action`,
-  `src/structs/acl.rs:19-58`), read/write actions, job/pool/path scopes.
-  `tests/acl_endpoints.rs` fails the build on any unclassified RPC.
+  `crates/common/src/structs/acl.rs:19-58`), read/write actions, job/pool/path scopes.
+  `tests/integration/acl_endpoints.rs` fails the build on any unclassified RPC.
 
 ## 6. Proposed design
 
@@ -339,7 +350,7 @@ Mechanics:
 - ACL: new resource **`scale`** (read/write, job-name scope). `job:write` does
   not imply `scale:write` and vice versa — the whole point is granting an
   autoscaler (or a teammate) the right to resize without the right to
-  redeploy. Both new RPCs get `tests/acl_endpoints.rs` entries.
+  redeploy. Both new RPCs get `tests/integration/acl_endpoints.rs` entries.
 
 ### 6.2 Ownership: overrides vs resubmits vs rollouts
 
@@ -487,7 +498,7 @@ Semantics, mostly borrowed and credited:
 
 - **Defaults for the simple form**: `target.cpu`/`target.memory` are fractions
   of the task's *requested* resources (requests already exist and default
-  sanely — `src/resources.rs`), evaluated over a 1m window, averaged across
+  sanely — `crates/common/src/resources.rs`), evaluated over a 1m window, averaged across
   replicas.
 
 Policy *sharing* needs no new machinery in v1: policies are data, and jsonnet
@@ -648,7 +659,7 @@ autoscaler: {
   identity comes from a node attribute (`providerInstanceId`) that the
   provisioning template sets at join.
 - **The provider contract is an exec ABI, not a dylib** — the volume-plugin
-  precedent (`src/volumes/exec.rs`): ops (`status`, `scale_up`, `terminate`)
+  precedent (`crates/common/src/volumes/exec.rs`): ops (`status`, `scale_up`, `terminate`)
   as argv, JSON on stdin/stdout, timeout, no cloud SDKs compiled into the
   manager. v1 ships the `exec` provider (ops glue their cloud with a script or
   any CLI — Terraform, `aws`, whatever) and `noop` (emits events only, for
@@ -729,7 +740,7 @@ path, in order of trust required:
 - The split-out agent's recommended policy is least-privilege:
   `scale:write` + `job:read` + `node:read` (+ `node:write` and `state:read`
   only if it runs node groups / uses SQL reads). Explicitly not `job:write`.
-- Every new RPC is classified in `tests/acl_endpoints.rs`; the build enforces
+- Every new RPC is classified in `tests/integration/acl_endpoints.rs`; the build enforces
   it.
 
 ## 7. Proto, struct, config, and persistence changes
@@ -756,7 +767,7 @@ path, in order of trust required:
   schemars for the jobspec schema).
 - New table `task_scale` (§6.1), Scheduler-lane ownership; `scaling` config
   persists inside the existing `task_config` row (it is spec).
-- New eval kind `job_scale` in the dispatch table (`src/structs/eval.rs`).
+- New eval kind `job_scale` in the dispatch table (`crates/manager/src/manager/eval.rs`).
 - `validate_job_config` gains scaling validation (min/max sanity, min-zero
   activation rule, keyed/`count.per` rejection). Cluster-aware checks
   (prometheus reachability) stay in manager admission, per the volume
@@ -780,7 +791,7 @@ path, in order of trust required:
 
 **Events**: `scale.applied|deferred|clamped|check_failed`,
 `nodegroup.scale_up|scale_in|provider_failed` added to the catalog
-(`src/storage/events.rs`).
+(`crates/manager/src/storage/events.rs`).
 
 ## 8. Implementation phases
 
@@ -836,7 +847,7 @@ versa.
   `exec` provider incl. drain-then-terminate ordering and `ForgetNode`;
   provider timeout/failure emits events and never strands a draining node
   (uncordon on abort).
-- **Regression gates**: every new RPC in `tests/acl_endpoints.rs`; capability
+- **Regression gates**: every new RPC in `tests/integration/acl_endpoints.rs`; capability
   catalog test (`mutates` flags); scheduler benchmarks before/after the
   effective-count accessor (it sits on the hot path — AGENTS.md scheduler
   rule).

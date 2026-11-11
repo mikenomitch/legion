@@ -27,7 +27,7 @@ now retries with backoff and redrives failure reports.
 
 The plan suggested hooking slot assignment into `build_plan`. We instead bind
 instances inside the store's allocation-insert transaction (`assign_slot_instance_tx`
-in `src/storage/store.rs`), because plans are dry-runnable and rejectable on stale
+in `crates/manager/src/storage/store.rs`), because plans are dry-runnable and rejectable on stale
 epochs, while the insert is the single choke point every placement path goes through
 (scheduler plans, `place_alloc` reconciliation, rollouts). This makes instance
 creation/binding atomic with placement and required no scheduler or plan-format

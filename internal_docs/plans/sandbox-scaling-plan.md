@@ -143,7 +143,7 @@ ceilings today, in this order.
 
 **The write rate.** Every keyed instance lifecycle step is a raft entry
 (§5.1). Each lane drains through one pipeline thread with one proposal in
-flight (`pipeline_loop`, `src/storage/raft/driver.rs:1781`), and the
+flight (`pipeline_loop`, `crates/manager/src/storage/raft/driver.rs:1781`), and the
 default `single` topology puts every lane on that one pipeline
 (`docs/multi-raft.md`, "Topology"). On the AWS rig (3 × 4-vCPU managers),
 the coalesced plan commit took 9.2, 13.5, and 23.3 ms at 5k, 20k, and 50k
@@ -158,7 +158,7 @@ cluster writes.
 snapshot is a `VACUUM INTO` image held in memory while it is built,
 served, and installed (`docs/multi-raft.md`, "Snapshots, compaction, and
 catch-up"). Every keyed instance keeps its row as a `terminated` tombstone
-for the life of its job (`src/storage/store.rs:15556-15565`). A platform
+for the life of its job (`crates/manager/src/storage/store.rs:15556-15565`). A platform
 that creates a million sessions a day under one long-lived job adds a
 million rows a day that never leave, and every new manager and every
 lagging follower receives all of them in memory. Kubernetes hits the same
@@ -487,20 +487,20 @@ this plan is that sessions start fast and come back.
 Counted from the code with the default `single` topology, no volumes, no
 idempotency keys, and an idle cluster. Phase 0 confirms these with
 `legion_raft_ops_total{lane,op,outcome}`. Every mutating store method is
-one entry through `Store::replicated` (`src/storage/store.rs:2439`). The
-payload is a SQLite changeset (`StoreCommand`, `src/storage/raft/mod.rs:189`),
+one entry through `Store::replicated` (`crates/manager/src/storage/store.rs:2439`). The
+payload is a SQLite changeset (`StoreCommand`, `crates/manager/src/storage/raft/mod.rs:189`),
 nested calls inside a capture fuse into one entry, and empty changesets
-skip raft (`src/storage/raft/driver.rs:1666`).
+skip raft (`crates/manager/src/storage/raft/driver.rs:1666`).
 
 | Stage | Trigger | Entries | Where |
 | --- | --- | --- | --- |
-| Create | `CreateInstance` | 2: `create_keyed_instance` + coalesced eval enqueue (+1 idempotency) | `src/manager/server.rs:4856-4993`, `src/storage/store.rs:15322` |
-| Place | eval claim, plan, settle | 4: claim, plan apply (allocation, instance bind, volume, event in one changeset), status-lane `task_status` projection, settle | `src/manager/scheduler.rs:1676-1708`, `src/storage/store.rs:4989-5035`, `:16049` |
-| Run | heartbeat | 0 per beat for liveness, but **1 status-lane entry per node per beat** for allocation health (below) | `src/storage/store.rs:7986`, `:13226-13310` |
-| Suspend | `SuspendInstance` + capture report | 4: `begin_suspend`, `apply_snapshot_report`, two standalone events (+1 idempotency) | `src/storage/store/suspend_ops.rs:330-398`, `src/manager/server/snapshot_rpcs.rs:991-1027` |
-| Resume | `StartInstance` on a suspended instance | 8: `resume_suspended_instance`, enqueue, placement (4), restore report + event (+1 idempotency) | `src/storage/store/suspend_ops.rs:732`, `src/storage/store/snapshot_ops.rs:733-781` |
-| Fork ×N | `ForkInstance` | 8 + 2N | `src/storage/store/fork_ops.rs:64`, `src/manager/server/snapshot_rpcs.rs:1185-1292` |
-| Destroy | `DestroyInstance` | 4: destroy, enqueue, claim, settle (+1 idempotency). The row stays as a tombstone | `src/storage/store.rs:15511-15584` |
+| Create | `CreateInstance` | 2: `create_keyed_instance` + coalesced eval enqueue (+1 idempotency) | `crates/manager/src/manager/server.rs:4856-4993`, `crates/manager/src/storage/store.rs:15322` |
+| Place | eval claim, plan, settle | 4: claim, plan apply (allocation, instance bind, volume, event in one changeset), status-lane `task_status` projection, settle | `crates/manager/src/manager/scheduler.rs:1676-1708`, `crates/manager/src/storage/store.rs:4989-5035`, `:16049` |
+| Run | heartbeat | 0 per beat for liveness, but **1 status-lane entry per node per beat** for allocation health (below) | `crates/manager/src/storage/store.rs:7986`, `:13226-13310` |
+| Suspend | `SuspendInstance` + capture report | 4: `begin_suspend`, `apply_snapshot_report`, two standalone events (+1 idempotency) | `crates/manager/src/storage/store/suspend_ops.rs:330-398`, `crates/manager/src/manager/server/snapshot_rpcs.rs:991-1027` |
+| Resume | `StartInstance` on a suspended instance | 8: `resume_suspended_instance`, enqueue, placement (4), restore report + event (+1 idempotency) | `crates/manager/src/storage/store/suspend_ops.rs:732`, `crates/manager/src/storage/store/snapshot_ops.rs:733-781` |
+| Fork ×N | `ForkInstance` | 8 + 2N | `crates/manager/src/storage/store/fork_ops.rs:64`, `crates/manager/src/manager/server/snapshot_rpcs.rs:1185-1292` |
+| Destroy | `DestroyInstance` | 4: destroy, enqueue, claim, settle (+1 idempotency). The row stays as a tombstone | `crates/manager/src/storage/store.rs:15511-15584` |
 
 **Total: about 22 entries per create, place, suspend, resume, destroy, or
 26 with idempotency keys.** About 16 of them are on the scheduler lane.
@@ -512,51 +512,51 @@ Three findings from the count that the plan acts on:
 
 - **Allocation health is a per-node, per-beat raft write.** Every
   allocation gets a health entry when it starts
-  (`src/worker/task_manager.rs:2537`). The worker re-sends the whole set
+  (`crates/worker/src/worker/task_manager.rs:2537`). The worker re-sends the whole set
   every beat (`:1240-1253`), and the manager upserts it with
-  `updated_at = now` (`src/manager/server.rs:6311`,
-  `src/storage/store.rs:13291-13310`), so the changeset is never empty.
+  `updated_at = now` (`crates/manager/src/manager/server.rs:6311`,
+  `crates/manager/src/storage/store.rs:13291-13310`), so the changeset is never empty.
   Node health checks skip unchanged rows. Allocation health does not. At
   10,000 sandboxes on a node, every beat is a 10,000-row changeset. This
   quietly undoes much of
   [liveness-off-the-raft-path](liveness-off-the-raft-path-plan.md) for
   dense nodes. The AWS rig never saw it because simulated workers send no
-  allocation health (`src/worker/simulate.rs:810`).
+  allocation health (`crates/worker/src/worker/simulate.rs:810`).
 - **Edge boot does not avoid the create write.** Ratification binds an
   existing unbound keyed instance and refuses otherwise
-  (`src/storage/store.rs:12560-12580`). `CreateInstance` also enqueues a
+  (`crates/manager/src/storage/store.rs:12560-12580`). `CreateInstance` also enqueues a
   placement eval that can bind the row before the edge claim does. A
   realistic edge start is create (2) + an eval (2) + ratification (4:
   ticket spend on the control lane, plan apply, status projection, event,
-  `src/manager/edge_boot.rs:70-120`, `:312-331`).
+  `crates/manager/src/manager/edge_boot.rs:70-120`, `:312-331`).
 - **Events are raft writes.** Events staged inside an op's transaction
   ride its entry. Standalone `store.events()` calls are entries of their
-  own (`src/storage/store.rs:10533-10556`), and the journal keeps only
+  own (`crates/manager/src/storage/store.rs:10533-10556`), and the journal keeps only
   the newest ~10,000 rows (`docs/event-stream.md`).
 
 ### 5.2 The instance model and its guarantees
 
 - **Keyed instances** are created by `CreateInstance`. Server-minted ids
   are `{task}-{16 alphanumerics}`, about 95 bits, checked against every row
-  (`src/storage/store.rs:15293-15300`). Caller ids must be unique against
+  (`crates/manager/src/storage/store.rs:15293-15300`). Caller ids must be unique against
   every row, including tombstones (`:15273-15281`).
 - **Never recycled for the life of the job.** Destroy keeps a `terminated`
   tombstone (`:15556-15565`). `job destroy` deletes the job's instance rows
   (`:8966`), after which ids are free again (`docs/stateful-workloads.md`,
   "Id rules").
 - **`requireId`** refuses creates without a caller id. It is enforced in the
-  handler and changes no writes (`src/manager/server.rs:4913-4930`).
+  handler and changes no writes (`crates/manager/src/manager/server.rs:4913-4930`).
 - **At most one live allocation per instance**, bound inside the plan
   apply transaction (`assign_stateful_instance_tx`).
 - **ACLs** scope instance operations by job name and namespace
-  (`AclScope::job`, `src/manager/server.rs:4860-4878`).
+  (`AclScope::job`, `crates/manager/src/manager/server.rs:4860-4878`).
 - **Workload identity** is issued per allocation. The handler reads the
   allocation row and checks that it is on the calling node
-  (`src/manager/server.rs:5977-6085`). The default `sub` is
+  (`crates/manager/src/manager/server.rs:5977-6085`). The default `sub` is
   `<region>:<job>:<group>:<task>`, and `{instance}` may be added
   (`docs/workload-identity.md`). Issuing writes nothing.
 - **Idempotency** keys are recorded on the control lane
-  (`Store::idempotency_record`, `src/storage/store.rs:17912`).
+  (`Store::idempotency_record`, `crates/manager/src/storage/store.rs:17912`).
 - **Listing** is an exact read of raft-replicated rows.
 
 ### 5.3 Edge boot
@@ -574,19 +574,19 @@ estimate ratification at about 1,700, 1,200, and 700 per second at 5k,
 
 - **Liveness is off raft.** A steady-state heartbeat writes nothing.
   Only transitions replicate, and a fleet-wide display checkpoint runs
-  every 30 s (`src/storage/store.rs:7986-8021`,
+  every 30 s (`crates/manager/src/storage/store.rs:7986-8021`,
   `docs/node-liveness.md`). Adaptive cadence serves 2 s to 21 s intervals
   as the fleet grows (`docs/heartbeat-cadence-and-scale.md`).
 - **Lanes** split control, scheduler, and status writes into three raft
   groups (`topology = "lanes"`, opt-in). Table ownership pins `instance`,
   `allocation`, `snapshot`, `volume`, and `eval` to the scheduler lane
-  (`src/storage/raft/ownership.rs:196-260`). (`docs/multi-raft.md` says
+  (`crates/manager/src/storage/raft/ownership.rs:196-260`). (`docs/multi-raft.md` says
   instance writes are on the control lane. The code says scheduler. The
   TODO item records the doc fix.)
 - **Group commit** exists for plan apply (cap 16), eval enqueue, job
   submit, and task-status seed (cap 64), and the mixed-version heartbeat
-  fallback (cap 128) (`src/storage/coalesce.rs`,
-  `src/storage/store.rs:1604-1622`). Instance create, suspend, resume,
+  fallback (cap 128) (`crates/manager/src/storage/coalesce.rs`,
+  `crates/manager/src/storage/store.rs:1604-1622`). Instance create, suspend, resume,
   destroy, snapshot reports, allocation health, ticket spends, and
   standalone events are not batched.
 
@@ -612,7 +612,7 @@ freed capacity. §6.13 and §6.15 open with the code-level detail for each.
 ### 5.7 The worker's local state
 
 `WorkerStateStore` is a JSON file rewritten in full on every save
-(`src/worker/state.rs:151`). It holds allocations, task configs, and PIDs
+(`crates/worker/src/worker/state.rs:151`). It holds allocations, task configs, and PIDs
 for restart recovery. The heartbeat carries every allocation id on every
 beat (`HeartbeatRequest.allocation_ids`, `proto/legion.proto:4266`).
 Neither shape survives 10,000 sessions per node with churn.
@@ -784,7 +784,7 @@ from full reports. Until every live node has sent one, list replies
 carry `complete: false`.
 
 **Reconcile.** Today `reconcile_allocations` stops anything the manager
-does not list (`src/worker/task_manager.rs`, see `docs/edge-boot.md`, "The
+does not list (`crates/worker/src/worker/task_manager.rs`, see `docs/edge-boot.md`, "The
 kill path"). Sessions are exempt by construction: they are children of an
 envelope allocation, and only the envelope is in the desired set. The
 manager can still end a session by putting its id in the heartbeat reply's
@@ -946,7 +946,7 @@ today's boundary. Calls entry 33 records the trade.
 - **Idle detection.** Gated plan Phase 3 (live egress bytes and
   connections) feeds the node-local idle policy. Idle suspend of a session
   is decided and executed on the node, so the manager's idle sweep
-  (`src/manager/server/suspend_rpcs.rs:571-729`) skips session tasks.
+  (`crates/manager/src/manager/server/suspend_rpcs.rs:571-729`) skips session tasks.
 - **Fork.** Forking a session forks a checkpoint into N new unnamed
   sessions, each with its own random id, MAC, and token, using the
   existing fork identity rebind. No raft entry unless a fork is named.
@@ -1019,11 +1019,11 @@ through raft. Delivery then has two halves:
   allocation, bounded by a 512-permit semaphore, and does not wait for it.
   The code says why: "Dispatch is best-effort BY DESIGN: the heartbeat
   reply carries the full desired set, so a lost push costs at most one
-  heartbeat interval" (`src/manager/dispatcher.rs:139-146`, `:22`).
+  heartbeat interval" (`crates/manager/src/manager/dispatcher.rs:139-146`, `:22`).
 - **A full desired set on every beat.** `build_desired_allocations`
   rebuilds a complete `TaskAllocation` payload for every dispatchable
   allocation on the node, every heartbeat, with a store read for each
-  keyed instance and its volume mounts (`src/manager/server.rs:10330-10388`).
+  keyed instance and its volume mounts (`crates/manager/src/manager/server.rs:10330-10388`).
   The worker stops anything not in that set
   (`TaskManager::reconcile_allocations`). The request side is just as
   total: every beat lists every allocation id
@@ -1174,13 +1174,13 @@ finish work, and runtime is billed only while a session is `running`
 **Today.**
 
 - A node registering or being uncordoned calls `request_capacity_reconcile`
-  (`src/manager/server.rs:6718`, `:6971`), which enqueues one cluster-wide
+  (`crates/manager/src/manager/server.rs:6718`, `:6971`), which enqueues one cluster-wide
   `node_join` eval unless one is already pending
-  (`src/storage/store.rs:14616-14632`).
+  (`crates/manager/src/storage/store.rs:14616-14632`).
 - That eval runs `reschedule_allocations_for_new_node`, which scans every
   job that is not stopped or failed and re-plans each one short of its
   `count` or with a `count.per` task (`job_configs_waiting_on_capacity`,
-  `src/storage/store.rs:14557-14607`). It re-plans them whether or not the
+  `crates/manager/src/storage/store.rs:14557-14607`). It re-plans them whether or not the
   new node could ever host them.
 - That SQL compares allocations to the task's `count`. Keyed tasks define no
   count (their desired count comes from `count_live_keyed_instances` in the
@@ -1313,7 +1313,7 @@ throughput ceiling, and every later phase states its effect on them.
   and `lease_issued_at`. `ListInstancesReply` gains `complete`, `as_of`,
   and a request flag `include_idle`.
 - `Manager.PromoteInstance { instance_id, new_id?, idempotency_key }`,
-  ACL `job:write` on the instance's job. Added to `tests/acl_endpoints.rs`.
+  ACL `job:write` on the instance's job. Added to `tests/integration/acl_endpoints.rs`.
 - `HeartbeatRequest.sessions` (a delta) and `full_session_report` flag.
   `HeartbeatReply.stop_sessions`.
 - `IssueWorkloadIdentityTokenRequest.session_lease` and `session_id`.
@@ -1332,7 +1332,7 @@ indexMaxEntries = 2000000 }`.
 
 **Delivery (Phase 2):**
 - `Manager.StreamWork` (server streaming, worker plane, ACL via
-  `acl::enforce_worker_plane` and classified in `tests/acl_endpoints.rs`).
+  `acl::enforce_worker_plane` and classified in `tests/integration/acl_endpoints.rs`).
   The worker sends `{ node_id, last_epoch, last_seq }` and acks on the
   stream. The server sends `WorkDelta { epoch, seq, add | update | stop |
   provisional }` or `FullResync { desired_allocations }`.
@@ -1382,7 +1382,7 @@ mode requires `contentStore`.
 Each phase ships alone and is worth having alone.
 
 - **Phase 0: measure (gate).**
-  - A lifecycle op-count test on the `tests/raft_apply_roundtrip.rs`
+  - A lifecycle op-count test on the `tests/integration/raft_apply_roundtrip.rs`
     harness (`raft_config(..., "single")` and `"lanes"`) that drives create,
     place, suspend, resume, fork, and destroy on `noop` with the checkpoint
     capability faked, and asserts the `legion_raft_ops_total` delta per
@@ -1454,6 +1454,10 @@ Each phase ships alone and is worth having alone.
   checkpoint per envelope, and density measurements per node.
 - **Phase 9: sub-VM tier seam.** `TaskPlugin::start_session`,
   `sessionsPerInstance`, accounting, and the isolation warning in docs.
+  *2026-10-28:* [isolate-runtime-plan.md](isolate-runtime-plan.md)
+  plans a concrete sub-VM tier: many tenants per `legion-isolate` host
+  process riding session envelopes, with burst to this plan's sandboxes.
+  It does not use a `start_session` seam on an existing allocation.
 - **Phase 10: cells (conditional).** Built only past the §6.11 trigger.
 
 ## 10. Testing plan
@@ -1496,7 +1500,7 @@ Each phase ships alone and is worth having alone.
     collision is refused. Capacity is not double counted.
   - Identity: a node cannot get a token for a lease naming another node,
     an ended session, or a job its envelope does not run.
-  - ACL: every new RPC is in `tests/acl_endpoints.rs`.
+  - ACL: every new RPC is in `tests/integration/acl_endpoints.rs`.
   - Worker restart: sessions in the local log are restored or killed per
     their gate, never silently orphaned.
 - **Phase 7:** a request to an idle session's hostname resumes it and is
@@ -1643,8 +1647,8 @@ stated local substitute (calls entry 20), not the AWS rig.
   (calls entry 46). Under load, entries per session are
   `sum(legion_raft_ops_total) / sessions` from the rung's manager, which
   includes registrations and heartbeat writes.
-- **Sizes and heartbeat bytes.** `tests/instance_scale_measure.rs` (release,
-  `--ignored`), and `tests/work_stream.rs` for the streaming heartbeat.
+- **Sizes and heartbeat bytes.** `tests/integration/instance_scale_measure.rs` (release,
+  `--ignored`), and `tests/integration/work_stream.rs` for the streaming heartbeat.
 - **Scheduler micro-benchmarks.** `benchmarks/micro/scheduler_bench.rs`,
   before and after, recorded in `benchmarks/scheduler/README.md`.
 - **Runtime boot and restore are simulated** (no KVM): the §7.2 runtime
@@ -1679,7 +1683,7 @@ p50 / p99 in ms):
 10/s and 20/s because each session spends about 5 s waiting for suspend and
 resume, which ride heartbeats; it holds every session.
 
-Sizes (release, local store, `tests/instance_scale_measure.rs`):
+Sizes (release, local store, `tests/integration/instance_scale_measure.rs`):
 
 | Measure | Value |
 | --- | --- |
@@ -1698,7 +1702,7 @@ Heartbeat, full desired set (the pre-Phase 2 shape):
 The keyed-pending bug: a keyed instance left `pending` by a full cluster
 was never retried by the capacity pass, because a keyed task's `count` is
 stored as 1 and the pass retried only tasks with zero allocations. Fixed in
-Phase 0, with `tests/capacity_retry.rs` (calls entry 47).
+Phase 0, with `tests/integration/capacity_retry.rs` (calls entry 47).
 
 ### 14.3 Phase 1: group commit and write trimming
 
@@ -1742,10 +1746,10 @@ remaining levers are more work per entry or cheaper entries (calls entry
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Placement reaches the worker within RTT + 5 ms at p50, heartbeats paused | p50 pending ms, p99 pending ms on loopback, 30 s heartbeat (`tests/work_stream.rs`, release) | yes |
+| Placement reaches the worker within RTT + 5 ms at p50, heartbeats paused | p50 pending ms, p99 pending ms on loopback, 30 s heartbeat (`tests/integration/work_stream.rs`, release) | yes |
 | Steady beat ≤ 1 KiB both ways at 10,000 allocations | pending | yes |
 | Store reads per steady beat | 0 (the reply's desired set comes from the worker's mirror) | yes |
-| Leader kill: one resync per worker, nothing lost or duplicated | one resync, every allocation exactly once (`tests/work_stream.rs`) | yes |
+| Leader kill: one resync per worker, nothing lost or duplicated | one resync, every allocation exactly once (`tests/integration/work_stream.rs`) | yes |
 | Edge-boot provisional deltas | not built; speculative dispatch still pushes (calls entry 39) | deferred |
 
 Dispatch under load (the ladder's "Dispatch" column, placement committed →
@@ -1756,7 +1760,7 @@ only once the manager saturates.
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Join to a pool wakes only evals blocked on that pool's class, plus `escaped` | yes (`tests/blocked_evals.rs`) | yes |
+| Join to a pool wakes only evals blocked on that pool's class, plus `escaped` | yes (`tests/integration/blocked_evals.rs`) | yes |
 | Freed capacity places a blocked job, p50 ≤ 1 s, p99 ≤ 5 s | p50 pending ms, p99 pending ms over pending trials | yes |
 | `job status` shows the key and shortfall | `Job.blocked` (`key`, `task`, `shortfall`, `message`, `since`, `eval_id`) and the `blocked` derived status | yes |
 | Unblock during the job's running eval is not lost | missed-unblock detection by capacity sequence | yes |
@@ -1892,28 +1896,28 @@ mTLS worker plane, so every latency is the control plane's share.
 | --- | --- | --- |
 | An unnamed destroy leaves no row; a named one leaves a tombstone | yes (`tests/raft_lifecycle_ops.rs` now expects `NOT_FOUND` after destroying its minted instance; store unit tests cover named ids) | yes |
 | Existing rows keep their tombstones across the migration | every existing row is marked named (calls entry 52) | yes |
-| 10^6 unnamed creates and destroys leave the table at the live count | 10^5 creates and destroys around 1,000 live instances leave 1,000 rows, and the store image is the same size before and after (753,664 bytes); 1,817 create-and-destroy pairs a second, store only, debug build (`tests/instance_scale_measure.rs::unnamed_churn_keeps_the_table_at_the_live_count`) | yes, at 10^5 |
+| 10^6 unnamed creates and destroys leave the table at the live count | 10^5 creates and destroys around 1,000 live instances leave 1,000 rows, and the store image is the same size before and after (753,664 bytes); 1,817 create-and-destroy pairs a second, store only, debug build (`tests/integration/instance_scale_measure.rs::unnamed_churn_keeps_the_table_at_the_live_count`) | yes, at 10^5 |
 | The destroy stays one entry | 1 (`tests/raft_lifecycle_ops.rs`, unchanged table) | yes |
 
 ### 16.2 Phase 5: archived idle instances
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Archive and unarchive round trip | yes, `slim` and `manifestOnly` (`tests/archive_integration.rs`) | yes |
+| Archive and unarchive round trip | yes, `slim` and `manifestOnly` (`tests/integration/archive_integration.rs`) | yes |
 | A lost manifest follows `onRestoreFailure` | yes | yes |
-| `--include-idle` pages a bucket listing | yes (`src/manager/archive.rs` tests, `file://`) | yes |
+| `--include-idle` pages a bucket listing | yes (`crates/manager/src/manager/archive.rs` tests, `file://`) | yes |
 | Archiving adds no raft entry | by construction: the rows drop inside the publish report's entry (calls entry 8); not yet in the op-count test | not measured |
-| 10^6 archived instances leave 10^6 slim rows and no snapshot or allocation rows | 20 instances in `tests/archive_integration.rs`; the 10^6 run is open in `TODO.md` | not measured |
+| 10^6 archived instances leave 10^6 slim rows and no snapshot or allocation rows | 20 instances in `tests/integration/archive_integration.rs`; the 10^6 run is open in `TODO.md` | not measured |
 
 ### 16.3 Phase 6: session mode
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Unnamed session starts write zero raft entries | 0 entries for every start in `tests/session_integration.rs`, and 0 over 5,000 starts in `session_start_latency_measure` (applied index summed over lanes) | yes |
+| Unnamed session starts write zero raft entries | 0 entries for every start in `tests/integration/session_integration.rs`, and 0 over 5,000 starts in `session_start_latency_measure` (applied index summed over lanes) | yes |
 | Session start: p50 ≤ 2 ms, p99 ≤ 10 ms (§7.2) | 2.5 ms p50, 5.5 ms p99 serial; this includes the node's mTLS round trip and its admission, which the target leaves out (debug build) | p99 yes; p50 not separable from the round trip |
-| Promotion is one entry | 1 (`tests/session_integration.rs`) | yes |
+| Promotion is one entry | 1 (`tests/integration/session_integration.rs`) | yes |
 | A promoted session is indistinguishable from a keyed instance in `instance get` | yes, apart from `promotedFrom` | yes |
-| Duplicate convergence | the later copy is stopped on the next report, read, or delayed check (`tests/session_integration.rs`) | yes, with up to 20 s across managers (calls entry 26) |
+| Duplicate convergence | the later copy is stopped on the next report, read, or delayed check (`tests/integration/session_integration.rs`) | yes, with up to 20 s across managers (calls entry 26) |
 | 10^4 simulated starts on `raft_lanes`; a leader kill leaves every session running and the list `complete` within one full-report period | not run: simulated workers do not run sessions (calls entries 18 and 58) | deferred |
 | Identity: tokens refused for an ended session or another node's lease | not built (calls entry 18) | deferred |
 | Worker restart: sessions restored or killed per gate, never orphaned | a restart ends them (calls entry 19) | changed |
@@ -1922,7 +1926,7 @@ Session start rate and latency, measured from `CreateInstance` to the
 node accepting the start: one raft manager, 16 fake nodes on loopback
 behind the real mTLS worker plane, 2,000 starts one at a time and then
 3,000 with 64 in flight
-(`tests/session_integration.rs::session_start_latency_measure`, debug
+(`tests/integration/session_integration.rs::session_start_latency_measure`, debug
 build, with the caller, the manager, and all 16 nodes in one process on the
 four cores):
 

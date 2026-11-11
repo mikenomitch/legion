@@ -7,7 +7,10 @@
 # Order: cp-0 bootstraps, then a raft join token minted on cp-0 enrolls
 # cp-1 and cp-2. Exit: all three /readyz and 3 voters on every lane.
 #
-#   install-legion-a.sh [--eval-threads N]
+#   [LEGION_SCHEDULING_POLICY=bin_pack|spread] install-legion-a.sh [--eval-threads N]
+#
+# The policy must match the scenario run-step.sh measures; run-campaign.sh
+# sets it from the scenario.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 load_rig
@@ -18,6 +21,15 @@ load_rig
 # the control plane through reset-control-plane.sh, which does not — and
 # should not have to — know every installer's options.
 EVAL_THREADS="${LEGION_EVAL_THREADS:-4}"
+# LEGION_HEARTBEAT_FIXED=1 turns adaptive cadence off, so every node beats
+# at its worker-type interval (2s) however large the fleet. Only for the
+# ablation cell that asks how much adaptive cadence flatters a throughput
+# number; comparative campaigns run the default (README § Heartbeat cadence).
+# The manager's schedulingPolicy. run-campaign.sh exports it from the
+# scenario; a hand-driven install gets Legion's own default.
+SCHEDULING_POLICY="$(rig_scheduling_policy)"
+HEARTBEAT_LINE=""
+[ "${LEGION_HEARTBEAT_FIXED:-0}" = 1 ] && HEARTBEAT_LINE="heartbeat = { adaptive = false },"
 while [ $# -gt 0 ]; do
     case "$1" in
     --eval-threads)
@@ -37,7 +49,7 @@ case "$EVAL_THREADS" in
     ;;
 esac
 
-log "installing legion-a (lanes topology, 3 voters, evalThreads=$EVAL_THREADS)"
+log "installing legion-a (lanes topology, 3 voters, evalThreads=$EVAL_THREADS, schedulingPolicy=$SCHEDULING_POLICY${HEARTBEAT_LINE:+, fixed 2s heartbeats})"
 
 "$(dirname "$0")/wipe-control-plane.sh"
 
@@ -50,7 +62,9 @@ render_config() { # render_config <node-idx> <bootstrap> <join-token-line>
         CP1_IP="${CP_PRIVATE_IPS[1]}" \
         CP2_IP="${CP_PRIVATE_IPS[2]}" \
         EVAL_THREADS="$EVAL_THREADS" \
-        render_tpl NODE_ID BOOTSTRAP JOIN_TOKEN_LINE PRIVATE_IP CP0_IP CP1_IP CP2_IP EVAL_THREADS \
+        HEARTBEAT_LINE="$HEARTBEAT_LINE" \
+        SCHEDULING_POLICY="$SCHEDULING_POLICY" \
+        render_tpl NODE_ID BOOTSTRAP JOIN_TOKEN_LINE PRIVATE_IP CP0_IP CP1_IP CP2_IP EVAL_THREADS HEARTBEAT_LINE SCHEDULING_POLICY \
         <"$AWS_BENCH_ROOT/configs/legion/manager-a.ncl.tpl"
 }
 

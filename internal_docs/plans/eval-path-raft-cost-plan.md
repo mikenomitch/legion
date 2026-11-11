@@ -58,7 +58,7 @@ unmeasured remainder outside the plan phases is two rounds
 (`claim`/`complete`), not three or four. A raft commit on instance NVMe inside one AZ
 should be 1-3 ms, so those rounds are not committing slowly, they are
 **queueing**: each lane drains through a single `pipeline_loop` thread
-(`src/storage/raft/driver.rs`), and phase 2 measured 3.07 ms of
+(`crates/manager/src/storage/raft/driver.rs`), and phase 2 measured 3.07 ms of
 `pipeline_wait` per op across 67,165 scheduler-lane ops.
 
 Two consequences, both consistent with everything measured so far:
@@ -107,7 +107,7 @@ touching plan-apply.
 
 ## 5. What exists today
 
-`eval_worker_loop` (`src/manager/daemon.rs`) claims, hands the eval to
+`eval_worker_loop` (`crates/manager/src/manager/daemon.rs`) claims, hands the eval to
 `handle_claimed_eval` on the blocking pool, and that function performs
 the terminal write itself — one of `complete_eval_with_event`,
 `release_eval_for_retry`, or `release_eval_for_retry_with_event`. The
@@ -366,13 +366,13 @@ well below its `_count`.
 
 ## 7. Testing
 
-- `tests/eval_regen_failover.rs`: a batch of one is indistinguishable
+- `tests/integration/eval_regen_failover.rs`: a batch of one is indistinguishable
   from a single claim and an empty queue returns immediately; priority
   order is preserved across a batch; the fused batch write settles every
   member and claims the next batch; an unobserved member stays
   `in_flight` while its siblings settle, and `requeue_in_flight_evals`
   recovers it.
-- The intake group commit is tested in `src/storage/store.rs`: a batch of
+- The intake group commit is tested in `crates/manager/src/storage/store.rs`: a batch of
   one is asserted to be the single enqueue it replaced (same row, same
   priority, same claim order); a request that cannot be applied fails
   alone while its batch-mates commit; a batch preserves
@@ -380,7 +380,7 @@ well below its `_count`.
   concurrent submitters each get their own eval exactly once; the batched
   status seed writes what N single seeds would, duplicates included; and
   concurrent `idempotency_record` calls for one key have exactly one
-  winner whose response the losers can read. `tests/raft_seam.rs`
+  winner whose response the losers can read. `tests/integration/raft_seam.rs`
   classifies `enqueue_evals_isolated` (scheduler) and
   `seed_task_statuses_batch` (status). Like everything else here, the
   round-trip saving is **structurally unmeasurable locally**.
@@ -388,11 +388,11 @@ well below its `_count`.
   boundaries that matter: a shallow queue must yield exactly one, a deep
   one must be capped, and degenerate inputs must not produce a zero-sized
   batch.
-- `tests/eval_regen_failover.rs`: the fused call finishes one eval and
+- `tests/integration/eval_regen_failover.rs`: the fused call finishes one eval and
   claims the next; the queue draining returns `None`; a delayed
   `Released` goes back to pending and does not re-claim itself; batched
   enqueue creates every row and each stays independently claimable.
-- `tests/raft_seam.rs` classifies both new ops onto the scheduler lane —
+- `tests/integration/raft_seam.rs` classifies both new ops onto the scheduler lane —
   the guard that fails the build if a replicated op is unclassified. It
   caught both of these during development, which is the point of it —
   and phase 4's `claim_evals` /
@@ -407,7 +407,7 @@ well below its `_count`.
   an unreadable row — cold cache and warm. Plus a drift battery that
   drives real inserts, a removal that bumps only the job-config epoch, an
   in-plan eviction and a wholesale job removal through the public store
-  API, re-asserting the equivalence after each. `src/resources.rs` carries
+  API, re-asserting the equivalence after each. `crates/common/src/resources.rs` carries
   the aggregate's own properties (add/remove are inverses; item counts are
   a multiset, not a set union).
 

@@ -21,11 +21,196 @@ change how the spec is produced and who is allowed to submit it.
   It also decides what this job may displace when the cluster is full, and
   what may displace it. See
   [preemption-and-eviction.md](preemption-and-eviction.md).
+- `namespace`: the [namespace](namespaces.md) the job lives in. Optional:
+  unset means the request's (`-n`, else `$LEGION_NAMESPACE`), else `default`.
+  `name` may instead be qualified (`payments-prod/web`). The job's id is
+  `namespace/name`, or the bare name in `default`; a [namespace
+  policy](namespaces.md#namespace-policies) may restrict its pools, runtimes,
+  host volumes and quota.
 
 Task names:
 
 - map keys become task names
 - list tasks default to `task-<n>` unless they set `name`
+
+Job, group, and task names may use only `A-Z`, `a-z`, `0-9`, `.`, `_`, and
+`-`, are 1 to 128 characters, and may not start with `.`. A job name's one
+`/` separates its namespace, which is a DNS label. A task's name is a
+directory on every worker that runs it (`allocs/<allocation>/<task>/`), so a
+name that is a path, or `.`/`..`, is refused at submit:
+
+```console
+error: Error validating task configs: task name "../web" may only contain [A-Za-z0-9._-] and may not start with "." (the name becomes a directory on every worker that runs it)
+```
+
+## Extension Keys
+
+Installed [apps](apps.md#jobspec-extensions) add their own keys to the
+jobspec, at fixed **extension points**: the job's top level, a group (written
+on one of its tasks), a task, a `volumes` entry, a `network.ports` entry, and
+a task's `service` block. You write them where they belong, like any other
+field:
+
+```nickel
+volumes = [{ name = "data", backup = { schedule = "0 3 * * *", keep = 14 } }]
+```
+
+Each key has a JSON Schema the submit checks the value against, with the
+schema's defaults filled in; the version stores the value as written, by the
+app that owns it, and `legion job info` shows it with its defaults and its
+state. Every key also has a qualified spelling, `apps.<app> = { … }` at the
+same point, which never collides with a core field. `legion app extensions`
+lists the keys this cluster's apps add, and `legion job schema` has them at
+their points. A resubmit that changes only extension values moves the job's
+allocations to the new version in place, with no rollout. The whole story,
+from declaring a key to the app reading its values, is in
+[Apps: Jobspec extensions](apps.md#jobspec-extensions).
+
+## Unknown Fields
+
+Every key in a jobspec must be one Legion knows: a core field, or a key an
+installed app declares at that extension point. A key it does not know fails
+the submit, whether it sits at the top of the jobspec, in a task, or in any
+nested block (`stop`, `stateful.storage`, `network.ports[]`, `rollout`, and
+so on). The error names each key with its path and, when a known key is close,
+suggests it, installed apps' keys included:
+
+```console
+$ legion job run web.ncl
+Error: failed to run job: Error parsing jobspec: web: task web: unknown field `cuont` (did you mean `count`?)
+web: task web: unknown field `stop.signall` (did you mean `stop.signal`?)
+web: task web: volume data: unknown field `bakup` (did you mean `backup`, the backup app's key?)
+web: task web: volume data: unknown field `snapshot`: not a volume field, and no installed app declares a `snapshot` key on volumes [code=InvalidArgument]
+Hint: fix or remove each field above (`legion app extensions` lists the keys installed apps add). To submit anyway, pass --allow-unknown-fields (`allow_unknown_fields` on the RPC): keys on the job, a task, a volume, a port, or a service are kept as pending, and the rest are dropped
+```
+
+The path reads from the job down: `task web` and `volume data` name the
+block, and a dotted path (`stop.signall`, `checks[0].everyy`) names the key
+inside it. Every unknown key is listed at once, so one round of fixes is
+enough. A suggestion is the known key within an edit distance of a third of
+the typed key's length, ignoring case, `_`, and `-` (`kill_after` suggests
+`killAfter`); there is none when nothing is that close.
+
+**Whether a key is known depends on the cluster.** A key an installed app
+declares is known on that cluster and unknown on one without the app.
+`legion job validate` asks a manager which keys are installed and checks
+values against their schemas; with no manager reachable it checks core
+fields only, and reports each key at an extension point as not checked
+(`installedKeys: unchecked` in its JSON).
+
+A value for an installed app's key that fails the key's schema is an error
+too, with its full path (`orders-db: task postgres: volume data:
+backup.keep: 0 is less than the minimum of 1`), and `--allow-unknown-fields`
+does not excuse it.
+
+This exists because the alternative is a silent failure. Before, a misspelled
+key was accepted and ignored: `autoscael = true` deployed a job without
+whatever it was meant to turn on, and the submit said it succeeded.
+
+Some keys are data, not fields, and are never checked: the runtime's
+`config` (validated against the runtime's own schema, see
+[task-runtime-plugins.md](task-runtime-plugins.md)), `resources` (its keys
+are resource dimensions, including the cluster's custom ones),
+`constraints`, `permit`, `affinities`, `network.labels`, `service.meta`,
+volume `params`, and identity `extraClaims`.
+
+### Submitting anyway: `--allow-unknown-fields`
+
+`legion job run`, `legion job plan`, `legion job validate`, and
+`legion template run` take `--allow-unknown-fields`
+(`allow_unknown_fields` on `RunJob`, `PlanJob`, and `RunJobTemplate`, and on
+the MCP `legion_job_run`, `legion_job_plan`, `legion_job_validate`, and
+`legion_template_run` tools). With it, the spec is accepted, and each unknown
+key is handled by where it sits:
+
+- **On an extension point, it is kept.** The extension points are the places
+  where apps declare their own keys, so a key there may belong to an app
+  that is not installed yet:
+
+  | Point | Where the key is written |
+  | --- | --- |
+  | job | the top level of the jobspec |
+  | task | a task |
+  | volume | an entry in a task's `volumes` |
+  | port | an entry in a task's `network.ports` |
+  | service | a task's `service` block |
+
+  (A `group` key is written on a task, so it is kept on the task.) The key
+  and its value are stored as written, unvalidated, in that block's
+  `pendingExtensions` map, and travel with every version whose spec still
+  carries them. Nothing in Legion acts on a pending value until an app that
+  declares the key at that point is installed: the app then **adopts** it
+  (its install prompt lists the values it adopts), and `legion job info`
+  shows it as that app's, checked against its schema. A pending value for a
+  key whose app declares `requires` stays pending until the job is
+  resubmitted by someone who holds the permission. `apps.<app>` for an app
+  that is not installed is kept the same way.
+- **Anywhere else, it is dropped.** Inside `stop`, `rollout`, a check, and
+  so on, no app can ever own a key, so the version does not carry it.
+
+Each key is reported as a warning, dropped keys first:
+
+```console
+$ legion job run orders-db.ncl --allow-unknown-fields
+Job submit success
+warning: task postgres: dropped unknown field `stop.signall`
+warning: task postgres: volume data: kept `backup` as pending (no installed app declares it)
+```
+
+The set is recorded on the job config version the submit created, and
+`legion job info` shows it, so the escape hatch stays visible:
+
+```console
+$ legion job info orders-db
+...
+submitted with --allow-unknown-fields: dropped task postgres: stop.signall; backup on task postgres: volume data pending (no installed app declares it)
+```
+
+In JSON, the warnings are `warnings` in the `job run`, `job plan`, `job
+validate`, and `template run` data (`RunJobReply.warnings`,
+`PlanJobReply.warnings`, `RunJobTemplateReply.warnings`), and the record is
+`unknownFields` in `legion job info -j` (`GetJobInfoReply.unknown_fields`).
+
+The flag is for keys Legion does not know, never for values it knows are
+wrong: a bad type, an out-of-range number, or an unknown runtime still fails
+with it. The cases it exists for are a spec written for a newer Legion and
+submitted mid-upgrade, a spec that configures an app before the app is
+installed, and a spec moved between clusters with different apps.
+
+`pendingExtensions` is written by Legion. A strict submit that carries it
+(for example, a config exported with its pending keys and submitted again) is
+refused with a message saying to write the keys directly; with the flag, its
+entries are accepted as pending.
+
+### Known limitations
+
+- **Some blocks stay strict even with the flag.** The network policy blocks
+  (`network.egress`, `network.ingress`, and an upstream's `handlers`) are the
+  same language as `legion net policy` objects; value sources
+  (`{ kv = … }`, `{ identity = … }`, `{ file = … }`), the runtime's `config`,
+  and the hand-parsed shorthands `count = { num, per }`, `gang = { … }`, and
+  `schedule = { cron | every }` check their own keys. An unknown key in any of
+  them is an error with or without the flag.
+- **A pending-only change is a new version**, but not a rollout: like a
+  change to installed apps' extension values, it moves the job's
+  allocations to the new version in place.
+- **The record describes the submit that created the version.** Resubmitting
+  a spec that renders to the same config is `unchanged` and keeps the existing
+  version and its record, even when the resubmit no longer carries the keys
+  the record says were dropped. A version the manager creates itself, by
+  re-rendering a job's [KV references](kv-store.md), carries the pending keys
+  forward but no record.
+- **`legion template render` has no flag.** It renders the way a strict
+  `template run` would.
+- **Adoption does not rewrite the version.** An adopted pending value is
+  reported as its app's, but stays stored as pending until the job is
+  resubmitted; if the app is uninstalled, it reads as pending again.
+- **An orphaned value blocks a strict resubmit.** When an app is uninstalled
+  (with `--force`), its stored values stay, flagged `orphaned`, and the
+  job's next submit fails on the key until it is removed or
+  `--allow-unknown-fields` keeps it pending.
+- **An older manager drops unknown keys silently**, and ignores
+  `allow_unknown_fields`; see [upgrades.md](upgrades.md#strict-jobspec-fields).
 
 ## Task Fields That Affect Placement
 
@@ -39,6 +224,13 @@ Important `TaskConfig` fields:
 - `count`:
   - integer count
   - or `{ num, per }` for per-attribute placement
+- `gang`: `true` or `{ min, placementTimeout, onMemberLoss }`. The task's
+  replicas place all together (or at least `min` of them together) or not at
+  all, and a gang that does not fit waits, blocked and holding nothing,
+  instead of placing what fits. `placementTimeout` fails the job if the wait
+  runs too long, and a lost member restarts the whole gang (or, with
+  `onMemberLoss`, is replaced alone or fails the job). See
+  [Gang Scheduling](gang-scheduling.md).
 - `group`: task grouping for rollouts and automatic anti-affinity
 - `runtime`: task-runtime plugin (`exec`, `container`, etc.)
 - `resources`: normalized by the manager's `ResourcePolicy`
@@ -48,10 +240,10 @@ Important `TaskConfig` fields:
 - `dependsOn`: task dependency graph
 - `lifecycle`: `service`, `batch`, `sidecar`
 - `schedule`: only valid for `batch`
-- `checks` and `on_unhealthy`: health and restart/reschedule policy
+- `checks` and `onUnhealthy`: health and restart/reschedule policy
 - `restart`: what happens when the task process exits (`always` /
   `onFailure` / `never`, delay, `successExitCodes`). Shares the
-  `on_unhealthy` restart budget. See
+  `onUnhealthy` restart budget. See
   [Task Supervision](task-supervision.md).
 - `stateful`: opt-in stable instance identity for the task's replicas. In
   `slot` mode each replica gets an ordinal slot `0..count-1` whose instance id
@@ -75,6 +267,13 @@ Important `TaskConfig` fields:
   [Workload Identity](workload-identity.md) for the full spec reference,
   claim details, and provider examples. Tasks without `identities` are
   unaffected.
+- `autoscale`: `true`, or a record overriding some of the effective
+  defaults: the bundled autoscaler then owns the task's live count, holding
+  CPU near 70% of the reservation between `count` and four times `count` by
+  default, and `count` becomes the floor. A resubmit that changes only
+  `autoscale` (or an autoscaled task's `count`) moves the running
+  allocations to the new version without a rollout. See
+  [Autoscaling](autoscaling.md).
 
 ## Task Lists and Dependency Readiness
 
@@ -103,8 +302,11 @@ fails for good.
 Held tasks move on their own. When a worker reports that a task with
 dependents reached a terminal state, the manager queues an eval for the job:
 a `job_reschedule`, or a `rollout_tick` when the config is being rolled out
-to, so the rollout's step and health gating still apply. That eval places
-whatever the exit made ready. A three-step pipeline therefore runs one step
+to. That eval places whatever the exit made ready. A rollout places released
+dependents ahead of its own gates (a pause, a manual advance, the batch
+retire window), so a gated rollout does not freeze the DAG; a service
+dependent is still held to its rollout step's size (see
+[Rollouts](rollouts.md#resubmitting-a-batch-or-dag-job)). A three-step pipeline therefore runs one step
 at a time:
 
 ```nickel
@@ -205,15 +407,21 @@ regular affinity rules plus the `same_node_as` task colocation preference.
 On top of explicit affinity rules, policy scoring applies an automatic
 anti-affinity penalty.
 
-The penalty for each candidate node is:
+The penalty for each candidate node, with `collisions =
+max(same_task_allocations_on_node, same_group_allocations_on_node)`, is:
 
-- `max(same_task_allocations_on_node, same_group_allocations_on_node)`
+- `0` when `collisions` is 0;
+- `(collisions + 1) / count` otherwise, where `count` is the task's desired
+  replica count.
 
 It is then weighted by the scheduler setting `automatic_anti_affinity`
 (default `0.2`).
 
 As a result, the scheduler prefers not to stack allocations of the same task
-or group on one node. This is a soft preference, so it can still happen.
+or group on one node. This is a soft preference, and it weakens as the count
+grows: a three-replica service spreads, while under `bin_pack` a
+twenty-replica batch task packs onto as few nodes as fit it
+([scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring)).
 
 ## Content Locality
 
@@ -234,7 +442,7 @@ Every candidate node's score is a weighted sum. Set the weights under
   schedulerSettings = {
     weights = {
       affinities = 1.0,              # affinity rules and same_node_as
-      automatic_anti_affinity = 0.2, # subtracted per stacked allocation
+      automatic_anti_affinity = 0.2, # times (stacked + 1) / count
       locality = 1.0,                # content locality; 0 disables
       # spread / bin_pack default to 1.0 for the matching policy, else 0.
     },
@@ -244,11 +452,26 @@ Every candidate node's score is a weighted sum. Set the weights under
 
 ```
 score = affinities * affinity
-      + spread * (emptiness relative to the other candidates)
-      + bin_pack * (fullness relative to the other candidates)
-      - automatic_anti_affinity * stacked allocations
+      + spread * (1 - utilization after placing)
+      + bin_pack * (utilization after placing)
+      - automatic_anti_affinity * (stacked + 1) / count   (0 when nothing is stacked)
       + locality * content locality
 ```
+
+**Utilization** is resource-based, not a count of allocations: the largest
+fraction, over the resources the task requests (memory, cpu, cores, allocation
+slots with a finite `maxAllocations`), of the node's schedulable capacity that
+would be in use once the task is placed. A small balanced-allocation term
+favors nodes whose resources fill evenly. It is absolute, so a node scores the
+same whichever other nodes are candidates. The exact formula is in
+[scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring).
+
+So `bin_pack` puts a 2 GiB task on the node that is 75% full of one large
+allocation before the one that holds three small ones, keeping the emptier
+node whole for a large task, and `spread` does the reverse. Replicas of one
+task spread when they are few and pack under `bin_pack` when they are many,
+because the anti-affinity penalty is divided by the count (above); set
+`automatic_anti_affinity = 0` to stack them whatever the count.
 
 Weights must be non-negative numbers. Unknown keys are ignored. The highest
 score wins, with exact ties broken at random.
@@ -262,6 +485,12 @@ When `count.per` is set:
 - in reschedule mode, it subtracts the count already placed for the same task and group.
 
 If the attribute is missing on all candidates, placement fails.
+
+Two keys need no operator attribute. `per = "id"` groups by node id, which
+gives one-per-node placement (`count = { num = 1, per = "id" }`). `per =
+"pool"` groups by node pool: every worker publishes its pool as the `pool`
+attribute, unless its worker type already declares an attribute of that
+name.
 
 ## Group Co-Placement Behavior
 
@@ -369,6 +598,12 @@ worker page) drives three operator flows:
 The RPC is idempotent (optional `idempotency_key`), returns NotFound for
 unknown nodes, and requires `node:write` on the node's pool.
 
+A drained node that will not come back is removed with `legion node forget
+<ID>` (`ForgetNode`, MCP `legion_node_forget`), which drops the record and
+revokes the node's token. It refuses a node that still has allocations, is
+live and not cordoned, or holds node-local volumes, unless `--force`. See
+[Forgetting a node](architecture-managers-workers.md#forgetting-a-node).
+
 ## Dynamic Node Attr Update
 
 `update_node_dynamic`:
@@ -415,12 +650,21 @@ status 1; last stderr: Error: ... 429 Too Many Requests`).
 For each allocation with checks:
 
 - runs boot, readiness, and health checks on intervals
-- tracks failure windows (`unhealthy_after_count` and an optional timespan)
+- tracks failure windows (`unhealthyAfterCount` and an optional timespan)
 
 When the unhealthy threshold is reached:
 
-1. Restart locally if `on_unhealthy.restart_count/restart_period/restart_delay` allows it.
+1. Restart locally if `onUnhealthy.restartCount/restartPeriod/restartDelay` allows it.
 2. If restarts are exhausted, record an allocation failure.
+
+Check types are `tcp` and `http` (dialed by the worker on loopback, at the
+task's port) and `exec`. An `exec` check's command runs **on the host**, as
+the worker's user, whatever the task's runtime: it is not run inside a
+container or sandbox. So a task with an `exec` check is
+[host-level](auth-and-acls.md#host-level-jobs), and submitting it needs a
+`job:write` rule with `host = true`. The command gets the same allowlisted
+environment an `exec` task gets ([Exec runtime](task-runtime-exec.md)), not
+the worker's own.
 
 Health checks start when the task starts, including tasks that stage
 artifacts first (every container image when `containerImageDesugar` is on).
@@ -433,6 +677,38 @@ against a dead process can only fail, and the exit is the real cause, so the
 supervisor's verdict is the one the allocation reports. After the supervisor
 relaunches the task, the checks start over with a fresh boot grace window.
 
+#### Startup probing
+
+A check runs once when the task starts and then every `every` (10s by
+default). On that cadence alone, a task whose port opens half a second after
+it starts would fail its first check and report healthy only on the next one,
+10 seconds later. Until a check first passes after a start or a restart, the
+worker also probes it between ticks, 100ms after the start and then on a
+doubling backoff capped at one second (or at `every`, if that is shorter).
+The first passing probe counts as a passing check, so the allocation turns
+healthy within about a second of its port opening.
+
+- A failed probe is never counted. Failures count only on the `every`
+  cadence, exactly as without probing, so `unhealthyAfterCount`,
+  `bootGraceTime`, and `unhealthyAfterCountTimespan` mean what they
+  did.
+- A probe gives up after 1 second, or after the check's `timeout` if that is
+  shorter. An endpoint slower than that still passes, on the cadence check
+  with the full `timeout`.
+- Only `tcp` and `http` checks are probed. An `exec` check runs a host
+  command whose cost Legion can't know, so it keeps its cadence. A readiness
+  check never changes the allocation's health, so it isn't probed either.
+- A `health` check waits for the `boot` checks, probes included.
+- A `boot` check's first cadence run happens the moment the task starts,
+  before most workloads have bound their port. A failure in the first
+  `every` after a start or restart is not counted (or the first
+  `bootGraceTime`, if that is longer), so `unhealthyAfterCount = 1` does
+  not fail the task on that first run. A pass in that window still counts.
+- Once a check passes, probing stops until the task restarts.
+
+`legion_task_start_stage_seconds{stage="health"}` ([metrics.md](metrics.md))
+records how long each start took to its first passing check.
+
 ### Manager-side move logic
 
 The worker reports failed allocations in its heartbeat (from a failed health
@@ -441,34 +717,44 @@ check, a failed restart, or a bad exit). The memory pressure response's
 its reservation. The manager then, in one replicated write:
 
 1. removes the failed allocation row
-2. counts the task's moves within `move_period`
-3. if that count has reached `move_count`, marks the job failed and the
+2. counts the task's moves within `movePeriod`
+3. if that count has reached `moveCount`, marks the job failed and the
    task's status `failed`
 4. otherwise, records a **reschedule hold** and enqueues a delayed
    `job_reschedule` for when the hold lapses
 
-The backoff starts at `move_delay` (default `30s`) and doubles for each
-consecutive failure, up to 30 minutes (or `move_delay` itself, if you set it
+The backoff starts at `moveDelay` (default `30s`) and doubles for each
+consecutive failure, up to 30 minutes (or `moveDelay` itself, if you set it
 higher). With the defaults, a task that fails on every start is re-placed
 after 30s, 1m, 2m, 4m, 8m, 16m, then every 30m. A failure continues the run
-while it comes within `move_period` (default `30m`) of the previous
-replacement's release. Once a replacement survives a whole `move_period`,
-the next failure starts over at `move_delay`. Each stateful instance has its
+while it comes within `movePeriod` (default `30m`) of the previous
+replacement's release. Once a replacement survives a whole `movePeriod`,
+the next failure starts over at `moveDelay`. Each stateful instance has its
 own run, so one keyed sandbox that keeps failing doesn't slow another's first
 retry. A stateless task has one run for all its replicas.
 
-`move_count` is unlimited unless you set it, so without it a broken service
+`moveCount` is unlimited unless you set it, so without it a broken service
 keeps retrying at that slow pace rather than failing the job. Set it to fail
 the job instead, and tune the other two to taste:
 
 ```nickel
-on_unhealthy = {
-  move_delay = "10s",  # first backoff; doubles per consecutive failure, capped at 30m
-  move_period = "1h",  # how long a replacement must survive to reset the backoff,
-                       # and the window move_count is counted in
-  move_count = 5,      # fail the job on the 6th move inside move_period
+onUnhealthy = {
+  moveDelay = "10s",  # first backoff; doubles per consecutive failure, capped at 30m
+  movePeriod = "1h",  # how long a replacement must survive to reset the backoff,
+                       # and the window moveCount is counted in
+  moveCount = 5,      # fail the job on the 6th move inside movePeriod
 },
 ```
+
+A keyed instance (`stateful.mode = "keyed"`, such as one sandbox or
+workspace per user) counts its own moves instead. Each keyed instance is a
+separate unit of work, so a few unrelated instances of one job failing does
+not fail the job: an instance whose moves inside `movePeriod` reach
+`moveCount` is stopped, as `legion instance stop` would leave it, and the
+job and its other instances keep running. Its `last_stop` names the spent
+budget, and `legion instance start <id>` retries it with a fresh budget.
+Slot instances and stateless tasks share the task's budget, and spending it
+fails the job.
 
 The hold is what makes the backoff stick. The scheduler leaves one
 replacement unplaced per active hold, whichever eval runs for the job: the
@@ -481,12 +767,26 @@ task still places right away. Holds are replicated, so every manager reports
 them, and the move history they record survives a manager restart or a
 change of leader.
 
+A hold belongs to the task, not to one version of the job. When a
+[rollout](rollouts.md) replaces a version whose allocation failed, the new
+version's replacement of that task (matched by group and task name) waits out
+the same hold instead of placing at once, so a crash-looping task does not
+get an undelayed retry from every resubmit. The rollout group reports
+`Group <name> waiting for <task> (<n>) to wait out a reschedule backoff` and
+looks again when the hold lapses. The wait is not a capacity block:
+`capacityBlockTimeout` does not run during it. The backoff chain and the
+`moveCount` budget are still counted per version, so a new version's first
+failure starts a new chain at `moveDelay`. To place the new version without
+waiting, `legion job run <spec> --force-reschedule` drops the holds as
+described below.
+
 Operators see a deferred replacement in three places:
 
 - an `allocation.reschedule_deferred` event (warn) per deferral, with the
   task, instance, node, allocation, attempt, backoff, next attempt time, and
   reason, and an `allocation.reschedule_exhausted` event (error) when the
-  budget runs out, ahead of `job.failed` (see the
+  budget runs out, ahead of `job.failed` (or, for a keyed instance, with
+  `instanceStopped: true` and no `job.failed`; see the
   [event table](event-stream.md));
 - `legion instance get` and `instance list` for a stateful instance, whose
   state reads `rescheduling` and whose detail says why and until when:
@@ -637,6 +937,55 @@ Job config unchanged; no update needed (the job is running; use --force-reschedu
 "Not running" means no live allocation and no placing eval queued for the
 job, so a finished batch job runs again and a job that could not be placed
 gets another attempt.
+
+### Watching a job's status
+
+`legion job watch web` prints the job each time anything its status reads
+changes (its versions, allocations, or task outcomes), and
+`legion job info web --index <revision>` waits for the next such change. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
+### Listing a job's allocations
+
+`legion ledger --job web` lists the job's allocations, grouped by the node
+each runs on: id, task config, status, reserved resources, and a resize
+override when one is set. `-j` returns the same rows as JSON. The allocation
+ids it prints are what `legion alloc resize` and
+`legion job logs --allocation` take. A namespaced job is named
+`namespace/name` (or with `-n`):
+
+```console
+$ legion ledger --job web
+Ledger:
+- Node node-a (status: ready, availability: eligible)
+  • Allocation 812 (task 41, job web): status running
+    Resources: {
+  "cpu": 500,
+  "memory": 268435456
+}
+```
+
+`legion ledger` without `--job` lists every node, including nodes with no
+allocations. It reads the manager's GetLedger, which needs `node:read` and
+leaves out nodes in pools the caller cannot read, and `--job` filters on the
+client: the reply carries every readable node, so on a large fleet do not
+poll it in a loop. A job with no allocation prints
+`No allocations for job <name>.`. Allocations the manager has removed are not
+in the ledger; `legion job logs <name> --include-removed` shows those removed
+in the last 24 hours.
+
+## Job Versions and Compare-and-Set
+
+`Job.version` is the job's spec version: the version of its latest config,
+raised by every submit that changes the spec. An unchanged resubmit, a
+stop, a status change, and a scale (`legion job scale`) leave it alone.
+`legion job run --expected-version N` submits only when the job is still at
+version `N` (`0`: only if it does not exist yet), checked in the same write
+that stores the new version, so two people or agents editing one job cannot
+silently overwrite each other; the loser gets `ABORTED` naming the current
+version and writes nothing. `legion job plan` lists, field by field, what a
+submit would change in the stored spec. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md#compare-and-set-on-jobs).
 
 ## Job Timestamps: `created_at` and `updated_at`
 

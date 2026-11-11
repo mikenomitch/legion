@@ -30,17 +30,17 @@ Legion never notices a task process exiting.
 
 - Nothing calls `waitpid`/`try_wait` on a task child while it runs. The only
   `try_wait` in the tree belongs to interactive exec sessions
-  (`src/worker/exec.rs:211`).
+  (`crates/worker/src/worker/exec.rs:211`).
 - A task with no `checks` is marked healthy once and never re-examined:
   `spawn_health_monitor` short-circuits with `healthy (no checks configured)`
-  (`src/worker/task_health.rs:54`).
+  (`crates/worker/src/worker/task_health.rs:54`).
 - `reconcile_allocations` compares desired-vs-tracked **id sets**
-  (`src/worker/task_manager.rs:523`); a dead process still has an `instances`
+  (`crates/worker/src/worker/task_manager.rs:523`); a dead process still has an `instances`
   entry, so the worker believes it is running, and `is_allocation_active` is
   literally `instances.contains_key` (`:612`).
 - A batch task's `Success` is derived from its **lifecycle at planning time** —
   `task_status_for_lifecycle`: `TaskLifecycle::Batch => TaskStatusState::Success`
-  (`src/storage/store.rs:6455`). Exit codes never enter the picture, so
+  (`crates/manager/src/storage/store.rs:6455`). Exit codes never enter the picture, so
   `dependsOn: { condition: "success" }` means *"was placed"*.
 - Exited children are never reaped, so a long-lived worker accumulates zombies
   for every task that dies.
@@ -52,7 +52,7 @@ only failure mode is "the process died", and accept that a batch task that exits
 Two adjacent gaps make host processes second-class in ways containers are not:
 
 - `resources` is scheduling arithmetic only. `exec`'s `cgroup` field *joins* an
-  already-existing cgroup v2 path (`src/task_plugins/exec.rs:472-481`); Legion
+  already-existing cgroup v2 path (`crates/worker/src/task_plugins/exec.rs:472-481`); Legion
   never creates a cgroup and never writes a limit. Capacity is an honour system
   on `exec` nodes.
 - Isolation for `exec` is `user` + `oom_score_adj` + Landlock paths. No
@@ -150,9 +150,9 @@ production, which is why enforcement here is opt-in per worker.
 ## 5. Background — what exists today
 
 - `TaskInstance` carries `child: Option<Child>` and `pid: Option<u32>`
-  (`src/task_plugins/mod.rs`). `exec`, `container`, and `sandbox` all set both
+  (`crates/worker/src/task_plugins/mod.rs`). `exec`, `container`, and `sandbox` all set both
   (`exec.rs:416`, `container.rs:518`, `sandbox.rs:971`); `noop` sets neither.
-- `reap_task_process` (`src/task_plugins/mod.rs:117`) kills by child handle or
+- `reap_task_process` (`crates/worker/src/task_plugins/mod.rs:117`) kills by child handle or
   by pid — the shared "one host process we spawned" teardown.
 - `WorkerTaskManager` owns `instances`, `allocations`, `task_configs`,
   `allocation_health`, `failed`, and persists a `PersistedAllocation` list;
@@ -161,16 +161,16 @@ production, which is why enforcement here is opt-in per worker.
   alloc dir, and queues a `FailedAllocationReport` for the heartbeat.
 - The health monitor owns a **local** `restart_history` and calls
   `can_restart` against `on_unhealthy.restart_count/restart_period`
-  (`src/worker/task_health.rs:262`), then `restart_allocation`.
+  (`crates/worker/src/worker/task_health.rs:262`), then `restart_allocation`.
 - Heartbeat carries `allocation_ids`, `failed_allocations`, `allocation_health`,
   `volume_reports`; the manager's handler is `heartbeat`
-  (`src/manager/server.rs:4548`) and `build_desired_allocations` decides what the
+  (`crates/manager/src/manager/server.rs:4548`) and `build_desired_allocations` decides what the
   worker should be running.
-- `update_task_statuses_for_allocations_apply` (`src/storage/store.rs:6491`)
+- `update_task_statuses_for_allocations_apply` (`crates/manager/src/storage/store.rs:6491`)
   stamps task status from lifecycle at placement.
 - Node registration records `protocolVersion` in the node's dynamic attrs
-  (`src/manager/server.rs:4715`); `PROTOCOL_VERSION` lives in
-  `src/constants.rs`. Upgrade order is managers first, then workers
+  (`crates/manager/src/manager/server.rs:4715`); `PROTOCOL_VERSION` lives in
+  `crates/common/src/constants.rs`. Upgrade order is managers first, then workers
   (`docs/upgrades.md`).
 
 ## 6. Proposed design
@@ -212,7 +212,7 @@ monitor's local `Vec<Instant>` into `WorkerTaskManager`, keyed by allocation.
 
 ### 6.2 Exit observation
 
-A supervisor loop in the worker daemon (`src/worker/task_supervisor.rs`) ticks
+A supervisor loop in the worker daemon (`crates/worker/src/worker/task_supervisor.rs`) ticks
 once a second and asks the task manager for exits. Per tracked instance:
 
 - `child.try_wait()` when the worker owns the handle — this also reaps.
@@ -322,15 +322,15 @@ Non-Linux platforms validate the block and warn that it is ignored.
 ## 7. Proto, struct, config, and persistence changes
 
 - `proto/legion.proto`: `TerminatedAllocation` message; `HeartbeatRequest.terminated_allocations`.
-- `src/constants.rs`: `PROTOCOL_VERSION` 1 → 2.
-- `src/structs/job.rs`: `TaskConfig.restart: Option<TaskRestartPolicy>` with
+- `crates/common/src/constants.rs`: `PROTOCOL_VERSION` 1 → 2.
+- `crates/common/src/structs/job.rs`: `TaskConfig.restart: Option<TaskRestartPolicy>` with
   `policy`, `delay`, `success_exit_codes`; defaults resolved per lifecycle.
-- `src/structs/config.rs`: worker `resourceEnforcement { enabled, cgroupParent }`.
-- `src/task_plugins/exec.rs`: `hardening` config block; managed cgroup lifecycle.
-- `src/task_plugins/mod.rs`: `TaskPlugin::supervises_process()`.
-- `src/worker/task_supervisor.rs`: new module.
-- `src/worker/task_manager.rs`: terminal map, shared restart budget, exit polling.
-- `src/storage/store.rs`: terminal allocation status, protocol-aware batch status.
+- `crates/common/src/structs/config.rs`: worker `resourceEnforcement { enabled, cgroupParent }`.
+- `crates/worker/src/task_plugins/exec.rs`: `hardening` config block; managed cgroup lifecycle.
+- `crates/worker/src/task_plugins/mod.rs`: `TaskPlugin::supervises_process()`.
+- `crates/worker/src/worker/task_supervisor.rs`: new module.
+- `crates/worker/src/worker/task_manager.rs`: terminal map, shared restart budget, exit polling.
+- `crates/manager/src/storage/store.rs`: terminal allocation status, protocol-aware batch status.
 - No SQL migration: `allocation.status` already exists and is written today.
 - `configs/jobs/maximal.jsonnet`: `restart` block and `hardening` block.
 

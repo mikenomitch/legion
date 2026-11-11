@@ -1,6 +1,6 @@
 # Task Runtime: container
 
-`container` is a built-in task runtime implemented in `src/task_plugins/container.rs`.
+`container` is a built-in task runtime implemented in `crates/worker/src/task_plugins/container.rs`.
 
 ## Purpose
 
@@ -23,8 +23,10 @@ Legion picks the runtime by operating system. There is no Docker dependency.
   number allocations from 1, and a bare `legion-<alloc>` would collide.
 - **Linux: a low-level OCI runtime.** Legion uses `runc` by default, which
   must be 1.2 or newer for the default [user namespace](#security). Set
-  `LEGION_OCI_RUNTIME` to run `crun` instead. These are the only two: any
-  other binary is refused at launch (see below). These runtimes can't pull
+  `LEGION_OCI_RUNTIME` to run `crun` instead. These are the only two for the
+  node's default runtime: any other binary is refused at launch (see below).
+  Other runtimes, such as gVisor and Kata, are offered per task as
+  [runtime classes](#runtime-classes). These runtimes can't pull
   images or read image references. They run a *bundle* (an extracted `rootfs/`
   plus a `config.json` runtime spec), which Legion builds from the image's OCI
   layout (see [Linux: image → bundle](#linux-image--bundle)).
@@ -47,7 +49,7 @@ runtime.
 ### Linux: image → bundle
 
 A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
-(`src/task_plugins/oci_bundle.rs`):
+(`crates/worker/src/task_plugins/oci_bundle.rs`):
 
 1. **Get the image's OCI layout.** If the image was staged through the
    artifact pipeline (`artifacts.containerImageDesugar`), Legion uses that
@@ -86,7 +88,11 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
    - the image's working dir and user. Named users and groups resolve against
      the extracted rootfs's `/etc/passwd` and `/etc/group`, and `HOME` comes
      from the passwd entry when the env doesn't set it. Names that can't be
-     resolved fall back to root with a warning.
+     resolved fall back to root with a warning. As in Docker, the process
+     also gets every `/etc/group` group that lists the user by name, when
+     the user is given in the implicit form (a name, a uid with a passwd
+     entry, or no `USER` at all, which is root); `user:group` sets exactly
+     that one group.
    - the allocation's network namespace when it runs gated (the default; see
      [Networking](#networking-gated-by-default-on-linux)), with a generated
      `resolv.conf` pointing at its resolver. With `network.mode = "host"`, the
@@ -102,9 +108,22 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
    - `RLIMIT_NOFILE` at 1048576, adjustable with
      [`ulimits`](#resource-limits-ulimits),
    - `noNewPrivileges`.
-3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`, with the task's
-   log files as its stdout and stderr (see
-   [Stdout and stderr](#stdout-and-stderr)).
+3. **Run it:** `<runtime> run --bundle <dir> legion-<node>-<alloc>`, with the
+   task's log files as its stdout and stderr (see
+   [Stdout and stderr](#stdout-and-stderr)). The container id is also the
+   container's hostname. It carries the node id (lowercased, reduced to
+   `[a-z0-9-]`) because OCI ids are global to the runtime's state directory
+   (`/run/runc`), which every cluster on the host shares. The node part is
+   cut short when the id would pass the kernel's 63-byte hostname limit; the
+   allocation id never is.
+
+   A container still holding the id from an earlier start (a worker crash,
+   or a run killed before the runtime reaped it) is removed first, but only
+   if `<runtime> state` says it was created from this allocation's own
+   bundle directory. Anything else under the id is left alone and the start
+   fails with `an OCI container with id legion-<node>-<alloc> already exists
+   in runc's state and is not this allocation's (it was created from bundle
+   …)`, naming the `delete --force` that removes it if it really is stale.
 
 The image and bundle scratch space lives under the allocation's private
 directory and is removed on destroy.
@@ -128,6 +147,12 @@ Optional:
   [Capabilities](#capabilities-security).
 - `ulimits`: per-process resource limits (`setrlimit`), such as
   `{ nofile = 65536 }`. See [Resource limits](#resource-limits-ulimits).
+- `runtimeClass`: an OCI runtime class the node's worker type declares, such
+  as `gvisor` or `kata`. See [Runtime classes](#runtime-classes).
+
+Devices (GPUs) are not runtime config: they are `resources.devices`, and the
+container gets the device nodes, cgroup rules, mounts, and env the device
+plugin returns. See [Devices](#devices) and [docs/devices.md](devices.md).
 
 `security` and `ulimits` apply on Linux. Apple `container` runs each container
 in its own VM with the runtime's defaults, so on macOS they are accepted and
@@ -148,6 +173,84 @@ and `CMD` are not used. Apple `container` follows Docker's rule instead, where
 image's entrypoint on both, name it in `command`. For the official Postgres
 image, `command = ["docker-entrypoint.sh", "postgres"]` works everywhere: the
 entrypoint passes a command it does not recognize straight through.
+
+## Runtime classes
+
+A worker type can offer OCI runtimes besides the node's default runc or crun,
+by name, and a task picks one. This is how containers run under **gVisor**
+(`runsc`) or **Kata Containers**: a user-space kernel or a VM between the
+workload and the host, for code you do not trust.
+
+```nickel
+# Worker type
+container = {
+  runtimeClasses = {
+    gvisor = { path = "/usr/local/bin/runsc", userNamespace = false, isolatesRoot = true },
+    kata   = { path = "/usr/bin/kata-runtime", userNamespace = false, isolatesRoot = true },
+  },
+},
+```
+
+```nickel
+# Task
+config = { image = "python:3.12", command = ["python", "agent.py"], runtimeClass = "gvisor" },
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `path` | required | Absolute path to a runtime with runc's command line (`run --bundle`, `exec`, `kill`, `delete`, `state`). To pass flags (`runsc --platform=systrap`), point it at a wrapper script that adds them. |
+| `userNamespace` | `true` | The runtime applies an OCI user namespace with idmapped mounts. |
+| `seccomp` | `true` | The runtime applies the OCI seccomp profile. |
+| `isolatesRoot` | `false` | The runtime keeps container root off host root by itself (gVisor's kernel, Kata's VM). |
+
+How it works:
+
+- At start, the worker runs `<path> --version` for each class and
+  advertises the ones that answer as the node attribute
+  `container.runtimeClasses`. A class whose runtime is missing is logged
+  (`Container runtime class unavailable; not advertised`) and not
+  advertised.
+- A task with `runtimeClass` gets an implicit constraint
+  `container.runtimeClasses contains "<class>"`, so it only places on nodes
+  that have it. Unlike the default runtime, a class's binary is not required
+  to be runc or crun: the operator declared it.
+- The [privilege floor](#security) is applied as far as the class supports
+  it. A part the class does not support is **dropped when the class
+  `isolatesRoot`** (the start logs `Runtime class isolates root itself`),
+  because the class's own isolation stands in for it; otherwise the start
+  **fails** rather than run below the floor:
+
+  ```text
+  runtime class plain cannot apply a user namespace with idmapped mounts, which this task asks for (security.userNamespace, on by default), and the class does not isolate root by itself (isolatesRoot is false). Set security.userNamespace to opt out on the task (which makes it host-level), or run it on a class that supports it
+  ```
+
+  `isolatesRoot` is a trust statement: set it only for runtimes that really
+  are sandboxes. The submit-time host-level rules do not change with a
+  class: a task that keeps the default floor is not host-level whether or
+  not its class drops parts of it.
+- A task naming a class that the node it reached does not configure fails
+  with the classes the node has.
+
+Not verified here: no gVisor or Kata runtime has run these bundles in this
+repository's tests. gVisor's GPU support (`nvproxy`) and Kata's device
+passthrough are not wired to [devices](devices.md). Runtime classes are
+Linux only.
+
+## Devices
+
+A container task that asks for devices (`resources.devices`, see
+[docs/devices.md](devices.md)) gets, in its OCI bundle:
+
+- each device node in `linux.devices`, with `type`, `major`, and `minor` read
+  from the host node when the plugin left them out;
+- an allow rule per device node in `linux.resources.devices`, **after** the
+  deny-all rule every container has, so it reaches exactly its devices;
+- the plugin's and CDI spec's mounts (driver libraries) and hooks;
+- `LEGION_DEVICE_<NAME>_IDS` and the plugin's env, such as
+  `CUDA_VISIBLE_DEVICES` (a task's own `env` still wins).
+
+Under the default user namespace, runc and crun bind-mount device nodes
+instead of creating them. None of this has run on a real GPU here.
 
 ## Capabilities (`security`)
 
@@ -571,7 +674,7 @@ one.
 
 How each platform does it:
 
-- **Linux:** `<runtime> kill legion-<alloc> <signal>` ("not running" is
+- **Linux:** `<runtime> kill legion-<node>-<alloc> <signal>` ("not running" is
   ignored, since a finished batch container is already gone). Then Legion
   polls `<runtime> state` until the container is stopped or gone, up to the
   grace period. Finally it always runs `<runtime> delete --force`, which
@@ -769,9 +872,13 @@ resolver. A host-mode container can reach the node, other allocations'
 listeners, and the cloud metadata service, so keep it for trusted images.
 
 On macOS, `auto` stays `host`: Apple `container` already runs each container
-in its own VM on its own network, and macOS has no network namespaces. The
-full model, the fail-closed rules, and the limits are in
-[Network Handlers](network-handlers.md#gated-mode).
+in its own VM on its own network, and macOS has no network namespaces. An
+explicit `gated` runs the VM on Legion's `legion-gated` network, where `pf`
+lets it reach only its own egress proxy and upstreams on the Mac (macOS 26
+or later, worker running as root;
+[Gated mode on macOS](network-handlers.md#gated-mode-on-macos), not yet
+verified on macOS hardware). The full model, the fail-closed rules, and the
+limits are in [Network Handlers](network-handlers.md#gated-mode).
 
 ## Security
 
@@ -815,6 +922,8 @@ config = {
   | `…/allocs/` | `0711` | anyone, by exact path (no listing) |
   | `…/allocs/<alloc>/` | `0710`, group = the allocation's range | the worker, and this allocation's container root |
   | `…/allocs/<alloc>/<task>/` | `0700` | the worker. It reaches the container as an idmapped mount, which the runtime opens with the worker's privilege |
+  | `…/local-volumes/` | `0711` | anyone, by exact path (no listing) |
+  | `…/local-volumes/<volume>/` | `0700` | the worker (or an `exec` task's `user` it was handed to). Its `data/` reaches the container as a mount |
   | state files, `logs/`, `content/`, `volumes/`, `identity/` | `0600` / `0700` | the worker |
 
   Another allocation's root is another gid, so it can't enter. Without a
@@ -851,8 +960,12 @@ grant on job:write)
   `userNamespace = false` on that node's jobs, or move them to a newer
   kernel.
 - Idmapped mounts also need runtime support: runc 1.2 or newer, or crun.
-  runc before 1.2 ignores them, so on it a start with a user namespace
-  fails before any image work:
+  A worker on an older runc advertises `container.idmappedMounts =
+  "unsupported"`, and a user-namespaced task carries the implicit
+  constraint `container.idmappedMounts is_not_set`, so it is not placed
+  there (see [Installation](installation.md)). runc before 1.2 ignores
+  idmapped mounts, so a start that reaches it anyway fails before any image
+  work:
 
   ```text
   OCI runtime `runc` is runc 1.1.12-0ubuntu3, which predates idmapped mounts; security.userNamespace (on by default) needs them for the task directory and volumes. Install runc 1.2 or newer (the default) or crun, and point LEGION_OCI_RUNTIME at it, or set security.userNamespace = false on the task
@@ -886,6 +999,7 @@ grant on job:write)
 | Signal delivery | ✅ to the container init, both platforms |
 | Graceful stop (`stop { signal, killAfter }`) | ✅ both platforms |
 | Memory / CPU limits | ✅ macOS (guest sizing). ✅ Linux with `resourceEnforcement.enabled` (cgroup v2). See [docs/resource-enforcement.md](resource-enforcement.md) |
+| Resize in place (`memory`, `memoryMax`, `cpu`) | ✅ Linux, live: `memory.low`, `memory.max`, and `cpu.weight` are rewritten on the container's cgroup. A ceiling below current use is refused unless `--force`. ❌ macOS (the guest VM's size is fixed at start; a resize there is an accounting change). See [docs/resize.md](resize.md) |
 | Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning). macOS sizes the guest instead |
 | Port publishing | ✅ macOS (`--publish`). Linux: ingress listeners forward each host port into the gated namespace (`to`, or the same port); not applied in `host` mode |
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |
@@ -894,6 +1008,8 @@ grant on job:write)
 | Capability adjustments (`security.capabilities`) | ✅ Linux, within the node's `container.allowCaps` (drops always allowed). Ignored on macOS (VM boundary, runtime defaults) |
 | Resource limits (`ulimits`) | ✅ Linux. Ignored on macOS |
 | Image layer cache | ✅ Linux, per node, in the content store. macOS: Apple `container`'s own image store |
+| Devices (`resources.devices`) | ✅ Linux: device nodes, cgroup allow rules, mounts, hooks, and env ([Devices](#devices)). ❌ macOS |
+| Runtime classes (`runtimeClass`) | ✅ Linux ([Runtime classes](#runtime-classes)). ❌ macOS |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
 (`host = false`). An `exec:write` rule without `host` is enough.
@@ -969,9 +1085,10 @@ only its changed layers.
 ## Current Scope and Limitations
 
 - The runtime integration is simple: it shells out to runtime binaries.
-- On Linux the container id stays `legion-<alloc>`, with no node in it. OCI
-  runtimes have no labels, so stale-container cleanup deletes by name. Two
-  clusters sharing one Linux host and one runtime state directory can collide.
+- On Linux the task's cgroup leaf stays `legion-<alloc>` (see
+  [resource enforcement](resource-enforcement.md)), under the worker's own
+  cgroup root. Two workers on one host need different `cgroupParent`s, as
+  they already do for their slice masks.
 - A container left running by a cluster whose state was deleted keeps
   running under its old node's name. Legion doesn't remove it, because it no
   longer belongs to any node. Remove it with `container rm --force`.
@@ -1018,6 +1135,4 @@ only its changed layers.
 - Only the image's `USER` can reopen `/dev/stdout` and `/dev/stderr` by path;
   a process that switched to another user inside the container gets `EACCES`
   (see [Stdout and stderr](#stdout-and-stderr)).
-- Supplementary groups from the image's `/etc/group` are not applied to the
-  process; it runs with the resolved uid and gid only.
 - Health checks still run through the worker health monitor.

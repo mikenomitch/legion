@@ -69,6 +69,7 @@
 //! ```
 
 mod instances;
+mod sessions;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,6 +173,7 @@ fn main() -> Result<()> {
         .context("failed to build the tokio runtime")?;
     match matches.get_one::<String>("mode").map(String::as_str) {
         Some("instances") => runtime.block_on(run_instances(&matches)),
+        Some("sessions") => runtime.block_on(run_sessions(&matches)),
         _ => runtime.block_on(run(&matches)),
     }
 }
@@ -235,6 +237,57 @@ async fn run_instances(matches: &clap::ArgMatches) -> Result<()> {
     Ok(())
 }
 
+async fn run_sessions(matches: &clap::ArgMatches) -> Result<()> {
+    let managers: Vec<String> = matches
+        .get_one::<String>("manager")
+        .cloned()
+        .or_else(|| std::env::var("LEGION_ADDR").ok())
+        .unwrap_or_else(|| legion::prelude::DEF_MANAGER_ADDRESS.to_string())
+        .split(',')
+        .map(|address| address.trim().to_string())
+        .filter(|address| !address.is_empty())
+        .collect();
+    let opts = sessions::SessionsOptions {
+        managers,
+        job: matches.get_one::<String>("job").unwrap().clone(),
+        task: matches
+            .get_one::<String>("task")
+            .cloned()
+            .context("sessions mode needs --task")?,
+        via: match matches.get_one::<String>("via").map(String::as_str) {
+            Some("edge") => sessions::Via::Edge,
+            _ => sessions::Via::Manager,
+        },
+        wait: match matches.get_one::<String>("wait").map(String::as_str) {
+            Some("running") => sessions::Wait::Running,
+            _ => sessions::Wait::Accepted,
+        },
+        count: *matches.get_one::<usize>("count").unwrap(),
+        rate: *matches.get_one::<f64>("rate").unwrap(),
+        concurrency: *matches.get_one::<usize>("concurrency").unwrap(),
+        connections: *matches.get_one::<usize>("connections").unwrap(),
+        ticket: matches
+            .get_one::<String>("ticket")
+            .cloned()
+            .or_else(|| std::env::var("LEGION_SESSION_TICKET").ok())
+            .unwrap_or_default(),
+        ca: matches.get_one::<String>("ca").cloned(),
+        hold: Duration::from_millis(*matches.get_one::<u64>("hold-ms").unwrap()),
+        stop_at_end: matches.get_flag("stop-at-end"),
+        poll: Duration::from_millis(*matches.get_one::<u64>("poll-ms").unwrap()),
+        timeout: Duration::from_millis(*matches.get_one::<u64>("timeout-ms").unwrap()),
+        quiet: matches.get_flag("quiet"),
+    };
+    let summary = sessions::run(opts).await?;
+    let rendered = serde_json::to_string_pretty(&summary)?;
+    if let Some(out) = matches.get_one::<String>("out") {
+        std::fs::write(out, format!("{rendered}\n"))
+            .with_context(|| format!("failed to write {out}"))?;
+    }
+    println!("{rendered}");
+    Ok(())
+}
+
 fn cli() -> Command {
     Command::new("legion-loadgen")
         .about(
@@ -245,12 +298,69 @@ fn cli() -> Command {
         .arg(
             Arg::new("mode")
                 .long("mode")
-                .value_parser(["jobs", "instances"])
+                .value_parser(["jobs", "instances", "sessions"])
                 .default_value("jobs")
                 .help(
                     "`jobs` submits the rig's jobspecs; `instances` drives keyed-instance \
-                     lifecycles against an embedded simulated fleet",
+                     lifecycles against an embedded simulated fleet; `sessions` starts \
+                     session-mode units on real nodes, through a manager or at the edge",
                 ),
+        )
+        .arg(
+            Arg::new("task")
+                .long("task")
+                .help("sessions mode: the session task to start (required)"),
+        )
+        .arg(
+            Arg::new("via")
+                .long("via")
+                .value_parser(["manager", "edge"])
+                .default_value("manager")
+                .help("sessions mode: CreateInstance on a manager, or StartSession on the nodes"),
+        )
+        .arg(
+            Arg::new("wait")
+                .long("wait")
+                .value_parser(["accepted", "running"])
+                .default_value("accepted")
+                .help("sessions mode: time each start to the node's admit, or to running"),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("1000")
+                .help("sessions mode: starts to make"),
+        )
+        .arg(
+            Arg::new("ticket")
+                .long("ticket")
+                .help("sessions mode, --via edge: a session ticket (or LEGION_SESSION_TICKET)"),
+        )
+        .arg(
+            Arg::new("ca").long("ca").help(
+                "sessions mode, --via edge: the cluster CA bundle (default: ask the manager)",
+            ),
+        )
+        .arg(
+            Arg::new("stop-at-end")
+                .long("stop-at-end")
+                .action(ArgAction::SetTrue)
+                .help("sessions mode: stop every session still running once all starts are in"),
+        )
+        .arg(
+            Arg::new("poll-ms")
+                .long("poll-ms")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("20")
+                .help("sessions mode, --via manager --wait running: GetInstance poll interval"),
+        )
+        .arg(
+            Arg::new("timeout-ms")
+                .long("timeout-ms")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("60000")
+                .help("sessions mode: how long one start may take before it fails"),
         )
         .arg(
             Arg::new("workload-dir")
@@ -305,7 +415,8 @@ fn cli() -> Command {
         .arg(Arg::new("join-token").long("join-token").help(
             "instances mode, required with --simulate: a `legion join-token create` \
                      token for the embedded fleet (sets its worker type and secret, \
-                     overriding --worker-type, and pins the cluster CA)",
+                     overriding --worker-type, and pins the cluster CA); the worker \
+                     type must grant the fleet (`attributes = { workerFleet = \"lg-*\" }`)",
         ))
         .arg(Arg::new("advertise-addr").long("advertise-addr").help(
             "instances mode: host the manager dials to push work to the embedded \
@@ -620,6 +731,7 @@ async fn submit_one(
     job: &PreparedJob,
 ) -> Result<SubmitReply, String> {
     let request = tonic::Request::new(RunJobRequest {
+        namespace: Default::default(),
         // The rig renders jobspecs to JSON up front (translate.py), which is
         // already the `parsed_jobspec` the manager consumes — the same string
         // `render_jobspec()` produces for a `.json` path in src/cmd/job.rs.
@@ -636,6 +748,8 @@ async fn submit_one(
         priority: None,
         force_reschedule: false,
         idempotency_key: None,
+        allow_unknown_fields: Default::default(),
+        expected_version: None,
     });
 
     match client.run_job(request).await {

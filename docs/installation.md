@@ -103,8 +103,14 @@ with:
 OCI runtime `runc` is not installed on this node (install runc 1.2+ or crun, or set LEGION_OCI_RUNTIME to one that is)
 ```
 
-`container: pass` does not check runc's version. A runc older than 1.2 still
-passes, and its user-namespaced starts fail with:
+`container: pass` does not check runc's version, but placement does. A
+worker whose runc is older than 1.2 registers with the node attribute
+`container.idmappedMounts = "unsupported"` and logs a warning saying so, and
+every container task that keeps `security.userNamespace` on (the default)
+carries the implicit constraint `container.idmappedMounts is_not_set`, so
+it is never placed there. `legion job inspect` shows the constraint. A task
+that reaches such a node anyway (one that registered before the upgrade)
+fails its start with:
 
 ```text
 OCI runtime `runc` is runc 1.1.12-0ubuntu3, which predates idmapped mounts; security.userNamespace (on by default) needs them for the task directory and volumes. Install runc 1.2 or newer (the default) or crun, and point LEGION_OCI_RUNTIME at it, or set security.userNamespace = false on the task
@@ -163,7 +169,7 @@ not untrusted code (see
 it is installed. It publishes a static binary with each release:
 
 ```bash
-CH_VERSION=v48.0       # see https://github.com/cloud-hypervisor/cloud-hypervisor/releases
+CH_VERSION=v51.2       # see https://github.com/cloud-hypervisor/cloud-hypervisor/releases
 # x86_64:
 curl -fsSL -o /tmp/cloud-hypervisor \
   "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
@@ -177,22 +183,30 @@ The worker finds `cloud-hypervisor` on its `PATH`, or at
 `PATH`, or `LEGION_FIRECRACKER_BIN`); `auto` falls back to it when
 cloud-hypervisor is absent.
 
-Install the filesystem tools the root-disk build uses:
+Install the filesystem tools the root-disk build uses. The worker formats
+root disks with `mkfs.ext4` and writes each sandbox's own files into its disk
+with `debugfs`. Both ship in e2fsprogs:
 
 ```bash
-sudo apt-get install -y e2fsprogs       # mkfs.ext4; or set LEGION_MKFS_EXT4
+sudo apt-get install -y e2fsprogs       # mkfs.ext4 and debugfs; or set LEGION_MKFS_EXT4
+# Alpine splits debugfs out: apk add e2fsprogs e2fsprogs-extra
 ```
+
+The worker keeps each image's built root disk in a node-wide cache, so only
+the first sandbox of an image on a node pays for the build. A data dir on a
+filesystem with reflinks (XFS, btrfs) makes every later start's copy of it
+near-instant. See [the root disk cache](task-runtime-sandbox.md#the-root-disk-cache).
 
 ### 3. Install a guest kernel
 
 A microVM boots an uncompressed kernel image (`vmlinux`, not `bzImage`).
 cloud-hypervisor maintains a guest kernel and publishes builds on its
 [linux releases page](https://github.com/cloud-hypervisor/linux/releases).
-Each release carries a `vmlinux-x86_64` asset (and an arm64 image). Put it
-where the worker looks by default:
+Each release carries a `vmlinux-x86_64` asset (and `Image-arm64` for
+aarch64). Put it where the worker looks by default:
 
 ```bash
-KERNEL_TAG=ch-release-v6.12.8-20250114  # see the releases page for the latest tag
+KERNEL_TAG=ch-release-v6.16.9-20261001  # see the releases page for the latest tag
 sudo mkdir -p /var/lib/legion/kernels
 sudo curl -fsSL -o /var/lib/legion/kernels/vmlinux \
   "https://github.com/cloud-hypervisor/linux/releases/download/${KERNEL_TAG}/vmlinux-x86_64"
@@ -208,6 +222,13 @@ Two other ways to supply it, in the order the worker checks them:
 them fails with an error that names all three. Memory reclaim from a running
 guest (free page reporting) needs a kernel built with `CONFIG_PAGE_REPORTING`;
 see [docs/task-runtime-sandbox.md](task-runtime-sandbox.md#guest-memory-under-pressure).
+
+The reference kernel is built for every kind of guest (the build Legion's
+AWS measurements used is 48 MB), and the VMM loads it into guest memory on
+every boot. On a node that starts many
+sandboxes, a kernel built with only what Legion needs saves host CPU and
+guest memory on every start: [A smaller guest kernel](task-runtime-sandbox.md#a-smaller-guest-kernel)
+lists the options and a build recipe.
 
 ### 4. Check it
 

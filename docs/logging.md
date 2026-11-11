@@ -66,9 +66,19 @@ worker opens the capture file descriptors before spawning the task.
 Capture runs through the task plugin runtime. The worker sets a log directory
 on `TaskInstance`, and the built-in `exec` and `container` task runtimes
 redirect their child process to those files
-([`configure_task_log_capture`](../src/task_plugins/mod.rs)). The task writes
+([`configure_task_log_capture`](../crates/worker/src/task_plugins/mod.rs)). The task writes
 to a file descriptor instead of a pipe to the worker. So logging keeps working,
 and tasks keep running, across worker restarts.
+
+**Isolates.** An [`isolate`](task-runtime-isolate.md#logs) task has no
+process of its own. The output of its HTTP and session-isolate invocations
+is appended by the worker to the **envelope allocation's** `stdout.log` and
+`stderr.log`, once per invocation when it ends, each line prefixed with
+`[isolate <id>]` (and ` tenant=<key>` when it has one), a line cut at
+16 KiB, control characters other than tab written as visible `\xHH`, and
+each job and task limited to 512 KiB of log per second under a per-host
+ceiling ([details](task-runtime-isolate.md#logs)). Runs in request and
+tenant isolates return their output in the run's reply instead.
 
 > **Note on custom task plugins:** a plugin captures logs automatically if it
 > spawns its work with `spawn_task_process` after calling
@@ -82,7 +92,7 @@ and tasks keep running, across worker restarts.
 
 Legion doesn't run a separate logging process per task (Nomad's `logmon`
 model). Log handling is an in-process, pluggable **`LogSink`**
-([`src/worker/log_sink.rs`](../src/worker/log_sink.rs)):
+([`crates/worker/src/worker/log_sink.rs`](../crates/worker/src/worker/log_sink.rs)):
 
 ```rust
 pub trait LogSink: Send + Sync {
@@ -176,9 +186,9 @@ LEGION_LOG_RETENTION_DAYS=2 \
 legion start worker
 ```
 
-Defaults live in [`src/constants.rs`](../src/constants.rs)
+Defaults live in [`crates/common/src/constants.rs`](../crates/common/src/constants.rs)
 (`DEF_TASK_LOG_*`). The rotation code is in
-[`src/worker/logs.rs`](../src/worker/logs.rs).
+[`crates/worker/src/worker/logs.rs`](../crates/worker/src/worker/logs.rs).
 
 ---
 
@@ -280,6 +290,9 @@ legion job logs web --include-removed
 # Any one allocation, live or removed in the last 24 hours:
 legion job logs --allocation 31
 ```
+
+The UI's job Logs tab has the same switch: **Removed** adds the removed
+allocations after the live ones (`include_removed`).
 
 In `--json` output each allocation carries `removed`, `removalCause` (the stop
 cause: `stop`, `update`, `reschedule`, `node_lost`, `preempted`, `destroy`,
@@ -517,5 +530,5 @@ Notes:
 - Local trace files (`legion start … --o11y` → `./traces`) still work as
   before. OTLP export runs alongside them.
 
-Implementation: [`src/otel.rs`](../src/otel.rs), wired in
-[`src/tracing_util.rs`](../src/tracing_util.rs).
+Implementation: [`crates/common/src/otel.rs`](../crates/common/src/otel.rs), wired in
+[`crates/common/src/tracing_util.rs`](../crates/common/src/tracing_util.rs).

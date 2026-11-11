@@ -124,7 +124,7 @@ let http_check = fun check_path =>
     port = "http",
     every = "5s",
     timeout = "2s",
-    unhealthy_after_count = 3,
+    unhealthyAfterCount = 3,
   }
 in
 
@@ -147,19 +147,19 @@ in
       connect = {
         upstreams = [
           {
-            service = "api",
+            to = "http://api",
             # HTTP mode: per-request balancing, a deadline, retries on
-            # idempotent requests, and ejecting a replica that keeps failing.
+            # idempotent requests. A replica that keeps answering 5xx is
+            # ejected for 30s on its own.
             http = {
               timeout = "5s",
               retries = { attempts = 2, on = ["5xx", "connect-failure"] },
-              outlier = { consecutive5xx = 5, ejectFor = "30s" },
             },
           },
         ],
       },
       checks = [http_check "/"],
-      resources = { cpus = 0.1, memory = 64 },
+      resources = { cpu = 100, memory = 64 },
     },
     {
       name = "api",
@@ -177,13 +177,15 @@ in
         env = { APP_PY = api_py, PYTHONUNBUFFERED = "1" },
       },
       network = { ports = [{ name = "http" }] },
-      # Only the frontend may reach the API through the mesh.
-      service = { port = "http", meta = { protocol = "http" }, allow = ["fullstack"] },
+      # On the mesh, so only callers from this job reach the API: the
+      # endpoint feed hides it from everyone else, and the receiving node
+      # refuses any verified caller outside `allow`.
+      service = { port = "http", meta = { protocol = "http" }, mesh = true, allow = ["fullstack"] },
       # Least-connections, so a slow query doesn't pile more requests on
       # the replica that's already busy.
-      connect = { upstreams = [{ service = "postgres", balance = "least_conn" }] },
-      checks = [http_check "/healthz" & { boot_grace_time = "60s" }],
-      resources = { cpus = 0.25, memory = 128 },
+      connect = { upstreams = [{ to = "postgres", balance = "least_conn" }] },
+      checks = [http_check "/healthz" & { bootGraceTime = "60s" }],
+      resources = { cpu = 250, memory = 128 },
     },
     {
       name = "postgres",
@@ -211,9 +213,9 @@ in
       # A TCP check, not `pg_isready`: exec checks run on the host, outside
       # the container, where neither the binary nor the task env exists.
       checks = [
-        { type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", boot_grace_time = "60s" },
+        { type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", bootGraceTime = "60s" },
       ],
-      resources = { cpus = 0.5, memory = 512 },
+      resources = { cpu = 500, memory = 512 },
     },
     # A sidecar runs beside its group's primary task and shares its node and
     # lifecycle. This one exports Postgres metrics for Prometheus to scrape.
@@ -237,8 +239,8 @@ in
       },
       network = { ports = [{ name = "metrics" }] },
       service = { name = "postgres-metrics", port = "metrics", meta = { protocol = "http", path = "/metrics" } },
-      connect = { upstreams = [{ service = "postgres" }] },
-      resources = { cpus = 0.05, memory = 32 },
+      connect = { upstreams = [{ to = "postgres" }] },
+      resources = { cpu = 50, memory = 32 },
     },
   ],
 }

@@ -18,7 +18,14 @@ default) the manager registers one built-in worker type, `default`, in pool
 instead; a configured directory that does not exist stops the manager at
 startup with an error naming it. The repo's `configs/manager.ncl` sets
 `workerConfigPath = "./configs/workers/"`, so it is meant to be run from a
-checkout.
+checkout. Either way the manager also registers the built-in
+`legion-system` type its [system
+worker](architecture-managers-workers.md#the-system-worker) joins as (the
+manager config's `systemWorker` block configures that worker); a worker
+config may not declare a type of that name. A worker config's `namespaces`
+list reserves its nodes for some namespaces
+([`configs/workers/ci.ncl`](../configs/workers/ci.ncl),
+[namespaces.md](namespaces.md#nodes-that-accept-only-some-namespaces)).
 | ACL policies | `legion acl policy create -f` | see [Auth & ACLs](auth-and-acls.md) |
 | Job templates | `legion template create -f` | [`configs/templates/render.ncl`](../configs/templates/render.ncl) |
 
@@ -299,14 +306,53 @@ task and has nothing to do with evaluation.
 | `invalid contract expression … can't be used as a contract` | A JSON object being read as Nickel. Rename the file to `.json`, or convert `:` to `=`. |
 | `is not valid JSON` | A `.json` file that doesn't parse. The message includes the line and column. |
 | `is JSON, which has no variables` | `--var` against a `.json` spec. |
+| `evaluation did not finish within 1000000 steps` | The program never ends: a field defined in terms of itself (`host = { oneOf = [host] }`), or a recursive function with no base case. See [Evaluation limits](#evaluation-limits). |
 
 Evaluation errors include the source line and a caret, both in the CLI and in
 the manager's gRPC status.
+
+## Evaluation limits
+
+Every Nickel evaluation, in the CLI and in the manager, runs under a budget of
+**1,000,000 steps**. A step is one variable lookup or field access, or one new
+pending computation. A program that never finishes spends the budget and fails
+with an error, instead of running until the process runs out of memory:
+
+```nickel
+{ host = { oneOf = [host] } }   # an infinite value
+```
+
+```text
+evaluation did not finish within 1000000 steps; the program most likely never ends, such as a
+field defined in terms of itself (`host = { oneOf = [host] }`) or a recursive function with no
+base case
+```
+
+The same applies to job templates and app manifests the manager evaluates on a
+caller's behalf, so a runaway template ends with this error rather than holding
+the manager's evaluation thread. The budget is fixed and is not configurable.
+
+Real configurations use a small fraction of it. The largest example Legion
+ships, `configs/jobs/maximal.ncl`, takes about 3,500 steps. A jobspec that
+generates 1,000 tasks with `std.array.generate` takes about 140,000. A
+runaway reaches the budget in about half a second in a release build, holding
+a few hundred megabytes while it does. Heavy computation can reach the budget
+legitimately: sorting 5,000 generated records with `std.array.sort` takes
+about 46 million steps. Generate that data with another tool and import it as
+JSON instead.
 
 ## Known limitations
 
 - **No environment-variable access**, by design (see above). Configs that
   interpolated `$HOME`-style values need KV or an imported file.
+- **Evaluation has a fixed step budget**, not a memory limit (see
+  [Evaluation limits](#evaluation-limits)). It bounds memory only through the
+  steps it takes to build it, so a program can hold a few hundred megabytes
+  before it is stopped. Each evaluation runs on its own thread with a 1 GiB
+  stack reservation, because Nickel frees a long chain of pending computations
+  recursively. A host that refuses that reservation falls back to 64 MiB, and
+  a runaway chain stopped at the budget can then overflow that stack and abort
+  the process.
 - **No incremental evaluation cache.** Every submit re-evaluates from source.
   That's fine at jobspec sizes, and it's why template rendering has a 5s
   budget.

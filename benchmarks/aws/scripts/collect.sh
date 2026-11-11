@@ -105,11 +105,6 @@ snapshot raft_propose_apply_mean 'sum by (lane) (rate(legion_raft_propose_apply_
 snapshot store_write_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_write_lock_wait_seconds_bucket[1m])))'
 snapshot store_read_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_read_lock_wait_seconds_bucket[1m])))'
 snapshot evals_processed 'sum by (kind, outcome) (legion_evals_processed_total)'
-# Plans thrown away because the read model moved mid-plan, then re-run
-# with the eager O(fleet) sample. Measured after the fact at 27% of plans
-# at 5,000 nodes and 55% at 10,000 (plan-path-fleet-scaling-plan.md § 5.1);
-# archived per cell so that number never again has to be recovered by hand.
-snapshot lazy_sample_fallback 'sum(legion_scheduler_lazy_sample_fallback_total)'
 # Whole-eval time, not just planning. The plan-phase histogram covers
 # planning only, so before this the time an eval spent outside planning
 # (dispatch, follow-ups, settling the batch) could only be inferred from
@@ -165,6 +160,12 @@ snapshot liveness_tracked_nodes 'legion_liveness_tracked_nodes'
 snapshot liveness_loss_suppressed 'sum by (reason) (rate(legion_liveness_loss_suppressed_total[1m]))'
 snapshot grpc_p99 'histogram_quantile(0.99, sum by (method, le) (rate(legion_grpc_request_duration_seconds_bucket[1m])))'
 snapshot cpu 'sum by (instance_name, role) (rate(node_cpu_seconds_total{mode!="idle"}[1m]))'
+# `cpu` counts every non-idle mode, so a box waiting on its disk reads as
+# a box out of CPU. Both competitor leaders read 4.00/4 cores in the
+# 2026-10-10 cells and nothing archived could say which it was. The mode
+# split (iowait vs user/system) and the disk's busy fraction answer it.
+snapshot cpu_by_mode 'sum by (instance_name, role, mode) (rate(node_cpu_seconds_total{role="control-plane", mode!="idle"}[1m]))'
+snapshot disk_busy 'max by (instance_name, device) (rate(node_disk_io_time_seconds_total{role="control-plane"}[1m]))'
 # Memory is a first-class result alongside CPU — "what does the control
 # plane cost at 1k vs 10k nodes" needs both, and every cell is archived
 # at a known node count, so the scale steps are the load axis.
@@ -177,19 +178,19 @@ snapshot cpu 'sum by (instance_name, role) (rate(node_cpu_seconds_total{mode!="i
 # share of `used` that is reclaimable, not resident cost.
 snapshot memory_used 'sum by (instance_name, role) (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)'
 snapshot memory_anon 'sum by (instance_name, role) (node_memory_MemTotal_bytes - node_memory_MemFree_bytes - node_memory_Cached_bytes - node_memory_Buffers_bytes)'
+# The manager process's own resident set, from the gauge the manager exports
+# on :4749 (node_exporter exports the same family for itself, hence the job
+# filter).
+snapshot manager_rss 'process_resident_memory_bytes{job="legion-managers"}'
 
 # Reduced memory summary: peak and mean per role, so "memory at low /
 # medium / high load" is one small file per cell rather than a
 # re-derivation from the range export. The range data above stays
 # authoritative; this is the readable form.
 #
-# Known limitation, stated here because it changes how the number reads:
-# this is WHOLE-BOX memory from node_exporter, not the manager process's
-# RSS. Legion registers no process collector, so
-# `process_resident_memory_bytes` does not exist on :4749. The
-# control-plane boxes run nothing else of consequence, so box memory
-# tracks the manager closely — but it includes the OS and, in `used`,
-# the page cache. Treat these as an upper bound on the manager's cost.
+# These two are WHOLE-BOX memory from node_exporter: they include the OS
+# and, in `used`, the page cache, so they are an upper bound on the
+# manager's cost. The manager's own resident set is `manager_rss` below.
 # Same window as the range snapshots above, for the same reason: a peak
 # taken over a trailing 2h is the rig's peak, not the cell's.
 WINDOW_SECS=$((END - START))
@@ -224,6 +225,23 @@ jq -n \
 
 snapshot nomad_plan 'rate(nomad_nomad_plan_apply_count[1m])'
 snapshot k8s_sched 'histogram_quantile(0.99, sum by (extension_point, le) (rate(scheduler_framework_extension_point_duration_seconds_bucket[1m])))'
+# The competitors' commit path, the counterpart of Legion's raft_* and
+# coalesce_* snapshots: etcd round trips as the apiserver sees them, the
+# apiserver's own flow-control throttling, and Nomad's raft commit time.
+snapshot k8s_etcd_p99 'histogram_quantile(0.99, sum by (operation, le) (rate(etcd_request_duration_seconds_bucket[1m])))'
+snapshot k8s_apf_rejected 'sum by (priority_level, reason) (rate(apiserver_flowcontrol_rejected_requests_total[1m]))'
+snapshot k8s_apf_wait_p99 'histogram_quantile(0.99, sum by (priority_level, le) (rate(apiserver_flowcontrol_request_wait_duration_seconds_bucket[1m])))'
+snapshot k8s_sched_attempts 'sum by (result) (rate(scheduler_schedule_attempts_total[1m]))'
+# Heartbeat load each control plane actually absorbed, so a throughput
+# number can be read against it: Legion's beats/s (the `heartbeats`
+# snapshot above), Nomad's Node.UpdateStatus calls, and K8s node-lease
+# renewals plus node status patches. Defaults differ on purpose (adaptive
+# ~2,500/s, Nomad ~50/s, K8s one lease per node per 10s); this records
+# what each paid rather than what each was configured for.
+snapshot nomad_heartbeats 'sum(rate(nomad_nomad_client_update_status_count[1m]))'
+snapshot k8s_heartbeats 'sum by (resource) (rate(apiserver_request_total{resource=~"leases|nodes", verb=~"update|patch"}[1m]))'
+snapshot nomad_raft_commit 'nomad_raft_commitTime{quantile="0.99"}'
+snapshot nomad_plan_submit 'nomad_nomad_plan_submit{quantile="0.99"}'
 
 # Fairness record: exactly what ran, where, at what version, with what
 # config. This file is what makes the numbers defensible.

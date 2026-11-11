@@ -235,20 +235,18 @@ wait_for_workers() { # wait_for_workers <count> [timeout-secs]
 # --- The sim fleet's identity, and how a cell proves it ----------------
 #
 # start-sim-fleet.sh names slice `i` with `--name-prefix sim-<i>`, and
-# src/worker/simulate.rs appends `-<profile>-<n>`, so every node this rig
-# creates is `sim-<slice>-<profile>-<n>`. Those names are REUSED run to
-# run, deliberately: Legion has no node-deregistration RPC
-# (`Store::remove_node` exists but has nothing calling it in production),
-# so a stopped fleet leaves every row behind. Name reuse is the only
-# thing bounding the node table — a unique per-run prefix would make
-# every run leak its whole fleet instead of overwriting the last one's.
+# crates/worker/src/worker/simulate.rs appends `-<profile>-<n>`, so every node this rig
+# creates is `sim-<slice>-<profile>-<n>`. stop-sim-fleet.sh removes those
+# rows again with `legion node forget --force` (forget_sim_nodes below),
+# so a stopped fleet no longer leaves its nodes in the store.
 #
-# The consequence a cell has to defend against: the node table is a
-# high-water mark of every fleet the control plane has ever seen. A
-# 4000-node experiment followed by a 1000-node cell leaves 3000 orphan
-# rows, all of them `lost`, all of them still counted by
-# `SELECT COUNT(*) FROM node`. That is why the gates below assert an
-# EXACT census instead of a lower bound.
+# The consequence a cell still has to defend against: anything that skips
+# the forget — a fleet stopped by hand, a forget that failed against an
+# unreachable manager, a real worker that wandered in — leaves rows that
+# `SELECT COUNT(*) FROM node` still counts. A 4000-node experiment
+# followed by a 1000-node cell would otherwise measure a scheduler
+# carrying 3000 extra rows. That is why the gates below assert an EXACT
+# census instead of a lower bound.
 SIM_NAME_PREFIX="${SIM_NAME_PREFIX:-sim}"
 
 # What start-sim-fleet.sh last started, written on the loadgen box so any
@@ -265,14 +263,14 @@ FLEET_STATE_REMOTE="${FLEET_STATE_REMOTE:-/opt/bench/runs/fleet-state.json}"
 # node name), or a real worker that wandered in. Health comes from
 # `node_health` — the `node.status` column was moved there by the
 # node/node_health split, and an absent row means `active`, which is the
-# same COALESCE every liveness query in src/storage/store.rs uses.
+# same COALESCE every liveness query in crates/manager/src/storage/store.rs uses.
 #
 # `unavailable` is counted separately because it is a different failure
 # with the same symptom: `node.availability` is the column the SCHEDULER
 # gates placement on, node loss sets it to `unavailable` on the control
 # lane, and recovery has to undo both halves. A node that came back
 # `active` but stayed `unavailable` reads as healthy everywhere and never
-# receives work — src/storage/store.rs calls that out as presenting like
+# receives work — crates/manager/src/storage/store.rs calls that out as presenting like
 # a scheduler bug and being almost impossible to diagnose from outside.
 node_census() { # node_census <manager-addr> <slice-count>
     local manager="$1" slices="$2" i like=""
@@ -300,6 +298,39 @@ node_census() { # node_census <manager-addr> <slice-count>
     printf '%s\n' "$out"
 }
 
+# Forget every node whose name carries this rig's sim prefix, on the
+# manager the fleet registered with. Called by stop-sim-fleet.sh once the
+# sim processes are down.
+#
+#   forget_sim_nodes <manager-addr>   -> echoes the rows left afterwards
+#
+# `--force` because the rows are still `active` (or not yet drained) for
+# up to a heartbeat timeout after the processes stop, and an unforced
+# forget refuses a live, uncordoned node or one with allocations. The
+# machines are gone for good, which is exactly what `--force` asserts;
+# their allocations are released for replacement at once, the same
+# reschedule churn a node loss would raise later (wait_for_eval_drain
+# absorbs it). One CLI call per node, 16 in flight: there is no batch
+# forget RPC, and 10,000 nodes take a few minutes this way.
+#
+# Echoes -1 when the manager could not be asked (not a Legion control
+# plane, or not answering); the caller treats that as "nothing forgotten".
+forget_sim_nodes() { # forget_sim_nodes <manager-addr>
+    local manager="$1" sql left
+    sql="SELECT id FROM node WHERE id LIKE '$SIM_NAME_PREFIX-%'"
+    # Listing and forgetting both run on the loadgen box, which holds the
+    # CLI token (rig_install_cli_token). A failed forget prints its node
+    # id to stderr and does not stop the rest.
+    rsh "$LOADGEN_ADDR" "export LEGION_ADDR=$manager
+        legion state query \"$sql\" -j 2>/dev/null |
+            jq -r '.data.rows[]?.id // empty' |
+            xargs -r -P 16 -I{} sh -c 'legion node forget \"\$1\" --force -j >/dev/null 2>&1 ||
+                echo \"forget failed: \$1\" >&2' _ {}" || true
+    left=$(rsh "$LOADGEN_ADDR" "LEGION_ADDR=$manager legion state query \"SELECT COUNT(*) AS n FROM node WHERE id LIKE '$SIM_NAME_PREFIX-%'\" -j" 2>/dev/null |
+        jq -r '.data.rows[0].n // -1' 2>/dev/null || echo -1)
+    echo "${left:--1}"
+}
+
 census_line() { # census_line <census-json> <expected>
     jq -r --arg want "$2" \
         '"total=\(.total // "?") active=\(.active // "?") lost=\(.lost // "?") other=\(.other // "?") unavailable=\(.unavailable // "?") foreign=\(.foreign_ids // "?") expected=\($want)"' \
@@ -323,8 +354,8 @@ census_line() { # census_line <census-json> <expected>
 # Retries, because registration is genuinely progressive: rows appear as
 # the sim processes work through `--register-rate`, and a node that just
 # re-registered can sit `lost` for a tick until its first heartbeat lands.
-# It does NOT retry when total already EXCEEDS expected: nothing removes
-# a node row, so that number only ever grows and waiting is pure cost.
+# It does NOT retry when total already EXCEEDS expected: only a forget
+# removes a node row, so that number never shrinks by waiting.
 assert_fleet() { # assert_fleet <manager> <expected> <slices> [timeout]
     local manager="$1" want="$2" slices="$3" timeout="${4:-600}"
     local deadline census total
@@ -343,9 +374,10 @@ assert_fleet() { # assert_fleet <manager> <expected> <slices> [timeout]
             fi
             if [ "$total" -gt "$want" ] 2>/dev/null; then
                 echo "fleet is LARGER than this cell asked for: $(census_line "$census" "$want")" >&2
-                echo "  Legion has no node-deregistration RPC, so those rows never leave on" >&2
-                echo "  their own and no amount of waiting will fix this. Reset the control" >&2
-                echo "  plane before the campaign: scripts/reset-control-plane.sh --system <s>" >&2
+                echo "  Node rows never leave on their own, so no amount of waiting will fix" >&2
+                echo "  this. Stop the fleet with scripts/stop-sim-fleet.sh (it forgets every" >&2
+                echo "  $SIM_NAME_PREFIX-* node), or reset the control plane:" >&2
+                echo "  scripts/reset-control-plane.sh --system <s>" >&2
                 return 1
             fi
         fi
@@ -357,6 +389,40 @@ assert_fleet() { # assert_fleet <manager> <expected> <slices> [timeout]
         }
         sleep 10
     done
+}
+
+# --- Scheduling policy ---------------------------------------------------
+#
+# Every scenario names a `scheduling_policy` (bin_pack|spread). In Legion
+# that is the manager's `schedulingPolicy`, not a jobspec field, so it is
+# set when the control plane is installed: run-campaign.sh exports
+# LEGION_SCHEDULING_POLICY from the scenario, the installers render it via
+# rig_scheduling_policy, and run-step.sh checks the running manager with
+# manager_scheduling_policy before a cell measures anything.
+
+# The policy an installer should render: LEGION_SCHEDULING_POLICY, else
+# Legion's own default (bin_pack). Fails on anything else.
+rig_scheduling_policy() {
+    local policy="${LEGION_SCHEDULING_POLICY:-bin_pack}"
+    case "$policy" in
+    bin_pack | spread) echo "$policy" ;;
+    *)
+        echo "LEGION_SCHEDULING_POLICY must be bin_pack or spread, got '$policy'" >&2
+        return 1
+        ;;
+    esac
+}
+
+# A scenario file's scheduling_policy, or nothing if it has none.
+scenario_scheduling_policy() { # scenario_scheduling_policy <scenario.json>
+    jq -r '.scheduling_policy // empty' "$1"
+}
+
+# What the installed manager on cp-0 was rendered with, or nothing if no
+# Legion config is there.
+manager_scheduling_policy() {
+    rsh "${CP_ADDRS[0]}" "cat /opt/legion/configs/manager.ncl 2>/dev/null" 2>/dev/null |
+        sed -n 's/^[[:space:]]*schedulingPolicy[[:space:]]*=[[:space:]]*"\([a-z_]*\)".*/\1/p' | head -1
 }
 
 # Copy the driver, translator, and scenarios onto the loadgen box. Called
@@ -518,9 +584,23 @@ rig_install_cli_token() { # rig_install_cli_token
 }
 
 rsh() { # rsh <ip> <command...>
-    local ip="$1"
+    local ip="$1" attempt rc=0
     shift
-    ssh "${SSH_OPTS[@]}" "$ip" "$@"
+    # Exit 255 is ssh's own failure (connect, banner, auth), not the remote
+    # command's. A control-plane box coming off a 4/4-core overload timed
+    # out the banner exchange twice on 2026-10-14 and each one ended a whole
+    # campaign at its first `wipe`, so ssh-level failures get two retries.
+    # A piped or redirected stdin may already be partly consumed, so those
+    # calls are never replayed.
+    for attempt in 1 2 3; do
+        if ssh "${SSH_OPTS[@]}" "$ip" "$@"; then return 0; else rc=$?; fi
+        [ "$rc" -eq 255 ] || return "$rc"
+        { [ -p /dev/stdin ] || [ -f /dev/stdin ]; } && return "$rc"
+        [ "$attempt" -lt 3 ] || break
+        echo "ssh to $ip failed (exit 255), retrying in $((attempt * 10))s" >&2
+        sleep $((attempt * 10))
+    done
+    return "$rc"
 }
 
 rcp() { # rcp <local-path> <ip>:<remote-path>

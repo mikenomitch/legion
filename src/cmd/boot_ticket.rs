@@ -129,7 +129,8 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .cloned()
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
         .context("Must provide a job")?;
     let task = arg_matches
         .get_one::<String>("task")
@@ -244,7 +245,8 @@ async fn list(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .cloned()
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
         .unwrap_or_default();
 
     let mut client = connect_manager_client().await?;

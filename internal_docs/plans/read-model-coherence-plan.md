@@ -9,7 +9,7 @@ and widening the scrub to task configs.
 ## 1. Problem
 
 The manager plans from an in-memory `SchedulingReadModel`
-(`src/storage/store.rs`): nodes, each node's allocations, task configs,
+(`crates/manager/src/storage/store.rs`): nodes, each node's allocations, task configs,
 free pools, and the scope-epoch mirror. SQLite is the truth. Every write
 has to reach both, and nothing checked that it did.
 
@@ -60,7 +60,7 @@ Turning the check on for the integration tests found a fifth, in every
 mode: the full read-model load hardcoded `speculative_start: None` while
 the incremental path read the column, so a restart, snapshot install, or
 (after Phase 2) outside-write rebuild silently dropped every cached task's
-speculative-start block (`tests/edge_boot_integration.rs`).
+speculative-start block (`tests/integration/edge_boot_integration.rs`).
 
 ## 2. Prior art
 

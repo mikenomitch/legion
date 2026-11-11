@@ -159,7 +159,7 @@ The notable ones:
 ### P0-1. Workers on other hosts lose exec, logs, discovery, and the mesh
 
 *Shimmed; planned.* The worker binds and advertises `127.0.0.1:4848`
-(`src/worker/daemon.rs:137-138`, `:315-318`), and its API is
+(`crates/worker/src/worker/daemon.rs:137-138`, `:315-318`), and its API is
 unauthenticated. Fix designed in
 [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md). The shim adds
 `LEGION_WORKER_HOST` and `LEGION_WORKER_ADVERTISE_ADDR`, and the rig limits
@@ -168,7 +168,7 @@ unauthenticated. Fix designed in
 ### P0-2. Batch tasks never finish, and `restart` policies are ignored
 
 *Open.* The worker rebuilds each task's `TaskConfig` from the dispatch
-payload with no `lifecycle` or `restart` (`src/worker/task_manager.rs`,
+payload with no `lifecycle` or `restart` (`crates/worker/src/worker/task_manager.rs`,
 `task_from_allocation`), because `TaskAllocation` carries neither field.
 Every task therefore runs as a `service` with `restart = always`.
 
@@ -184,9 +184,9 @@ whole task config, and add an end-to-end test where a batch task exits 0.
 ### P0-3. Health checks never start for tasks with artifacts, including every container image when `containerImageDesugar` is on
 
 *Shimmed.* Artifact staging runs on a plain OS thread
-(`spawn_staging_thread`, `src/worker/task_manager.rs`), which then starts the
+(`spawn_staging_thread`, `crates/worker/src/worker/task_manager.rs`), which then starts the
 health monitor. That calls `tokio::spawn` outside a runtime and panics:
-`there is no reactor running` at `src/worker/task_health.rs:73`. The task
+`there is no reactor running` at `crates/worker/src/worker/task_health.rs:73`. The task
 runs, but it sits at "health checks starting" forever. It is never healthy,
 so service discovery returns no endpoints, the mesh routes nothing, and
 health-gated rollouts never advance. The shim enters the caller's runtime
@@ -196,8 +196,8 @@ handle inside the thread, and is probably the real fix.
 
 *Open.* The scheduler counts a batch dependency as satisfied when it is
 merely planned in the same pass (`dependency_satisfied`,
-`src/manager/scheduler.rs`, the `planned_dep && Batch` arms), and the worker
-has no dependency gating at all (`src/worker` never reads `depends_on`). A
+`crates/manager/src/manager/scheduler.rs`, the `planned_dep && Batch` arms), and the worker
+has no dependency gating at all (`crates/worker/src/worker` never reads `depends_on`). A
 whole chain of batch steps starts at once.
 
 - On macOS, `validate` crashed with `FileNotFoundError` before `fetch` had
@@ -219,7 +219,7 @@ job when a batch task completes), or gate starts on the worker.
   `sc-mgr-1` came back as a follower, every forwarded heartbeat failed:
   `ForwardLaneWrite lane mismatch: envelope says control, op
   update_node_heartbeat belongs to status`
-  (`src/storage/raft/server.rs:240`). The sender tags the physical lane, and
+  (`crates/manager/src/storage/raft/server.rs:240`). The sender tags the physical lane, and
   the receiver checks the logical one. `single` is the topology the docs
   recommend.
 
@@ -249,7 +249,7 @@ common images:
 
 - **Minimal capabilities.** Containers get only `CAP_AUDIT_WRITE`,
   `CAP_KILL`, and `CAP_NET_BIND_SERVICE`
-  (`src/task_plugins/oci_bundle.rs:639-642`), where Docker also grants
+  (`crates/worker/src/task_plugins/oci_bundle.rs:639-642`), where Docker also grants
   `CHOWN`, `SETUID`, `SETGID`, `DAC_OVERRIDE`, `FOWNER`, and more, and there is
   no jobspec knob. Stock nginx fails with `chown("/var/cache/nginx/client_temp",
   101) failed (1: Operation not permitted)`. The Postgres entrypoint's chown
@@ -282,7 +282,7 @@ upgrade or reboot. The rig now mints 720h tokens as a workaround.
 
 ### P1-1. Resource enforcement never turns on
 
-*Open.* In `run_worker_with_manager` (`src/worker/daemon.rs`), the worker
+*Open.* In `run_worker_with_manager` (`crates/worker/src/worker/daemon.rs`), the worker
 creates its task manager, whose `NodeResourceGovernor::from_env()` reads the
 enforcement env, about fifteen lines before `apply_resource_enforcement_env`
 sets that env. The governor is
@@ -345,7 +345,7 @@ the TAP device.
 ### P1-6. macOS sandboxes do not start
 
 *Fixed on main* after the run, so `shims.patch` no longer carries it. Dev
-mode passed a `--` after the image (`src/task_plugins/sandbox.rs:563` at the
+mode passed a `--` after the image (`crates/worker/src/task_plugins/sandbox.rs:563` at the
 time), which Apple `container` runs as the
 command: `failed to find target executable --`. The container runtime avoids
 exactly this, and its test asserts no separator. With the fix, exec into a
@@ -420,7 +420,7 @@ no obvious way to retry.
     default runtime), cloud-hypervisor, or a guest kernel. Existing TODO
     items cover the kernel and `redis.ncl`.
 12. **The UI's Managers page shows only managers that have led.** A manager
-    writes its row (`upsert_manager_config` in `src/manager/daemon.rs`) only
+    writes its row (`upsert_manager_config` in `crates/manager/src/manager/daemon.rs`) only
     while it holds control-lane leadership, so followers never appear. The
     three-voter rig showed one manager. `legion raft status` is the accurate
     view. The page should list raft members and their roles.

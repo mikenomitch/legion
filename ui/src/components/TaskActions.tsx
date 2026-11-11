@@ -75,7 +75,7 @@ const shellQuote = (value: string): string =>
 
 /**
  * The value's problem, if any, mirroring `ActionParam::validate_value` in
- * src/structs/job.rs. A pattern the browser's regex engine cannot compile is
+ * crates/common/src/structs/job.rs. A pattern the browser's regex engine cannot compile is
  * left to the manager.
  */
 const paramError = (param: JobActionParam, value: string): string | undefined => {

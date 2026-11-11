@@ -1,25 +1,17 @@
 #!/usr/bin/env bash
 # Put the control plane back to an empty store, then reinstall the system
-# under test on it. This is the ONLY reliable way to remove node records.
+# under test on it.
 #
 #   reset-control-plane.sh --system legion-a
 #
-# Why this script exists, in one paragraph. Legion has no node
-# deregistration: `Store::remove_node` exists but nothing in production
-# calls it, and `stop-sim-fleet.sh` only stops the sim PROCESSES — every
-# node they registered stays in the store, `lost`, forever. So the node
-# table is a high-water mark across everything the control plane has ever
-# seen, and a campaign that follows a wider run inherits its orphans: a
-# 4000-node packing-density ladder followed by a 1000-node campaign left
-# 3000 dead rows, the fleet gate (a `>=` count) waved it through, and
-# every cell of that campaign was measured against a scheduler carrying
-# four times the nodes the results claim. Wiping and reinstalling is what
-# makes the next campaign's first cell honest.
-#
-# The counter-fix — giving every run a unique node-name prefix — is
-# deliberately NOT taken: name REUSE is the only thing bounding the node
-# table today, so unique prefixes without deregistration would make every
-# single run leak its entire fleet instead of overwriting the last one's.
+# stop-sim-fleet.sh now forgets every sim node it stops (`legion node
+# forget --force`), so this is no longer the only way to empty the node
+# table. It is still the way to start a campaign from a store that holds
+# NOTHING from before it: no node rows a skipped or failed forget left
+# behind (a 4000-node packing-density ladder followed by a 1000-node
+# campaign once left 3000 of them, and every cell measured a scheduler
+# carrying four times the nodes the results claim), and no jobs, evals,
+# or allocations from the previous run either.
 #
 # Cost: the installers wipe and reinstall all three boxes, a couple of
 # minutes, once per campaign. Cheap next to a campaign of cells that
@@ -60,7 +52,9 @@ esac
 # against a manager that has never heard of them, and the reinstalled
 # cluster picking up half a fleet in an order nobody chose.
 log "=== resetting the control plane for $SYSTEM ==="
-"$(dirname "$0")/stop-sim-fleet.sh" || log "WARNING: sim fleet stop reported an error (continuing)"
+# SIM_FORGET=0: the wipe below removes the node rows, so forgetting them
+# one RPC at a time first is minutes of wasted work.
+SIM_FORGET=0 "$(dirname "$0")/stop-sim-fleet.sh" || log "WARNING: sim fleet stop reported an error (continuing)"
 
 # Each installer already runs wipe-control-plane.sh as its first act, so
 # reinstalling IS the wipe — kept as one call rather than wipe-then-install

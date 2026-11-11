@@ -204,14 +204,14 @@ per-job or per-tenant; the report is cluster-wide operational state.
 **The precedent.** `legion node cadence` (`src/cmd/node.rs:117` clap config,
 `:269` `get_heartbeat_cadence`) is backed by one RPC
 (`GetHeartbeatCadence`, `proto/legion.proto:482`, handler
-`src/manager/server.rs:5242`), classified `node:read` in
-`tests/acl_endpoints.rs:96`, exposed as MCP tool `legion_node_cadence`
+`crates/manager/src/manager/server.rs:5242`), classified `node:read` in
+`tests/integration/acl_endpoints.rs:96`, exposed as MCP tool `legion_node_cadence`
 (`src/cmd/mcp.rs:257`, dispatch `:834`), and catalogued at
 `src/cmd/capabilities.rs:359`. It prints a table, emits the envelope under
 `--json`, and refuses to guess on a manager that does not own the subsystem.
 This plan reproduces that shape exactly.
 
-**The registry.** Hand-rolled on atomics in `src/manager/telemetry.rs`: cells at
+**The registry.** Hand-rolled on atomics in `crates/manager/src/manager/telemetry.rs`: cells at
 `:76-167`, `CounterVec` `:346`, `GaugeVec` `:407`, `HistogramVec` `:479`, and a
 per-family cap `MAX_SERIES_PER_FAMILY = 256` (`:51`) enforced in `Series::cell`
 (`:193-222`) that folds overflow into an all-`"other"` series. A new family must
@@ -223,7 +223,7 @@ label to an existing family requires updating every call site**.
 **The four gaps, precisely located.**
 
 1. `legion_eval_queue_depth` — unlabelled `Gauge` (`telemetry.rs:840`), set from
-   `Store::pending_eval_count_tx` (`src/storage/store.rs:12723`), a bare
+   `Store::pending_eval_count_tx` (`crates/manager/src/storage/store.rs:12723`), a bare
    `SELECT COUNT(*) FROM eval WHERE status = 'pending'`. Refreshed at four call
    sites (`store.rs:12344` claim, `:12406` startup requeue, `:12828` conflict
    requeue, `:13013` enqueue). Two paths are missing: `prune_stale_evals_apply`
@@ -259,9 +259,9 @@ label to an existing family requires updating every call site**.
 
 **What already works and must be reused.** `legion_scheduler_plan_phase_seconds`
 phases are timed in `Scheduler::plan_and_apply_internal`
-(`src/manager/scheduler.rs:1198`) and emitted by `PlanTimings::observe`
+(`crates/manager/src/manager/scheduler.rs:1198`) and emitted by `PlanTimings::observe`
 (`:139`). Eval kinds are bare `&str` dispatched in `Eval::handle`
-(`src/structs/eval.rs:31-42`); there is no enum, which is a small hazard for
+(`crates/manager/src/manager/eval.rs:31-42`); there is no enum, which is a small hazard for
 label bounding. `legion state query` (`src/cmd/state.rs:56`) plus the curated
 `AGENT_SAVED_QUERIES` (`:13-53`, already carrying `agent:pending-evals` and
 `agent:recent-failed-evals`) are the workarounds the public doc points at today.
@@ -374,7 +374,7 @@ them.
 ### 6.3 The detectors
 
 One per observed signature, each with a named discriminator. Thresholds are
-constants in `src/manager/diagnose.rs` with the derivation in a comment.
+constants in `crates/manager/src/manager/diagnose.rs` with the derivation in a comment.
 
 | Code | Fires when | Discriminator carried | Action |
 | --- | --- | --- | --- |
@@ -530,10 +530,10 @@ string doc_anchor; }`.
 
 **ACL.** `self.check_acl(&request, AclResource::Operator, AclAction::Read,
 AclScope::any())?` as the handler's first line, plus the entry in
-`tests/acl_endpoints.rs` `endpoint_table` and a request builder — the
+`tests/integration/acl_endpoints.rs` `endpoint_table` and a request builder — the
 `every_manager_rpc_is_classified` test fails the build otherwise.
 
-**Structs.** New `src/manager/diagnose.rs`: a `SchedulerSnapshot` (plain data,
+**Structs.** New `crates/manager/src/manager/diagnose.rs`: a `SchedulerSnapshot` (plain data,
 no I/O), a `diagnose(before, after, config) -> Report` **pure function**, and the
 threshold constants. Purity is the point — it is what makes tonight's numbers
 usable as test fixtures.
@@ -600,7 +600,7 @@ signatures undiagnosable, a test fails.
 manager path, `sample_seconds = 0`, and a snapshot where a counter *decreased*
 (manager restart mid-sample) which must not produce negative rates.
 
-**Integration** — `tests/acl_endpoints.rs` (mandatory: the classification test
+**Integration** — `tests/integration/acl_endpoints.rs` (mandatory: the classification test
 fails the build without it); an unauthenticated call returns `PermissionDenied`;
 the MCP tool appears in `tools/list` **without** `--allow-write`; the
 capabilities unit test.
@@ -686,7 +686,7 @@ path, so `cargo bench --bench scheduler_bench` on base and change goes in the PR
   field and a direction; a reviewer can check this by reading the fixtures.
 - All seven detectors present; the healthy-cluster fixture puts every one in
   `passed` with evidence.
-- `tests/acl_endpoints.rs` passes with the new endpoint classified; an
+- `tests/integration/acl_endpoints.rs` passes with the new endpoint classified; an
   unauthenticated call is denied.
 - `legion_scheduler_diagnose` is listed by `mcp serve` without `--allow-write`,
   and absent from no listing.

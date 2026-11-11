@@ -2,6 +2,7 @@ import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import type { JobTask, TaskInstanceSummary } from '../utils/jobspec'
 import { taskStatusTone } from '../utils/jobspec'
+import { jobPath } from '../utils/namespaces'
 
 // ── Layout constants ────────────────────────────────────────────────
 const NODE_W = 232
@@ -418,7 +419,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
               const inProgress = () => tone() === 'warning'
               const dimmed = () => isDimmed(taskName)
               const groupColor = () => groupColors().get(pos.task.group) ?? '#64748b'
-              const href = `/jobs/${encodeURIComponent(props.jobName)}/tasks/${encodeURIComponent(taskName)}`
+              const href = `${jobPath(props.jobName)}/tasks/${encodeURIComponent(taskName)}`
 
               // ── Sidecar: compact, dashed-indigo, clearly badged ──
               if (pos.isSidecar) {

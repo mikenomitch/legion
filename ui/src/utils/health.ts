@@ -55,6 +55,12 @@ export const summarizeHealthChecks = (healthChecks?: string): HealthSummary => {
   } catch {
     parsed = healthChecks
   }
+  // The device report (docs/devices.md) rides the health checks; an
+  // unhealthy GPU is that device's state, not the node's.
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const { devices: _devices, ...rest } = parsed as Record<string, unknown>
+    parsed = rest
+  }
 
   const values = extractHealthStrings(parsed)
   if (values.length === 0) {

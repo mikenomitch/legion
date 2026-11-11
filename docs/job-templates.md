@@ -149,6 +149,15 @@ Every verb takes `--json`. `run` supports `--idempotency-key`,
 `--force-reschedule`, `--priority`/`--asap`, and `--wait`/`--timeout`, with
 the same behavior as `legion job run`.
 
+Templates are cluster objects; the job a run creates lands in a
+[namespace](namespaces.md). `render` and `run` take `-n` (or
+`$LEGION_NAMESPACE`) as the target. A template whose rendered spec names a
+namespace of its own may run without one, and is refused when the target
+disagrees, since the two have no right winner. Unlike `job run`, the CLI sends
+`$LEGION_NAMESPACE` as the target too: it cannot see what the template
+renders before the manager does. The UI's launch form offers a target
+namespace to identities that read several.
+
 Versions are immutable and start at 1. `create` on an existing name appends
 the next version and moves the latest pointer. Runs and renders use the
 latest version unless you pin one with `--version`. You can't delete
@@ -218,7 +227,7 @@ template, and can see and stop only the jobs it produces:
 ```nickel
 [
   { resources = ["template"], actions = ["read"], templates = ["render"] },
-  { resources = ["job"], actions = ["read", "write"], templates = ["render"] },
+  { resources = ["job"], actions = ["read", "write"], namespaces = ["default"], templates = ["render"] },
 ]
 ```
 
@@ -241,14 +250,24 @@ Other things to know:
 - **Spec-changing writes ignore provenance.** On that path, the attribute
   comes only from the template being run. A template-only account can't push
   arbitrary specs to a job just because its template once created it.
-- **The collision guard.** A template run fails with `FAILED_PRECONDITION`
-  if it would update an existing job whose latest config didn't come from the
-  same template. The exception is a caller who also holds plain `job:write`
-  on that job name. Without this guard, a template whose rendered job name
-  depends on user input would let a template-only account overwrite unrelated
-  jobs. As extra protection, authors should also constrain rendered names
-  (prefix them), and operators can add `names` selectors alongside
-  `templates`.
+- **The collision guard.** A template run is refused if it would update an
+  existing job (in the target namespace) whose latest config didn't come
+  from the same template. The exception is a caller who also holds plain
+  `job:write` on that job name. Without this guard, a template whose
+  rendered job name depends on user input would let a template-only account
+  overwrite unrelated jobs. As extra protection, authors should also
+  constrain rendered names (prefix them), and operators can add `names`
+  selectors alongside `templates`.
+
+  What the refusal says depends on whether the caller may read the job. A
+  caller with `job:read` on it gets `FAILED_PRECONDITION: job 'x' already
+  exists and was not created from template …`. Anyone else gets
+  `PERMISSION_DENIED: a run of template 't' may create job 'x' or update it
+  only while its latest config came from that template …`, which states
+  the rule and does not say whether `x` exists. A refused run still differs
+  from a successful one, which creates the job, so the guard cannot hide a
+  job from someone allowed to create it; what it does not do is confirm
+  the job to a caller who could not read it.
 - **Delegating template access means trusting the template author.** Whoever
   holds `template:write` on a name controls what every delegated runner of
   that name submits.
@@ -265,7 +284,8 @@ Other things to know:
 | `imports are not allowed here` | The template used the `import` keyword. Inline everything. |
 | `template rendering exceeded the 5s limit` | Runaway or extremely heavy Nickel. Simplify the template. |
 | `RESOURCE_EXHAUSTED: the manager is already evaluating N templates` | Every evaluation slot is busy, possibly with runaway templates that haven't finished. Retry. If it persists, find the template that times out. Restarting the manager clears abandoned evaluations. |
-| `FAILED_PRECONDITION: job 'x' already exists and was not created from template …` | The collision guard (see above). |
+| `FAILED_PRECONDITION: job 'x' already exists and was not created from template …` | The collision guard (see above), for a caller who may read job `x`. |
+| `PERMISSION_DENIED: a run of template 't' may create job 'x' or update it only while …` | The collision guard, for a caller without `job:read` on `x`. Render a different job name, or get plain `job:write` on `x`. |
 | `PermissionDenied: job:write requires a policy granting it` on `template run` | The identity has neither plain `job:write` for the rendered name nor a `templates`-scoped job rule matching this template. |
 
 ## Known limitations

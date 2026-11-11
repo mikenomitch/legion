@@ -64,7 +64,7 @@ psql "postgres://postgres:legion-demo@10.0.0.4:29315/legion"
     },
     network = { mode = "auto", ports = [{ name = "pg" }] },
     service = { name = "postgres", port = "pg" },
-    checks = [{ type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", boot_grace_time = "60s" }],
+    checks = [{ type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", bootGraceTime = "60s" }],
   }],
 }
 ```
@@ -125,7 +125,7 @@ Scope:      node-local (instance is pinned to its node)
 Job:        postgres
 Instance:   postgres-db-0
 Node:       node-a1
-Mounted at: /var/lib/legion/workers/node-a1/volumes/local-dir/9f2c8a1b…
+Mounted at: /var/lib/legion/workers/node-a1/local-volumes/9f2c8a1b…/data
 Params:     {"size":"20G"}
 ```
 
@@ -324,7 +324,7 @@ lose data. There are two built-in ways to back up:
   schedule = "0 3 * * *",
   # Reach the database through service discovery. The worker load-balances
   # $LEGION_UPSTREAM_POSTGRES (127.0.0.1:<port>) to the healthy Postgres.
-  connect = { upstreams = [{ service = "postgres" }] },
+  connect = { upstreams = [{ to = "postgres" }] },
   config = {
     image = "postgres:16-alpine",
     command = ["sh", "-c", "pg_dump \"postgres://postgres:legion-demo@$LEGION_UPSTREAM_POSTGRES/legion\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],

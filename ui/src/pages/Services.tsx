@@ -25,6 +25,8 @@ import { managerClient } from '../grpcClient'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
 import { indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
 import { retainOnError, usePoll } from '../utils/polling'
+import { jobPath, selectionIsMulti, servicePath } from '../utils/namespaces'
+import { useNamespaceSelection } from '../components/NamespaceSwitcher'
 
 // Health of a service as a whole: every endpoint healthy, some, or none.
 const serviceTone = (healthy: number, total: number) => {
@@ -42,10 +44,14 @@ const serviceStatus = (healthy: number, total: number) => {
 function ServicesContent() {
   const [search, setSearch] = createSignal('')
   const tick = usePoll()
+  const selection = useNamespaceSelection()
 
   const [services] = createResource(
-    () => tick() + 1,
-    retainOnError(async () => (await managerClient.listServices({})).services, () => 'services'),
+    () => [tick(), selection().join(',')] as const,
+    retainOnError(
+      async () => (await managerClient.listServices({ namespaces: selection() })).services,
+      () => `services|${selection().join(',')}`,
+    ),
   )
 
   const filtered = createMemo(() => {
@@ -59,7 +65,7 @@ function ServicesContent() {
     )
   })
 
-  useIndexJumpTargets(() => filtered().map((service) => `/services/${encodeURIComponent(service.service)}`))
+  useIndexJumpTargets(() => filtered().map((service) => servicePath(service.namespace, service.service)))
 
   // Feed ⌘K so a service can be jumped to by name, like jobs and workers.
   createEffect(() => {
@@ -68,7 +74,7 @@ function ServicesContent() {
         id: `Services:${service.service}`,
         label: service.service,
         subtitle: `${service.healthyCount}/${service.totalCount} healthy`,
-        href: `/services/${encodeURIComponent(service.service)}`,
+        href: servicePath(service.namespace, service.service),
         source: 'Services',
       })),
     )
@@ -153,9 +159,12 @@ function ServicesContent() {
                       <tr class={trHoverClass}>
                         <td class={cx(tdClass, 'relative', jumpHintGutterClass())}>
                           <JumpHint keys={indexHintKey(index())} class="absolute left-3 top-1/2 -translate-y-1/2" />
-                          <A href={`/services/${encodeURIComponent(service.service)}`} class="font-medium text-ink hover:text-brass-strong">
+                          <A href={servicePath(service.namespace, service.service)} class="font-medium text-ink hover:text-brass-strong">
                             {service.service}
                           </A>
+                          <Show when={selectionIsMulti(selection())}>
+                            <span class="ml-2 font-mono text-2xs text-faint">{service.namespace}</span>
+                          </Show>
                         </td>
                         <td class={tdClass}>
                           <Badge tone={serviceTone(service.healthyCount, service.totalCount)} dot class="uppercase tracking-wide">
@@ -166,12 +175,12 @@ function ServicesContent() {
                           {service.healthyCount} / {service.totalCount} healthy
                         </td>
                         <td class={tdClass}>
-                          <A href={`/jobs/${encodeURIComponent(service.jobId)}`} class="text-muted hover:text-brass-strong">
+                          <A href={`${jobPath(service.jobId)}`} class="text-muted hover:text-brass-strong">
                             {service.jobId}
                           </A>
                           <span class="text-faint"> · </span>
                           <A
-                            href={`/jobs/${encodeURIComponent(service.jobId)}/tasks/${encodeURIComponent(service.taskName)}`}
+                            href={`${jobPath(service.jobId)}/tasks/${encodeURIComponent(service.taskName)}`}
                             class="text-muted hover:text-brass-strong"
                           >
                             {service.taskName}

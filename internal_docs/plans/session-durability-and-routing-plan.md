@@ -49,20 +49,20 @@ one:
 - **A session cannot sleep.** Suspend, fork, and snapshot are refused on
   an unpromoted session (`docs/session-mode.md:139`), and a session task
   may not use `suspend.durability = "local"` at all
-  (`src/structs/session.rs:408`). An agent sandbox that is idle for an
+  (`crates/common/src/structs/session.rs:408`). An agent sandbox that is idle for an
   hour either burns its envelope share the whole hour or is thrown away.
   "Come back to the same sandbox later" means promoting it, which is the
   raft write session mode exists to avoid.
 - **Finding a session costs a cluster-wide fan-out.** Each manager indexes
   only the sessions of nodes that heartbeat to it
-  (`src/storage/session_index.rs:1-14`), so `get`, `stop`, `start`, and an
+  (`crates/manager/src/storage/session_index.rs:1-14`), so `get`, `stop`, `start`, and an
   idempotent create on an id this manager does not index ask every peer
-  (`src/manager/sessions.rs:71`, `:173`). A node silent for 120 s drops out
-  of the index (`src/storage/session_index.rs:45`), and its sessions answer
+  (`crates/manager/src/manager/sessions.rs:71`, `:173`). A node silent for 120 s drops out
+  of the index (`crates/manager/src/storage/session_index.rs:45`), and its sessions answer
   `NOT_FOUND`, indistinguishable from an id that never existed.
 - **Every start goes through a manager.** The router builds a room view,
   ranks envelopes, and calls the chosen worker
-  (`src/manager/sessions.rs:477-606`), and edge starts are refused
+  (`crates/manager/src/manager/sessions.rs:477-606`), and edge starts are refused
   (`docs/session-mode.md:365`). Starts scale with how fast managers can
   route, not with the fleet. The one measurement, about 970 starts a
   second, ran one manager, 16 fake nodes and the load generator on four
@@ -244,21 +244,21 @@ they are.
 - **Starts go through a manager.** The router picks the envelope with the
   most room from a one-second view built from raft allocation rows and the
   merged session index, then calls the worker's `PostWork`
-  (`src/manager/sessions.rs:369-407`, `:477-606`). Edge starts are refused
+  (`crates/manager/src/manager/sessions.rs:369-407`, `:477-606`). Edge starts are refused
   (`docs/session-mode.md:365`).
 - **The session index is soft, per manager.** Nodes report deltas against
   an epoch with a full report every 30 beats
-  (`src/storage/session_index.rs:16-24`). Reads merge this manager's index
-  with every peer's (`src/manager/sessions.rs:71-150`).
+  (`crates/manager/src/storage/session_index.rs:16-24`). Reads merge this manager's index
+  with every peer's (`crates/manager/src/manager/sessions.rs:71-150`).
 - **Ids are minted with no record.** `{task}-{26 base32}`, 130 random bits
-  (`src/structs/instance.rs:296`); `is_minted_instance_id`
+  (`crates/common/src/structs/instance.rs:296`); `is_minted_instance_id`
   (`:310`) gates every session lookup, so a caller id never fans out.
   Idempotent creates derive the id from the key
-  (`src/structs/session.rs:135`).
+  (`crates/common/src/structs/session.rs:135`).
 - **Start on a running session is a no-op**, and on an unknown id is
-  `NOT_FOUND` (`src/manager/server.rs:6050-6064`).
+  `NOT_FOUND` (`crates/manager/src/manager/server.rs:6050-6064`).
 - **The worker holds sessions in memory.** Ending one is routine
-  (`src/worker/task_manager.rs:3008`); a session whose envelope leaves the
+  (`crates/worker/src/worker/task_manager.rs:3008`); a session whose envelope leaves the
   node is ended after 30 s (`:355`). Nothing is written to disk.
 - **Allocations survive a worker restart** through the JSON
   `WorkerStateStore`, re-adopted by pid and start time
@@ -270,7 +270,7 @@ they are.
 - **A manager-routed session start is already a provisional claim.** The
   router sends `PostWork` with a `ProvisionalAllocation` whose `origin` is
   `"manager"`, an empty `ticket_jti`, and a `SessionStart` lease
-  (`src/manager/sessions.rs:609-681`). The worker admits it against the
+  (`crates/manager/src/manager/sessions.rs:609-681`). The worker admits it against the
   envelope, not node free capacity. An edge start is the same claim with
   `origin = "edge"` and a ticket.
 - **Edge boot already has the edge half.** `Worker.StartClaim` on the
@@ -281,7 +281,7 @@ they are.
   "The spec cache"). Prefix tickets with many uses already exist; a ticket
   must name an instance or a non-empty prefix.
 - **Session suspend is refused** at submit, both `durability = "local"`
-  and a `reserve` (`src/structs/session.rs:404-420`).
+  and a `reserve` (`crates/common/src/structs/session.rs:404-420`).
 
 ## 6. Proposed design
 
@@ -292,24 +292,24 @@ Today it cannot run starts side by side, for three reasons found reading
 the worker on `main`:
 
 - **One lock covers the whole launch.** Every worker RPC and the heartbeat
-  share one `Arc<Mutex<WorkerTaskManager>>` (`src/worker/server.rs:58`).
-  A session start takes it to admit (`src/worker/edge.rs:96-103`), then
+  share one `Arc<Mutex<WorkerTaskManager>>` (`crates/worker/src/worker/server.rs:58`).
+  A session start takes it to admit (`crates/worker/src/worker/edge.rs:96-103`), then
   takes it again for the launch itself
-  (`src/worker/task_manager.rs:4550`, `begin_task_allocation_gated`), and
+  (`crates/worker/src/worker/task_manager.rs:4550`, `begin_task_allocation_gated`), and
   the runtime's `plugin.start()` runs inside it
-  (`src/worker/task_manager.rs:2796`). A sandbox start that takes 30 ms
+  (`crates/worker/src/worker/task_manager.rs:2796`). A sandbox start that takes 30 ms
   holds every other start, stop, heartbeat, and exec on the node for 30 ms,
   so a node tops out near 1 / (launch time), about 30 starts a second,
   however many cores it has.
 - **Every start rewrites and fsyncs the worker's whole state file.**
   `run_allocation` ends in `persist_state()`
-  (`src/worker/task_manager.rs:2805`), which serializes every allocation
+  (`crates/worker/src/worker/task_manager.rs:2805`), which serializes every allocation
   to pretty JSON and writes it with `sync_all`
-  (`src/worker/state.rs:156-168`, `:313-315`), under the same lock. It
+  (`crates/worker/src/worker/state.rs:156-168`, `:313-315`), under the same lock. It
   skips unratified claims' contents (`:4148-4159`) but still pays the
   write and the fsync for each session start, and the file grows with
   everything else on the node.
-- **Every start spawns an OS thread** (`src/worker/edge.rs:121`). Cheap
+- **Every start spawns an OS thread** (`crates/worker/src/worker/edge.rs:121`). Cheap
   one at a time, but a burst of a few hundred concurrent starts on one node
   becomes a few hundred threads blocked on the lock above.
 
@@ -325,7 +325,7 @@ The fix:
    start that cannot get a launch slot within `edgeBoot.queueTimeout`
    (default 1 s) is refused with `RESOURCE_EXHAUSTED` and `retryable`, so
    the picker spills to the next node instead of piling up threads.
-4. `session_usage` (`src/worker/task_manager.rs:3095`) scans every
+4. `session_usage` (`crates/worker/src/worker/task_manager.rs:3095`) scans every
    session on each admission; the ledger keeps running totals instead.
 
 This phase is valuable alone: the manager-routed path gets the same
@@ -477,7 +477,7 @@ $ legion session start agents --node https://10.0.1.7:4848 --ticket "$T" --key r
 **The manager-routed path stays,** for platforms with no load balancer
 and for low rates, and gets faster where measurement says. Known costs on
 `main`: an idempotent create calls `find()` before placing, which
-fans out to every peer (`src/manager/sessions.rs:487-499`); and one
+fans out to every peer (`crates/manager/src/manager/sessions.rs:487-499`); and one
 manager process per start does an ACL check, a config lookup, and an mTLS
 `PostWork` (`:609-681`). Phase 4 measures it in a release build with three
 managers on separate hosts, then fixes what dominates; the derived-id
@@ -492,16 +492,16 @@ starts and 50,000 ends a second across 2,000 nodes and three managers
 
 | Ceiling | Where | At the target | Fix | Phase |
 | --- | --- | --- | --- | --- |
-| Manager routes every start | `src/manager/sessions.rs:477` | ~1k/s measured on 4 cores, debug | Edge starts | 4 |
-| Launch under the node-wide lock | `src/worker/task_manager.rs:4550`, `:2796` | ~1 / launch time per node | Admission/launch split | 1 |
-| Full-state JSON fsync per start | `src/worker/task_manager.rs:2805`, `src/worker/state.rs:156` | one fsync per start, under the lock | `sessions.db` group commit | 1, 2 |
-| Thread per start | `src/worker/edge.rs:121` | unbounded under bursts | bounded launch pool, `RESOURCE_EXHAUSTED` | 1 |
-| Admission scans every session | `src/worker/task_manager.rs:3095` | O(sessions) per start | running totals | 1 |
-| Idempotent create fans out | `src/manager/sessions.rs:487` | one peer RPC per manager per start | node-local dedupe (edge), single probe (routed) | 4 |
-| `get`/`stop` fan out | `src/manager/sessions.rs:173` | one peer RPC per manager per call | tag routing | 3 |
-| Heartbeat ingest | `src/storage/session_index.rs:286` | ~100k deltas/s cluster-wide, ~33k/s per manager under one `RwLock` write | fine at the target (map updates); shard the lock by node if profiling shows contention | measure in 4 |
-| Full report size | `src/manager/daemon.rs:605` (tonic's 4 MiB default decode limit) | ~200 B a session, so about 20,000 sessions per node per full report | chunk full reports across beats, or raise the limit for heartbeats | 2 |
-| Index memory | `src/storage/session_index.rs` | ~300 B a session; 10^6 running is ~300 MB across managers | none needed | — |
+| Manager routes every start | `crates/manager/src/manager/sessions.rs:477` | ~1k/s measured on 4 cores, debug | Edge starts | 4 |
+| Launch under the node-wide lock | `crates/worker/src/worker/task_manager.rs:4550`, `:2796` | ~1 / launch time per node | Admission/launch split | 1 |
+| Full-state JSON fsync per start | `crates/worker/src/worker/task_manager.rs:2805`, `crates/worker/src/worker/state.rs:156` | one fsync per start, under the lock | `sessions.db` group commit | 1, 2 |
+| Thread per start | `crates/worker/src/worker/edge.rs:121` | unbounded under bursts | bounded launch pool, `RESOURCE_EXHAUSTED` | 1 |
+| Admission scans every session | `crates/worker/src/worker/task_manager.rs:3095` | O(sessions) per start | running totals | 1 |
+| Idempotent create fans out | `crates/manager/src/manager/sessions.rs:487` | one peer RPC per manager per start | node-local dedupe (edge), single probe (routed) | 4 |
+| `get`/`stop` fan out | `crates/manager/src/manager/sessions.rs:173` | one peer RPC per manager per call | tag routing | 3 |
+| Heartbeat ingest | `crates/manager/src/storage/session_index.rs:286` | ~100k deltas/s cluster-wide, ~33k/s per manager under one `RwLock` write | fine at the target (map updates); shard the lock by node if profiling shows contention | measure in 4 |
+| Full report size | `crates/manager/src/manager/daemon.rs:605` (tonic's 4 MiB default decode limit) | ~200 B a session, so about 20,000 sessions per node per full report | chunk full reports across beats, or raise the limit for heartbeats | 2 |
+| Index memory | `crates/manager/src/storage/session_index.rs` | ~300 B a session; 10^6 running is ~300 MB across managers | none needed | — |
 | Idempotent `store` starts | §6.7 | one conditional bucket `PUT` per idempotent start (tens of ms on S3), in the start's latency | random ids skip it; only callers that ask for idempotency pay | 5 |
 | Raft | none on the path | 0 entries per session | keep it so | — |
 | Ticket verification | `docs/edge-boot.md`, "Verification" | one ES256 verify a start, ~0.1 ms of node CPU | cache verified tickets by `jti` | 4 |
@@ -521,7 +521,7 @@ the ticket is the check).
 ### 6.6 Sleeping on the node (Phase 5)
 
 Session tasks may suspend. The jobspec surface is today's `suspend` block,
-with the session refusals at `src/structs/session.rs:404-420` relaxed:
+with the session refusals at `crates/common/src/structs/session.rs:404-420` relaxed:
 
 ```nickel
 stateful = {
@@ -625,7 +625,7 @@ With `durability = "store"` the session manifest records it, and every
 resume of the session, on its old node or a new one, claims the next
 generation with a conditional write to the manifest (`If-Match` on its
 ETag; the S3 client already speaks it for the streaming lease,
-`src/storage/s3_credentials.rs:213`) before its gate opens. The bucket is
+`crates/manager/src/storage/s3_credentials.rs:213`) before its gate opens. The bucket is
 the fencing authority, so a move needs no raft entry and no manager, and
 a stale resume anywhere fails its write and aborts. The generation rides
 on the session's reports and in its `SessionStatus`. A `local` session
@@ -807,7 +807,7 @@ then, every session-sized write stays off raft.
   ids may not take either (breaking, per `AGENTS.md`).
 - **Proto, manager:** `ListSessionNodes(ListSessionNodesRequest) →
   ListSessionNodesReply` (read-only, `job:read`, in
-  `tests/acl_endpoints.rs`, the capability catalog, and MCP as
+  `tests/integration/acl_endpoints.rs`, the capability catalog, and MCP as
   `legion_session_nodes`). `CreateBootTicketRequest.scope` gains
   `session`.
 - **Proto, worker plane:** `Worker.StartSession`, `Worker.StopSession`
@@ -879,7 +879,7 @@ then, every session-sized write stays off raft.
   burst; a burst past the pool answers `RESOURCE_EXHAUSTED`, not a pile of
   threads.
 - **Phase 2:** a worker-restart integration test in
-  `tests/session_integration.rs` (fake node over the real worker plane,
+  `tests/integration/session_integration.rs` (fake node over the real worker plane,
   restarted mid-run): sessions adopted, ended processes dropped, full
   report on first beat. Unit tests for the log's group commit and recovery
   from a truncated WAL; a full report of 50,000 sessions crosses the

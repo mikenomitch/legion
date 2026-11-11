@@ -51,13 +51,13 @@ cannot answer any of them.
 - A `sandbox` task has `network = { mode = "none" }` (loopback only) or
   `mode = "tap"` — attach to a **pre-created** host TAP device Legion refuses
   to make because it needs `CAP_NET_ADMIN` and a host addressing plan
-  ([src/task_plugins/sandbox.rs:121](../../src/task_plugins/sandbox.rs)). No
+  ([crates/worker/src/task_plugins/sandbox.rs:121](../../crates/worker/src/task_plugins/sandbox.rs)). No
   network, or the operator's whole network. Nothing between.
 - `container` on Linux runs in the **host network namespace** — a test
-  asserts it ([src/task_plugins/oci_bundle.rs:779](../../src/task_plugins/oci_bundle.rs)).
+  asserts it ([crates/worker/src/task_plugins/oci_bundle.rs:779](../../crates/worker/src/task_plugins/oci_bundle.rs)).
   `exec` is a host process. Same all-or-nothing.
 - The one datapath Legion owns —
-  [`src/worker/forwarder.rs`](../../src/worker/forwarder.rs) behind
+  [`crates/worker/src/worker/forwarder.rs`](../../crates/worker/src/worker/forwarder.rs) behind
   `connect.upstreams` — splices sockets and emits **no metrics**. It cannot
   deny, cannot see a request, cannot say who talked to whom.
 - `service.allow` intentions are enforced by *omitting* endpoints from a
@@ -73,9 +73,9 @@ cannot answer any of them.
   ([edge-boot-plan.md §6.7](edge-boot-plan.md)). Per-destination policy for
   the gated state is deferred to "a networking feature."
 - Tasks survive a worker restart (`restore_allocations`,
-  [src/worker/task_manager.rs:2138](../../src/worker/task_manager.rs)); the
+  [crates/worker/src/worker/task_manager.rs:2138](../../crates/worker/src/worker/task_manager.rs)); the
   forwarder does not (`UpstreamForwarder` is rebuilt at
-  [daemon.rs:328](../../src/worker/daemon.rs), its `Drop` aborts every
+  [daemon.rs:328](../../crates/worker/src/worker/daemon.rs), its `Drop` aborts every
   listener). **The workload outlives its network.** Today that is a papercut.
   Once the network path is a security boundary, it is the boundary
   disappearing during an upgrade.
@@ -260,7 +260,7 @@ All shipped code.
 
 | Thing | Where | What it gives this plan |
 | --- | --- | --- |
-| Port assignment in-transaction at placement, statics first then one dynamic cursor across task ports **and** upstream loopback ports | `assign_allocation_ports` [network.rs:420](../../src/structs/network.rs); `Store::assign_allocation_network` | Any extra port (private ingress port, egress proxy port) comes from the same set — no new collision machinery |
+| Port assignment in-transaction at placement, statics first then one dynamic cursor across task ports **and** upstream loopback ports | `assign_allocation_ports` [network.rs:420](../../crates/common/src/structs/network.rs); `Store::assign_allocation_network` | Any extra port (private ingress port, egress proxy port) comes from the same set — no new collision machinery |
 | `network.mode` — parsed, stored, **read by nothing** | `network.rs:49` | A pre-carved extension point |
 | `AllocNetwork { address, ports, upstreams }` persisted and shipped; `env_pairs()` → `LEGION_PORT_*`, `LEGION_UPSTREAM_*` | `network.rs:232`, `:260`; proto `TaskAllocation.network` | Where private ports and the egress proxy address get injected |
 | Egress datapath: one loopback listener per `(allocation, upstream)`; splice at `copy_bidirectional` | `forwarder.rs:382`, `:444` | The single seam; everything above it is reconciled and idempotent |
@@ -268,7 +268,7 @@ All shipped code.
 | Fail-static heartbeat feed; zero-query fast path when nothing declares upstreams | `server.rs:8177` `build_upstream_endpoints`; `daemon.rs:1074` `apply_upstreams` | The delivery contract policy reuses |
 | `lifecycle = "sidecar"` — co-scheduled peer, **no ordering guarantee** | `job.rs:414`; `task_plugins/mod.rs:1202` | Where a sidecar handler lives; why hops fail closed until healthy |
 | `TaskPlugin::network_gate()` / `set_network_gate()` — edge-boot's hook; `Enforced` for `sandbox` (TAP link down via `ip link`), advisory for host runtimes | `task_plugins/mod.rs:710`, `:720`; `sandbox.rs` `set_tap_link` | The hook `netd` implements: for a gated allocation the gate is "policy withheld," on every runtime |
-| Workload identity: OIDC JWTs, `sub` = `{region}:{job}:{group}:{task}`; **no CA, no cert issuance** (`src/certs.rs` is a dev fixture) | `structs/workload_identity.rs:90`; `manager/workload_identity.rs` | Identity for attribution and `requireIdentity`; the CA is phase 6b's new work |
+| Workload identity: OIDC JWTs, `sub` = `{region}:{job}:{group}:{task}`; **no CA, no cert issuance** (`crates/common/src/certs.rs` is a dev fixture) | `structs/workload_identity.rs:90`; `manager/workload_identity.rs` | Identity for attribution and `requireIdentity`; the CA is phase 6b's new work |
 | Keyed stateful instances, `LEGION_INSTANCE_ID` | `docs/stateful-workloads.md` | Per-user sandboxes are keyed instances; the key is free attribution |
 | KV: no `WatchKv`, no broadcast; server-side `queue_kv_change` → debounce → `reconcile_kv_changes` | `server.rs:2040`, `:2384` | Why policy rides the heartbeat, not a watch |
 | ACL policies: stored, replicated, `legion acl` CLI, `AclRule` selectors for `namespaces` / `names` / `pools` | `structs/acl.rs:103`, `:186` | The precedent and the selector vocabulary for policy objects |
@@ -601,7 +601,7 @@ the `build_upstream_endpoints` fast path, preserved.
 
 **ACL.** A new `AclResource::Net`, scoped by pool and namespace, so a pool's
 admin can set posture for their pool without cluster-wide write. `GetNetPolicy`
-is worker-plane. Every RPC lands in `tests/acl_endpoints.rs`.
+is worker-plane. Every RPC lands in `tests/integration/acl_endpoints.rs`.
 
 **Bootstrap.** `network.seedPolicies` in `configs/manager.ncl`, applied once
 at cluster init, so a fresh cluster is not open in the window before the first
@@ -700,7 +700,7 @@ Certificates in two phases: **6a bring-your-own** (`certPath`/`keyPath`/
 `clientCa` as files or `${artifact.<name>}`) — useful immediately, no manager
 machinery; **6b `certFrom = "legion"`** — a workload CA issuing short-lived
 certs whose SAN is the identity `sub`, delivered on the existing identity path
-(`src/worker/identity.rs`) and rotated by its loop. 6b is the outstanding
+(`crates/worker/src/worker/identity.rs`) and rotated by its loop. 6b is the outstanding
 "mTLS between forwarders" item and makes `service.allow` cryptographic.
 
 **kTLS + `splice` passthrough.** When ingress terminates mTLS and no handler
@@ -745,6 +745,12 @@ without sending anything. All with `--json`, all in `catalog()`, `policy show`
 
 ### 7.12 Performance invariants — pinned, not promised
 
+> **Update (datapath-performance plan):** invariants 2 and 3 are measured by
+> `benchmarks/micro/net_bench.rs`, and the L4 path now splices on Linux.
+> The benchmarks are run by hand and reported in PRs rather than failing CI;
+> see [datapath-performance-plan_calls.md](../calls/datapath-performance-plan_calls.md)
+> entry 8.
+
 Stated as benchmarks in `benchmarks/micro/` that fail on regression:
 
 1. **A task with no policy and no capture is byte-identical on the wire**,
@@ -760,7 +766,7 @@ Stated as benchmarks in `benchmarks/micro/` that fail on regression:
 
 ## 8. Concrete Change Surface
 
-**New modules.** `src/structs/netpolicy.rs` (`PolicyObject`, `Selector`,
+**New modules.** `crates/common/src/structs/netpolicy.rs` (`PolicyObject`, `Selector`,
 `ChainConfig`, `RuleConfig`, `HandlerConfig`, `TlsConfig`, normalize +
 validate + the deterministic merge); `src/netd/` (`main` subcommand,
 `capture/{netns,vsock,proxyenv}.rs`, `edge/{tcp,udp,http,tls,dns}.rs`,

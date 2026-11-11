@@ -119,7 +119,7 @@ lands, on today's listener, and document the local gap.
 does a shell into sandboxes.
 
 **Why (security).** Today the worker binds `127.0.0.1:4848` with no
-authentication (`src/worker/daemon.rs:155`, `src/worker/server.rs:200`), so
+authentication (`crates/worker/src/worker/daemon.rs:155`, `crates/worker/src/worker/server.rs:200`), so
 any process on the worker's host can call `ExecTask` against any
 allocation on the node, including an `exec` task or a host-network
 container. Sandboxes are exempt only because they cannot be exec'd into.
@@ -454,7 +454,7 @@ just someone with exec on those jobs.
 **Why (security and simplicity).** The plan named `acl:write`: a key mints
 shell access for every matching job forever, which is the power to create
 credentials, not to use one. The DER prefix check refuses P-384 and RSA keys
-by name with no new dependency. `tests/raft_seam.rs` scans `store.rs` and
+by name with no new dependency. `tests/integration/raft_seam.rs` scans `store.rs` and
 `acl_store.rs` for replicated writes, so the code sits where the seam test
 sees it.
 
@@ -582,7 +582,7 @@ new code, because the worker already counts open sessions per allocation.
 
 *Implementation (Phase 0), narrower than plan §10.*
 
-**Call.** `tests/exec_session_benchmark.rs` runs a manager and a separate
+**Call.** `tests/integration/exec_session_benchmark.rs` runs a manager and a separate
 worker on one machine and measures proxied and direct sessions at 1, 10,
 100, and 500, plus mint throughput. The numbers are in
 `benchmarks/scheduler/README.md`.

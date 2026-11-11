@@ -1,0 +1,8 @@
+<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+  <Error>
+    <Type>Sender</Type>
+    <Code>ValidationError</Code>
+    <Message>Instance Id not found - No managed instance found for instance ID: i-0dead</Message>
+  </Error>
+  <RequestId>7b4e0c3a-6c4f-4c4b-8a5e-1f0d3c2bEXAMPLE</RequestId>
+</ErrorResponse>

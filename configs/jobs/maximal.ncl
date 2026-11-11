@@ -1,6 +1,27 @@
 {
     name = "maximal-demo",
+    # The namespace the job lives in (docs/namespaces.md). Optional: unset
+    # means the request's namespace (`-n`, else $LEGION_NAMESPACE), else
+    # `default`. Writing it pins the job there; a request naming a different
+    # namespace is refused rather than silently resolved. `name` may instead
+    # be qualified (`payments-prod/maximal-demo`); the two must agree. The
+    # namespace must exist (`legion namespace create`), and the job's id is
+    # then `<namespace>/<name>` (bare in `default`).
+    namespace = "default",
     version = 1,
+    # Jobspec extensions (docs/apps.md, "Jobspec extensions"): keys that
+    # installed apps add at the job, a group (written on one of its tasks),
+    # a task, a volume, a port, or a service. They are commented out here
+    # because each needs its app installed (`legion app extensions` lists
+    # this cluster's keys), and this file must submit on a bare cluster. The
+    # one at the job level, for an app that declares `uptime` on jobs:
+    #
+    #   uptime = { url = "https://maximal.acme.dev/healthz", alert = "#oncall" },
+    #
+    # Every key also has a qualified spelling, `apps.<app>`, that no core
+    # field can ever take:
+    #
+    #   apps = { uptime = { url = "https://maximal.acme.dev/healthz" } },
     # How important this job is, relative to everything else on the cluster
     # (docs/preemption-and-eviction.md). One of, most important first:
     #
@@ -70,6 +91,13 @@
         prep = {
             replacement = "createFirst",
         },
+        # A gang's replicas place and replace as one unit, so its group's
+        # rollout must resolve to a single step: a canary of half a gang is
+        # a broken gang (docs/gang-scheduling.md). This overrides the global
+        # percentSteps above; validation rejects any multi-step mode here.
+        trainer = {
+            percentSteps = [100],
+        },
     },
     tasks = [
         {
@@ -78,6 +106,30 @@
             runtime = "exec",
             group = "frontend",
             lifecycle = "service",
+            # Child sessions (docs/child-sessions.md): each `web` allocation
+            # may own sessions of the `scratch` session task below. A child
+            # is started under its owner (`legion instance create
+            # maximal-demo --task scratch --owner <ALLOC ID>`, or `legion
+            # session start scratch --owner self` inside the task, over the
+            # API socket the `legion` identity below provides), ends when
+            # its owner is stopped or lost, is charged to scratch's own
+            # envelope, and is listed under its owner. Any task except a
+            # child task may declare this.
+            children = {
+                # Session (or keyed) tasks of this job this task's units may
+                # own. A session task may not name a keyed task.
+                tasks = ["scratch"],
+                # The most children one owner holds at once (default 1).
+                max = 2,
+                # Whether an owner's children suspend when it does (default
+                # false: each child follows its own task's idle policy).
+                suspendWithOwner = false,
+                # Session owners only: how long a child on another node
+                # outlives an owner nobody can reach (default "10m", at
+                # least "1m"). Read for nothing else; shown here for the
+                # full surface.
+                orphanAfter = "10m",
+            },
             # Cross-group dependency: service and batch tasks may depend on
             # tasks in any group. web is not planned until the prep group's
             # batch task has succeeded. (A service may only take a
@@ -136,6 +188,10 @@
                     retainOnStop = true,
                 },
             },
+            # An extension key on a task, or on its group (written on one
+            # task of the group, applying to the whole group), for an
+            # installed app that declares it (docs/apps.md):
+            #   tier = { level = "gold" },
             # Claims on storage that exists independently of any instance —
             # an operator's host path, an NFS export, scratch space (see
             # docs/volumes.md). Unlike stateful.storage these are shared, are
@@ -150,6 +206,9 @@
                     params = { name = "models" },
                     path = "/models",
                     readOnly = true,
+                    # An extension key on a volume, for an installed app that
+                    # declares `backup` on volumes (docs/apps.md):
+                    #   backup = { schedule = "0 3 * * *", keep = 14 },
                 },
             ],
             config = {
@@ -168,15 +227,36 @@
                 # `container` on a Linux node and `host` everywhere else
                 # (exec, macOS; sandboxes per docs/task-runtime-sandbox.md).
                 # `host` opts a container out. A `require` policy can impose
-                # a mode for a pool. `bridge` / `cni/<name>` are reserved for
-                # the datapath plugin.
+                # a mode for a pool.
                 mode = "auto",
                 ports = [
                     # Gated: the datapath owns the host port and forwards to
                     # 8080 inside the task's namespace. Host: dynamic host
                     # port (macOS publishes it to 8080).
                     { name = "http", to = 8080 },
+                    # An extension key on a port, for an installed app that
+                    # declares `dns` on ports:
+                    #   { name = "http", to = 8080, dns = { hostname = "maximal.acme.dev" } },
                     { name = "metrics", static = 9090 },  # fixed host port
+                    # TLS the node terminates on this port with a certificate
+                    # that is not the mesh's (docs/network-handlers.md, "TLS
+                    # on ports"); the task speaks plaintext on its private
+                    # port. `cert` is { kv = "<path>" } (one PEM bundle: the
+                    # chain, then the key; swapped live on `kv put`; the
+                    # submitter needs kv read on it) or { file = { cert, key } }
+                    # (or one `file` holding both) on the node. `clients`
+                    # makes the port mutual: client certificates must verify
+                    # against `ca` ({ kv } or { file }), and the verified
+                    # identity (URI SAN, else DNS SAN, else CN) feeds
+                    # `identity` rules and `authz`. Never on the service's
+                    # mesh port.
+                    {
+                        name = "admin",
+                        tls = {
+                            cert = { kv = "certs/admin.example.com" },
+                            clients = { ca = { kv = "certs/admin-clients" } },
+                        },
+                    },
                 ],
                 # Attribution keys carried on every net.denied event and
                 # access-log line (never on a metric label). Stored policies
@@ -188,7 +268,6 @@
                 egress = {
                     protocol = "tcp",         # tcp (default) | http — never inferred
                     policy = "deny",          # fallthrough: allow | deny (deny when `allow` is used)
-                    onError = "deny",         # what a failed handler means: deny | allow
                     accessLog = false,
                     # Sugar: host, host:port, cidr, cidr:port — and host/path
                     # once protocol = "http". Desugars to allow rules ahead of
@@ -203,42 +282,35 @@
                     ],
                     # Handlers: code on the path, only when policy is not
                     # enough, run in order after the rules allow the flow.
+                    # Each is written as its kind, with the kind's settings
+                    # inside it:
                     # authz = a webhook verdict, cached per (identity,
                     # destination) for `cache` (default 10s, max 5m);
                     # proxy = hand the flow to any proxy (PROXY v2 header on
-                    # TCP, Legion-* headers on HTTP) by catalog service /
-                    # node-local service / a sidecar's port label;
-                    # log; dlp (HTTP bodies, needs protocol = "http").
-                    # Every hop: timeout (default 2s) and onError (deny).
+                    # TCP, Legion-* headers on HTTP): a catalog `service`
+                    # (`local = true` for its endpoints on this node only) or
+                    # a sidecar's `port` label;
+                    # dlp = reject HTTP bodies that match (needs HTTP).
+                    # Every hop: timeout (default 2s) and onError (what a
+                    # failed hop means: deny, the default, or allow).
                     handlers = [
-                        { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
-                        { handler = "proxy", service = "egress-filter", proxyProtocol = true, onError = "deny" },
+                        { authz = { url = "http://policy.internal/check", cache = "30s" }, timeout = "2s", onError = "deny" },
+                        { proxy = { service = "egress-filter", local = true, proxyProtocol = true }, onError = "deny" },
                     ],
                 },
                 # Inline ingress policy in front of this task's advertised
                 # ports: the datapath binds the advertised port, the task
                 # binds a private twin (docs/network-handlers.md, "Ingress").
+                # Chains carry policy only; TLS lives on the port (above) or
+                # is the mesh (service.mesh, below).
                 ingress = {
                     protocol = "http",
                     rules = [
                         { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
-                        # Peer identity is known with tls.mode = "mutual".
-                        { when = { identity = "auto:web:*" }, action = "allow" },
+                        # Peer identity is known on the mesh port and on a
+                        # mutual port.
+                        { when = { identity = "*:web:*:*" }, action = "allow" },
                     ],
-                    # TLS on the advertised port. server | mutual with
-                    # certFrom = "legion" (the node's mesh certificate; peers
-                    # verified against the mesh CA with clientCa = "legion"),
-                    # certFrom = { kv = "<path>" } (a PEM bundle in KV: the
-                    # chain, then the key; swapped live on `kv put`, and the
-                    # submitter needs kv read on the path), or
-                    # certPath/keyPath (+ clientCa bundle) for your own PKI.
-                    tls = {
-                        mode = "off",          # off | server | mutual
-                        # certFrom = "legion",
-                        # certFrom = { kv = "certs/web.example.com" },
-                        # clientCa = "legion",
-                        # requireIdentity = ["auto:web:*"],
-                    },
                 },
             },
             service = {
@@ -246,58 +318,106 @@
                 port = "http",      # label from network.ports; or a number/'dynamic' to declare inline
                 tags = ["v1", "public"],
                 meta = { protocol = "http" },
-                # Connect intentions (see docs/service-discovery.md): job ids
-                # allowed to reach this service through a `connect` upstream.
-                # Omit the field (or use ["*"]) to allow every job. Denied
-                # consumers simply get an empty endpoint list; enforcement is
-                # control-plane + forwarder, not cryptographic identity.
-                allow = ["gateway", "maximal-demo"],
+                # Put the service on the mesh (docs/network-handlers.md, "The
+                # mesh"): its port terminates node-to-node mTLS with the node
+                # certificate, consumers originate mesh TLS to it, and a plain
+                # client dialing the port directly is refused at the
+                # handshake. A policy object can impose or default it.
+                mesh = true,
+                # Connect intentions (see docs/service-discovery.md): job
+                # globs allowed to reach this service through a `connect`
+                # upstream. A bare entry matches jobs in this job's own
+                # namespace; `ns/job` (globs on either side, `payments-*/api`)
+                # admits a consumer in another namespace. Omit the field (or
+                # use ["*"]) to allow every job in this namespace. Always
+                # enforced by the endpoint feed (others get no endpoints);
+                # with mesh = true also at the receiving node, against the
+                # verified caller's job (Legion-Denied-By: service/allow).
+                allow = ["gateway", "maximal-demo", "checkout-*/api"],
+                # An extension key on a service, for an installed app that
+                # declares `probe` on services:
+                #   probe = { path = "/healthz" },
+                # The bundled ingress's key (docs/ingress.md): route these
+                # public hostnames, under `path`, to this service, with
+                # HTTPS from the cert manager. The ingress speaks plain
+                # HTTP to the service, so it reports a `mesh = true`
+                # service like this one as unroutable; route a service
+                # without `mesh`.
+                ingress = {
+                    host = ["maximal.acme.dev", "www.maximal.acme.dev"],
+                    path = "/",          # a prefix, on segment boundaries
+                    stripPath = false,   # true: /api/users reaches the service as /users
+                },
             },
-            # Services this task dials, each via a node-local loopback
-            # forwarder that load-balances across the upstream's healthy
-            # endpoints. The task reads $LEGION_UPSTREAM_<SERVICE>
-            # ("127.0.0.1:<port>") and $LEGION_UPSTREAM_PORT_<SERVICE>.
-            # The named service need not exist yet.
+            # Services this task dials, each through the node's forwarder,
+            # which load-balances across the upstream's healthy endpoints.
+            # `to` names the upstream and its scheme alone decides the
+            # protocol: a bare service name (or tcp://name) is L4,
+            # http://name parses HTTP; a URL with a dotted host (or a port)
+            # is an external destination. The task reads one address per
+            # upstream: $LEGION_UPSTREAM_<KEY> (the VIP on Linux, a loopback
+            # port elsewhere) and its _HOST_ and _PORT_ parts. The named
+            # service need not exist yet.
             connect = {
                 upstreams = [
-                    # Minimal form: loopback port assigned at placement out of
-                    # the same per-node range as host ports.
-                    { service = "db" },
-                    # Pin the loopback port for clients that cannot read env
-                    # vars. Must not collide with a static port above.
-                    { service = "cache", localPort = 6379 },
-                    # Strategy override: round_robin (default) | random |
-                    # least_conn | local_first (same-node endpoints first,
+                    # Minimal form: a catalog service over L4.
+                    { to = "db" },
+                    # Pin the port: the VIP listens on it and 127.0.0.1:6379
+                    # is bound too, for clients that need a literal loopback
+                    # address. Must not collide with a static port above.
+                    { to = "cache", port = 6379 },
+                    # Strategy override: least_latency (default; two random
+                    # picks, the lower latency x load wins) | round_robin |
+                    # least_conn (even connection counts, for long-lived
+                    # connections) | local_first (same-node endpoints first,
                     # widening when none is healthy locally).
-                    { service = "search", balance = "least_conn" },
-                    # HTTP framing and traffic management on a service
-                    # upstream (docs/network-handlers.md): a per-request
-                    # deadline, bounded retries (idempotent methods only by
-                    # default), a canary split by service tag, and outlier
-                    # ejection.
+                    { to = "search", balance = "least_conn" },
+                    # Reaching a service in another namespace is explicit,
+                    # and the target must admit this job with a qualified
+                    # `allow` entry (`"default/maximal-demo"`). The key, env
+                    # vars and DNS name become `<service>.<namespace>`:
+                    # LEGION_UPSTREAM_AUTH_SHARED, auth.shared.svc.legion.
+                    { to = "auth", namespace = "shared" },
+                    # An HTTP service upstream (docs/network-handlers.md):
+                    # a per-request deadline, bounded retries (idempotent
+                    # methods only by default), and a canary split by service
+                    # tag. An endpoint that answers 5xx five times in a row is
+                    # ejected for 30s, with no setting. A request body up to
+                    # `maxBodyBytes` (default 1Mi, at most 64Mi) is kept so
+                    # a retry can resend it; a larger one streams once and
+                    # is not retried ("Request bodies").
                     {
-                        service = "api",
+                        to = "http://api",
                         http = {
                             timeout = "3s",
-                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
+                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%", maxBodyBytes = "1Mi" },
                             split = [{ tag = "canary", weight = 10 }],
-                            outlier = { consecutive5xx = 5, ejectFor = "30s" },
                         },
                     },
-                    # An external upstream: `name` + `to` instead of a
-                    # service. The task gets $LEGION_UPSTREAM_OPENAI on
-                    # loopback and speaks plaintext; Legion originates TLS
-                    # (https / tls schemes), so the body is visible to
-                    # handlers without intercepting anyone's TLS. The scheme
-                    # also decides HTTP framing (http / https).
+                    # An external upstream: a URL plus a `name`. The task
+                    # dials $LEGION_UPSTREAM_OPENAI and speaks plaintext;
+                    # Legion originates TLS (https / tls schemes), so the
+                    # body is visible to handlers without intercepting
+                    # anyone's TLS. The scheme also decides HTTP framing
+                    # (http / https).
                     {
                         name = "openai",
                         to = "https://api.openai.com",
                         handlers = [
                             {
-                                handler = "dlp",
-                                config = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
+                                dlp = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
                                 onError = "deny",
+                            },
+                            # A WASM network plugin (docs/network-plugins.md):
+                            # a stored plugin object with usableBy = "jobs",
+                            # run with this reference's config (checked
+                            # against the object's configSchema at submit).
+                            # Its stages, limits, and module live on the
+                            # object.
+                            {
+                                plugin = { name = "llm-token-meter", config = { budget = 100000, per = "1h" } },
+                                onError = "deny",
+                                timeout = "2s",
                             },
                         ],
                         # Credential injection (docs/network-handlers.md,
@@ -319,6 +439,10 @@
                         # task's "billing" workload identity for the
                         # allocation and the node injects it, asking for a
                         # new one once half its TTL has passed.
+                        # Verify the destination against this trust bundle
+                        # instead of the public roots: { kv } or { file }
+                        # (PEM). tls:// and https:// external upstreams only.
+                        ca = { kv = "certs/internal-ca" },
                         credentials = [
                             { header = "Authorization", prefix = "Bearer ", from = { identity = "billing" } },
                         ],
@@ -361,13 +485,38 @@
                 {
                     # Reserved control-plane identity: authenticates back to
                     # Legion itself. Omit `audience` — the manager owns it and
-                    # stamps aud = the cluster issuer.
+                    # stamps aud = the cluster issuer. Declaring it also gives
+                    # the allocation a local API socket and ambient env
+                    # (LEGION_ADDR=unix://$LEGION_SECRETS_DIR/legion.sock,
+                    # LEGION_IDENTITY_TOKEN_FILE), so `legion ...` inside the
+                    # task needs no setup. `file` is optional here: without
+                    # it the token is written to
+                    # $LEGION_SECRETS_DIR/legion.token.
                     name = "legion",
                     file = {
                         path = "/var/run/legion/identity/legion/token",
                         mode = "0400",
                     },
                     changeMode = "noop",
+                    # What the job may do as itself: inline ACL rules, in the
+                    # shape `legion acl policy apply` takes. Granted at submit
+                    # only if the submitting token holds every one of them
+                    # (docs/workload-identity.md, "Permissions"); listed and
+                    # revoked with `legion acl grants`.
+                    permissions = [
+                        { resources = ["kv"], actions = ["read"], paths = ["maximal/*"] },
+                        {
+                            resources = ["job"],
+                            actions = ["read"],
+                            namespaces = ["default"],
+                            names = ["maximal-*"],
+                        },
+                    ],
+                    # Names of existing ACL policies to grant as well, under
+                    # the same check. Commented out because a named policy
+                    # must exist when the job is submitted, and this file
+                    # must submit on a bare cluster.
+                    # policies = ["cert-writer"],
                 },
                 {
                     # Injection only: no env or file, because the "billing"
@@ -380,6 +529,9 @@
             ],
             # Task-level KV policy defaults; entries override field-by-field
             # (see docs/kv-store.md "Reactive updates"). Keys are camelCase.
+            # onChange / onDelete: none (store the new render; it reaches
+            # the task at its next replacement) | update (files only) |
+            # restart | rollout | fail.
             kv = {
                 watch = true,
                 onChange = "restart",
@@ -425,9 +577,9 @@
                 },
             ],
             resources = {
-                # MHz. `cpus` is an older alias for `cpu`, also in MHz (not
-                # a CPU count): `cpus = 1` reserves 1 MHz, and submit warns
-                # about any value under 10. Use `cores` for whole CPUs.
+                # MHz, not a CPU count: `cpu = 1` reserves 1 MHz, and submit
+                # warns about any value under 10. Use `cores` for whole
+                # CPUs. (`cpus` is refused: it is not a resource.)
                 cpu = 1500,
                 memory = 512,
                 disk = 1024,
@@ -452,7 +604,7 @@
                     port = "http",  # port label -> resolved to the assigned host port
                     every = "5s",
                     timeout = "2s",
-                    unhealthy_after_count = 1,
+                    unhealthyAfterCount = 1,
                 },
                 {
                     type = "health",
@@ -461,18 +613,21 @@
                     port = "http",  # port label -> resolved to the assigned host port
                     every = "10s",
                     timeout = "2s",
-                    unhealthy_after_count = 1,
+                    unhealthyAfterCount = 1,
                 },
             ],
-            on_unhealthy = {
-                restart_count = 3,
-                restart_period = "30m",
-                restart_delay = "30s",
-                move_count = 3,
-                move_period = "30m",
+            onUnhealthy = {
+                restartCount = 3,
+                restartPeriod = "30m",
+                restartDelay = "30s",
+                # Moves inside movePeriod before the job fails. A keyed
+                # instance counts its own, and spending them stops just
+                # that instance.
+                moveCount = 3,
+                movePeriod = "30m",
                 # The first reschedule's wait. It doubles for each earlier
-                # move within move_period, capped at 30m.
-                move_delay = "30s",
+                # move within movePeriod, capped at 30m.
+                moveDelay = "30s",
             },
             # What happens when the task PROCESS exits, as opposed to a health
             # check failing (see docs/task-supervision.md). Both paths spend
@@ -483,7 +638,7 @@
                 # service/sidecar, "onFailure" for batch.
                 policy = "always",
                 # Wait before relaunching. Defaults to
-                # on_unhealthy.restart_delay when omitted.
+                # onUnhealthy.restartDelay when omitted.
                 delay = "5s",
                 # Exit codes counted as success. Default [0].
                 successExitCodes = [0],
@@ -619,6 +774,31 @@
             resources = {
                 cpu = 500,
                 memory = 256,
+                # Devices (docs/devices.md): whole devices from the node's
+                # device plugins or `devices.static`. The task sees the ids
+                # it got as LEGION_DEVICE_<NAME>_IDS, plus whatever env the
+                # plugin adds (CUDA_VISIBLE_DEVICES for nvidia).
+                devices = [
+                    {
+                        # `type`, `vendor/type`, or `vendor/type/model`.
+                        name = "nvidia/gpu",
+                        # Default 1. All from one device group (one model).
+                        count = 2,
+                        # The task constraint syntax, over the device's
+                        # attributes (the group's, then the instance's) plus
+                        # vendor, type, model, and id.
+                        constraints = [
+                            { key = "memoryMiB", operator = ">=", value = 40000 },
+                        ],
+                        # Prefer devices; picks devices on the node, never
+                        # the node. Within a group Legion already keeps a
+                        # request inside one peerGroup (NVLink), then one
+                        # numaNode, when it can.
+                        affinities = [
+                            { key = "computeCapability", value = "9.0", multiplier = 1 },
+                        ],
+                    },
+                ],
             },
             constraints = [
                 {
@@ -677,7 +857,16 @@
                     # Bounding-set drops. ["all"] drops everything; named
                     # capabilities work with or without the CAP_ prefix.
                     # Needs CAP_SETPCAP on the worker.
-                    capabilities = { drop = ["all"] },
+                    #
+                    # `add` keeps a capability across the switch to `user`,
+                    # as an ambient capability the program inherits. Only
+                    # net_bind_service may be named (bind ports below 1024
+                    # without root; the bundled ingress uses it), and never
+                    # together with a drop that removes it.
+                    capabilities = {
+                        drop = ["net_raw", "sys_ptrace"],
+                        add = ["net_bind_service"],
+                    },
                     # Octal file-mode creation mask.
                     umask = "0027",
                     # Scheduling niceness, -20..=19.
@@ -797,8 +986,8 @@
                     # "exec" on a sandbox pinned to a VMM (a microVM takes no
                     # exec sessions). On a sandbox, "network" also counts
                     # bytes the guest sends on its TAP or Apple container
-                    # NIC. "hint" (the workload's own signal) is not
-                    # available yet and is refused.
+                    # NIC. "hint" is refused: the workload's own signal is
+                    # `park` below, whose `busy` keeps this policy off.
                     signals = ["network", "cpu", "exec", "connections"],
                     # The cpu signal's threshold, as a fraction of this
                     # task's cpu. Default 0.02.
@@ -820,6 +1009,19 @@
                     # instance resumes, then 503 with Retry-After. Default
                     # "30s", from "1s" to "5m".
                     timeout = "30s",
+                },
+                # The workload says when it is waiting (docs/park.md): the
+                # task gets $LEGION_PARK_SOCKET, a unix socket only it can
+                # reach. `park [LABEL] [after=DURATION]
+                # [checkpoint=memory|disk]` suspends the instance from its
+                # node once `after` passes; `unpark` cancels; `busy` holds
+                # the idle policy off; `status` reports. exec, container,
+                # and sandbox runtimes. Unset: no socket.
+                park = {
+                    # How long a park waits before it suspends, unless the
+                    # `park` line names its own `after`. Default "10s";
+                    # "0s" suspends at once; at most "24h".
+                    after = "10s",
                 },
             },
             resources = {
@@ -859,6 +1061,19 @@
                     # Extra placement constraints for the envelopes, on top
                     # of the task's own `constraints`. Optional.
                     constraints = { node_class = "sandbox" },
+                    # An elastic envelope (docs/session-mode.md, "Elastic
+                    # envelopes"): `resources` above becomes the floor each
+                    # node always holds, and each node grows its envelope up
+                    # to this ceiling as its sessions fill it (when they fill
+                    # more than 90%), through the scheduler, taking only free
+                    # room. Must size exactly the keys `resources` sizes,
+                    # each at or above it. Optional; without it (or equal to
+                    # `resources`) the envelope is fixed.
+                    max = { cpu = 16000, memory = 16384 },
+                    # How long a node's sessions must use less than half of
+                    # its envelope before the node gives the room back.
+                    # Default "10m", at least "1m". Only with `max`.
+                    shrinkAfter = "10m",
                 },
                 # Whether a caller-chosen id is accepted (`instance create
                 # --id`, a keyed instance from birth; `instance promote
@@ -867,6 +1082,12 @@
                 promote = {
                     onName = true,
                 },
+                # How a manager's session router picks the node a session
+                # starts on (docs/session-mode.md, "Picking a node").
+                # "spread" (the default): the node with the most room left.
+                # "fast": the roomier of two random nodes with room, the same
+                # cost on any fleet size, for a less even spread.
+                placement = "spread",
                 # How long a node may reach neither a manager nor its
                 # contentStore before it suspends this task's running
                 # sessions on its own disk, so a copy cut off from the
@@ -926,6 +1147,27 @@
                 # here). Session tasks only.
                 # checkpointEvery = "10m",
             },
+            # One-shot runs (docs/session-runs.md): `legion session run
+            # maximal-demo --task scratch --file main.sh --input '{"n": 3}'`
+            # starts a fresh, single-use session of this task, stages the
+            # caller's files under /legion/run/ (on exec: the session's own
+            # run directory, also in LEGION_RUN_DIR), executes `command`
+            # once, returns stdout, stderr, the exit status, and
+            # /legion/run/result.json as `result`, and ends the session.
+            # Session tasks on the exec, container, or sandbox runtime only.
+            run = {
+                # The argv a run executes.
+                command = ["sh", "/legion/run/main.sh"],
+                # Deadline of one run (required; at most "24h"). A run past
+                # it is stopped and answered with stopped.reason = "wall".
+                wall = "30s",
+                # Most stdout plus stderr returned (default and maximum
+                # "1MiB"); the reply says `truncated` beyond it.
+                output = "256KiB",
+                # Whether a caller may replace `command` (--command); the
+                # caller also needs exec:write on the job. Default false.
+                allowCommand = false,
+            },
             # One session's size, in the envelope's units.
             resources = {
                 cpu = 250,
@@ -934,6 +1176,139 @@
             # The task's constraints and affinities place its envelopes
             # (the generated `scratch-envelope` task inherits both, plus
             # envelope.constraints above).
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
+            },
+        },
+        {
+            # Isolate task (see docs/task-runtime-isolate.md): a session task
+            # whose units are WebAssembly isolates in a node's
+            # `legion-isolate` host, started in tens of microseconds (one to
+            # three milliseconds for the `js` and `python` images) and
+            # charged a few MiB each. `legion session run maximal-demo --task snippets
+            # --file main.py` runs one; a run picks its tier (isolate or VM)
+            # before it starts. Nothing per isolate is written to the store:
+            # Legion places only the generated `snippets-envelope` (on
+            # workers with the `isolates` capability), and the node's
+            # isolate supervisor does the rest.
+            name = "snippets",
+            runtime = "isolate",
+            group = "snippets",
+            config = {
+                # What runs: a built-in image, "js" or "python" (pin a build
+                # with "python@sha256:<hex>"). Exactly one of image and
+                # module.
+                image = "python",
+                # The script every invocation runs, staged from `artifacts`
+                # below: a path relative to the task directory, or
+                # "${artifact.<name>}". Images only. Omit it for dynamic
+                # code, which each run brings as its main file.
+                entry = "main.py",
+                # Your own WebAssembly component instead of an image: an
+                # https://, s3://, oci://, or file:// URL (file:// makes the
+                # task host-level) and its SHA-256.
+                # module = { source = "oci://ghcr.io/acme/handler:1.4", sha256 = "<64 hex>" },
+                # "request" (default): a fresh instance per invocation.
+                # "tenant": one warm instance per tenant key (the run's
+                # --tenant, or the Legion-Tenant header). "session": an
+                # addressable instance with a session id, hibernated when
+                # idle (it may then set `suspend`).
+                lifetime = "request",
+                # Per-invocation budgets. cpu and wall are required (no
+                # default); a run past one stops with stopped.reason =
+                # "limits".
+                limits = {
+                    cpu = "100ms",      # CPU per invocation, turns summed
+                    wall = "30s",       # wall clock per invocation, at most "24h"
+                    output = "1MiB",    # stdout + stderr returned (default and max "1MiB")
+                },
+                # Which host process the isolates share: "namespace"
+                # (default), "job" (a host for this job alone), or "shared"
+                # (only where a namespace policy lists it in isolateCordons).
+                cordon = "namespace",
+                # The VM tier: the sibling sandbox session task a tier =
+                # "vm" run executes in (its `run` block), which must be in
+                # children.tasks. Absent: runs always run as isolates.
+                vm = {
+                    task = "snippets-vm",   # default: the only entry in children.tasks
+                    memoFor = "1h",         # default "1h": route a code hash that needed a VM straight to one
+                },
+                # Environment every isolate sees. Default {}.
+                env = { MODE = "demo" },
+            },
+            # Delivers config.entry. An isolate task takes artifacts only
+            # for its entry.
+            artifacts = [
+                { source = "https://example.com/snippets/main.py", dest = "main.py" },
+            ],
+            # Reservation and ceiling, as for every runtime: `memory` is
+            # what one resident isolate is charged against the envelope
+            # (default: the image's idle size), `memoryMax` the cap on its
+            # linear memory (default 128, at most 4096 and the worker's
+            # isolate.maxMemory). `cpu` is a weight in the host's shard
+            # scheduler (default 10).
+            resources = { cpu = 10, memory = 16, memoryMax = 128 },
+            stateful = {
+                mode = "session",
+                envelope = { resources = { cpu = 16000, memory = 32768 } },
+            },
+            # The VM task, which this task's isolates may also start as a
+            # child they drive.
+            children = { tasks = ["snippets-vm"], max = 1 },
+            # Ingress and egress go through the node datapath, gated, bound
+            # for the envelope: an HTTP handler declares a port, and egress
+            # follows the policy and `connect` upstreams (credentials are
+            # injected by the node, never seen by the isolate).
+            network = {
+                ports = [{ name = "http" }],
+                egress = { allow = ["api.openai.com"] },
+            },
+            connect = {
+                upstreams = [
+                    {
+                        name = "openai",
+                        to = "https://api.openai.com",
+                        credentials = [
+                            { header = "Authorization", prefix = "Bearer ", from = { kv = "secrets/openai" } },
+                        ],
+                    },
+                ],
+            },
+            # Place the envelopes (constraints and affinities carry onto
+            # `snippets-envelope`, which also requires the `isolates`
+            # capability).
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "edge",
+            },
+        },
+        {
+            # The isolate task's VM (config.vm.task above): an ordinary
+            # sandbox session task that takes runs. A tier = "vm" run of
+            # `snippets` stages its entry as /legion/run/main.py (main.mjs
+            # for js) and executes `run.command` here, in a fresh microVM.
+            name = "snippets-vm",
+            runtime = "sandbox",
+            group = "snippets-vm",
+            config = {
+                image = "python:3.13-slim",
+                command = ["sleep", "infinity"],
+                vcpus = 1,
+                # No NIC. A gated sandbox session is not available yet, so
+                # this VM gets no datapath (and no `connect`).
+                network = { mode = "none" },
+            },
+            resources = { cpu = 1000, memory = 1024 },
+            stateful = {
+                mode = "session",
+                envelope = { resources = { cpu = 8000, memory = 16384 } },
+            },
+            run = { command = ["python3", "/legion/run/main.py"], wall = "5m" },
             constraints = {
                 os = "linux",
             },
@@ -969,10 +1344,10 @@
                 },
                 # Guest working directory (defaults to the image's).
                 cwd = "/workspace",
-                # Guest vCPUs (default 1), independent of resources.cpus.
-                # Guest RAM is not set here: it follows `resources` below
-                # (memoryMax, else memory). An explicit `memory_mib` still
-                # wins this release, with a submit warning when it disagrees.
+                # Guest vCPUs (default 1), independent of resources.cpu.
+                # Guest RAM is not set here: it is `resources` below
+                # (memoryMax, else memory, else 512). There is no
+                # `memory_mib`; submit refuses one.
                 vcpus = 1,
                 # Writable scratch in the ephemeral root disk, on top of the
                 # image contents (default 256). Anything written outside the
@@ -987,6 +1362,13 @@
                 # An ${artifact.<name>} reference works here too.
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
+                # How a memory checkpoint's guest RAM comes back on a resume,
+                # snapshot restore, fork, or create from a snapshot. "lazy"
+                # (default) runs the guest first and loads each page on first
+                # touch (cloud-hypervisor needs v52+ and a userfaultfd, else it
+                # copies). "eager" reads all of it before the guest runs, for
+                # a workload that touches most of its memory right away.
+                memory_restore = "lazy",
                 # The guest's own network, for a sandbox that is not gated.
                 # This task is gated (the task-level `network` below), and
                 # submit refuses a gated sandbox with a `config.network`: a
@@ -1023,10 +1405,10 @@
             # the guest agent listens on $LEGION_UPSTREAM_API and on the
             # VIP api.svc.legion resolves to, and relays to the node's
             # upstream listener over vsock ("Sandboxes"). Submit refuses a
-            # localPort of 1080 or 53 here (the agent's proxy and resolver).
+            # port of 1080 or 53 here (the agent's proxy and resolver).
             # A sandbox that is not gated cannot reach its upstreams.
             connect = {
-                upstreams = [{ service = "api" }],
+                upstreams = [{ to = "api" }],
             },
             network = {
                 mode = "gated",
@@ -1088,6 +1470,12 @@
             name = "container",
             count = 1,
             runtime = "container",
+            # Task autoscaling (docs/autoscaling.md). `true` takes the
+            # effective defaults: the built-ins (min = count, max = 4 x
+            # count, CPU held at 70% of the reservation, fast up, slow down)
+            # as the cluster's scaling defaults and namespace policies
+            # override them. `legion job plan` prints the expansion.
+            autoscale = true,
             config = {
                 image = "alpine:latest",
                 command = ["echo", "hello", "from", "container"],
@@ -1127,6 +1515,11 @@
                     nofile = 65536,
                     nproc = { soft = 4096, hard = 8192 },
                 },
+                # An OCI runtime class the worker type declares in
+                # container.runtimeClasses (docs/task-runtime-container.md,
+                # "Runtime classes"): gVisor, Kata, ... The task only places
+                # on nodes that advertise it. Unset: the node's runc or crun.
+                runtimeClass = "gvisor",
             },
             resources = {
                 # Real limits on Linux when the worker runs with
@@ -1144,6 +1537,123 @@
             },
             affinities = {
                 region = "us-west",
+            },
+        },
+        {
+            name = "trainer",
+            runtime = "exec",
+            # A gang has its group to itself: a multi-task group already
+            # places all of its tasks together on one node, so validation
+            # rejects `gang` on a task that shares one.
+            group = "trainer",
+            count = 4,
+            # All-or-nothing placement for this task's replicas
+            # (docs/gang-scheduling.md). `gang = true` means every replica
+            # places in one plan or none does: a gang that does not fit
+            # places NOTHING (nor do the job's other tasks in that pass),
+            # holds no capacity while it waits, and its eval blocks until a
+            # node that could help has room. A running gang that loses
+            # members tops them all up together, and preemption never takes
+            # it below its quorum.
+            #
+            # The long form lowers the quorum for elastic workloads: place
+            # once `min` replicas fit together, and add the rest as room
+            # appears. `min` must be 1..=count; `min = count` is `true`.
+            # Not combinable with count.per or keyed stateful tasks, and the
+            # group's rollout must replace it in one step (see
+            # rolloutByGroup.trainer above).
+            gang = {
+                min = 3,
+                # How long the gang may wait for its quorum before the job
+                # fails (stopping any members already running). Counted from
+                # the first time the gang came up short, not per retry.
+                # Unset: wait indefinitely. At least 1s.
+                placementTimeout = "30m",
+                # What a lost member (failed, node lost, drained, evicted)
+                # does to the rest when it leaves fewer than `min` running:
+                #   "restart" (default) stops the survivors and places the
+                #             whole gang again, together, once their stop
+                #             grace has passed;
+                #   "replace" keeps the survivors and places the missing
+                #             members together once they fit;
+                #   "fail"    fails the job and stops every member.
+                # A loss that leaves the quorum running is always replaced
+                # alone. Restarts after a failure spend onUnhealthy's move
+                # budget; once it is spent the job fails.
+                onMemberLoss = "restart",
+                # Keep the members inside one value of a node attribute: one
+                # rack, one NVLink domain (docs/gang-scheduling.md,
+                # "Topology"). `key` names the attribute the way count.per
+                # and `distinct` do. `mode`:
+                #   "required" (default) every member in one domain, or the
+                #              gang waits, holding nothing, until one domain
+                #              has room; a top-up stays in its domain;
+                #   "preferred" one domain when one fits, else the fewest
+                #              domains that hold the quorum, else anywhere.
+                # Nodes without the attribute are in no domain. `job plan`
+                # reports the domain chosen, or the best one and how many
+                # members it fits.
+                topology = { key = "rack", mode = "preferred" },
+            },
+            # Every member starts with LEGION_GANG_RANK (0..count-1),
+            # LEGION_GANG_SIZE, LEGION_GANG_MIN, and LEGION_GANG_LEADER_ADDR
+            # (rank 0's node), fixed when it is placed: what a rendezvous
+            # such as torchrun needs. Members start as their workers get
+            # them; the rendezvous is where they meet. A gang's
+            # speculativeStart is capped at `stage`.
+            config = {
+                command = ["sleep", "3600"],
+            },
+            resources = {
+                cpu = 500,
+                memory = 512,
+            },
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                region = "us-west",
+            },
+            # Every autoscale field (docs/autoscaling.md, "The full policy
+            # surface"); each one left out takes its effective default. On a
+            # gang, `min` must hold the quorum (gang.min).
+            autoscale = {
+                min = 4,                # a count, or a multiple of count ("1x")
+                max = "2x",
+                cpu = 0.65,             # hold CPU at 65% of the reservation
+                memory = 0.8,           # and memory at 80%
+                # Explicit checks; the largest desired count wins. `source`
+                # is `legion` (Legion's own measurements) or a source the
+                # operator installed in the autoscaler's app config
+                # (prometheus, http, a plugin: docs/autoscaling.md,
+                # "Sources"); a strategy `name` that is not built in names
+                # an installed strategy plugin.
+                checks = [
+                    {
+                        name = "backlog",
+                        source = "legion",
+                        query = "task.unplaced",
+                        window = "2m",
+                        strategy = { name = "threshold", steps = [{ above = 0, add = 1 }] },
+                        scaleIn = false,  # may push up, never pull down
+                        # With min = 0: above this reading the task wakes
+                        # from zero; at or below it on every activation
+                        # check, it may sleep ("Scale to zero").
+                        activation = 0,
+                    },
+                ],
+                up = { stabilize = "30s", step = { replicas = 2 }, every = "1m" },
+                down = { stabilize = "10m", step = { percent = 10, replicas = 1 }, every = "2m" },
+                headroom = 0,
+                warmup = "45s",
+                tolerance = 0.1,
+                window = "2m",
+                # Raise the floor on weekday mornings, New York time.
+                schedule = [
+                    { cron = "0 8 * * 1-5", for = "10h", min = 6, timezone = "America/New_York" },
+                ],
+                onMissing = "hold",     # hold (default) | ignore
+                mode = "dry-run",       # enforce (default) | dry-run
             },
         },
     ],

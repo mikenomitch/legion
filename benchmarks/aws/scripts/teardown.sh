@@ -43,9 +43,18 @@ if load_rig 2>/dev/null; then
 fi
 
 if $CONFIRM; then
-    read -r -p "Destroy the entire benchmark rig (instances + bucket)? [y/N] " answer
+    # No terminal to ask (nohup, `< /dev/null`, CI): `read` would hit EOF and
+    # `set -e` would end the script silently with the rig still billing.
+    # Refuse loudly instead, and never guess a yes.
+    if [ ! -t 0 ]; then
+        echo "teardown.sh: NOT destroying the rig: stdin is not a terminal, so there is" >&2
+        echo "             no one to confirm. Re-run with --yes to destroy unattended." >&2
+        exit 2
+    fi
+    answer=""
+    read -r -p "Destroy the entire benchmark rig (instances + bucket)? [y/N] " answer || true
     [[ "$answer" == [yY]* ]] || {
-        echo "aborted"
+        echo "teardown.sh: aborted; the rig is still running" >&2
         exit 1
     }
 fi

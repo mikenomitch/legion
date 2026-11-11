@@ -235,9 +235,9 @@ Validation rules (enforced at `job validate` and submit time):
   the default `targetRatePerSecond`, a fleet past about 16,250 nodes is
   served 21s, so its window (105s) passes the 90s fence. A healthy worker
   still beats every 21s and only fences after about 70 seconds of failed
-  retries, but the margin shrinks with every rung, and past about 68,750
-  nodes the served interval itself nears the fence. See the known
-  limitations in
+  retries. The margin shrinks with every rung, which is why the served
+  interval stops at 55s by default (`heartbeat.maxInterval`), leaving about
+  30 seconds of retries. See the known limitations in
   [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md#known-limitations).
 
 ### Seed list (`initialInstances`) semantics
@@ -267,11 +267,13 @@ dispatch time, so they are present at process start for `exec` and
 | Variable | When | Meaning |
 | --- | --- | --- |
 | `LEGION_ALLOC_ID` | **all** tasks (stateless too) | Current allocation id. Changes with each placement. |
-| `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id. Survives reschedules. |
+| `LEGION_INSTANCE_ID` | stateful tasks | Stable, canonical instance id (`payments-prod/user-42`; bare in `default`). Survives reschedules. |
+| `LEGION_INSTANCE_KEY` | stateful tasks | The id without its namespace (`user-42`): what a caller named the instance. |
 | `LEGION_INSTANCE_MODE` | stateful tasks | `slot`, `keyed`, or `session` (an unnamed [session](session-mode.md)). |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
+| `LEGION_GANG_RANK`, `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, `LEGION_GANG_LEADER_ADDR` | [gang](gang-scheduling.md#starting-together) tasks only | The member's rank `0..size-1`, the gang's count, its quorum, and the address of the node running rank 0. Fixed when the member is placed. |
 | `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task has **no** `LEGION_ALLOC_ID` yet, and Legion doesn't set a placeholder. `LEGION_INSTANCE_ID` is correct from the start. |
 
 Key your app's durable state and "who am I" decisions on
@@ -346,6 +348,17 @@ together, one on each side of the partition.
    window. Once the manager answers and the worker re-registers, the normal
    watchdog takes over. Registration resets the node's loss on the manager
    too, so both clocks restart together.
+
+   A task fenced this way is reported like one the watchdog fences. The
+   worker records it (`boot_fenced.json`, beside `worker_state.json`), and
+   the restore after registration reports it failed with
+   `self-fenced: worker lost manager contact for <d> (> onLost.selfTerminateAfter <w>);
+   fenced at worker boot, before it reached a manager`. Its volumes are
+   unmounted then too. So are the volumes of any task that died while the
+   worker was down, except a volume a surviving allocation on the node
+   still uses. A worker that crashes between that restore and its next
+   heartbeat loses the report, and the manager learns of the fence only
+   from the allocation's absence.
 
    Because this record is a wall clock, a large clock step on the worker
    host while the worker is down moves the restart-time fence. A step
@@ -740,10 +753,13 @@ Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
   create can't ask the server to mint ids (`--count`). Without it (the
   default), the server creates an id when the request omits one. A valid
   caller-supplied id is always used either way.
-- Ids are unique across the whole cluster and **never recycled for the
-  lifetime of the job that owns them**. Creating an id that matches any
-  existing instance row, in this job or another one, is rejected
-  (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
+- An id you choose is a **key, qualified by the job's
+  [namespace](namespaces.md#instances)** exactly as job ids are: `user-42` in
+  `default`, `payments-prod/user-42` in `payments-prod`. Ids are unique within
+  a namespace (two namespaces may each hold `user-42`) and **never recycled
+  for the lifetime of the job that owns them**. Creating an id that matches
+  any existing instance row of the namespace, in this job or another one, is
+  rejected (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
   tombstone. So a dead sandbox's identity (and its WI `sub`) can never
   be given to a new one while the job exists. Destroying the whole job (`job
   destroy`) clears its instance history, since rows are deleted with the job
@@ -802,7 +818,7 @@ and replace every live instance's allocation with one on the new config.
 ### Inspecting an instance in the UI
 
 Instance ids on the job page link to an instance page,
-`/jobs/<job>/instances/<id>`. It covers state, the current allocation and
+`/jobs/<namespace>/<job>/instances/<id>`. It covers state, the current allocation and
 node, storage, lineage, last stop, usage, the instance's snapshots, the
 instance actions, and a timeline of every event about the instance and the
 allocations that ran it. `legion events list --instance <id>` gives the same

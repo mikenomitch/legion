@@ -20,6 +20,13 @@ Primary objects:
   - `key`, `lock_id`, optional owner
   - acquired/expiry timestamps
 
+**The `legion/` prefix is reserved** for the leases and state of Legion's
+own jobs. An ACL `paths` glob reaches a key under it only when the pattern
+itself starts with `legion/`: `paths = ["*"]`, and a `kv` rule with no
+`paths`, stop short of it ([Auth & ACLs](auth-and-acls.md#policies)). Nothing
+stops a token that does hold `legion/*` from writing there, so keep tenant
+keys out of it.
+
 ## Encryption at rest
 
 The manager encrypts values before they reach the store. It uses AES-256-GCM
@@ -78,7 +85,9 @@ used by:
   fullstack /tasks/api/kvInjections/env/DB_PASSWORD
 ```
 
-`--json` prints the entry only. Use `GetKv` directly for `references`.
+`--json` puts the same list in `data.references`, beside the entry's own
+fields (`jobId` and `jsonPointer` per reference, `[]` when nothing reads the
+key).
 
 ### In the UI
 
@@ -139,6 +148,25 @@ that into `NotFound`. There is no MCP tool for KV.
 
 This is used for optimistic concurrency.
 
+## Waiting for a key to change
+
+`GetKv` and `ListKv` replies carry a `revision`, and both take the
+blocking-read headers, so you can wait for a key (or a prefix) to change
+instead of polling it:
+
+```console
+$ legion kv get app/config --json | jq -r .data.revision
+4812
+$ legion kv get app/config --index 4812 --wait 60 --json   # returns when it changes
+$ legion kv watch app/                                       # every write and delete under app/
+$ legion kv watch app/ --from 4812 --json                    # resume after a revision
+```
+
+A watch carries each changed entry with its value (or `deleted`), filtered
+to the keys you can read. `PutKv` and `DeleteKv` replies carry the revision
+at which the write is visible. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
 ## Locking Model
 
 Optional lock enforcement for mutating operations:
@@ -149,6 +177,13 @@ Optional lock enforcement for mutating operations:
 - Mutations that provide wrong/missing lock ID conflict when lock is active.
 
 `force` on acquire can take over an existing lock.
+
+`ListKvRequest.include_locks = true` also lists the unexpired locks under
+the prefix (`ListKvReply.locks`): each lock's key, `owner`, `acquired_at`
+and `expires_at`, filtered by `kv:read` like entries. A listed lock's
+`lock_id` is always empty: it is the holder's secret, and whoever has it can
+renew or release the lock. This is how the autoscaler's replicas see each
+other's leases ([autoscaling.md, "Replicas"](autoscaling.md#replicas)).
 
 ## JSON Patch
 
@@ -214,6 +249,16 @@ reconciliation. The result lands in the task config the worker receives (the
 key itself and every key the template looks up, so a change to either triggers
 the entry's policy.
 
+An edit to a `templateKv` template may not reach a key the job did not name
+when it was submitted. Submitting checks `kv:read` on every key against the
+submitter ([Auth and ACLs](auth-and-acls.md)), and the template's writer is
+not the submitter, so an edit that adds a lookup is not rendered: the job
+keeps its last render, nothing about the new key is stored, and a
+`job.kv_render_refused` warning event names the key. Resubmit the job
+(`legion job run`) to add it; the submit checks the new key against you.
+Edits that only rearrange the keys the job already names re-render as
+usual.
+
 If a required key is missing at submit time, the submit fails with
 `kv entry <key> not found`. Legion never admits a job with unresolvable
 references.
@@ -235,14 +280,20 @@ override `onChange` while inheriting `watch = true` from the task, or set
 `watch = false` to opt out entirely.
 
 A put resolves through `onChange` and a delete through `onDelete`. Edges with
-`watch = false` (the default) never act. A put still refreshes the rendered
-value in the stored desired config, and the task picks it up on its next
-restart or update. When one KV change matches several edges of a job, the
+`watch = false` (the default) never act: a put to their key is handled as
+`none` below. When one KV change matches several edges of a job, the
 strongest action wins: `none < update < restart < rollout < fail`.
 
 Actions:
 
-- `none`: re-render and store the desired state. Nothing is scheduled.
+- `none`: re-render and store the desired state, and replace nothing. The
+  running allocations are moved to the new config in place (like `update`,
+  but no file is rewritten and no signal is sent), so they keep running with
+  the values they started with. The new value reaches a task only when its
+  allocation is next replaced: a `restart` or `rollout` from another edge or
+  a later `job run`, a rescheduling after a node failure, or any other
+  placement. A running process never sees it. On a `failed` job, nothing
+  moves (see below).
 - `update` (files only): re-render, then rewrite the file under the running
   task and apply its `changeMode`. The allocation is not replaced. See
   [Live file updates](#live-file-updates).
@@ -428,6 +479,20 @@ same way while the container runs (see
 [Live file updates](#live-file-updates)). Without `update`, a re-render only
 reaches the container when the allocation restarts or is replaced. See
 [docs/task-runtime-container.md](task-runtime-container.md).
+
+`exec` file paths: an absolute `path` is that path on the host, and a
+relative one resolves against the task's directory (`LEGION_TASK_DIR`). A
+`..` that climbs out of the task directory is refused.
+
+Files below the task directory are written without following symbolic
+links, at the first write and at every rewrite: the task can change its own
+directory while it runs, and the worker writes as root. A link anywhere on
+the path makes that write fail (the allocation's status names the file),
+rather than land wherever the link points. Only a `mode`'s permission bits
+apply there: a setuid, setgid, or sticky bit is dropped.
+
+Naming a key in a job, here or anywhere else, needs `kv:read` on it
+([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
 
 ### Env precedence
 

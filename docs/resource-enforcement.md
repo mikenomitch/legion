@@ -85,11 +85,12 @@ Two rules follow, checked at submit on every governed runtime:
 memory or CPU limit. Scheduler defaults aren't folded in. The task still
 lands in the hierarchy, which keeps it off other tasks' reserved cores.
 
-`resources.cpus` is an older alias for `cpu`, so it is in MHz too, not a CPU
-count: `cpus = 0.5` reserves half a megahertz, and `cpus = 1` reserves one.
-Declare `cpu = 500` for a share of about half a 1 GHz core, and `cores` for
-whole exclusive CPUs. Submit warns about any `cpu` or `cpus` under 10, since
-that is almost always a CPU count in the wrong unit.
+`resources.cpu` is in MHz, not a CPU count: `cpu = 0.5` reserves half a
+megahertz, and `cpu = 1` reserves one. Declare `cpu = 500` for a share of
+about half a 1 GHz core, and `cores` for whole exclusive CPUs. Submit warns
+about any `cpu` under 10, since that is almost always a CPU count in the
+wrong unit. `resources.cpus` is refused at submit: it was an alias for `cpu`
+that read like a count.
 
 ## Burstable memory: `memoryMax`
 
@@ -145,6 +146,12 @@ of reservations fits in physical memory. A task within its reservation is
 then never stopped for node memory pressure. Only tasks above their
 reservation compete for what is left, and they are the ones the [memory
 pressure response](#memory-pressure) acts on.
+
+**Changing them on a running task.** `memory`, `memoryMax`, and `cpu` can
+be changed in place, without a restart or a new job version: `legion alloc
+resize` and `legion instance resize` rewrite `memory.low`, `memory.max`, and
+`cpu.weight` on the task's cgroup, and move a sandbox guest's ceiling with
+its balloon. See [Resize](resize.md).
 
 ## Oversubscription
 
@@ -230,6 +237,13 @@ The cgroup path is predictable: `legion/share/legion-<alloc>` or
 `legion/reserve/legion-<alloc>`. You can find a task's cgroup by allocation ID
 and see the share/reserve split in the hierarchy.
 
+A manager's [system worker](architecture-managers-workers.md#the-system-worker)
+builds the same tree under its own parent, `legion-system/`, and writes the
+manager's lend (`systemWorker.resources`) on that parent as `cpu.max` and
+`memory.max`. Its allocations burst within the lend by `cpu.weight`, but
+never past it together, and a standalone worker on the same host keeps its
+own `legion/` tree. The system worker also offers no exclusive `cores`.
+
 ### Exclusivity scope
 
 The fence covers every runtime that opts in, which today means `container`,
@@ -308,9 +322,8 @@ Things to know:
 - **The guest size follows `resources`.** A sandbox boots a guest of
   `memoryMax` MiB when set, else `memory` MiB (512 when undeclared, the
   runtime's own default, ahead of `taskResourceDefaults`), so what the
-  scheduler reserves and what the VM gets can no longer drift apart. An explicit
-  `config.memory_mib` still wins in this release, and submit warns when it
-  disagrees with `resources`. A later release rejects the mismatch. See
+  scheduler reserves and what the VM gets can no longer drift apart. There
+  is no `config.memory_mib`; submit refuses one. See
   [task-runtime-sandbox.md](task-runtime-sandbox.md#guest-size).
 - **`cpu` and `cores` apply to the VMM's threads**, so a guest with more
   `vcpus` than its `cores` reservation shares those cores among its vCPUs.
@@ -403,6 +416,16 @@ goes into the state store: it changes every 10 seconds and is worthless after
 a restart, so a manager restart or failover shows no usage until the next
 report arrives.
 
+**Per node, ask the manager the node reports to; per task, ask any manager.**
+The per-node reply (`legion node usage`, below) is the raw report, held by
+the manager that received it. For the per-task view, every manager rolls its
+reports up per (node, task) every 10 seconds and sends them to the manager
+that leads the status lane, on the liveness digest. That manager merges them
+and serves `GetScalingInputs` (and the usage table in `legion job info`),
+and any other manager forwards the request to it, so the per-task numbers are
+cluster-wide wherever you ask. See
+[Scaling inputs](autoscaling.md#scaling-inputs).
+
 ### `legion node usage`
 
 ```console
@@ -419,7 +442,12 @@ Node w-03 (ready)  usage sampled 4s ago
 ```
 
 - **Capacity** is the node's fingerprint minus its worker-type
-  `reservedResources`, the same number the scheduler packs against.
+  `reservedResources`, the same number the scheduler packs against. A
+  worker type cannot raise or replace the fingerprinted `memory`, `cpu`, or
+  `cores`: its `resources` block declares custom resources only, and the
+  manager refuses to start on a worker config whose `resources` names a
+  builtin (`cpu`, `memory`, `cores`, or `allocations`; cap allocations with
+  `maxAllocations`).
 - **Reserved** is the sum of every placed allocation's `resources` after
   defaults, plus what suspended instances keep held
   ([`suspend.reserve`](#suspended-instances)). Held rows
@@ -477,9 +505,12 @@ Known gaps:
 - **Only governed allocations are measured.** Tasks on `noop` and on
   third-party plugins that haven't adopted enforcement show a reservation and
   no usage, and node `used` doesn't count them.
-- **Usage lives on the manager that received the heartbeat.** With several
-  managers, ask the one the node reports to. Another manager answers with
-  `usage_reported: false`.
+- **Per-node usage lives on the manager that received the heartbeat.** With
+  several managers, `legion node usage <node>` must reach the one the node
+  reports to; another manager answers with `usage_reported: false`. Per-task
+  usage is cluster-wide on every manager through `GetScalingInputs` and
+  `legion job info`, at 10-second rollup resolution
+  ([Scaling inputs](autoscaling.md#scaling-inputs)).
 - **A `sandbox` task's memory is the VMM's.** Guest pages the VMM touched stay
   charged even after the guest frees them, because there is no balloon or free
   page reporting yet.
@@ -499,7 +530,7 @@ instead of stopped.
 A stopped task is rescheduled, and its stop reason says `node_pressure`,
 with the numbers. A task stopped for bursting above its reservation is
 treated like a failed allocation: its replacement waits the task's
-`on_unhealthy.move_delay` and counts toward `move_count` (see
+`onUnhealthy.moveDelay` and counts toward `moveCount` (see
 [task supervision](task-supervision.md)). A suspended one waits, holding no
 memory, until `legion instance start` resumes it (see
 [suspend and resume](suspend-and-resume.md#under-memory-pressure)).
@@ -519,7 +550,7 @@ that was enough before it takes another.
 | --- | --- | --- | --- |
 | `reclaim` | Writes the bytes above the reservation to the cgroup's `memory.reclaim`, or for a sandbox with a balloon, inflates the balloon by that much | Allocations above their reservation | Yes, nothing stops. A balloon deflates when the episode ends |
 | `suspend` | Checkpoints and stops the instance, keeping its state. The node acts first and the manager records it | Instances whose task sets `suspend.onPressure = true`, most idle first | Yes, `instance start` resumes it |
-| `evict-bursting` | Stops allocations above their reservation | Allocations above their reservation | Rescheduled after `on_unhealthy.move_delay`, counted toward `move_count`, `cause = node_pressure` |
+| `evict-bursting` | Stops allocations above their reservation | Allocations above their reservation | Rescheduled after `onUnhealthy.moveDelay`, counted toward `moveCount`, `cause = node_pressure` |
 | `evict-reserved` | Stops allocations within their reservation. Only when `oversubscribe.memory > 1` | Anyone below `critical` | Rescheduled at once, `cause = node_pressure` |
 
 Within a step, candidates go **lowest band first** (the preemption order,
@@ -667,7 +698,10 @@ allocation out of relaunch until the manager drops it from the desired set,
 and a heartbeat that fails is retried with the same report.
 
 Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
-`legion_worker_pressure_actions_total{step}` on the worker. See
+`legion_worker_pressure_actions_total{step}` on the worker, with
+`legion_node_memory_pressure_some_avg10{node}` (the stall the
+`maxStall` trigger reads) and `legion_node_memory_reserved_bytes{node}`
+(what the node's allocations reserve) beside the measured memory. See
 [metrics.md](metrics.md#node-usage).
 
 ### Limits of the response
@@ -680,7 +714,7 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
   started before this release) falls back to `memory.reclaim`, which frees
   little from guest RAM.
 - **The balloon is a request.** The guest driver gives back what it can, and
-  `freed_bytes` reports the balloon's growth, not a measurement.
+  `freedBytes` reports the balloon's growth, not a measurement.
 - **`suspend` needs the instance's node to take a checkpoint**: the worker's
   content store for a memory checkpoint, or a retained volume for a disk one.
   A suspend that cannot capture leaves the task running and the next step
@@ -693,9 +727,9 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
   of pressure, so an evicted allocation may be placed back on the node that
   evicted it if it is the best fit by reservations.
 - **A task that always outgrows its reservation keeps coming back.** Each
-  `evict-bursting` stop is a move, so the replacement waits `move_delay`
-  first, but `move_count` is unlimited by default. Set
-  `on_unhealthy.move_count` to fail the job instead, or raise
+  `evict-bursting` stop is a move, so the replacement waits `moveDelay`
+  first, but `moveCount` is unlimited by default. Set
+  `onUnhealthy.moveCount` to fail the job instead, or raise
   `resources.memory` toward real usage.
 - **Only governed allocations are candidates.** Tasks on `noop` and on
   plugins that haven't opted in are never measured, never reclaimed, and
@@ -707,13 +741,14 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
 | --- | --- | --- |
 | Startup warning "no cgroup v2 unified hierarchy; tasks run unconfined" | The node runs cgroup v1, or the unified hierarchy isn't mounted | Boot with `systemd.unified_cgroup_hierarchy=1` (or your distro's equivalent), or leave enforcement off on that node |
 | Startup warning "could not fingerprint any usable CPUs" | The worker's `cpuset.cpus.effective` is unreadable or empty | Check the worker's own cgroup placement. Enforcement stays off until the file is readable |
-| Allocation fails: "cannot reserve N exclusive core(s) … this node has M free" | The scheduler's count said yes, but whole cores aren't actually free (fingerprint drift, offlined CPUs) | The message lists the free, reserved, and usable sets. The allocation goes through the normal `on_unhealthy` move handling instead of getting stuck |
+| Allocation fails: "cannot reserve N exclusive core(s) … this node has M free" | The scheduler's count said yes, but whole cores aren't actually free (fingerprint drift, offlined CPUs) | The message lists the free, reserved, and usable sets. The allocation goes through the normal `onUnhealthy` move handling instead of getting stuck |
 | Allocation fails: "reserving N core(s) … would leave the share slice empty" | The reservation would take every usable CPU | Leave at least one core unreserved, or lower the reservation |
 | Submit fails: "resources.cores … must be a whole number" | Fractional `cores` on a governed runtime | Round it, or declare `cpu` in MHz (for example `cpu = 500`) for a proportional share |
-| Submit warns: "sets resources.cpus = 1, which is 1 MHz, not 1 CPU(s)" | `cpu` and its alias `cpus` are in MHz, and the value reads like a CPU count | Declare `cpu` in MHz (`cpu = 1000`), or `cores` for whole CPUs |
+| Submit warns: "sets resources.cpu = 1, which is 1 MHz, not 1 CPU(s)" | `cpu` is in MHz, and the value reads like a CPU count | Declare `cpu` in MHz (`cpu = 1000`), or `cores` for whole CPUs |
+| Submit fails: "task resources set `cpus`, which is not a resource" | `cpus` was an alias for `cpu` and has been removed | Declare `cpu` in MHz, or `cores` for whole CPUs |
 | Submit fails: "declares both resources.cores and resources.cpu" | Two CPU contracts on one task | Pick one |
 | Submit fails: "resources.cores together with config.cgroup" | Legion can't fence an `exec` task that names its own cgroup | Drop `cores`, or drop `cgroup` and let the worker place the task |
-| `legion node usage` says "no usage reported" | Enforcement is off on that worker, the worker predates usage reporting, no report has reached this manager since it started, or the node reports to another manager | Turn on `resourceEnforcement.enabled`, upgrade the worker, wait 10 seconds, or ask the manager the node reports to |
+| `legion node usage` says "no usage reported" | Enforcement is off on that worker, the worker predates usage reporting, no report has reached this manager since it started, or the node reports to another manager | Turn on `resourceEnforcement.enabled`, upgrade the worker, wait 10 seconds, or ask the manager the node reports to. `legion job info` shows the job's per-task usage from any manager |
 | `usage sampled` age keeps growing past 10s | The node stopped heartbeating, or stopped sending reports | Check `legion node list`. Reports older than 2 minutes are dropped and the node's gauges fall to zero |
 | A sandbox is OOM-killed with plenty of guest memory free | The VMM needs more than `sandbox.vmmOverheadMiB` | Raise `sandbox.vmmOverheadMiB` on that worker type |
 | Allocation fails: "failed to place task … within this node's resource limits: cgroup … does not delegate the … controller(s)" | A cgroup in Legion's hierarchy (`cgroupParent`, `share`, or `reserve`) could not put `cpuset`, `cpu`, and `memory` in its `cgroup.subtree_control`, usually because its parent doesn't offer them (`cgroup.controllers`) | The message prints both files. Delegate the missing controller from the parent cgroup down. Processes found sitting in `share` or `reserve` themselves are moved into a `stray` child first, since the kernel won't delegate from a cgroup that holds processes |
@@ -740,7 +775,9 @@ See [docs/task-runtime-exec.md](task-runtime-exec.md).
 ## Not implemented
 
 - **Usage-aware placement.** The scheduler packs on reservations times the
-  ratio, never on measured usage.
+  ratio, never on measured usage. Per-task usage is collected cluster-wide
+  ([Scaling inputs](autoscaling.md#scaling-inputs)), but nothing places or
+  scales on it yet.
 - **macOS.** Apple `container` has no CPU weight or pinning equivalent.
   `memory` and `cores` size the guest VM, and `cpu` (MHz) is used only for
   scheduling.
