@@ -83,7 +83,7 @@ pub async fn start(
             .map_err(|err| warn!(error = %format!("{err:#}"), "Isolate images unreadable; image tasks cannot run here"))
             .ok()
     });
-    let (state_dir, store, stager, registry, gate, alloc_root) = {
+    let (state_dir, store, stager, registry, gate, alloc_root, logs_root) = {
         let manager = task_manager.lock().ok()?;
         let state_dir = manager
             .state_store()
@@ -98,6 +98,7 @@ pub async fn start(
             manager.run_registry(),
             manager.runtime_gate(),
             manager.alloc_root().to_path_buf(),
+            manager.state_store().logs_base_dir(),
         )
     };
     let fallback_dir = state_dir.join("cwasm");
@@ -154,6 +155,7 @@ pub async fn start(
     });
     supervisor.attach(task_manager);
     supervisor.set_alloc_root(alloc_root);
+    supervisor.set_log_root(logs_root);
     if let Ok(mut manager) = task_manager.lock() {
         manager.set_isolates(Some(supervisor.clone()));
     }

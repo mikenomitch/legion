@@ -162,7 +162,10 @@ async fn a_session_hibernates_on_park_and_wakes_with_its_state_test() {
     call(&h, "s", "acme", "sess-1", &["park"]).await;
     // Hibernation happens after the call returns.
     for _ in 0..50 {
-        if h.worker.checkpoints.lock().unwrap().contains_key("sess-1") {
+        // Done when the checkpoint is saved and the host has let go.
+        if h.worker.checkpoints.lock().unwrap().contains_key("sess-1")
+            && h.host.get_session("sess-1").is_err()
+        {
             break;
         }
         sleep_ms(10).await;

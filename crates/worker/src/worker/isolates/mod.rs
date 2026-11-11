@@ -4,6 +4,7 @@
 
 pub mod binary;
 pub mod egress;
+pub mod guest_logs;
 pub mod host;
 pub mod ingress;
 pub mod modules;

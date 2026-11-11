@@ -225,6 +225,8 @@ pub struct IsolateSupervisor {
     alloc_root: Mutex<Option<PathBuf>>,
     /// Ingress sockets served per task (dropped to stop serving).
     ingress: Mutex<HashMap<TaskKey, Vec<super::ingress::IngressServer>>>,
+    /// Where guest output goes: the envelope allocations' task logs.
+    guest_logs: RwLock<Option<super::guest_logs::GuestLogs>>,
 }
 
 impl std::fmt::Debug for IsolateSupervisor {
@@ -286,6 +288,7 @@ impl IsolateSupervisor {
             runtime: Mutex::new(tokio::runtime::Handle::try_current().ok()),
             alloc_root: Mutex::new(None),
             ingress: Mutex::new(HashMap::new()),
+            guest_logs: RwLock::new(None),
         })
     }
 
@@ -303,6 +306,20 @@ impl IsolateSupervisor {
 
     /// Where the node keeps allocation directories: ingress sockets go in
     /// the envelope's.
+    /// Guest output (`IsolateWorker.Log`) is appended to the envelope
+    /// allocation's task log under `logs_root` (the worker's
+    /// `<state dir>/logs`).
+    pub fn set_log_root(&self, logs_root: PathBuf) {
+        if let Ok(mut slot) = self.guest_logs.write() {
+            *slot = Some(super::guest_logs::GuestLogs::new(logs_root));
+        }
+    }
+
+    /// Where guest output is written, when it is.
+    pub fn guest_logs(&self) -> Option<super::guest_logs::GuestLogs> {
+        self.guest_logs.read().ok().and_then(|slot| slot.clone())
+    }
+
     pub fn set_alloc_root(&self, alloc_root: PathBuf) {
         *lock(&self.alloc_root) = Some(alloc_root);
     }

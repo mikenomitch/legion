@@ -859,8 +859,8 @@ async fn a_session_isolate_is_reached_by_the_tag_in_its_id_test() -> R<()> {
     assert!(
         err.message().starts_with(
             "isolate sessions cannot be promoted (a keyed instance is an allocation each); \
-             give the session a stable id with an idempotency key and use \
-             suspend.durability = \"store\" to keep it across nodes"
+             give the session a stable id with an idempotency key, and keep what must outlive \
+             the node in legion:isolate/state or an upstream store"
         ),
         "{err:?}"
     );

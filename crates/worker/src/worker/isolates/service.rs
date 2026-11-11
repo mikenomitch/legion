@@ -171,20 +171,39 @@ impl IsolateWorker for WorkerService {
         request: Request<Streaming<LogBatch>>,
     ) -> Result<Response<LogReply>, Status> {
         // ACL: node-local, as `egress`.
+        // Guest output goes to the envelope allocation's task log, each line
+        // prefixed with its isolate (and tenant); see `guest_logs`.
         let mut stream = request.into_inner();
         while let Some(batch) = stream.message().await? {
-            let (_, task) = match self.task(batch.origin.as_ref()) {
+            let (supervisor, task) = match self.task(batch.origin.as_ref()) {
                 Ok(found) => found,
                 Err(_) => continue,
             };
-            for line in batch.lines {
-                debug!(
+            let Some(logs) = supervisor.guest_logs() else {
+                for line in batch.lines {
+                    debug!(
+                        job_id = %task.job_id,
+                        task = %task.task_name,
+                        isolate_id = %task.isolate_id,
+                        stream = if line.stderr { "stderr" } else { "stdout" },
+                        "{}",
+                        String::from_utf8_lossy(&line.line).trim_end()
+                    );
+                }
+                continue;
+            };
+            let prefix = super::guest_logs::line_prefix(&task.isolate_id, &task.tenant);
+            let envelope = task.envelope_allocation_id;
+            let written =
+                tokio::task::spawn_blocking(move || logs.append(envelope, &prefix, &batch.lines))
+                    .await;
+            if let Ok(Err(err)) = written {
+                warn!(
                     job_id = %task.job_id,
                     task = %task.task_name,
-                    isolate_id = %task.isolate_id,
-                    stream = if line.stderr { "stderr" } else { "stdout" },
-                    "{}",
-                    String::from_utf8_lossy(&line.line).trim_end()
+                    allocation_id = envelope,
+                    error = %format!("{err:#}"),
+                    "Could not append isolate output to the task log"
                 );
             }
         }

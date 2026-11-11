@@ -264,8 +264,9 @@
     #     # Idle time before a resident isolate's private pages are paged
     #     # out. Default "2s"; "0s" never pages out.
     #     pageOutAfter = "2s",
-    #     # What separates cordons: "process" (default, a confined host
-    #     # process each) or "vm" (a microVM each).
+    #     # What separates cordons: "process" (the default and the only
+    #     # value available: a confined host process each). "vm" (a microVM
+    #     # per cordon) is not built yet and is refused at startup.
     #     cordonBoundary = "process",
     #     # How memory slots are laid out: "guard-pages" (default), "mpk"
     #     # (x86-64 Linux with PKU; denser), or "small" (densest, slower).

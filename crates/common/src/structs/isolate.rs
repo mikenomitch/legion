@@ -763,8 +763,8 @@ pub fn validate_tenant_key(key: &str) -> Result<(), String> {
 pub fn promote_refusal(task: &TaskConfig) -> Option<String> {
     is_isolate_task(task).then(|| {
         "isolate sessions cannot be promoted (a keyed instance is an allocation each); give the \
-         session a stable id with an idempotency key and use suspend.durability = \"store\" to \
-         keep it across nodes"
+         session a stable id with an idempotency key, and keep what must outlive the node in \
+         legion:isolate/state or an upstream store"
             .to_string()
     })
 }
@@ -866,8 +866,8 @@ fn validate_isolate_task(config: &JobConfig, task: &TaskConfig) -> Result<(), St
     {
         return Err(format!(
             "{prefix}: stateful.promote does not apply: isolate sessions are never promoted to \
-             keyed instances\nHint: remove promote; a durable, named isolate takes a stable id \
-             from an idempotency key and suspend.durability = \"store\""
+             keyed instances\nHint: remove promote; a named isolate takes a stable id from an \
+             idempotency key"
         ));
     }
 
@@ -895,6 +895,21 @@ fn validate_isolate_task(config: &JobConfig, task: &TaskConfig) -> Result<(), St
                  to its own checkpoint format at a turn boundary, and wakes on its next \
                  request\nHint: remove suspend.{field}; idle.after, keepFor, durability, and \
                  onWorkerStop apply"
+            ));
+        }
+        // Not built yet: the node keeps an isolate's checkpoint in its own
+        // content store and never publishes it (the node refuses it too, as
+        // a backstop for a job stored before this check).
+        if suspend
+            .durability
+            .as_deref()
+            .is_some_and(|durability| durability.trim().eq_ignore_ascii_case("store"))
+        {
+            return Err(format!(
+                "{prefix}: suspend.durability = \"store\" is not available for isolates yet: a \
+                 session isolate's checkpoint stays on the node that took it, so it wakes only \
+                 there and is lost with the node\nHint: remove suspend.durability (the default \
+                 is \"local\"), and keep what must outlive the node in an upstream store"
             ));
         }
     }
@@ -1049,7 +1064,10 @@ pub enum CordonBoundary {
     /// A confined host process per cordon.
     #[default]
     Process,
-    /// A microVM per cordon, the host process inside it.
+    /// A microVM per cordon, the host process inside it. Not available:
+    /// [`WorkerIsolateConfigFull::validate`] refuses it, so a worker config
+    /// that asks for it stops the manager instead of being run as
+    /// `process`.
     Vm,
 }
 
@@ -1135,8 +1153,9 @@ pub struct WorkerIsolateConfig {
     /// out. Default `2s`; `0s` never pages out.
     #[serde(default)]
     pub page_out_after: Option<String>,
-    /// What separates cordons: `process` (the default, a confined host
-    /// process each) or `vm` (a microVM each).
+    /// What separates cordons: `process` (the default and the only value
+    /// available: a confined host process each). `vm` (a microVM each) is
+    /// refused at validation; it is not built.
     #[serde(default)]
     pub cordon_boundary: Option<CordonBoundary>,
     /// How slots are laid out: `guard-pages` (the default), `mpk`, or
@@ -1242,6 +1261,13 @@ impl WorkerIsolateConfigFull {
                 }
             }
         }
+        if self.cordon_boundary == CordonBoundary::Vm {
+            bail!(
+                "isolate.cordonBoundary = \"vm\" is not available: cordon hosts run as \
+                 confined processes on this release\nHint: remove isolate.cordonBoundary, or \
+                 set it to \"process\""
+            );
+        }
         let max_memory = self.max_memory_bytes()?;
         if !(1 << 20..=MAX_MEMORY_MAX_MIB << 20).contains(&max_memory) {
             bail!(
@@ -1252,7 +1278,9 @@ impl WorkerIsolateConfigFull {
         let max_slots = self.layout.max_slots();
         if self.slots_per_host == 0 || self.slots_per_host > max_slots {
             bail!(
-                "isolate.slotsPerHost must be between 1 and {max_slots} with layout {:?}, got {}:                  each slot reserves address space, and a cordon that needs more slots runs                  another host process",
+                "isolate.slotsPerHost must be between 1 and {max_slots} with layout {:?}, got {}: \
+                 each slot reserves address space, and a cordon that needs more slots runs \
+                 another host process",
                 serde_json::to_value(self.layout)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_string))
@@ -1267,7 +1295,8 @@ impl WorkerIsolateConfigFull {
         }
         if slice < epoch {
             bail!(
-                "isolate.slice {:?} is shorter than isolate.epoch {:?}; a turn is only noticed                  at an epoch tick",
+                "isolate.slice {:?} is shorter than isolate.epoch {:?}; a turn is only noticed \
+                 at an epoch tick",
                 self.slice,
                 self.epoch
             );
@@ -1645,9 +1674,24 @@ mod isolate_test {
         let task = with(
             isolate_task(config.clone()),
             &["suspend"],
-            json!({ "idle": { "after": "1m" }, "keepFor": "2h", "durability": "store" }),
+            json!({ "idle": { "after": "1m" }, "keepFor": "2h", "durability": "local" }),
         );
         check(vec![task, machine()]).unwrap();
+        // `store` is refused at submit, so `job validate` says so.
+        let task = with(
+            isolate_task(config.clone()),
+            &["suspend"],
+            json!({ "idle": { "after": "1m" }, "durability": "store" }),
+        );
+        let err = check(vec![task, machine()]).unwrap_err();
+        assert!(
+            err.starts_with(
+                "[isolate] code-runner/run: suspend.durability = \"store\" is not available for \
+                 isolates yet"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("Hint: remove suspend.durability"), "{err}");
         for (field, value) in [
             ("checkpoint", json!("memory")),
             ("checkpointEvery", json!("5m")),
@@ -1859,7 +1903,7 @@ mod isolate_test {
             "shards": 4,
             "layout": "mpk",
             "confine": "best-effort",
-            "cordonBoundary": "vm",
+            "cordonBoundary": "process",
             "pageOutAfter": "0s",
         }))
         .unwrap();
@@ -1940,6 +1984,12 @@ mod isolate_test {
             (
                 json!({ "maxBodyBytes": "0" }),
                 "maxBodyBytes must be greater",
+            ),
+            // Parsed (the enum keeps the value) but not built: refused,
+            // never run as `process`.
+            (
+                json!({ "cordonBoundary": "vm" }),
+                "isolate.cordonBoundary = \"vm\" is not available",
             ),
         ] {
             let err = resolved(block.clone());
