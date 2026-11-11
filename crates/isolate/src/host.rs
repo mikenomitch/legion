@@ -265,6 +265,15 @@ impl Running {
 // The host
 // ---------------------------------------------------------------------------
 
+/// The jobspec's word for a lifetime (`config.lifetime`).
+fn lifetime_word(l: Lifetime) -> &'static str {
+    match l {
+        Lifetime::Request => "request",
+        Lifetime::Tenant => "tenant",
+        Lifetime::Session => "session",
+    }
+}
+
 /// What a [`Host`] is built from.
 pub struct HostSetup {
     pub config: HostConfig,
@@ -533,9 +542,9 @@ impl Host {
         let life = Lifetime::try_from(spec.lifetime).unwrap_or(Lifetime::Request);
         if life != Lifetime::Request && !module.exports.runner && !module.exports.http_handler {
             return Err(Status::failed_precondition(format!(
-                "lifetime {:?} needs a component that exports legion:isolate/runner or \
+                "lifetime \"{}\" needs a component that exports legion:isolate/runner or \
                  wasi:http/incoming-handler; wasi:cli/run is single-shot",
-                life.as_str_name()
+                lifetime_word(life)
             )));
         }
         let key = (spec.job_id.clone(), spec.task_name.clone());
@@ -653,11 +662,11 @@ impl Host {
                 }
                 if !module.exports.runner && life != Lifetime::Request {
                     return Err(Status::failed_precondition(format!(
-                        "task {} has lifetime {} but its component exports only \
+                        "task {} has lifetime \"{}\" but its component exports only \
                          wasi:cli/run, which is single-shot: use lifetime \"request\" or \
                          export legion:isolate/runner",
                         task.name(),
-                        life.as_str_name().to_lowercase()
+                        lifetime_word(life)
                     )));
                 }
             }

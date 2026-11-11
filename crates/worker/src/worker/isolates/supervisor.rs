@@ -130,10 +130,22 @@ pub struct Replica {
     restarts: AtomicU32,
     problem: Mutex<String>,
     retired: AtomicBool,
+    /// A restarted host is live but its tasks are not reloaded yet: calls
+    /// wait (answer UNAVAILABLE, retry) instead of reaching a host that
+    /// does not know their task.
+    reloading: AtomicBool,
     last_stats: Mutex<Option<StatsReply>>,
 }
 
 impl Replica {
+    /// The connection calls may use: live, and done reloading.
+    fn serving(&self) -> Option<Arc<HostConn>> {
+        if self.reloading.load(Ordering::Acquire) {
+            return None;
+        }
+        self.conn()
+    }
+
     fn conn(&self) -> Option<Arc<HostConn>> {
         self.conn
             .lock()
@@ -728,6 +740,7 @@ impl IsolateSupervisor {
                 restarts: AtomicU32::new(0),
                 problem: Mutex::new(String::new()),
                 retired: AtomicBool::new(false),
+                reloading: AtomicBool::new(false),
                 last_stats: Mutex::new(None),
             });
             lock(&self.state)
@@ -955,6 +968,7 @@ impl IsolateSupervisor {
                 if replica.conn().is_some() {
                     return;
                 }
+                replica.reloading.store(true, Ordering::Release);
                 match me.start_replica(&replica).await {
                     Ok(()) => {
                         let tasks: Vec<TaskKey> = lock(&me.state)
@@ -971,6 +985,7 @@ impl IsolateSupervisor {
                                 warn!(job_id = %key.0, task = %key.1, %problem, "Could not reload an isolate task into its restarted host");
                             }
                         }
+                        replica.reloading.store(false, Ordering::Release);
                         return;
                     }
                     Err(err) => {
@@ -1340,7 +1355,7 @@ impl IsolateSupervisor {
                 .get(index as usize)
                 .cloned()
                 .unwrap_or_else(|| replicas[0].clone());
-            let conn = replica.conn().ok_or_else(|| unavailable(&replica))?;
+            let conn = replica.serving().ok_or_else(|| unavailable(&replica))?;
             return Ok((replica, conn));
         }
         if !tenant.is_empty() {
@@ -1348,13 +1363,13 @@ impl IsolateSupervisor {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             tenant.hash(&mut hasher);
             let replica = replicas[(hasher.finish() % replicas.len() as u64) as usize].clone();
-            let conn = replica.conn().ok_or_else(|| unavailable(&replica))?;
+            let conn = replica.serving().ok_or_else(|| unavailable(&replica))?;
             return Ok((replica, conn));
         }
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed);
         for offset in 0..replicas.len() {
             let replica = &replicas[(start + offset) % replicas.len()];
-            if let Some(conn) = replica.conn() {
+            if let Some(conn) = replica.serving() {
                 return Ok((replica.clone(), conn));
             }
         }

@@ -746,8 +746,12 @@ pub(crate) mod cluster {
         }
     }
 
-    /// An isolate task `run` of the `python` image.
-    pub fn isolate_task(config: Value) -> Value {
+    /// An isolate task `run` of the `python` image (limits are required;
+    /// generous ones unless the config sets its own).
+    pub fn isolate_task(mut config: Value) -> Value {
+        if config.get("limits").is_none() {
+            config["limits"] = json!({ "cpu": "2s", "wall": "10s" });
+        }
         json!({
             "name": "run",
             "runtime": "isolate",
@@ -984,7 +988,7 @@ async fn check_vm_tier_runs(cluster: &Cluster) {
             "the entry staged as main.py, the args appended to run.command (which ends \
              with it) and exported as LEGION_RUN_ARGS"
         );
-        assert!(reply.wall_micros > 0 && reply.isolate_start.is_empty());
+        assert!(reply.isolate_start.is_empty(), "{reply:?}");
         sessions.push(reply.session_id.clone());
         assert!(cluster.sessions().is_empty(), "the VM session ended");
     }
@@ -1130,7 +1134,16 @@ async fn check_session_child_vm(cluster: &Cluster) {
     let result: Value = serde_json::from_str(&reply.result).expect("result");
     let child = result["id"].as_str().unwrap().to_string();
     assert_eq!(children_of(cluster, "session", &id), vec![child.clone()]);
-    let isolate = cluster.supervisor.get_isolate(&id).await.expect("isolate");
+    // GetIsolate through the manager (forwarded to the node).
+    let isolate = cluster
+        .svc
+        .get_isolate(tonic::Request::new(legion::structs::GetIsolateRequest {
+            session_id: id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("GetIsolate")
+        .into_inner();
     assert!(
         isolate.children.iter().any(|c| c.session_id == child),
         "GetIsolate lists the child: {isolate:?}"

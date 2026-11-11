@@ -469,7 +469,10 @@ mod isolate_cmd_test {
 
     #[test]
     fn isolate_stats_table_has_a_row_per_node_and_task_test() {
-        let rows = stats_rows(&reply(vec![task("run", "default", 5), task("web", "x", 1)]));
+        let rows = stats_rows(&reply(vec![
+            task("run", "ns:default", 5),
+            task("web", "x", 1),
+        ]));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].stopped, 3);
         assert_eq!(rows[0].host_rss, "4MiB");

@@ -130,10 +130,19 @@ fn command(cfg: &HostConfig, extra: &[&str]) -> (Command, StdUnix, StdUnix, Chil
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     // SAFETY: dup2 into the child's fd 3..5 (clearing CLOEXEC) between fork
-    // and exec; only async-signal-safe calls.
+    // and exec; only async-signal-safe calls. Each source is first moved
+    // above 200, so a source numbered 3..5 is not overwritten before it is
+    // placed.
     unsafe {
         cmd.pre_exec(move || {
+            let mut high = [0i32; 3];
             for (i, fd) in raw.iter().enumerate() {
+                high[i] = libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 200);
+                if high[i] < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for (i, fd) in high.iter().enumerate() {
                 if libc::dup2(*fd, 3 + i as i32) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -830,13 +839,19 @@ fn landlock_scopes_alone_stop_signals_to_outside_processes_test() {
 #[cfg(feature = "confinement-test")]
 fn attempt_with_stray_fd(what: &str) -> String {
     let (stray, _keep) = StdUnix::pair().unwrap();
-    let raw = stray.as_raw_fd();
+    // Numbered above anything `command` places, so its placing cannot
+    // overwrite it.
+    // SAFETY: duplicating a descriptor we own; closed when `_high` drops.
+    let high = unsafe { libc::fcntl(stray.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 300) };
+    assert!(high >= 300);
+    // SAFETY: we own `high`.
+    let _high = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(high) };
     let cfg = bin_config(Confine::BestEffort);
     let (mut cmd, _c, _w, _ends) = command(&cfg, &["--test-attempt", what]);
     // SAFETY: dup2 between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(raw, 100) < 0 {
+            if libc::dup2(high, 100) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
