@@ -11953,7 +11953,7 @@ impl Store {
         // Size overrides follow the same rule (docs/resize.md): a submit
         // that changes a task's `resources` drops its override.
         for (group, task) in
-            self.arbitrate_task_resizes_tx(&tx, &job.id, &job_config_id, &config.tasks)?
+            self.arbitrate_task_resizes_tx(tx, &job.id, &job_config_id, &config.tasks)?
         {
             scale_reset_events.push(drafts::resize_reset(
                 &job.id,

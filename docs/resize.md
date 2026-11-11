@@ -2,8 +2,10 @@
 
 Resize changes the `memory`, `memoryMax`, or `cpu` of a unit that is already
 running, in place: no new job version, no rollout, and no restart. It works
-on a top-level allocation, a keyed or slot instance, a session, and a child
-session.
+on a top-level allocation, a keyed or slot instance, a session, a child
+session, and, with `legion job resize`, on every allocation of a task at
+once. A unit that cannot grow where it is can be resized by moving it
+(`--move`).
 
 ```console
 $ legion instance resize user-42 --memory 2GiB --memory-max 4GiB -j
@@ -15,6 +17,15 @@ $ legion instance resize user-42 --memory 2GiB --memory-max 4GiB -j
 
 $ legion alloc resize 88213 --cpu 2000 --reason "batch week"
 alloc 88213: cpu 1000 -> 2000 (override active; spec cpu 1000)
+
+$ legion job resize web --memory 1GiB
+shop/web: memory 512MiB -> 1GiB (override active; spec memory 512)
+  allocations: 3 resized in place, 0 kept their size, 0 replaced
+```
+
+```console
+$ legion instance resize ws-7 --memory 16GiB --move
+instance ws-7: memory 4GiB -> 16GiB (override active; spec memory 4096) [moved to w-22]
 ```
 
 A resize is an **override over the spec**, the same idea as `legion job
@@ -40,11 +51,13 @@ Without resize a unit's size is fixed when it starts:
 | --- | --- | --- |
 | Use up to the ceiling | Nothing. The unit uses memory between `memory` and `memoryMax`. | None |
 | Resize in place | The unit's reservation, ceiling, or CPU. | None for a session; one replicated write for a top-level allocation |
-| Replace | A new allocation at the new size (a deploy, or a restart). | A restart |
+| Move | The unit is suspended and resumed at the new size on a node with room (`--move`). | One suspend and resume |
+| Replace | A new allocation at the new size (`legion job resize --replace`, a deploy, or a restart). | A restart |
 
-Resize is the second step. It never performs the third on its own: a
+Resize is the second step. It never performs the others on its own: a
 runtime that cannot make a change while the unit runs answers
-`needs_restart`, and nothing is restarted.
+`needs_restart`, a grow that does not fit answers `refused`, and nothing is
+moved or restarted unless the caller passed `--move` or `--replace`.
 
 ## What a resize does
 
@@ -112,6 +125,113 @@ $ legion instance resize machine-q4n7c2rd.01jbz... --memory 4GiB --local
 Only the caller's own children are reachable, and only a child on the
 owner's node. A child on another node is resized through a manager.
 
+## Resizing a task
+
+`legion job resize` sets a **task-level override**: one record on the task,
+beside the count override `legion job scale` keeps, laid over the task's
+`resources`.
+
+```console
+$ legion job resize web --task api --memory 1GiB --cpu 2000 -j
+{"ok":true,"data":{"job":"web","group":"default","task":"api",
+ "from":{"memory":512,"cpu":1000},"to":{"memory":1024,"cpu":2000},
+ "spec":{"memory":512,"cpu":1000},"overrideActive":true,
+ "applied":2,"pending":1,"replaced":0,
+ "allocations":[
+  {"allocation":88213,"node":"w-03","outcome":"applied","from":{"memory":512,"cpu":1000},"to":{"memory":1024,"cpu":2000}},
+  {"allocation":88214,"node":"w-04","outcome":"applied","from":{"memory":512,"cpu":1000},"to":{"memory":1024,"cpu":2000}},
+  {"allocation":88215,"node":"w-09","outcome":"refused","from":{"memory":512,"cpu":1000},"to":{"memory":1024,"cpu":2000},
+   "message":"node w-09 has 256MiB free; the grow needs 512MiB more","free":{"memory":256,"cpu":4000}}],
+ "hint":"1 allocation(s) kept their old size and take the new one when they are next replaced; pass --replace to stop them now so the scheduler places their replacements at it",
+ "deduplicated":false}}
+```
+
+While the override stands:
+
+- **Every running allocation of the task is brought to it in place**, one
+  at a time, exactly as `legion alloc resize` would, and the reply carries
+  one answer per allocation.
+- **An allocation that cannot change in place keeps its old size** (no room
+  on its node, a runtime that answers `needs_restart` or `not_supported`, a
+  node that could not be reached) and takes the new size when it is next
+  replaced. `pending` counts these. Nothing is restarted.
+- **`--replace` stops those allocations now**, so the scheduler places
+  their replacements at the new size. They are stopped together, in one
+  write, with the stop cause `reschedule`; use it when the task can take
+  that many replicas restarting at once.
+- **Every new allocation of the task starts at the overridden size**: a
+  scale-out, a reschedule after a node is lost, a restart that places a new
+  allocation, and a rollout of a new version whose `resources` are
+  unchanged. The scheduler packs the overridden size, and the allocation's
+  row records the override.
+- **`--reset` removes the override** and brings the running allocations
+  back to the spec's size, in place where they can be.
+
+No job version is created and no rollout starts. `legion job scale <JOB>
+--status -j` (`GetJobScaleStatus`) reports the task's override in
+`resourcesOverride`, with its reason, who set it, and when.
+
+**The spec wins when it changes.** A submit that changes the task's
+`memory`, `memoryMax`, or `cpu` drops the override and emits `resize.reset`;
+a submit that leaves them alone keeps it. This is the rule count overrides
+follow ([Autoscaling](autoscaling.md)). A task the new version no longer
+has loses its override too.
+
+Session tasks are refused: a session task's room is its envelope
+(`stateful.envelope`), and each session is resized on its own.
+
+## When it does not fit: move
+
+A grow that finds no room on the unit's node is `refused`, and a sandbox
+asked to grow past the memory it booted with answers `needs_restart`. For
+a unit that can move, `--move` resizes it by moving it:
+
+```console
+$ legion instance resize ws-7 --memory 16GiB --move -j
+{"ok":true,"data":{"instance":"ws-7","allocation":88301,"node":"w-22",
+ "from":{"memory":4096,"cpu":2000},"to":{"memory":16384,"cpu":2000},
+ "spec":{"memory":4096,"cpu":2000},"outcome":"applied","movedTo":"w-22",
+ "deduplicated":false}}
+```
+
+1. The unit's new size is recorded with it.
+2. It is suspended, through the path `legion instance suspend` uses.
+3. It is resumed, through the path `legion instance start` uses, and placed
+   at the new size on a node with room.
+
+**A sandbox's guest size changes only at boot.** A memory checkpoint
+restores only into a guest of the size it was taken at
+([Sandbox Runtime](task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored)),
+and a guest's size is its `memoryMax` (or its `memory` when it has none). So:
+
+- A keyed sandbox moved to a **different guest size** is suspended to a
+  **disk** checkpoint and boots fresh at the new size: its disk is kept and
+  its memory is not. The reply's `message` and a `--dry-run` both say so.
+  This is the restart `needs_restart` asks for, done for you and placed
+  where it fits.
+- A keyed sandbox moved with its guest size unchanged (a larger
+  reservation under the same `memoryMax`, or more `cpu`) keeps its memory.
+- A sandbox **session** is refused a move that would change its guest size
+  (`FAILED_PRECONDITION`): a session resumes only from its memory
+  checkpoint. It can move for a larger reservation or more `cpu`.
+
+| Unit | Can move when | Where it resumes |
+| --- | --- | --- |
+| Keyed instance | its task has a `suspend` block | wherever the scheduler places its resume; a checkpoint that lives only on its node (`suspend.durability = "local"`) keeps it on that node, so the move helps a `needs_restart` but not a full node |
+| Session | its task sets `suspend.durability = "store"`, and for a sandbox the guest size does not change | another node whose envelope for the task has room, from its manifest in the content store |
+| Anything else | never | refused with `FAILED_PRECONDITION`, naming what is missing |
+
+A move interrupts the unit for one suspend and resume, so it needs
+`job:write` as well as `scale:write`.
+
+**A move that finds no room puts the unit back.** A session that no other
+node takes is resumed on the node it came from at the size it had. A keyed
+instance that is not placed at the new size within 60 seconds has its size
+record restored and is placed at the size it had. Either way the outcome is
+`refused` and retryable. `--dry-run` says whether the unit can move and
+what its size would become; whether a node has the room is only known when
+it resumes.
+
 ## What each runtime can change
 
 | Runtime | `memory` (reservation) | `memoryMax` (ceiling) | `cpu` |
@@ -177,7 +297,7 @@ error envelope. A refused grow says what the node has:
 $ legion alloc resize 88213 --memory 64GiB -j
 {"ok":false,"error":{"code":"resource_exhausted",
  "message":"node w-03 has 11GiB free; the grow needs 63GiB more",
- "hint":"resize to at most 12GiB here, or move the allocation",
+ "hint":"resize to at most 12GiB here, or `legion job resize --replace` to place the task's allocations at the new size elsewhere",
  "retryable":true,
  "details":{"outcome":"refused","alloc":"88213","node":"w-03",
   "from":{"memory":1024,"cpu":1000},"to":{"memory":65536,"cpu":1000},
@@ -193,7 +313,7 @@ Requests that cannot be acted on at all are gRPC errors:
 | --- | --- |
 | `INVALID_ARGUMENT` | No amount given, a non-positive amount, or a `memoryMax` below `memory` |
 | `NOT_FOUND` | No such allocation, instance, or session |
-| `FAILED_PRECONDITION` | The allocation is a session envelope, the instance is suspended or stopped, or the row changed under the call (`stale`) |
+| `FAILED_PRECONDITION` | The allocation is a session envelope, the instance is suspended or stopped, the row changed under the call (`stale`), `--move` on a unit that cannot move, or `job resize` on a session task |
 | `UNAVAILABLE` | The unit's node could not be reached. Nothing stays changed: a shrink was never committed, and a grow's reservation is given back |
 
 ## The surface
@@ -201,7 +321,9 @@ Requests that cannot be acted on at all are gRPC errors:
 ```console
 $ legion alloc resize <ALLOCATION> [--memory SIZE] [--memory-max SIZE] [--cpu MHZ]
       [--reason TEXT] [--force] [--dry-run] [--idempotency-key KEY] [-j]
-$ legion instance resize <INSTANCE|SESSION> [same flags] [--local]
+$ legion instance resize <INSTANCE|SESSION> [same flags] [--move] [--local]
+$ legion job resize <JOB> [--task TASK] [--group GROUP] [same flags] [--replace]
+$ legion job resize <JOB> [--task TASK] --reset
 ```
 
 - **Sizes.** `--memory` and `--memory-max` take `512`, `512MiB`, or `2GiB`
@@ -215,17 +337,23 @@ $ legion instance resize <INSTANCE|SESSION> [same flags] [--local]
 - **`--force`** allows a ceiling below what the unit uses now. The kernel
   reclaims what it can and may kill the task.
 - **`--reason`** is recorded on the override and on the event.
-- **`--idempotency-key`** makes a retry of an allocation or keyed-instance
-  resize return the first reply with `deduplicated: true`. A session's
-  resize records no key: it sets absolute amounts on one node, so repeating
-  it is safe and answers `applied`.
-- **RPCs.** `Manager.ResizeAllocation` and `Manager.ResizeInstance`, and
+- **`--idempotency-key`** makes a retry return the first reply with
+  `deduplicated: true`. For an allocation, a keyed instance, and a task the
+  managers record the key. For a session its node keeps the answer of an
+  applied resize for 10 minutes, in memory: the key is per node, as for
+  [session runs](session-runs.md), and a worker restart forgets it. A
+  session's resize sets absolute amounts, so the repeat that then happens
+  answers `applied` with `from` equal to `to`.
+- **`--move`** (instances and sessions) and **`--replace`** and
+  **`--reset`** (tasks) are described above.
+- **RPCs.** `Manager.ResizeAllocation`, `Manager.ResizeInstance`
+  (`move_unit` for `--move`), and `Manager.ResizeTask`; and
   `Worker.ResizeSession`, which only a manager calls. From inside a task,
   `Workload.ResizeChildSession` on the API socket.
-- **Agents.** MCP tools `legion_instance_resize` and `legion_alloc_resize`
-  (mutating, behind `--allow-write`), and `instance.resize` and
-  `alloc.resize` in `legion capabilities`. See
-  [Agent Readiness](agent-readiness.md).
+- **Agents.** MCP tools `legion_instance_resize` (with `move`),
+  `legion_alloc_resize`, and `legion_job_resize` (mutating, behind
+  `--allow-write`), and `instance.resize`, `alloc.resize`, and `job.resize`
+  in `legion capabilities`. See [Agent Readiness](agent-readiness.md).
 
 ### Permissions
 
@@ -233,7 +361,8 @@ Resize needs `scale:write` on the unit's job, the same permission `legion
 job scale` needs, so a principal can resize without redeploy rights
 ([Auth and ACLs](auth-and-acls.md)). The caller must hold `scale:write` on
 some job before the unit is looked up, so an id's existence cannot be
-probed without it.
+probed without it. `legion job resize` needs it on the job it names.
+`--move` also needs `job:write`, because it suspends and resumes the unit.
 
 ### Seeing the override
 
@@ -241,30 +370,50 @@ probed without it.
   resized keyed instance the override: what the spec says, the reason, who
   resized, and when. In JSON these are `resources` and `resourcesOverride`.
 - `GetLedger` reports each allocation's effective `resources` and, when it
-  was resized, `resources_override`. `legion ledger` prints the effective
-  `resources`.
+  was resized, `resources_override`. `legion ledger` prints both: a
+  "Resized" line under the allocation, and `resourcesOverride` in JSON.
+- `legion job scale <JOB> --status -j` reports a task-level override.
+- A suspended or stopped instance that carries a size shows it in
+  `resourcesOverride`: the size its next allocation starts at.
 - The UI's instance and allocation pages show the effective reservation and
   a "Resized in place" line with the same details.
 - Events `allocation.resized` and `instance.resized` carry `from`, `to`,
-  `spec`, `reason`, and `by` ([Event Stream](event-stream.md)).
+  `spec`, `reason`, and `by`; a move adds `movedFrom` and `movedTo`.
+  `task.resized` carries the task's `from`, `to`, and how many allocations
+  were applied, kept, and replaced; `resize.reset` says a submit dropped a
+  task's override ([Event Stream](event-stream.md)).
 - `legion_resizes_total{unit, outcome}` counts answered resizes
   ([Metrics](metrics.md)).
 
-A session's resize emits no event, because an event is a replicated write
-and a session's resize makes none. It is in the node's log, the metric, and
-the session's own `resources`.
+A session's resize emits no event, by design: an event is a replicated
+write, and a session's resize makes none. It is in the node's log, the
+metric, and the session's own `resources`. The same holds for a session's
+resize by moving.
 
 ## How long an override lasts
 
-- **It ends with the unit.** An allocation's override is on its row. A
-  replacement allocation (a reschedule after node loss, a rollout, a keyed
-  instance that was suspended and resumed, a restart that places a new
-  allocation) starts at the spec. A session's override ends with the
-  session.
-- **A resize back to the spec's amounts removes it.** There is nothing
-  else to reset.
-- **A deploy that changes `resources` replaces the allocations**, as every
-  spec change does, so the new spec wins.
+- **A plain allocation's override ends with the allocation.** `legion
+  alloc resize` on a service or batch allocation is on its row; its
+  replacement starts at the task's size (the spec, or the task-level
+  override when there is one).
+- **An instance's size stays with the instance.** A resize of a keyed or
+  slot instance is recorded on the instance as well as on its allocation,
+  so its next allocation (a resume after a suspend, a restart, a reschedule
+  after its node is lost, a move) starts at the same size. If the node
+  chosen has no room for it, that node is skipped and another candidate is
+  tried.
+- **A session's size stays with the session.** It survives a suspend and
+  resume on its node, and for a `store` session a resume on another node:
+  the size travels in the session's manifest. It ends with the session.
+- **A task-level override stays until it is reset or the spec changes.**
+- **Order of precedence** for a new allocation: the instance's own size,
+  then the task-level override, then the spec. `legion job resize` clears
+  the own size of every instance it resizes in place, so the task's size
+  governs them from then on.
+- **A resize back to the spec's amounts removes the override.**
+- **A submit that changes the task's `resources` wins.** It drops the
+  task-level override, and instance sizes recorded over the old spec no
+  longer apply: every override binds only to the spec it was laid over.
 - An allocation restarted in place by its restart policy keeps its override:
   the node restarts it at its effective size.
 
@@ -297,11 +446,33 @@ the session's own `resources`.
   placement.
 - **A grow never preempts.** It takes free room only. When the node is
   full, the answer is `refused` with the room there is.
-- **Per unit only.** There is no command that resizes every allocation of a
-  task at once, and none that moves a unit to another node to resize it;
-  restart or redeploy for those.
-- **An override does not follow a replacement.** See "How long an override
-  lasts".
+- **`--replace` is not a rollout.** It stops every allocation that could
+  not change in place in one write; it has no batch size, health gate, or
+  pause. Use a deploy when replacements must be paced.
+- **A task resize is not atomic across allocations.** Each allocation is
+  its own compare-and-set, so a call interrupted midway leaves some resized
+  and the override in place; repeat it (it is idempotent) to finish.
+- **A keyed instance moves only as far as its checkpoint can.** With a
+  checkpoint kept on its node, `--move` resumes it on the same node.
+- **The scheduler packs a keyed task at its largest waiting instance.**
+  While a resized instance waits for an allocation, every allocation of its
+  task planned in that pass is packed at that size, which can pass over a
+  node a smaller instance would have fit. The row is still written at each
+  instance's own size.
+- **A move waits.** `--move` on a keyed instance holds the call until the
+  suspend finishes (up to 3 minutes) and the resume is placed (up to 60
+  seconds). A suspend that outlasts the wait leaves the new size recorded:
+  `legion instance start` resumes the instance at it.
+- **A plain allocation's own override does not follow its replacement.**
+  See "How long an override lasts".
+- **The UI has no task-level line.** It shows the override on each
+  allocation and instance a task resize sized (the same "Resized" line a
+  unit resize gets); the task's own record is in `legion job scale
+  --status -j`.
+- **The move paths are tested without a real runtime.** The keyed move runs
+  in the ordinary suite against reported checkpoints; a `store` session's
+  move needs a content store and a runtime that checkpoints memory, and is
+  covered only by the unit tests of its parts.
 - **A task that declared no resources is not confined by a resize.** The
   reservation moves, but a unit that started without limits keeps running
   without them until it restarts.

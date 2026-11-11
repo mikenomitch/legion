@@ -1830,14 +1830,17 @@ async fn a_full_snapshot_budget_keeps_new_memory_suspend_instances_off_the_node(
 }
 
 /// Drive a resize by moving to its end: report the capture the suspend asks
-/// for, then run the evals that place the resumed instance.
-async fn drive_move(cluster: &Cluster, first_alloc: i64) -> R<()> {
+/// for, then run the evals that place the resumed instance. Returns the
+/// kind of checkpoint the suspend asked for.
+async fn drive_move(cluster: &Cluster, first_alloc: i64) -> R<String> {
     let mut captured = false;
+    let mut kind = String::new();
     for _ in 0..600 {
         let info = cluster.info().await?;
         if !captured && info.pending_op.as_deref() == Some("suspending") {
             let asked = cluster.heartbeat(Vec::new()).await?;
             if let Some(request) = asked.checkpoint_requests.first() {
+                kind = request.kind.clone();
                 cluster
                     .heartbeat(vec![capture_ok(&request.snapshot_id, first_alloc, "disk")])
                     .await?;
@@ -1851,7 +1854,7 @@ async fn drive_move(cluster: &Cluster, first_alloc: i64) -> R<()> {
                 .current_alloc_id
                 .is_some_and(|id| id != first_alloc)
             {
-                return Ok(());
+                return Ok(kind);
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1961,5 +1964,51 @@ async fn a_resize_by_moving_with_no_room_puts_the_instance_back() -> R<()> {
     let back = cluster.info().await?.current_alloc_id.context("placed")?;
     let view = cluster.store().allocation_size(back)?.context("row")?;
     assert_eq!(view.effective["memory"], json!(512));
+    Ok(())
+}
+
+/// A sandbox's guest size changes only at boot, and a memory checkpoint
+/// restores only into a guest of its own size: a move to another guest size
+/// asks for a disk checkpoint, and the reply says the guest booted fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_moved_to_a_new_guest_size_boots_from_a_disk_checkpoint() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job_with(
+        "sandbox",
+        Some(SuspendConfig::default()),
+        json!({ "cpu": 500, "memory": 512 }),
+    ))?;
+    let first_alloc = cluster.active_instance()?;
+    let request = |dry_run: bool| {
+        Request::new(legion::structs::ResizeInstanceRequest {
+            instance_id: ID.into(),
+            to: Some(legion::structs::ResizeResources {
+                memory: Some(2048.0),
+                ..Default::default()
+            }),
+            move_unit: true,
+            dry_run,
+            ..Default::default()
+        })
+    };
+    let dry = cluster
+        .svc
+        .resize_instance(request(true))
+        .await?
+        .into_inner();
+    assert!(dry.message.contains("disk checkpoint"), "{}", dry.message);
+
+    let (moved, driven) = tokio::join!(
+        cluster.svc.resize_instance(request(false)),
+        drive_move(&cluster, first_alloc)
+    );
+    assert_eq!(driven?, "disk", "the suspend asked for a disk checkpoint");
+    let moved = moved?.into_inner();
+    assert_eq!(moved.outcome, "applied", "{}", moved.message);
+    assert!(moved.message.contains("memory gone"), "{}", moved.message);
+    let resumed = cluster.info().await?.current_alloc_id.context("resumed")?;
+    let view = cluster.store().allocation_size(resumed)?.context("row")?;
+    assert_eq!(view.effective["memory"], json!(2048));
     Ok(())
 }

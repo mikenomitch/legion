@@ -41,6 +41,14 @@ fn move_resume_timeout() -> std::time::Duration {
 const OUTCOME_REPLACED: &str = "replaced";
 const OUTCOME_ERROR: &str = "error";
 
+/// The memory a sandbox's guest boots with: its ceiling, or its
+/// reservation when it declares none (docs/task-runtime-sandbox.md, "Guest
+/// size"). A memory checkpoint restores only into a guest of the size it
+/// was taken at.
+fn guest_size(resources: &ResourceSize) -> Option<f64> {
+    resources.memory_max.or(resources.memory)
+}
+
 /// A request carrying the caller's credentials on to another handler of
 /// this service (a move suspends and resumes through the handlers that
 /// already do both, under the caller's own grants).
@@ -432,10 +440,20 @@ impl ManagerDaemonService {
         reply.instance_id = instance_id.to_string();
         reply.job_id = view.job_id.clone();
         reply.dry_run = inner.dry_run;
+        // A guest's size changes only at boot, and a memory checkpoint
+        // restores only into a guest of its own size: such a move goes
+        // through a disk checkpoint, and says so.
+        let reboots = view.runtime == "sandbox" && guest_size(&from) != guest_size(&to);
+        let reboot_note = if reboots {
+            " The guest's size changes only at boot, so this move takes a disk checkpoint: \
+             the guest boots fresh at the new size with its disk kept and its memory gone."
+        } else {
+            ""
+        };
         if inner.dry_run {
             reply.message = format!(
                 "would suspend instance {instance_id} and resume it at {} on a node with room; \
-                 whether a node has that room is decided when it resumes",
+                 whether a node has that room is decided when it resumes.{reboot_note}",
                 to.to_json()
             );
             return Ok(Response::new(reply));
@@ -466,7 +484,7 @@ impl ManagerDaemonService {
                 metadata,
                 crate::structs::SuspendInstanceRequest {
                     instance_id: instance_id.to_string(),
-                    checkpoint: None,
+                    checkpoint: reboots.then(|| "disk".to_string()),
                     idempotency_key: None,
                 },
             ))
@@ -576,6 +594,7 @@ impl ManagerDaemonService {
         reply.moved_to = allocation.node_id.clone();
         reply.node_id = allocation.node_id.clone();
         reply.allocation_id = allocation.id;
+        reply.message = reboot_note.trim().to_string();
         metrics.resizes_total.inc(&["instance", "applied"]);
         self.store.emit_event(
             crate::storage::events::EventDraft::info(
@@ -668,6 +687,30 @@ impl ManagerDaemonService {
                     found.node_id
                 ))
             })?;
+        // A session suspends to a memory checkpoint, which restores only
+        // into a guest of the size it was taken at.
+        let held = found
+            .status
+            .as_ref()
+            .and_then(|status| serde_json::from_str::<Value>(&status.resources).ok())
+            .map(|resources| ResourceSize::of(&resources))
+            .unwrap_or_else(|| ResourceSize::of(&task.resources));
+        if task.runtime == "sandbox" {
+            let after = size
+                .apply_to(&held.to_json())
+                .map(|value| ResourceSize::of(&value))
+                .map_err(|err| Status::invalid_argument(format!("{err}")))?;
+            if guest_size(&held) != guest_size(&after) {
+                return Err(Status::failed_precondition(format!(
+                    "session {session_id} cannot move to a different guest size: a session \
+                     resumes from a memory checkpoint, which restores only into a guest of the \
+                     size it was taken at ({} MiB). Hint: --move can change its reservation \
+                     (--memory, when the task declares memoryMax) and --cpu; for a larger guest, \
+                     start a new session",
+                    json_amount(guest_size(&held).unwrap_or(0.0))
+                )));
+            }
+        }
         // The node's own dry run names the session's size now and after.
         let asked = resize_on_node(
             &self.store,

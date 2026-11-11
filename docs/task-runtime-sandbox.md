@@ -1303,7 +1303,11 @@ reservation and the CPU weight are the VMM cgroup's and change at once. The
 ceiling is the guest's usable memory: the balloon inflates to lower it and
 deflates to raise it again, up to the size the guest booted with. Nothing
 grows a guest past its boot size while it runs; that answer is
-`needs_restart`, and the guest is left as it was.
+`needs_restart`, and the guest is left as it was. A keyed sandbox with a
+`suspend` block gets past its boot size with `legion instance resize
+--move`: it is suspended to a disk checkpoint and boots fresh at the new
+size on a node with room, keeping its disk and losing its memory
+([Resize](resize.md#when-it-does-not-fit-move)).
 
 ## Guest memory under pressure
 

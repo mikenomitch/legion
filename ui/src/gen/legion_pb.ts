@@ -5722,6 +5722,16 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
    */
   version = protoInt64.zero;
 
+  /**
+   * The task-level size override `ResizeTask` set (docs/resize.md), as a
+   * JSON object: the overridden amounts (`memory`, `memoryMax`, `cpu`), the
+   * `spec` amounts it was laid over, `reason`, `by`, and `at`. Empty when
+   * the task runs at its spec size.
+   *
+   * @generated from field: string resources_override = 17;
+   */
+  resourcesOverride = "";
+
   constructor(data?: PartialMessage<TaskScaleStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5746,6 +5756,7 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
     { no: 14, name: "last_evaluation_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 15, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 16, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 17, name: "resources_override", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskScaleStatus {
@@ -32906,6 +32917,18 @@ export class ResumeSessionRequest extends Message<ResumeSessionRequest> {
    */
   forceMove = false;
 
+  /**
+   * Resume the session at this size instead of the size it was suspended
+   * at (`ResizeInstanceRequest.move_unit`, docs/resize.md). The amounts are
+   * laid over the session's resources before it is admitted into this
+   * node's envelope, so a size the envelope has no room for refuses with
+   * RESOURCE_EXHAUSTED and the checkpoint stays. Honoured only for a
+   * resume from a manifest (`job_id` set).
+   *
+   * @generated from field: legion.ResizeResources resize = 6;
+   */
+  resize?: ResizeResources;
+
   constructor(data?: PartialMessage<ResumeSessionRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -32919,6 +32942,7 @@ export class ResumeSessionRequest extends Message<ResumeSessionRequest> {
     { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "force_move", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "resize", kind: "message", T: ResizeResources },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeSessionRequest {
@@ -52015,12 +52039,35 @@ export class ResizeInstanceRequest extends Message<ResizeInstanceRequest> {
   dryRun = false;
 
   /**
-   * As `ResizeAllocationRequest.idempotency_key`. For a session the key is
-   * remembered by the manager that took the call, as for session runs.
+   * As `ResizeAllocationRequest.idempotency_key`, for a keyed or slot
+   * instance. A session's resize records no key: it sets absolute amounts
+   * on one node, so repeating it is safe and answers `applied` with `from`
+   * equal to `to`. With a key, the session's node keeps the answer for 10
+   * minutes and a retry that reaches the same node gets it back with
+   * `deduplicated` set; the key is per node, as for session runs.
    *
    * @generated from field: optional string idempotency_key = 6;
    */
   idempotencyKey?: string;
+
+  /**
+   * Resize by moving (docs/resize.md, "When it does not fit: move"): the
+   * unit is suspended, its new size is recorded with it, and it is resumed
+   * at that size on a node with room, through the paths a suspend and a
+   * resume already use. Only units that can move take it: a keyed instance
+   * whose task has a `suspend` block, and a session whose task sets
+   * `suspend.durability = "store"`. Any other unit is refused with
+   * FailedPrecondition naming what is missing. A move interrupts the unit
+   * for one suspend and resume; without it nothing is ever interrupted.
+   *
+   * When no node has room for the new size the unit is put back: a session
+   * is resumed at its old size on the node it came from, and a keyed
+   * instance's size record is cleared and it is started again. The reply's
+   * outcome is then `refused`.
+   *
+   * @generated from field: bool move_unit = 7;
+   */
+  moveUnit = false;
 
   constructor(data?: PartialMessage<ResizeInstanceRequest>) {
     super();
@@ -52036,6 +52083,7 @@ export class ResizeInstanceRequest extends Message<ResizeInstanceRequest> {
     { no: 4, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "move_unit", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeInstanceRequest {
@@ -52052,6 +52100,281 @@ export class ResizeInstanceRequest extends Message<ResizeInstanceRequest> {
 
   static equals(a: ResizeInstanceRequest | PlainMessage<ResizeInstanceRequest> | undefined, b: ResizeInstanceRequest | PlainMessage<ResizeInstanceRequest> | undefined): boolean {
     return proto3.util.equals(ResizeInstanceRequest, a, b);
+  }
+}
+
+/**
+ * Request payload for `Manager.ResizeTask`.
+ *
+ * @generated from message legion.ResizeTaskRequest
+ */
+export class ResizeTaskRequest extends Message<ResizeTaskRequest> {
+  /**
+   * The job. Required.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * The task's group. Empty means the task's own group when `task_name` is
+   * unique in the job.
+   *
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * The task to resize. May be left empty when the job has exactly one
+   * task.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * The new amounts for every allocation of the task. Unset amounts keep
+   * the spec's value. Required unless `reset` is set.
+   *
+   * @generated from field: legion.ResizeResources to = 4;
+   */
+  to?: ResizeResources;
+
+  /**
+   * Remove the task-level override and bring the task's allocations back
+   * to the spec's size. Mutually exclusive with `to`.
+   *
+   * @generated from field: bool reset = 5;
+   */
+  reset = false;
+
+  /**
+   * Stop each allocation that could not be resized in place, so the
+   * scheduler replaces it at the new size. Without it such an allocation
+   * keeps its old size until something else replaces it.
+   *
+   * @generated from field: bool replace = 6;
+   */
+  replace = false;
+
+  /**
+   * Why, recorded on the override, on each allocation's override, and on
+   * the `task.resized` event.
+   *
+   * @generated from field: string reason = 7;
+   */
+  reason = "";
+
+  /**
+   * As `ResizeAllocationRequest.force`, for each allocation.
+   *
+   * @generated from field: bool force = 8;
+   */
+  force = false;
+
+  /**
+   * Answer what the call would do, allocation by allocation, without
+   * writing the override or changing anything.
+   *
+   * @generated from field: bool dry_run = 9;
+   */
+  dryRun = false;
+
+  /**
+   * Optional caller-chosen key that makes the call retry-safe: a repeat
+   * with the same key answers the first call's reply with `deduplicated`
+   * set, without touching any allocation again.
+   *
+   * @generated from field: optional string idempotency_key = 10;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ResizeTaskRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeTaskRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "to", kind: "message", T: ResizeResources },
+    { no: 5, name: "reset", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "replace", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeTaskRequest {
+    return new ResizeTaskRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeTaskRequest {
+    return new ResizeTaskRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeTaskRequest {
+    return new ResizeTaskRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeTaskRequest | PlainMessage<ResizeTaskRequest> | undefined, b: ResizeTaskRequest | PlainMessage<ResizeTaskRequest> | undefined): boolean {
+    return proto3.util.equals(ResizeTaskRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for `Manager.ResizeTask`.
+ *
+ * @generated from message legion.ResizeTaskReply
+ */
+export class ResizeTaskReply extends Message<ResizeTaskReply> {
+  /**
+   * The job, group, and task the override is on.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * The task's spec resources (`memory`, `memoryMax`, `cpu`) as a JSON
+   * object, with cluster defaults folded in.
+   *
+   * @generated from field: string spec = 4;
+   */
+  spec = "";
+
+  /**
+   * The task-level size before this call, as a JSON object: the previous
+   * override laid over the spec, or the spec when there was none.
+   *
+   * @generated from field: string from = 5;
+   */
+  from = "";
+
+  /**
+   * The task-level size after this call, as a JSON object. Equal to `spec`
+   * after a reset.
+   *
+   * @generated from field: string to = 6;
+   */
+  to = "";
+
+  /**
+   * Whether an override stands after this call. False after a reset, and
+   * after a resize whose amounts equal the spec's.
+   *
+   * @generated from field: bool override_active = 7;
+   */
+  overrideActive = false;
+
+  /**
+   * One answer per live allocation of the task, in allocation-id order,
+   * each shaped as a `ResizeAllocation` reply. An allocation this call
+   * stopped for replacement has outcome `replaced`; an allocation that
+   * could not be reached has outcome `error` with the cause in `message`.
+   *
+   * @generated from field: repeated legion.ResizeReply allocations = 8;
+   */
+  allocations: ResizeReply[] = [];
+
+  /**
+   * How many allocations now run at the new size.
+   *
+   * @generated from field: uint32 applied = 9;
+   */
+  applied = 0;
+
+  /**
+   * How many allocations kept their old size (refused, deferred,
+   * `needs_restart`, `not_supported`, or unreachable). Each takes the new
+   * size when it is next replaced.
+   *
+   * @generated from field: uint32 pending = 10;
+   */
+  pending = 0;
+
+  /**
+   * How many allocations were stopped for replacement (`replace`).
+   *
+   * @generated from field: uint32 replaced = 11;
+   */
+  replaced = 0;
+
+  /**
+   * Echo of the request's `dry_run`.
+   *
+   * @generated from field: bool dry_run = 12;
+   */
+  dryRun = false;
+
+  /**
+   * True when this reply repeats an earlier call with the same
+   * idempotency key.
+   *
+   * @generated from field: bool deduplicated = 13;
+   */
+  deduplicated = false;
+
+  /**
+   * What to do about the allocations that kept their old size, when there
+   * are any.
+   *
+   * @generated from field: string hint = 14;
+   */
+  hint = "";
+
+  constructor(data?: PartialMessage<ResizeTaskReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeTaskReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "spec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "to", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "override_active", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "allocations", kind: "message", T: ResizeReply, repeated: true },
+    { no: 9, name: "applied", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 10, name: "pending", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 11, name: "replaced", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 12, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 13, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeTaskReply {
+    return new ResizeTaskReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeTaskReply {
+    return new ResizeTaskReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeTaskReply {
+    return new ResizeTaskReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeTaskReply | PlainMessage<ResizeTaskReply> | undefined, b: ResizeTaskReply | PlainMessage<ResizeTaskReply> | undefined): boolean {
+    return proto3.util.equals(ResizeTaskReply, a, b);
   }
 }
 
@@ -52173,6 +52496,15 @@ export class ResizeReply extends Message<ResizeReply> {
    */
   retryable = false;
 
+  /**
+   * Set when the unit was resized by moving (`move_unit`): the node it was
+   * resumed on. Empty for an in-place resize, and for a move that found no
+   * room and put the unit back.
+   *
+   * @generated from field: string moved_to = 15;
+   */
+  movedTo = "";
+
   constructor(data?: PartialMessage<ResizeReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -52195,6 +52527,7 @@ export class ResizeReply extends Message<ResizeReply> {
     { no: 12, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 14, name: "retryable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 15, name: "moved_to", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeReply {
@@ -52263,6 +52596,16 @@ export class ResizeSessionRequest extends Message<ResizeSessionRequest> {
    */
   reason = "";
 
+  /**
+   * Optional key for a session's resize. The node keeps the answer of an
+   * applied resize for 10 minutes; a repeat with the same key returns it
+   * with `deduplicated` set instead of resizing again. Ignored for an
+   * allocation's resize, whose key the manager records.
+   *
+   * @generated from field: string idempotency_key = 7;
+   */
+  idempotencyKey = "";
+
   constructor(data?: PartialMessage<ResizeSessionRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -52277,6 +52620,7 @@ export class ResizeSessionRequest extends Message<ResizeSessionRequest> {
     { no: 4, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeSessionRequest {
@@ -52430,6 +52774,14 @@ export class ResizeSessionReply extends Message<ResizeSessionReply> {
    */
   runtime = "";
 
+  /**
+   * True when this answer repeats an earlier call with the same
+   * idempotency key.
+   *
+   * @generated from field: bool deduplicated = 10;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<ResizeSessionReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -52447,6 +52799,7 @@ export class ResizeSessionReply extends Message<ResizeSessionReply> {
     { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeSessionReply {

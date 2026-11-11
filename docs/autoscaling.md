@@ -1222,10 +1222,13 @@ group at once. `legion scaling history workers-general
 ## Scaling by hand
 
 `legion job scale` changes how many copies of a task run. It does not create a
-new job version or start a rollout. Its vertical counterpart, [resize](resize.md)
-(`legion alloc resize`, `legion instance resize`), changes one running unit's
-`memory`, `memoryMax`, or `cpu` in place under the same `scale:write`
-permission; the autoscaler itself only changes counts. For nodes, `GetCapacityDemand` (and
+new job version or start a rollout. Its vertical counterpart, [resize](resize.md),
+changes `memory`, `memoryMax`, or `cpu` under the same `scale:write`
+permission: `legion job resize` sets a task-level size override beside the
+count override, with the same rule that a submit which changes the spec
+drops it, and `legion alloc resize` and `legion instance resize` change one
+running unit. `legion job scale --status -j` shows a task's size override in
+`resourcesOverride`. The autoscaler itself only changes counts. For nodes, `GetCapacityDemand` (and
 `legion scaling demand`) answers how many nodes of a given shape the work the
 scheduler could not place needs ([Capacity demand](#capacity-demand)).
 

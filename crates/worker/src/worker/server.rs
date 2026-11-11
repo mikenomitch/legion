@@ -786,9 +786,11 @@ impl Worker for WorkerDaemonService {
         };
         // A keyed session resize this node already applied is answered
         // from what it kept, not applied again.
-        let keyed = (!request.dry_run && !request.session_id.is_empty())
-            .then(|| request.idempotency_key.clone())
-            .unwrap_or_default();
+        let keyed = if !request.dry_run && !request.session_id.is_empty() {
+            request.idempotency_key.clone()
+        } else {
+            String::new()
+        };
         if let Some(kept) =
             crate::worker::task_manager::resize::recall_resize(&request.session_id, &keyed)
         {

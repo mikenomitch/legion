@@ -2,8 +2,8 @@
 
 > **Judgement calls:** [resize-plan_calls.md](../calls/resize-plan_calls.md)
 
-**Status: IN EXECUTION** (written 2026-10-28; Phases 1 and 2 built
-2026-11-10). Public page: [docs/resize.md](../../docs/resize.md).
+**Status: SHIPPED** (written 2026-10-28; Phases 1 to 4 built 2026-11-10).
+Public page: [docs/resize.md](../../docs/resize.md).
 
 - **Built, Phase 1:** `ResizeAllocation`, `ResizeInstance`,
   `Worker.ResizeSession`, and `Workload.ResizeChildSession`; `legion alloc
@@ -18,17 +18,38 @@
   the ceiling through the balloon within the boot size, `needs_restart`
   above it. The KVM tests are written and `#[ignore]`d; nothing here has
   been run against a real guest.
-- **Not built:** Phase 3 (`legion job resize`, the task-level override,
-  submit arbitration), Phase 4 (`--move`), and the autoscaler's vertical
-  strategies. The `isolate` row of §6.3 waits on the isolate runtime.
+- **Built, Phase 3:** `ResizeTask` and `legion job resize` with `--reset`,
+  `--replace`, `--dry-run`, and an idempotency key: the task-level override
+  (`task_resize`, beside `task_scale`), every running allocation resized in
+  place with one answer each, new allocations placed at the overridden
+  size, and submit arbitration (`resize.reset`).
+- **Built, Phase 4:** `--move` (`ResizeInstanceRequest.move_unit`) for a
+  keyed instance with a `suspend` block and for a `store` session, with the
+  unit put back when no node has room; the instance-level size record
+  (`instance.resources_override`), so a resized instance keeps its size
+  across its allocations; a resized session's size travelling in its
+  manifest.
+- **Not built, and why:** the `isolate` row of §6.3, because the isolate
+  runtime does not exist. The autoscaler's vertical strategies ("Then:" in
+  §8) are a phase of [autoscaler-v2-plan.md](autoscaler-v2-plan.md), which
+  now has `ResizeTask` and `ResizeInstance` to call. Memory hotplug,
+  `cores`, and devices are this plan's non-goals.
+- **Not verified here:** every sandbox path (no KVM), and a `store`
+  session's move end to end (it needs a content store and a runtime that
+  checkpoints memory; its parts are unit-tested and the keyed move runs in
+  the ordinary suite).
 - **Where the build differs from this text** (each is a calls entry):
   the row's `resources` are the effective amounts and `resources_override`
-  is only the record (3); the manager calls the node directly and the
-  desired set converges a missed call (4); a unit override ends with its
-  allocation, so a keyed instance resumes at its spec (7);
-  `Worker.ResizeSession` also takes an allocation id (10); a session's
-  resize emits no event and records no key (11); the `needs_restart` hint
-  does not offer `--move` until Phase 4 (16).
+  is only the record (3); the task-level override binds to the spec it was
+  laid over and is applied at the allocation insert (4); the manager calls
+  the node directly and the desired set converges a missed call (5);
+  `job resize` replaces nothing unless `--replace` is passed, and
+  `--replace` is not a rollout (7); an instance's size is a record on the
+  instance, and the scheduler packs a keyed task at its largest waiting
+  instance (9); a keyed move is the existing suspend and start under the
+  caller's grants, so it needs `job:write` too (10); `Worker.ResizeSession`
+  also takes an allocation id (14); a session's resize emits no event and
+  its idempotency key is per node, in memory (15).
 
 Today a running unit's size can change only through its ceiling
 (`memoryMax`) or by replacing it with a deploy. This plan adds **resize**:
@@ -153,7 +174,7 @@ allocation's effective resources and its resize events.
 - **Preempting other work to make room.** A grow takes free room only, as
   an envelope grow does.
 - **Changing a runtime** (an isolate becoming a VM). That is not a size
-  change; see [child sessions](child-sessions-plan.md) and calls entry 9.
+  change; see [child sessions](child-sessions-plan.md) and calls entry 13.
 
 ## 5. Background: what exists today
 

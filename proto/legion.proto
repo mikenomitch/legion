@@ -20786,6 +20786,14 @@ message ResizeInstanceRequest {
   // FailedPrecondition naming what is missing. A move interrupts the unit
   // for one suspend and resume; without it nothing is ever interrupted.
   //
+  // A sandbox's guest size (its `memoryMax`, or its `memory` when it has
+  // none) changes only at boot, and a memory checkpoint restores only into
+  // a guest of its own size. A keyed sandbox moved to a different guest
+  // size is therefore suspended to a disk checkpoint and boots fresh at the
+  // new size, keeping its disk and losing its memory; the reply's `message`
+  // says so. A sandbox session is refused such a move (FailedPrecondition),
+  // because a session resumes only from its memory checkpoint.
+  //
   // When no node has room for the new size the unit is put back: a session
   // is resumed at its old size on the node it came from, and a keyed
   // instance's size record is cleared and it is started again. The reply's

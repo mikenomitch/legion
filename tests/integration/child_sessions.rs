@@ -449,12 +449,20 @@ impl Cluster {
 
     /// The `Workload` service as the `ci` allocation's API socket serves it.
     fn socket(&self) -> R<AllocationWorkload> {
+        self.socket_with(None)
+    }
+
+    /// The same socket, with the worker's channel to a manager.
+    fn socket_with(
+        &self,
+        manager: Option<legion::worker::api_socket::ManagerLink>,
+    ) -> R<AllocationWorkload> {
         let launch_pool = Arc::new(std::sync::OnceLock::new());
         let _ = launch_pool.set(self.launch_pool.clone());
         Ok(AllocationWorkload::new(
             self.ci_allocation().context("the ci allocation")?,
             WorkloadChannel {
-                manager: None,
+                manager,
                 task_manager: self.task_manager.clone(),
                 launch_pool,
                 node_id: NODE.into(),
@@ -1069,6 +1077,58 @@ async fn a_worker_creates_a_keyed_child_for_its_allocation_test() -> R<()> {
         cluster.instance("ws-ci")?.state,
         legion::structs::InstanceState::Stopped
     );
+    Ok(())
+}
+
+/// Phase 3, end to end from inside a task: a call on the allocation's API
+/// socket reaches a manager over the worker's own channel, and the manager
+/// creates the keyed child owned by that allocation. The task holds no
+/// credential and names no owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_creates_a_keyed_child_through_its_socket_and_a_manager_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    let ci = cluster.ci_allocation().context("ci allocation")?;
+    // A manager serving the same store, as the worker would dial it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(legion::structs::manager_server::ManagerServer::new(
+                ManagerDaemonService::new(cluster.svc.store.clone()),
+            ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let channel = tonic::transport::Endpoint::from_shared(address)?
+        .connect()
+        .await?;
+    let socket = cluster.socket_with(Some(legion::worker::api_socket::ManagerLink {
+        channel,
+        credentials: Arc::new(legion::worker::daemon::WorkerCredentials::with_join_secret(
+            None,
+        )),
+    }))?;
+    let request = || {
+        Request::new(legion::structs::WorkloadCreateChildInstanceRequest {
+            task_name: WORKSPACE.into(),
+            instance_id: "ws-inside".into(),
+            idempotency_key: "inside-1".into(),
+        })
+    };
+    let created = socket.create_child_instance(request()).await?.into_inner();
+    assert_eq!(created.instance_id, "ws-inside");
+    assert_eq!(
+        created.owner,
+        Some(owner_ref(OWNER_ALLOCATION, &ci.to_string())),
+        "the socket's allocation is the owner; the task named none"
+    );
+    assert!(!created.deduplicated);
+    // The row is the managers': a replicated instance with its owner.
+    let row = cluster.instance("ws-inside")?;
+    assert_eq!(row.task_name, WORKSPACE);
+    // A retry through the socket is the same child.
+    let again = socket.create_child_instance(request()).await?.into_inner();
+    assert!(again.deduplicated);
+    assert_eq!(again.instance_id, "ws-inside");
     Ok(())
 }
 

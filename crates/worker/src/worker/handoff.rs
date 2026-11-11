@@ -352,14 +352,12 @@ pub fn hand_off(
     request: &HandoffRequest,
     connection: RawFd,
 ) -> R<std::os::unix::net::UnixStream> {
-    use std::io::{BufRead, BufReader};
     let control = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("connect {}", socket.display()))?;
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
     send_with_fd(control.as_raw_fd(), &line, connection)?;
-    let mut answer = String::new();
-    BufReader::new(&control).read_line(&mut answer)?;
+    let answer = read_line_exact(&control)?;
     let accepted: HandoffAccepted = serde_json::from_str(answer.trim())
         .with_context(|| format!("unexpected handoff answer {answer:?}"))?;
     if !accepted.ok {
@@ -368,11 +366,32 @@ pub fn hand_off(
     Ok(control)
 }
 
+/// Read one line off the control socket and not a byte more.
+///
+/// The worker writes two lines on it: the acceptance, then the close
+/// report. A short connection can end before the owner has read the first,
+/// so both are waiting in the socket; a buffered reader would take them in
+/// one read and drop the second with its buffer. The lines are a few dozen
+/// bytes, so a byte at a time costs nothing.
+fn read_line_exact(mut control: &std::os::unix::net::UnixStream) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match control.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
 /// Block until the worker reports the handed-off connection closed.
 pub fn wait_closed(control: std::os::unix::net::UnixStream) -> R<HandoffClosed> {
-    use std::io::{BufRead, BufReader};
-    let mut line = String::new();
-    BufReader::new(&control).read_line(&mut line)?;
+    let line = read_line_exact(&control)?;
     if line.trim().is_empty() {
         bail!("the worker closed the handoff without reporting how it ended");
     }
@@ -533,6 +552,24 @@ mod handoff_test {
         assert_eq!(closed.sent, 300 * 1024);
         assert_eq!(closed.received, 300 * 1024);
         assert_eq!(closed.error, "");
+        Ok(())
+    }
+
+    /// The close report can be waiting in the socket before the owner has
+    /// read the acceptance (a connection that ended at once): reading the
+    /// first line must not swallow the second.
+    #[test]
+    fn the_close_report_survives_arriving_with_the_acceptance_test() -> R<()> {
+        use std::io::Write;
+        let (owner, mut worker) = std::os::unix::net::UnixStream::pair()?;
+        worker.write_all(
+            b"{\"ok\":true}\n{\"closed\":true,\"sent\":3,\"received\":5,\"error\":\"\"}\n",
+        )?;
+        let accepted: HandoffAccepted = serde_json::from_str(read_line_exact(&owner)?.trim())?;
+        assert!(accepted.ok);
+        let closed = wait_closed(owner)?;
+        assert!(closed.closed);
+        assert_eq!((closed.sent, closed.received), (3, 5));
         Ok(())
     }
 

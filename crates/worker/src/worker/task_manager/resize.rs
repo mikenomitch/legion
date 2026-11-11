@@ -513,6 +513,27 @@ impl WorkerTaskManager {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_keyed_session_resize_is_answered_once_test() {
+        let reply = crate::structs::ResizeSessionReply {
+            outcome: "applied".into(),
+            from: r#"{"memory":64}"#.into(),
+            to: r#"{"memory":128}"#.into(),
+            ..Default::default()
+        };
+        // No key, nothing kept.
+        remember_resize("machine-a.01", "", &reply);
+        assert!(recall_resize("machine-a.01", "").is_none());
+
+        remember_resize("machine-a.01", "caller:grow-once", &reply);
+        let kept = recall_resize("machine-a.01", "caller:grow-once").expect("kept");
+        assert!(kept.deduplicated);
+        assert_eq!(kept.from, reply.from);
+        // The key is scoped to the session it was used on.
+        assert!(recall_resize("machine-b.02", "caller:grow-once").is_none());
+        assert!(recall_resize("machine-a.01", "caller:another").is_none());
+    }
+
     fn amounts(pairs: &[(&str, f64)]) -> std::collections::BTreeMap<String, f64> {
         pairs
             .iter()

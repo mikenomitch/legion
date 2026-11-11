@@ -641,6 +641,7 @@ fn node_is_down(store: &Store, node_id: &str) -> bool {
 /// resumes the session at a new size (a resize by moving, docs/resize.md);
 /// the caller passes `task` with that size already laid over its resources,
 /// so the router reserves the room the session will take.
+#[allow(clippy::too_many_arguments)]
 pub async fn resume_store_session(
     store: &Store,
     job_id: &str,
