@@ -40,7 +40,7 @@ pub const ISOLATE_RUNTIME: &str = "isolate";
 pub const ISOLATES_CAPABILITY: &str = "isolates";
 
 /// Default `resources.memoryMax` for an isolate, in MiB: the cap on its
-/// linear memory (calls entry 59).
+/// linear memory (calls entry 60).
 pub const DEFAULT_MEMORY_MAX_MIB: u64 = 128;
 
 /// The largest `resources.memoryMax` an isolate may declare, in MiB: a
@@ -503,7 +503,7 @@ impl IsolateTaskConfig {
     }
 }
 
-/// The error for a missing `limits.cpu` or `limits.wall` (calls entry 59).
+/// The error for a missing `limits.cpu` or `limits.wall` (calls entry 60).
 const LIMITS_REQUIRED: &str = "config.limits.cpu and config.limits.wall are required (budgets \
                                differ by orders of magnitude between a webhook and an agent \
                                loop; there is no default)";

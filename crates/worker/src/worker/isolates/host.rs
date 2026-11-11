@@ -16,15 +16,79 @@ use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 use tonic::transport::{Channel, Endpoint};
 
-/// The largest message either side sends: a run's staged files and reply
-/// are a few MiB; checkpoints are streamed.
+/// The largest message the worker sends a host or accepts in a reply from
+/// it (`IsolateHost`, where the worker is the client: a run's staged files
+/// and its reply are a few MiB; checkpoints are streamed).
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 
-/// The most `IsolateWorker` calls one host may have in flight (egress,
-/// child VMs, checkpoints, logs). Each egress call may buffer up to
-/// `isolate.maxBodyBytes` each way, so this also bounds what one host can
-/// make the worker hold.
-pub const MAX_HOST_CALLS: u32 = 256;
+/// What a message on the worker socket may carry beyond its body: headers
+/// (the host caps a header set at 64 KiB), the URL, the origin, framing.
+pub const MESSAGE_OVERHEAD_BYTES: usize = 1 << 20;
+
+/// The largest `LogBatch` a honest host sends: an invocation's stdout and
+/// stderr (each at most `limits.output`, at most 1 MiB) split into lines,
+/// with protobuf's per-line framing (a run of one-character lines encodes
+/// at about six times its text).
+pub const MAX_LOG_BATCH_BYTES: usize = 16 << 20;
+
+/// Outbound requests one invocation may have open at once (the host's
+/// `MAX_EGRESS_IN_FLIGHT`).
+pub const EGRESS_IN_FLIGHT_PER_INVOCATION: u32 = 8;
+
+/// The fewest and the most `IsolateWorker` calls one host may have open
+/// at once (egress, child VMs, checkpoints, logs).
+pub const MIN_HOST_CALLS: u32 = 16;
+pub const MAX_HOST_CALLS: u32 = 64;
+
+/// The least the worker lets one host hold in request bodies at once.
+pub const MIN_BODY_BUDGET_BYTES: usize = 64 << 20;
+
+/// What the worker accepts from one host on its worker socket (security
+/// review N3). Each limit is derived from the host's own configuration:
+///
+/// - `max_message_bytes`: the largest legitimate message, an egress body
+///   (`isolate.maxBodyBytes`) or a log batch, plus headers and framing:
+///   17 MiB with the default 16 MiB `maxBodyBytes`. A child-VM `put` or
+///   `exec` stdin larger than this is refused by the transport.
+/// - `max_calls`: the host's shards times the per-invocation egress cap
+///   (8), within 16..=64.
+/// - `body_budget_bytes`: the request bodies (egress bodies, child-VM file
+///   content and stdin) the worker holds for the host across calls while
+///   they wait on an upstream or a VM, at least 64 MiB or four messages; a
+///   call that would pass it is refused at once with RESOURCE_EXHAUSTED.
+///
+/// Worst case per host replica: `max_calls * max_message_bytes` decoded at
+/// the same instant (64 * 17 MiB = 1.06 GiB at the ceiling; 32 * 17 MiB =
+/// 544 MiB for a 4-shard host), of which at most `body_budget_bytes` (68
+/// MiB by default) is held across an await. It was 256 * 64 MiB = 16 GiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCallLimits {
+    pub max_message_bytes: usize,
+    pub max_calls: u32,
+    pub body_budget_bytes: usize,
+}
+
+impl HostCallLimits {
+    pub fn for_host(config: &HostConfig) -> Self {
+        let body = usize::try_from(config.max_body_bytes).unwrap_or(usize::MAX);
+        let max_message_bytes = body
+            .max(MAX_LOG_BATCH_BYTES)
+            .saturating_add(MESSAGE_OVERHEAD_BYTES);
+        let shards = match config.shards {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4),
+            n => n,
+        };
+        Self {
+            max_message_bytes,
+            max_calls: shards
+                .saturating_mul(EGRESS_IN_FLIGHT_PER_INVOCATION)
+                .clamp(MIN_HOST_CALLS, MAX_HOST_CALLS),
+            body_budget_bytes: MIN_BODY_BUDGET_BYTES.max(max_message_bytes.saturating_mul(4)),
+        }
+    }
+}
 
 /// The longest host stderr line the worker keeps; the rest of the line is
 /// dropped.
@@ -89,17 +153,22 @@ pub async fn client_over(stream: tokio::net::UnixStream) -> R<IsolateHostClient<
 }
 
 /// Serve `service` on one already-connected stream until it closes.
-pub fn serve_over<S: IsolateWorker>(stream: tokio::net::UnixStream, service: S) {
+pub fn serve_over<S: IsolateWorker>(
+    stream: tokio::net::UnixStream,
+    service: S,
+    limits: HostCallLimits,
+) {
+    // A host is not trusted with the worker's memory: bound the size of
+    // what it sends and how many calls it may have open at once on its one
+    // connection (see `HostCallLimits`).
     let server = IsolateWorkerServer::new(service)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(limits.max_message_bytes)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     tokio::spawn(async move {
         let incoming = tokio_stream::once(Ok::<_, std::io::Error>(stream));
-        // A host is not trusted with the worker's memory: bound how many
-        // calls it may have open at once on its one connection.
         if let Err(err) = tonic::transport::Server::builder()
-            .max_concurrent_streams(Some(MAX_HOST_CALLS))
-            .concurrency_limit_per_connection(MAX_HOST_CALLS as usize)
+            .max_concurrent_streams(Some(limits.max_calls))
+            .concurrency_limit_per_connection(limits.max_calls as usize)
             .add_service(server)
             .serve_with_incoming(incoming)
             .await
@@ -171,17 +240,42 @@ fn config_memfd(config: &HostConfig) -> R<std::os::fd::OwnedFd> {
     Ok(file.into())
 }
 
-fn sanitize(cordon: &str) -> String {
-    cordon
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// The cgroup directory name of one host: the cordon's [`path_component`]
+/// (a readable prefix and a digest of the exact cordon name, so cordons
+/// `job:acme/billing` and `job:acme_billing` never share a cgroup and its
+/// limits) and the replica.
+///
+/// [`path_component`]: super::path_component
+pub fn cgroup_leaf_name(cordon: &str, replica: u32) -> String {
+    format!("{}-r{replica}", super::path_component(cordon))
+}
+
+/// Make a cgroup leaf `dir/name` with its limits and open its
+/// `cgroup.procs` for a child to join between fork and exec (by writing
+/// `0`). Shared by hosts and the compiler.
+pub fn prepare_leaf(
+    dir: &Path,
+    name: &str,
+    memory_max_bytes: Option<u64>,
+    pids_max: u32,
+) -> R<(PathBuf, std::os::fd::OwnedFd)> {
+    std::fs::create_dir_all(dir)?;
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids");
+    }
+    let _ = std::fs::write(dir.join("cgroup.subtree_control"), "+memory +pids");
+    let leaf = dir.join(name);
+    std::fs::create_dir_all(&leaf)?;
+    if let Some(max) = memory_max_bytes.filter(|max| *max > 0) {
+        std::fs::write(leaf.join("memory.max"), max.to_string())?;
+    }
+    std::fs::write(leaf.join("pids.max"), pids_max.to_string())?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let procs = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(leaf.join("cgroup.procs"))?;
+    Ok((leaf, procs.into()))
 }
 
 /// Create the host's cgroup with its limits, before the host starts, and
@@ -191,24 +285,13 @@ fn sanitize(cordon: &str) -> String {
 /// effort: a node that cannot (no delegation, cgroup v1) runs the host in
 /// the worker's.
 fn prepare_cgroup(dir: &Path, spawn: &HostSpawn) -> R<(PathBuf, std::os::fd::OwnedFd)> {
-    std::fs::create_dir_all(dir)?;
-    if let Some(parent) = dir.parent() {
-        let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids");
-    }
-    let _ = std::fs::write(dir.join("cgroup.subtree_control"), "+memory +pids");
-    let leaf = dir.join(format!("{}-{}", sanitize(&spawn.cordon), spawn.replica));
-    std::fs::create_dir_all(&leaf)?;
-    if let Some(max) = spawn.memory_max_bytes.filter(|max| *max > 0) {
-        std::fs::write(leaf.join("memory.max"), max.to_string())?;
-    }
-    // Shards plus the epoch ticker and the I/O runtime; generous.
-    std::fs::write(leaf.join("pids.max"), "1024")?;
-    use std::os::unix::fs::OpenOptionsExt;
-    let procs = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(leaf.join("cgroup.procs"))?;
-    Ok((leaf, procs.into()))
+    // pids.max: shards plus the epoch ticker and the I/O runtime; generous.
+    prepare_leaf(
+        dir,
+        &cgroup_leaf_name(&spawn.cordon, spawn.replica),
+        spawn.memory_max_bytes,
+        1024,
+    )
 }
 
 /// Whether `pid` is a member of the cgroup `leaf`.
@@ -283,13 +366,22 @@ impl HostLauncher for ProcessLauncher {
                 Ok(())
             });
         }
-        // Spawned from an async (long-lived runtime) thread: the death
-        // signal follows the thread that forked, so never a blocking-pool
-        // thread that may exit while the host runs.
-        let mut child = tokio::process::Command::from(command)
-            .kill_on_drop(false)
-            .spawn()
-            .with_context(|| format!("start {} host", self.binary.display()))?;
+        // The death signal follows the THREAD that forked, not the
+        // process: fork on the spawner thread, which lives as long as the
+        // worker, never on a runtime or blocking-pool thread that may retire
+        // while the host runs (security review N8).
+        let handle = tokio::runtime::Handle::current();
+        let mut child = on_spawner(move || {
+            // tokio's child bookkeeping (SIGCHLD, the reaper) belongs to the
+            // worker's runtime.
+            let _runtime = handle.enter();
+            tokio::process::Command::from(command)
+                .kill_on_drop(false)
+                .spawn()
+        })
+        .await
+        .context("the isolate host spawner thread is gone")?
+        .with_context(|| format!("start {} host", self.binary.display()))?;
         drop((control_theirs, worker_theirs, config));
         let pid = child.id().unwrap_or_default();
         // A pidfd names this process, not its number: signalling through it
@@ -329,7 +421,8 @@ impl HostLauncher for ProcessLauncher {
             };
             let _ = exit_tx.send(Some(why));
         });
-        serve_over(tokio_stream(worker_ours)?, worker);
+        let limits = worker.limits();
+        serve_over(tokio_stream(worker_ours)?, worker, limits);
         let client = client_over(tokio_stream(control_ours)?).await?;
         let alive = exited.clone();
         let kill = Box::new(move || match pidfd.as_ref() {
@@ -365,6 +458,46 @@ impl HostLauncher for ProcessLauncher {
             cgroup,
         })
     }
+}
+
+/// Work for the spawner thread.
+type SpawnJob = Box<dyn FnOnce() + Send>;
+
+/// Run `job` on the worker's one spawner thread and hand back its result.
+///
+/// `PR_SET_PDEATHSIG` fires when the thread that forked the child exits,
+/// not when the process does. Tokio's threads are not that thread: an idle
+/// blocking-pool thread retires after a few seconds, and `block_in_place`
+/// hands a runtime worker's core to a new thread and lets the old one
+/// retire. A host forked on one of them would be killed while the worker
+/// runs. The spawner is a plain OS thread started once and never stopped,
+/// so the death signal fires only when the worker process itself is gone.
+pub fn on_spawner<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<T> {
+    static SPAWNER: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<SpawnJob>>> =
+        std::sync::OnceLock::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sender = SPAWNER.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<SpawnJob>();
+        std::thread::Builder::new()
+            .name("isolate-spawner".into())
+            .spawn(move || {
+                // The sender is a static: this loop never ends.
+                while let Ok(job) = receive.recv() {
+                    job();
+                }
+            })
+            .expect("start the isolate spawner thread");
+        Mutex::new(send)
+    });
+    let job: SpawnJob = Box::new(move || {
+        let _ = tx.send(job());
+    });
+    if let Ok(sender) = sender.lock() {
+        let _ = sender.send(job);
+    }
+    rx
 }
 
 /// `pidfd_open(2)`, or `None` where the kernel has none.
@@ -461,6 +594,108 @@ mod bounded_lines_test {
             got.push(line);
         }
         assert_eq!(got, vec!["short", "xxxxxxxxxxxxxxxx [cut]", "next", "tail"]);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod host_process_test {
+    use super::*;
+
+    #[test]
+    fn colliding_cordons_get_their_own_cgroup_test() {
+        // The review's pair: different jobs (and namespaces) whose cordon
+        // names sanitize alike.
+        let a = cgroup_leaf_name("job:acme/billing", 0);
+        let b = cgroup_leaf_name("job:acme_billing", 0);
+        assert_ne!(a, b);
+        assert_ne!(cgroup_leaf_name("job:t/a.b", 0), cgroup_leaf_name("job:t/a_b", 0));
+        assert_ne!(a, cgroup_leaf_name("job:acme/billing", 1));
+        // Each gets its own leaf with its own memory.max.
+        let dir = tempfile::tempdir().unwrap();
+        let spawn = |cordon: &str, max: u64| HostSpawn {
+            cordon: cordon.into(),
+            replica: 0,
+            config: HostConfig::default(),
+            memory_max_bytes: Some(max),
+        };
+        let (leaf_a, _) = prepare_cgroup(dir.path(), &spawn("job:acme/billing", 1 << 30)).unwrap();
+        let (leaf_b, _) = prepare_cgroup(dir.path(), &spawn("job:acme_billing", 1 << 20)).unwrap();
+        assert_ne!(leaf_a, leaf_b);
+        let max = |leaf: &Path| std::fs::read_to_string(leaf.join("memory.max")).unwrap();
+        assert_eq!(max(&leaf_a), (1u64 << 30).to_string());
+        assert_eq!(max(&leaf_b), (1u64 << 20).to_string());
+        assert!(leaf_a.file_name().unwrap().to_str().unwrap().starts_with("job_acme_billing-"));
+    }
+
+    #[test]
+    fn worker_socket_limits_follow_the_host_config_test() {
+        let limits = HostCallLimits::for_host(&HostConfig {
+            shards: 4,
+            max_body_bytes: 16 << 20,
+            ..Default::default()
+        });
+        assert_eq!(limits.max_message_bytes, (16 << 20) + MESSAGE_OVERHEAD_BYTES);
+        assert_eq!(limits.max_calls, 32);
+        assert_eq!(limits.body_budget_bytes, 4 * ((16 << 20) + MESSAGE_OVERHEAD_BYTES));
+        // Bounded both ways, and never below what a log batch needs.
+        let small = HostCallLimits::for_host(&HostConfig {
+            shards: 1,
+            max_body_bytes: 1024,
+            ..Default::default()
+        });
+        assert_eq!(small.max_calls, MIN_HOST_CALLS);
+        assert_eq!(small.max_message_bytes, MAX_LOG_BATCH_BYTES + MESSAGE_OVERHEAD_BYTES);
+        assert_eq!(small.body_budget_bytes, 4 * small.max_message_bytes);
+        let big = HostCallLimits::for_host(&HostConfig {
+            shards: 1000,
+            ..Default::default()
+        });
+        assert_eq!(big.max_calls, MAX_HOST_CALLS);
+    }
+
+    /// `sleep 30` with the death signal the launcher sets, forked by `fork`.
+    fn sleeper(fork: impl FnOnce(std::process::Command) -> std::process::Child) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        // SAFETY: prctl is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        fork(command)
+    }
+
+    fn alive_after_a_moment(child: &mut std::process::Child) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        alive
+    }
+
+    #[test]
+    fn a_child_forked_on_the_spawner_outlives_the_thread_that_asked_test() {
+        // Without the spawner: forked on a thread that then exits, the
+        // child is killed (the hazard is real here).
+        let mut direct = std::thread::spawn(|| sleeper(|mut c| c.spawn().unwrap()))
+            .join()
+            .unwrap();
+        assert!(!alive_after_a_moment(&mut direct), "the death signal follows the thread");
+        // With it: the asking thread exits, the child lives on.
+        let mut spawned = std::thread::spawn(|| {
+            sleeper(|c| {
+                let mut c = c;
+                on_spawner(move || c.spawn()).blocking_recv().unwrap().unwrap()
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(alive_after_a_moment(&mut spawned), "forked on the spawner thread");
     }
 }
 

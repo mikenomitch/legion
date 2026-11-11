@@ -136,3 +136,54 @@ pub trait IngressTarget: Send + Sync + 'static {
         request: crate::structs::isolate_host::HttpCall,
     ) -> Result<crate::structs::isolate_host::HttpOutcome, tonic::Status>;
 }
+
+/// A file or directory name for `name` (a cordon, a session id, ...) that
+/// never collides with another's: a readable prefix (at most 40 characters
+/// of `[A-Za-z0-9.-]`, anything else as `_`) and the first 12 hex digits of
+/// the SHA-256 of the exact name. Sanitizing alone is not injective:
+/// `job:acme/billing` and `job:acme_billing` would share one name, and with
+/// it a cgroup or a checkpoint file.
+pub fn path_component(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let prefix: String = name
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Never `.` or `..`, never hidden.
+    let prefix = prefix.trim_start_matches('.');
+    let digest = Sha256::digest(name.as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    if prefix.is_empty() {
+        hex
+    } else {
+        format!("{prefix}-{hex}")
+    }
+}
+
+#[cfg(test)]
+mod path_component_test {
+    use super::path_component;
+
+    #[test]
+    fn names_that_sanitize_alike_get_different_components_test() {
+        let a = path_component("job:acme/billing");
+        let b = path_component("job:acme_billing");
+        assert_ne!(a, b);
+        assert!(a.starts_with("job_acme_billing-"), "{a}");
+        assert_ne!(path_component("t/a.b"), path_component("t/a_b"));
+        // Stable, bounded, and safe as one path component.
+        assert_eq!(a, path_component("job:acme/billing"));
+        for name in ["..", ".", "/", "", &"x".repeat(10_000)] {
+            let c = path_component(name);
+            assert!(!c.is_empty() && c.len() <= 40 + 1 + 12, "{name:?} -> {c}");
+            assert!(!c.starts_with('.') && !c.contains('/'), "{name:?} -> {c}");
+        }
+    }
+}

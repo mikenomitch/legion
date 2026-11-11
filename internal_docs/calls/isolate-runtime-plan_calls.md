@@ -21,7 +21,7 @@ number is its rank.** The doc holds three kinds of entry, ranked together:
 - **Hardening-round calls** (2026-11-11, later the same day), made after a
   security review of the first build, an end-to-end test round through a
   manager, a worker, and real hosts, and control-plane fixes: entries 15
-  to 21, 27 to 29, 35, 36, 44, 45, and 65. Where they change an earlier
+  to 21, 27 to 29, 35 to 37, 45, 46, and 66. Where they change an earlier
   entry, that entry gains an **As built, hardening round** paragraph
   rather than a rewrite.
 
@@ -33,14 +33,14 @@ open.
 **Numbering.** Entries were renumbered twice on 2026-11-11, each time by
 inserting new entries at their rank. Original design-time numbers map to
 current ones as 1→1, 2→2, 3→4, 4→3, 5→6, 6→12, 7→33, 8→25, 9→8, 10→34,
-11→11, 12→22, 13→13, 14→23, 15→30, 16→37, 17→24, 18→38, 19→46, 20→47,
-21→59. The hardening round also moved every implementation entry from 15
-on: the previous numbers map to current ones as 1–14 unchanged, 15→22,
-16→23, 17→24, 18→25, 19→26, 20→30, 21→31, 22→32, 23→33, 24→34, 25→37,
-26→38, 27→39, 28→40, 29→41, 30→42, 31→43, 32→46, 33→47, 34→48, 35→49,
-36→50, 37→51, 38→52, 39→53, 40→54, 41→55, 42→56, 43→57, 44→58, 45→59,
-46→60, 47→61, 48→62, 49→63, 50→64, 51→66, 52→67, 53→68, 54→69, 55→70,
-56→71, 57→72, 58→73, 59→74.
+11→11, 12→22, 13→13, 14→23, 15→30, 16→38, 17→24, 18→39, 19→47, 20→48,
+21→60. The hardening round also moved the implementation entries: their
+numbers before that round map to current ones as 1–14 unchanged, 15→22,
+16→23, 17→24, 18→25, 19→26, 20→30, 21→31, 22→32, 23→33, 24→34, 25→38,
+26→39, 27→40, 28→41, 29→42, 30→43, 31→44, 32→47, 33→48, 34→49, 35→50,
+36→51, 37→52, 38→53, 39→54, 40→55, 41→56, 42→57, 43→58, 44→59, 45→60,
+46→61, 47→62, 48→63, 49→64, 50→65, 51→67, 52→68, 53→69, 54→70, 55→71,
+56→72, 57→73, 58→74, 59→75.
 
 ## 1. The engine is wasmtime; JS and Python run as interpreters inside Wasm, not on V8
 
@@ -98,7 +98,7 @@ by `legion-isolate`. Phase 0 measured V8 closer than the table above
 suggests: 0.92 ms to a first result and 1.2 MiB idle per isolate (without
 pointer compression), against 0.45 ms and 0.65 MiB for StarlingMonkey in the
 spike; V8's advantage is JIT throughput, which was not measured. The
-trigger stands. weval is not used in the shipped `js` image (entry 46).
+trigger stands. weval is not used in the shipped `js` image (entry 47).
 
 ---
 
@@ -143,7 +143,7 @@ exactly that.
 
 **As built (2026-11-11).** As designed. Cordon names are the job's
 namespace, `job:<job id>`, and `shared`; a cordon runs one host process
-per replica per node (entry 53). The policy rules are entry 57.
+per replica per node (entry 54). The policy rules are entry 58.
 
 **As built, hardening round (2026-11-11).** Cordon names now carry a
 kind prefix: `ns:<namespace>`, `job:<job id>`, and `shared` (entry 36),
@@ -198,7 +198,7 @@ of Legion's, and is not a default workspace member. The host confines
 loopback that is down rather than nothing. The channel is not PROXY v2:
 it is gRPC over two inherited socketpairs, attributed by an `Origin` on
 every request (entry 10). The host has no HTTP or TLS client at all; the
-worker originates TLS for `https://` (entry 51).
+worker originates TLS for `https://` (entry 52).
 
 ---
 
@@ -238,11 +238,11 @@ nodes is 2 GB per manager, for a list nobody reads at that size.
 **As built (2026-11-11).** As designed, and the node side goes further
 than the plan said: isolates do not use the worker's per-session claims
 either (entry 5). The heartbeat carries `isolate_tasks` and
-`isolate_hosts`, held in memory per manager (entry 71). Session isolates
+`isolate_hosts`, held in memory per manager (entry 72). Session isolates
 are reached by their id's node tag through the existing probe; an id
 derived from an idempotency key has no tag and needs `--on-node`
-(entry 42). Every session in this runtime is `local`: `durability =
-"store"` is not built (entry 58).
+(entry 43). Every session in this runtime is `local`: `durability =
+"store"` is not built (entry 59).
 
 ---
 
@@ -268,7 +268,7 @@ when a run, start, or ingress call names a task it does not hold.
 **Trade-off.** A second session lifecycle on the node. Anything built on
 claims (the claim records, `SessionReport`, the index, `instance list`)
 does not see isolates, and the session verbs reach a session isolate
-only because the worker synthesizes a `SessionStatus` for it (entry 42).
+only because the worker synthesizes a `SessionStatus` for it (entry 43).
 A new or resized envelope is noticed up to a second late unless a call
 arrives first.
 
@@ -322,7 +322,7 @@ who knows whether the code is safe to run twice, makes it.
 
 **As built (2026-11-11).** As designed. The decision is node-side, in this
 order: an explicit `tier`; else `auto` goes to the VM when the isolate
-runtime is disabled for the job and the task has a VM task (entry 43),
+runtime is disabled for the job and the task has a VM task (entry 44),
 when the pre-flight scan (image tasks only, a heuristic) finds a module the
 image lacks, or when the node's memo holds the code hash within
 `config.vm.memoFor`; else the isolate. `--fallback vm` is a second request
@@ -486,7 +486,7 @@ life means it never outlives its worker, with no polling.
 **As built, hardening round (2026-11-11).** The `Origin` check proved too
 coarse for child VMs, whose owners are isolate ids: a host may now act
 only as isolates the worker issued to its cordon (entry 28), and the
-worker caps what any host can make it buffer (entry 45).
+worker caps what any host can make it buffer (entry 46).
 
 ---
 
@@ -555,8 +555,8 @@ the common case is `vm = {}`, and a task whose `children` list exec
 children an isolate drives is not mistaken for one with a VM tier
 (`vm = {}` with two children is refused: "there is no default"). And the
 "shared network rules" cannot be shared yet: a sandbox session task still
-refuses `connect` (entry 64). A VM run's `args` are appended to the VM
-task's own `run.command` (entry 39).
+refuses `connect` (entry 65). A VM run's `args` are appended to the VM
+task's own `run.command` (entry 40).
 
 **As built, hardening round (2026-11-11).** A VM run's `args` are
 appended to the VM task's `run.command` only when it ends with the staged
@@ -651,7 +651,7 @@ built without the `signal` feature, so no `socketpair` at all.
 **Trade-off.** An allowlist kills the host on a syscall path the tests
 did not reach (a guest growing memory with `mremap` was added by reading,
 not observed); the kill shows as the host exiting with SIGSYS, and the
-worker restarts it (entry 68). A compromised host can make connected Unix
+worker restarts it (entry 69). A compromised host can make connected Unix
 pairs, which reach nothing outside the process. The "no new code" goal
 (G6) holds only as far as seccomp can take it.
 
@@ -884,7 +884,7 @@ fallback path; `F_SETFD` is std's `set_cloexec`). The lists are
 library degrades instead of dying.
 
 **Trade-off.** A library path the suite did not reach that uses another
-command kills the host. The worker restarts it (entry 68), and the exit
+command kills the host. The worker restarts it (entry 69), and the exit
 shows as SIGSYS.
 
 **Why (security, simplicity).** After confinement the only caller of those
@@ -1044,7 +1044,7 @@ Workers attack needed a connection held open for hours. At 5 to 30 µs per
 instance the safe default costs almost nothing.
 
 **As built (2026-11-11).** As designed. Reuse needs the guest to export
-`legion:isolate/runner` (entry 40). For the language images the fresh
+`legion:isolate/runner` (entry 41). For the language images the fresh
 cost is milliseconds, not microseconds: hello world 1.14 ms (`js`) and
 2.55 ms (`python`) fresh against 107 µs and 171 µs warm, so `tenant`
 matters more for images than the "almost nothing" above suggests.
@@ -1132,13 +1132,13 @@ until one appears.
 
 **As built (2026-11-11).** Five of the six rows were used as planned:
 `RunSession` with the isolate's fields, `runtime disable isolate`
-(entry 43), derived content of kind `cwasm` (entry 13), checkpoints in the
+(entry 44), derived content of kind `cwasm` (entry 13), checkpoints in the
 content store's `snapshots` class (entry 9), and the pressure response's
 `reclaim` and `suspend` steps through a `PressureSource::isolates` hook
 (entry 31). The last row was not: the host speaks its own node-local
 protocol, not the workload channel (entry 10). The pre-initialization
 kinds (`preinit-image`, `preinit-entry`) are defined but have no builder
-(entry 41).
+(entry 42).
 
 ---
 
@@ -1248,7 +1248,7 @@ for that job and task (the supervisor records each run and HTTP
 invocation in a per-cordon in-flight set, with a drop guard). An owner
 reference is bound to the job and task it was registered for, so a child
 registered by another job's isolate is never reachable. Checkpoint saves
-check the session the same way (entry 45).
+check the session the same way (entry 46).
 
 ```text
 PERMISSION_DENIED invocation 01JC0Q4N7C2RD... of task code-runner/run is not an isolate this worker gave the host
@@ -1278,7 +1278,7 @@ change to a registry other runtimes share.
 
 *Added in the hardening round (2026-11-11). Reverses the "appends them to
 the VM task's own `run.command`, so `allowCommand` is not involved" part
-of entry 39.*
+of entry 40.*
 
 **Call.** A run whose `args` are not empty and that goes to the VM tier is
 refused with `FAILED_PRECONDITION` unless the VM task's `run.command` ends
@@ -1350,7 +1350,7 @@ and its checkpoints keeps one model for both tiers (entry 25).
 mechanisms differ. Paging out is the kernel reclaiming from the host's
 cgroup, not `MADV_PAGEOUT` per isolate (entry 31); hibernation keeps the
 `state` map, not memory pages (entry 9), and happens only when no call is
-in flight (entry 7). Only `durability = "local"` exists (entry 58).
+in flight (entry 7). Only `durability = "local"` exists (entry 59).
 Host-held sockets are not built: bodies are buffered and there are no
 WebSockets, so nothing stays open across hibernation.
 
@@ -1496,9 +1496,9 @@ survives the node) without either.
 **As built (2026-11-11).** Promotion is refused as designed, and also at
 submit: a `stateful.promote` block on an isolate task is refused, and
 `CreateInstance` with an `instance_id` on an isolate task is
-`INVALID_ARGUMENT` before any write (entry 56). The second half of the
+`INVALID_ARGUMENT` before any write (entry 57). The second half of the
 call is not available: `suspend.durability = "store"` is not built for
-isolates (entry 58), so today a session isolate does not survive its node,
+isolates (entry 59), so today a session isolate does not survive its node,
 and the refusal no longer recommends it:
 
 ```text
@@ -1594,7 +1594,53 @@ name.
 
 ---
 
-## 37. Preemption by epoch, yielding at the end of a slice; fuel only on request
+## 37. A session task's generated envelope is not host-level, for every runtime's session tasks
+
+*Added in the hardening round (2026-11-11). A behavior change beyond
+isolates.*
+
+**Call.** The `<task>-envelope` task that submit generates for every
+session task (runtime `envelope`) was classified as an unknown runtime
+plugin, and so as host-level. Every job with a session task therefore
+needed a `job:write` rule with `host = true`: sandbox and container
+session jobs on the base branch, and every isolate job, which contradicted
+the documented rule that only a `file://` module makes an isolate task
+host-level. `runtime_host_level_reason` now answers "not host-level" for
+the envelope runtime: the envelope starts nothing, the session task it
+serves is judged by its own row, and a user-written task on the
+`envelope` runtime is refused at parse. A `file://` module or artifact
+still needs the grant.
+
+```text
+before, for any job with a session task and no host grant:
+permission denied: job "code-runner" has a host-level task ("run-envelope" uses runtime "envelope", a plugin whose isolation Legion cannot vouch for). Submitting it needs a job:write rule with host = true (docs/auth-and-acls.md, "Host-level jobs")
+
+after: accepted; still refused for a node-reaching source:
+permission denied: job "code-runner" has a host-level task ("run" fetches its isolate module file:///srv/handler.wasm from the node's own filesystem). Submitting it needs a job:write rule with host = true (docs/auth-and-acls.md, "Host-level jobs")
+```
+
+**Alternatives.** (a) Special-case isolate envelopes only. (b) Keep the
+envelope host-level and document that session jobs need the grant.
+
+**Trade-off.** Sandbox and container session jobs that needed the host
+grant only because of their envelope now submit with plain `job:write`;
+no installed base depends on the old refusal. `runtime_is_host_level`,
+which gates `exec` into a runtime, still counts `envelope` as host-level,
+so the two classifications differ for that one runtime.
+
+**Why (simplicity, security).** Host-level means "this task touches the
+node as root"; an envelope holds room and, for an isolate task, binds a
+gated datapath, and touches nothing. Requiring the host grant for every
+session job taught operators to hand out the grant broadly, which weakens
+the one check that matters. Found while confirming that a `file://`
+module is gated at submit (it is: `node_reaching_reason`, enforced by the
+manager's submit admission); tested by
+`a_session_tasks_envelope_is_not_host_level_test` and
+`acl_endpoints::file_sources_need_the_host_grant_whatever_names_them_test`.
+
+---
+
+## 38. Preemption by epoch, yielding at the end of a slice; fuel only on request
 
 **Call.** A ticker advances the engine epoch every millisecond; a turn
 that exceeds its 5 ms slice yields to its shard instead of trapping, and
@@ -1623,7 +1669,7 @@ not offered at all.
 
 ---
 
-## 38. Each host runs one shard per core, shared nothing
+## 39. Each host runs one shard per core, shared nothing
 
 **Call.** A host's isolates are partitioned across pinned shard threads,
 each a single-threaded executor; an isolate runs only on its shard and
@@ -1647,7 +1693,7 @@ run on).
 
 ---
 
-## 39. Runs gained `tenant`, `session_id`, and `args`
+## 40. Runs gained `tenant`, `session_id`, and `args`
 
 **Call.** `RunSessionRequest` gains three isolate-only fields beside
 `tier`: `tenant` (the tenant key for a `tenant`-lifetime task; 1 to 128
@@ -1695,7 +1741,7 @@ not `session` is now `FAILED_PRECONDITION` from the node too, and a
 
 ---
 
-## 40. Reuse needs the `legion:isolate/runner` export; `wasi:cli/run` is single-shot, with exit 0 or 1
+## 41. Reuse needs the `legion:isolate/runner` export; `wasi:cli/run` is single-shot, with exit 0 or 1
 
 **Call.** A component that exports only `wasi:cli/run` gets a fresh
 instance per run and serves `lifetime = "request"` only. Its exit status
@@ -1738,7 +1784,7 @@ lifetime "tenant" needs a component that exports legion:isolate/runner or wasi:h
 
 ---
 
-## 41. `entry` arrives through the task's artifacts and is staged per call, not pre-initialized
+## 42. `entry` arrives through the task's artifacts and is staged per call, not pre-initialized
 
 **Call.** `config.entry` is a relative path under the task directory or
 `${artifact.<name>}`, and needs at least one artifact; artifacts on an
@@ -1784,7 +1830,7 @@ Hint: rename the file
 
 ---
 
-## 42. Session isolates are reached through their id's node tag; untagged ids need `--on-node`
+## 43. Session isolates are reached through their id's node tag; untagged ids need `--on-node`
 
 **Call.** `sessions::find` and `sessions::locate` already ask the node a
 minted, tagged id names (`Worker.GetSession`) before they read the index,
@@ -1815,7 +1861,7 @@ the minted shape, already existed and was already ACL-ordered correctly.
 
 ---
 
-## 43. Disabling the isolate runtime: the node decides when a VM can take the run, and a drain hibernates only what it covers
+## 44. Disabling the isolate runtime: the node decides when a VM can take the run, and a drain hibernates only what it covers
 
 **Call.** The manager refuses a run up front (`runtime_disabled`,
 UNAVAILABLE, retryable) only when it cannot go to a VM: `tier = "isolate"`,
@@ -1851,7 +1897,7 @@ of one job from waking every other tenant of the cordon cold.
 
 ---
 
-## 44. A guest's outbound requests: at most 8 in flight per invocation, the rest wait, and none outlives the invocation
+## 45. A guest's outbound requests: at most 8 in flight per invocation, the rest wait, and none outlives the invocation
 
 *Added in the hardening round (2026-11-11).*
 
@@ -1887,7 +1933,7 @@ resource is dropped, which for a warm instance is never.
 
 ---
 
-## 45. The worker bounds what a host can make it hold
+## 46. The worker bounds what a host can make it hold
 
 *Added in the hardening round (2026-11-11).*
 
@@ -1906,7 +1952,7 @@ what one can make it buffer:
 - **Guest logs.** A batch carries at most 4,096 lines, a line is cut at
   16 KiB, and each host has a token bucket of 1 MiB/s with an 8 MiB burst;
   lines past either limit are dropped and replaced by one stderr line
-  (entry 69):
+  (entry 70):
 
 ```text
 [isolate notebook-q4n7c2rd.01jc3] 1200 lines dropped: over the isolate host's log rate or batch limit
@@ -1932,7 +1978,7 @@ also hit a reused pid.
 
 ---
 
-## 46. The default `js` image is StarlingMonkey; QuickJS is a candidate `js-small`
+## 47. The default `js` image is StarlingMonkey; QuickJS is a candidate `js-small`
 
 **Call.** `image = "js"` is SpiderMonkey compiled to Wasm with weval AOT.
 QuickJS ships as `js-small` only if Phase 0 shows a several-times smaller
@@ -1961,7 +2007,7 @@ with no Web APIs by default, and is an open item.
 
 ---
 
-## 47. Python is CPython for WASI; heavy packages run in a VM
+## 48. Python is CPython for WASI; heavy packages run in a VM
 
 **Call.** `image = "python"` is CPython built for WASI (componentize-py),
 pre-initialized with the standard library. Native-extension packages are
@@ -1979,13 +2025,13 @@ snapshot. CPython for WASI pre-initializes into a component wasmtime
 instantiates like any other.
 
 **As built (2026-11-11).** CPython 3.14 via componentize-py 0.25.1, with
-the whole standard library (entry 48) and no packages beyond it: no
+the whole standard library (entry 49) and no packages beyond it: no
 curated images were built. A fresh hello world is 2.55 ms and a 12 KB
 snippet 12.0 ms, so the plan's ≤ 5 ms holds for small snippets only.
 
 ---
 
-## 48. The Python standard library ships as a compiled, compressed blob, loaded on first import
+## 49. The Python standard library ships as a compiled, compressed blob, loaded on first import
 
 **Call.** componentize-py snapshots the interpreter after the runner
 module ran but ships none of the library's files, so at run time any
@@ -2014,7 +2060,7 @@ the host.
 
 ---
 
-## 49. A JS entry is a script; ES modules are `unsupported`; files go through `legion.fs`
+## 50. A JS entry is a script; ES modules are `unsupported`; files go through `legion.fs`
 
 **Call.** StarlingMonkey 0.23 cannot link a module from source at run time
 (`import('legion/run/x.mjs')` fails with `module record has unexpected
@@ -2047,7 +2093,7 @@ on, and a partial `fs` would fail in ways users would not expect.
 
 ---
 
-## 50. Child VMs of an isolate are owned per isolate, and judged by its node
+## 51. Child VMs of an isolate are owned per isolate, and judged by its node
 
 **Call.** A session isolate owns its children as `{kind: "session", id:
 <session id>}`: they outlive its invocations and its hibernation, and it
@@ -2060,7 +2106,7 @@ reconcile ends a child whose owner is no longer registered; session
 isolates restored after a worker restart are registered again before the
 first reconcile. Managers skip `isolate` owners in their owner notices
 (no manager knows of a request isolate) and judge session-isolate owners
-through the tagged-node probe (entry 42), with the existing grace and
+through the tagged-node probe (entry 43), with the existing grace and
 `orphanAfter` rules.
 
 **Alternatives.** (a) A `session` owner with the invocation id (no such
@@ -2085,11 +2131,11 @@ job and task, and the host may name only an isolate the worker issued it
 compromised host that learned two ids drive another job's child.
 End to end, child ownership ran with an `exec` task standing in for the
 sandbox, and re-attaching by id after hibernation is not covered
-(entry 65).
+(entry 66).
 
 ---
 
-## 51. Egress: the worker dials the envelope's own datapath listeners, and upstreams are addressed by name
+## 52. Egress: the worker dials the envelope's own datapath listeners, and upstreams are addressed by name
 
 **Call.** An isolate's `wasi:http` request is carried to the worker, which
 connects to the envelope's listener sockets as a client: absolute-URI
@@ -2125,14 +2171,14 @@ world.
 
 **As built, hardening round (2026-11-11).** At most 8 requests per
 invocation are in flight, the rest wait, and none outlives its invocation
-(entry 44). End to end, a request through the real datapath carried a
+(entry 45). End to end, a request through the real datapath carried a
 credential the guest never saw, and a policy denial reached the guest as
 an error; the credential was installed directly, not by the heartbeat
 path that installs it on a real node.
 
 ---
 
-## 52. Ingress: one Unix socket per port label, HTTP/1.1 inside, bodies buffered
+## 53. Ingress: one Unix socket per port label, HTTP/1.1 inside, bodies buffered
 
 **Call.** For each of the isolate task's `network.ports`, the node's
 ingress listener for the envelope allocation dials `ingress.sock_<label>`,
@@ -2164,7 +2210,7 @@ listener in front of it was not part of that test.
 
 ---
 
-## 53. A cordon's capacity: 10,000 slots per host, clamped by `vm.max_map_count`; replicas only grow
+## 54. A cordon's capacity: 10,000 slots per host, clamped by `vm.max_map_count`; replicas only grow
 
 **Call.** `isolate.slotsPerHost` defaults to 10,000 and is capped per
 layout at 16,000 (`guard-pages`), 200,000 (`mpk`), and 1,000,000
@@ -2195,7 +2241,7 @@ respect it. Grow-only is simple and testable with tiny slot counts.
 
 ---
 
-## 54. Admission is by reservation and CPU weight, enforced by the host per invocation
+## 55. Admission is by reservation and CPU weight, enforced by the host per invocation
 
 **Call.** The worker tells each host a task's `max_resident` (the
 envelope's memory over the task's reservation) and `max_active` (the
@@ -2226,7 +2272,7 @@ how `resources.cpu` is described.
 
 ---
 
-## 55. The router reserves nothing for isolate runs and session-isolate starts
+## 56. The router reserves nothing for isolate runs and session-isolate starts
 
 **Call.** `route_needs(task)` is empty for an isolate task: the router
 still picks among nodes holding the task's envelope (by
@@ -2250,7 +2296,7 @@ second attempt would find "every envelope full" without asking. Tested:
 
 ---
 
-## 56. A session-isolate start is confirmed by the node's reply, and is never a keyed instance
+## 57. A session-isolate start is confirmed by the node's reply, and is never a keyed instance
 
 **Call.** `sessions::start` on an isolate task records nothing in the
 index (a record would show a phantom session in `instance list` for 30 s
@@ -2279,7 +2325,7 @@ per-manager memo covers the common retry without a replicated record.
 
 ---
 
-## 57. `isolateCordons`: exact kinds, every governing policy must allow the job's; `shared` must be listed
+## 58. `isolateCordons`: exact kinds, every governing policy must allow the job's; `shared` must be listed
 
 **Call.** Namespace policy `isolateCordons` takes `namespace`, `job`, and
 `shared` (no globs), stored in that order. Every governing policy that
@@ -2308,7 +2354,7 @@ happen by default.
 
 ---
 
-## 58. `suspend` on a session isolate: what applies, what is refused, and `durability = "store"` is not built
+## 59. `suspend` on a session isolate: what applies, what is refused, and `durability = "store"` is not built
 
 **Call.** `suspend` is allowed only with `config.lifetime = "session"`.
 `idle`, `keepFor`, `onWorkerStop`, `onPressure`, `onRestoreFailure`, and
@@ -2350,7 +2396,7 @@ Hint: remove suspend.onWorkerStop
 
 ---
 
-## 59. Default limits: `memoryMax` 128 MiB (4 GiB at most), 1 MiB output; CPU and wall required
+## 60. Default limits: `memoryMax` 128 MiB (4 GiB at most), 1 MiB output; CPU and wall required
 
 **Call.** `resources.memoryMax` defaults to 128 MiB with a worker-wide
 maximum of 4 GiB, and `limits.output` to 1 MiB. `limits.cpu` and
@@ -2374,7 +2420,7 @@ because an isolate runs on one thread. The worker-wide maximum is
 
 ---
 
-## 60. `limits.output` truncates; `cpu`, `wall`, and memory stop the run
+## 61. `limits.output` truncates; `cpu`, `wall`, and memory stop the run
 
 **Call.** Output past `limits.output` is cut and the reply says
 `truncated`, as `run.output` does for session runs; it does not stop the
@@ -2397,7 +2443,7 @@ text mentions an `output` stop any more.
 
 ---
 
-## 61. wasi-libc guests start in `/`; the run directory is `/legion/run`
+## 62. wasi-libc guests start in `/`; the run directory is `/legion/run`
 
 **Call.** The scratch tree's preopens are `.` (the run directory) then
 `/`, and the host sets `initial_cwd("/legion/run")`. wasi-libc never reads
@@ -2428,7 +2474,7 @@ the cwd a guest reports matches where its relative paths go.
 
 ---
 
-## 62. Every clock a guest sees is the turn's coarse, frozen clock, and every instance gets its own seed
+## 63. Every clock a guest sees is the turn's coarse, frozen clock, and every instance gets its own seed
 
 **Call.** Both WASI clocks and the scratch tree's timestamps read one
 1 ms-resolution reading taken at the start of the turn; the tree never
@@ -2459,7 +2505,7 @@ the same property beside the code that makes the instances.
 
 ---
 
-## 63. The runtime turns on where the binary is found; images are found beside it
+## 64. The runtime turns on where the binary is found; images are found beside it
 
 **Call.** The worker uses `isolate.binary`, else `legion-isolate` beside
 its own executable, else `LEGION_ISOLATE_BINARY`; and images from
@@ -2486,7 +2532,7 @@ host.
 
 ---
 
-## 64. The VM task does not share the isolate's `connect` block yet
+## 65. The VM task does not share the isolate's `connect` block yet
 
 **Call.** A sandbox session task still may not declare `connect`, and a
 sandbox session whose network resolves gated is refused, so the demo VM
@@ -2506,7 +2552,7 @@ sandbox runtime and the datapath, outside this feature; it is an open item.
 
 ---
 
-## 65. VM-tier and child-VM tests run with an `exec` session task standing in for the sandbox
+## 66. VM-tier and child-VM tests run with an `exec` session task standing in for the sandbox
 
 *Added in the end-to-end round (2026-11-11).*
 
@@ -2540,7 +2586,7 @@ not met.
 
 ---
 
-## 66. The Python image stops unsupported calls by name, and reroutes stdlib networking through `legion.fetch`
+## 67. The Python image stops unsupported calls by name, and reroutes stdlib networking through `legion.fetch`
 
 **Call.** CPython for WASI lacks `_ctypes`, threads, sockets, `ssl`, and
 processes. The image replaces each with a stub that stops the run as
@@ -2574,7 +2620,7 @@ HTTP clients work instead of stopping.
 
 ---
 
-## 67. A child VM handle is bounded, and reaches only the child's own ports
+## 68. A child VM handle is bounded, and reaches only the child's own ports
 
 **Call.** `machine.fetch` dials the child through its attachment (vsock
 for a gated sandbox, its namespace's loopback, its TAP address) on any
@@ -2599,7 +2645,7 @@ child.
 
 ---
 
-## 68. A host restart fails its in-flight calls and loses resident sessions that never hibernated
+## 69. A host restart fails its in-flight calls and loses resident sessions that never hibernated
 
 **Call.** When a host exits, its in-flight calls fail `UNAVAILABLE` ("the
 isolate host for cordon X exited during the call; … retry"), and it is
@@ -2619,18 +2665,18 @@ had not hibernated. Run-level idempotency still holds per node (the
 worker's), but a retried call that was mid-flight in the host runs again.
 
 **Why (simplicity).** A periodic checkpoint is the `checkpointEvery` design
-entry 58 defers; until then the guarantee is the one a `local` session
+entry 59 defers; until then the guarantee is the one a `local` session
 already has.
 
 **As built, hardening round (2026-11-11).** A restarted host takes no
 calls until its tasks are reloaded (`UNAVAILABLE`, retry), which the
 forking host made visible: a run reached the new host before its task was
 configured and got a spurious `NOT_FOUND`. The kill goes through a pidfd
-(entry 45).
+(entry 46).
 
 ---
 
-## 69. Guest logs go into the envelope allocation's task log, one prefixed line each, once per invocation
+## 70. Guest logs go into the envelope allocation's task log, one prefixed line each, once per invocation
 
 **Call.** Output a handler or session isolate prints is forwarded by the
 host as one batch per invocation, when the invocation ends, and the worker
@@ -2666,7 +2712,7 @@ keeps 10^5 isolates from outrunning the sweep.
 **As built, hardening round (2026-11-11).** Bounded per host: at most
 4,096 lines per batch and 1 MiB/s with an 8 MiB burst, lines past either
 replaced by one `N lines dropped: over the isolate host's log rate or
-batch limit` line (entry 45). The prefix cannot be forged by a guest: the
+batch limit` line (entry 46). The prefix cannot be forged by a guest: the
 id is the worker's, and a tenant key is printable ASCII without spaces.
 End to end, a session isolate's output was read back through
 `GetAllocationLogs`, and an HTTP handler's from the envelope's
@@ -2674,7 +2720,7 @@ End to end, a session isolate's output was read back through
 
 ---
 
-## 70. Isolate metrics have no per-job labels, and count CPU in microseconds
+## 71. Isolate metrics have no per-job labels, and count CPU in microseconds
 
 **Call.** The `legion_isolate_*` families (`crates/common/src/telemetry.rs`)
 carry no `job` or `task` label; per-task numbers travel on the heartbeat
@@ -2693,7 +2739,7 @@ per-task series would hit the registry's 256-series cap on a busy node.
 
 ---
 
-## 71. `GetIsolateStats` asks the nodes this manager has no heartbeat from
+## 72. `GetIsolateStats` asks the nodes this manager has no heartbeat from
 
 **Call.** The manager keeps the latest `isolate_tasks`/`isolate_hosts`
 per node in memory (replaced per beat, forgotten on an empty beat, swept
@@ -2713,7 +2759,7 @@ envelope regardless of which manager answers, and nothing goes to raft.
 
 ---
 
-## 72. Run replies add isolate keys only on isolate replies; the default task is the isolate task
+## 73. Run replies add isolate keys only on isolate replies; the default task is the isolate task
 
 **Call.** `tier`, `tierReason`, and `nextTier` appear in `legion session
 run -j` only when the reply's `tier` is set; `vmMs` only when positive;
@@ -2741,7 +2787,7 @@ task exists to serve the isolate task (`tier = "vm"` reaches it).
 
 ---
 
-## 73. Isolate config refuses unknown fields; a `file://` module is host-level
+## 74. Isolate config refuses unknown fields; a `file://` module is host-level
 
 **Call.** Every isolate config struct, and the worker's `isolate` block,
 denies unknown fields (the schema has `additionalProperties: false`).
@@ -2767,7 +2813,7 @@ what the existing host-level rule is about.
 
 ---
 
-## 74. The image manifest is written from the built images; builds are not reproducible, so a release pins the artifact
+## 75. The image manifest is written from the built images; builds are not reproducible, so a release pins the artifact
 
 **Call.** `crates/isolate/images/build.sh` builds the images and then runs
 `manifest_write_test` against them, which writes `manifest.json`: each

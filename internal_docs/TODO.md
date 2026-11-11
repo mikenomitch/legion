@@ -258,6 +258,23 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 - [ ] **The capacity pass has triggers it doesn't listen to yet** (audit SC4).
       Allocations freed by stop or scale-in and a node recovering by heartbeat
       queue nothing, and batch tasks are never woken ([calls #10](calls/architecture-audit-2026-10-09_calls.md)).
+- [ ] **A partly placed job says nothing about the envelopes it left out.**
+      When a session task's envelope does not fit an eligible node, the
+      only traces are the "Placed N allocation(s)" event and a manager
+      WARN log line; the pending/capacity-demand view skips `count.per`
+      tasks, so an unplaced envelope never shows as pending
+      ([`pending_capacity_work`](../crates/manager/src/storage/store/demand_ops.rs));
+      and a session start or run on that task then answers
+      `FAILED_PRECONDITION no node runs an envelope for <job>/<task> yet`,
+      which misleads when the node is eligible but full
+      ([`sessions.rs`](../crates/manager/src/manager/sessions.rs)). The
+      cheapest diagnostic: one warn-level scheduler event per eval naming
+      each unplaced task with its reason, from `outcome.unplaced`
+      ([`eval.rs`](../crates/manager/src/manager/eval.rs)). Found while
+      chasing an isolate test harness whose node was sized from its
+      fingerprint, not `config_attrs.resources`
+      ([`ResourcePool::from_node`](../crates/common/src/resources.rs));
+      pre-existing for every session task.
 
 ### Placement features
 
@@ -541,7 +558,7 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
 - [ ] **`suspend.durability = "store"` for session isolates.** Refused at
       submit (and by the node as a backstop); checkpoints stay on the node,
       so no session isolate survives it, and there is no durable named
-      isolate ([calls 58](calls/isolate-runtime-plan_calls.md#58-suspend-on-a-session-isolate-what-applies-what-is-refused-and-durability--store-is-not-built)).
+      isolate ([calls 59](calls/isolate-runtime-plan_calls.md#59-suspend-on-a-session-isolate-what-applies-what-is-refused-and-durability--store-is-not-built)).
 - [ ] **Gateway wake and host-held connections for session isolates.** The
       wake gateway does not hold requests for a hibernated isolate, and no
       connection or WebSocket stays open across hibernation
@@ -549,12 +566,12 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
 - [ ] **Streaming guest logs.** Handler and session isolates' output
       reaches the envelope's task log one batch per invocation, when it
       ends, told apart only by a `[isolate <id> tenant=<key>]` prefix
-      ([calls 69](calls/isolate-runtime-plan_calls.md#69-guest-logs-go-into-the-envelope-allocations-task-log-one-prefixed-line-each-once-per-invocation)).
+      ([calls 70](calls/isolate-runtime-plan_calls.md#70-guest-logs-go-into-the-envelope-allocations-task-log-one-prefixed-line-each-once-per-invocation)).
 - [ ] **Stage-time pre-initialization of `entry`.** An entry is parsed and
       run on every fresh instance (the 300 µs JS target is unmet); the
       `preinit-image`/`preinit-entry` derived kinds have no builder, and the
       node has no componentize toolchain
-      ([calls 41](calls/isolate-runtime-plan_calls.md#41-entry-arrives-through-the-tasks-artifacts-and-is-staged-per-call-not-pre-initialized)).
+      ([calls 42](calls/isolate-runtime-plan_calls.md#42-entry-arrives-through-the-tasks-artifacts-and-is-staged-per-call-not-pre-initialized)).
 - [ ] **Dynamic Wasm modules as runs.** A run executes source in an image
       or the task's own module; sending a component to compile and run is
       not built ([plan §6.5](plans/isolate-runtime-plan.md#65-the-start-path-and-compilation)).
@@ -562,39 +579,39 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
       module from source at run time, so `import`/`export` stops the run as
       `unsupported`; also not observed: unhandled promise rejections that
       are never awaited, and `process.exit` in a timer after the entry
-      returns ([calls 49](calls/isolate-runtime-plan_calls.md#49-a-js-entry-is-a-script-es-modules-are-unsupported-files-go-through-legionfs)).
+      returns ([calls 50](calls/isolate-runtime-plan_calls.md#50-a-js-entry-is-a-script-es-modules-are-unsupported-files-go-through-legionfs)).
 - [ ] **Python packages beyond the standard library** (curated images such
       as `python-data`, plan §14 Q4), and npm packages for `js`
-      ([calls 47](calls/isolate-runtime-plan_calls.md#47-python-is-cpython-for-wasi-heavy-packages-run-in-a-vm)).
+      ([calls 48](calls/isolate-runtime-plan_calls.md#48-python-is-cpython-for-wasi-heavy-packages-run-in-a-vm)).
 - [ ] **`js-small` (QuickJS).** Phase 0 measured 5.1× smaller idle than
       StarlingMonkey, meeting the plan's condition; not built
-      ([calls 46](calls/isolate-runtime-plan_calls.md#46-the-default-js-image-is-starlingmonkey-quickjs-is-a-candidate-js-small)).
+      ([calls 47](calls/isolate-runtime-plan_calls.md#47-the-default-js-image-is-starlingmonkey-quickjs-is-a-candidate-js-small)).
 - [ ] **Streaming HTTP bodies.** Ingress, egress and `legion.fetch` buffer
       whole bodies up to `isolate.maxBodyBytes`; no WebSockets, no h2 to
       origins, no connection pooling per envelope
-      ([calls 51](calls/isolate-runtime-plan_calls.md#51-egress-the-worker-dials-the-envelopes-own-datapath-listeners-and-upstreams-are-addressed-by-name),
-      [52](calls/isolate-runtime-plan_calls.md#52-ingress-one-unix-socket-per-port-label-http11-inside-bodies-buffered)).
+      ([calls 52](calls/isolate-runtime-plan_calls.md#52-egress-the-worker-dials-the-envelopes-own-datapath-listeners-and-upstreams-are-addressed-by-name),
+      [53](calls/isolate-runtime-plan_calls.md#53-ingress-one-unix-socket-per-port-label-http11-inside-bodies-buffered)).
 - [ ] **The VM task sharing the isolate's `connect` block.** Sandbox session
       tasks refuse `connect` and a gated network, so a VM run or child VM
       has no upstreams or injected credentials; needs a session datapath for
-      sandboxes ([calls 64](calls/isolate-runtime-plan_calls.md#64-the-vm-task-does-not-share-the-isolates-connect-block-yet)).
+      sandboxes ([calls 65](calls/isolate-runtime-plan_calls.md#65-the-vm-task-does-not-share-the-isolates-connect-block-yet)).
 - [ ] **Connection handoff from an isolate to its child VM**, and resuming
       a child that its own idle policy suspended (answers `child-gone`)
       ([calls 33](calls/isolate-runtime-plan_calls.md#33-a-sessions-address-is-always-its-isolate-its-vm-is-reached-through-it),
-      [67](calls/isolate-runtime-plan_calls.md#67-a-child-vm-handle-is-bounded-and-reaches-only-the-childs-own-ports)).
+      [68](calls/isolate-runtime-plan_calls.md#68-a-child-vm-handle-is-bounded-and-reaches-only-the-childs-own-ports)).
 - [ ] **Untagged session-isolate ids in the instance verbs.** An id derived
       from an idempotency key carries no node tag; only `isolate get` and
       `session run` take `--on-node`, so stop/suspend/resize cannot find it
-      ([calls 42](calls/isolate-runtime-plan_calls.md#42-session-isolates-are-reached-through-their-ids-node-tag-untagged-ids-need---on-node)).
+      ([calls 43](calls/isolate-runtime-plan_calls.md#43-session-isolates-are-reached-through-their-ids-node-tag-untagged-ids-need---on-node)).
 - [ ] **A keyed session-isolate start retried through another manager can
       start a duplicate**; the per-manager memo lasts 10 minutes and the
       index's duplicate sweep does not see isolates
-      ([calls 56](calls/isolate-runtime-plan_calls.md#56-a-session-isolate-start-is-confirmed-by-the-nodes-reply-and-is-never-a-keyed-instance)).
+      ([calls 57](calls/isolate-runtime-plan_calls.md#57-a-session-isolate-start-is-confirmed-by-the-nodes-reply-and-is-never-a-keyed-instance)).
 - [ ] **Replica rebalancing and shrinking; shard rebalancing.** A cordon's
       replicas only grow and split each task evenly, holders never move
       between shards, and the shard count is fixed at host start
-      ([calls 53](calls/isolate-runtime-plan_calls.md#53-a-cordons-capacity-10000-slots-per-host-clamped-by-vmmax_map_count-replicas-only-grow),
-      [38](calls/isolate-runtime-plan_calls.md#38-each-host-runs-one-shard-per-core-shared-nothing)).
+      ([calls 54](calls/isolate-runtime-plan_calls.md#54-a-cordons-capacity-10000-slots-per-host-clamped-by-vmmax_map_count-replicas-only-grow),
+      [39](calls/isolate-runtime-plan_calls.md#39-each-host-runs-one-shard-per-core-shared-nothing)).
 - [ ] **A `cpu.weight` for the host cgroup.** The cgroup's `memory.max`
       follows envelope resizes and tasks joining or leaving the cordon, and
       the host is placed in it before `exec`, but no CPU weight is set; the
@@ -603,18 +620,18 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
       ([calls 31](calls/isolate-runtime-plan_calls.md#31-paging-out-is-kernel-reclaim-on-the-hosts-cgroup-not-madvise-per-isolate)).
 - [ ] **Per-job labels on isolate metrics** (or another way to break them
       down without the 256-series cap)
-      ([calls 70](calls/isolate-runtime-plan_calls.md#70-isolate-metrics-have-no-per-job-labels-and-count-cpu-in-microseconds)).
+      ([calls 71](calls/isolate-runtime-plan_calls.md#71-isolate-metrics-have-no-per-job-labels-and-count-cpu-in-microseconds)).
 - [ ] **Per-isolate attribution of egress denials.** `legion net denials`
       names the task; the isolate id and tenant are only in debug logs
       ([calls 10](calls/isolate-runtime-plan_calls.md#10-the-host-protocol-is-grpc-over-two-inherited-socketpairs-with-an-origin-on-every-request)).
 - [ ] **Invocation-level idempotency in the host**; a retried call that was
       mid-flight when a host died runs again, and a host crash loses every
       resident session that never hibernated
-      ([calls 68](calls/isolate-runtime-plan_calls.md#68-a-host-restart-fails-its-in-flight-calls-and-loses-resident-sessions-that-never-hibernated)).
+      ([calls 69](calls/isolate-runtime-plan_calls.md#69-a-host-restart-fails-its-in-flight-calls-and-loses-resident-sessions-that-never-hibernated)).
 - [ ] **`operator runtime status` counts 0 sessions for `isolate`**, and the
       `[runtime-disabled]` submit warning fires for an isolate task whose
       `auto` runs go to its VM
-      ([calls 43](calls/isolate-runtime-plan_calls.md#43-disabling-the-isolate-runtime-the-node-decides-when-a-vm-can-take-the-run-and-a-drain-hibernates-only-what-it-covers)).
+      ([calls 44](calls/isolate-runtime-plan_calls.md#44-disabling-the-isolate-runtime-the-node-decides-when-a-vm-can-take-the-run-and-a-drain-hibernates-only-what-it-covers)).
 - [ ] **A compile prefetch before a host upgrade** (plan §13): a new
       `legion-isolate` recompiles each module on first use per node.
 - [ ] **Phase 6 hardening and density.** `cordonBoundary = "vm"` (refused
@@ -645,7 +662,7 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
       8 × `isolate.maxBodyBytes` of bodies each way per invocation (plus
       header sets) lives outside the isolate's account; there is no
       per-cordon egress limit in the worker
-      ([calls 44](calls/isolate-runtime-plan_calls.md#44-a-guests-outbound-requests-at-most-8-in-flight-per-invocation-the-rest-wait-and-none-outlives-the-invocation)).
+      ([calls 45](calls/isolate-runtime-plan_calls.md#45-a-guests-outbound-requests-at-most-8-in-flight-per-invocation-the-rest-wait-and-none-outlives-the-invocation)).
 - [ ] **Tenant keys are caller-chosen.** Any caller who may run in the task
       and any HTTP client of an advertised port can name any tenant; the
       review's suggested jobspec switch to ignore a client-supplied
@@ -676,7 +693,7 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
 - [ ] **Reproducible image builds.** Two builds from the same inputs differ
       (snapshot random state and hash seed), so a release must pin the
       built artifact; nobody can verify a shipped image by rebuilding it
-      ([calls 74](calls/isolate-runtime-plan_calls.md#74-the-image-manifest-is-written-from-the-built-images-builds-are-not-reproducible-so-a-release-pins-the-artifact)).
+      ([calls 75](calls/isolate-runtime-plan_calls.md#75-the-image-manifest-is-written-from-the-built-images-builds-are-not-reproducible-so-a-release-pins-the-artifact)).
 - [ ] **V8 (Phase 7) and continuation migration (Phase 8)** stay behind the
       plan's trigger and research status
       ([calls 1](calls/isolate-runtime-plan_calls.md#1-the-engine-is-wasmtime-js-and-python-run-as-interpreters-inside-wasm-not-on-v8)).
@@ -1476,8 +1493,8 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Rerun `scheduler_speed`, `candidate_construction`, and the `locality` group before/after on a quiet host; the suspend plan's §9 numbers are noise-dominated ([plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)).
 - [ ] Isolate Phase 0 on the AWS rig (nested and metal, 16 vCPU / 64 GiB, a `la57` CPU for 5-level paging): the findings doc's measurements, then rewrite plan §4 and §10 from them; every number so far is from a 4-vCPU container ([findings](isolate-runtime-phase0-findings.md) · [plan §11](plans/isolate-runtime-plan.md#11-implementation-phases)).
 - [ ] Isolate density campaign (plan §12, Phases 4 and 6): fill a node with session isolates to its memory budget; report resident, paged-out and hibernated counts, wake latencies, and host RSS per isolate; include an MPK host with `vm.max_map_count` raised.
-- [ ] Isolate VM tier on KVM: a `tier = "vm"` run and an `auto` run that goes to the VM (reply shape, `vmMs`, a fresh VM per run, `args` on `run.command`), `--fallback vm`, and child VMs (`vm.acquire`/`exec`/`fetch`, `children.max`, a session isolate keeping its child across hibernation and re-attaching, the child ending with its owner, `child-gone`); nothing has run against a real VM. The tier logic and child ownership pass end to end with an `exec` session task standing in for the sandbox, and the two sandbox variants in `tests/integration/isolate.rs` are written and ignored ("needs /dev/kvm"); run them on a KVM node ([calls 65](calls/isolate-runtime-plan_calls.md#65-vm-tier-and-child-vm-tests-run-with-an-exec-session-task-standing-in-for-the-sandbox) · [plan §12 "Burst"](plans/isolate-runtime-plan.md#12-testing-plan)).
-- [ ] Isolate child re-attach by id after hibernation: a session isolate that hibernated calls `vm.attach(id)` on the child it started earlier and drives it. Not covered by any test (the test guest only calls `vm.acquire`); needs a runner fixture that calls `vm.attach`, then a run with the `exec` stand-in and on KVM ([calls 65](calls/isolate-runtime-plan_calls.md#65-vm-tier-and-child-vm-tests-run-with-an-exec-session-task-standing-in-for-the-sandbox)).
+- [ ] Isolate VM tier on KVM: a `tier = "vm"` run and an `auto` run that goes to the VM (reply shape, `vmMs`, a fresh VM per run, `args` on `run.command`), `--fallback vm`, and child VMs (`vm.acquire`/`exec`/`fetch`, `children.max`, a session isolate keeping its child across hibernation and re-attaching, the child ending with its owner, `child-gone`); nothing has run against a real VM. The tier logic and child ownership pass end to end with an `exec` session task standing in for the sandbox, and the two sandbox variants in `tests/integration/isolate.rs` are written and ignored ("needs /dev/kvm"); run them on a KVM node ([calls 66](calls/isolate-runtime-plan_calls.md#66-vm-tier-and-child-vm-tests-run-with-an-exec-session-task-standing-in-for-the-sandbox) · [plan §12 "Burst"](plans/isolate-runtime-plan.md#12-testing-plan)).
+- [ ] Isolate child re-attach by id after hibernation: a session isolate that hibernated calls `vm.attach(id)` on the child it started earlier and drives it. Not covered by any test (the test guest only calls `vm.acquire`); needs a runner fixture that calls `vm.attach`, then a run with the `exec` stand-in and on KVM ([calls 66](calls/isolate-runtime-plan_calls.md#66-vm-tier-and-child-vm-tests-run-with-an-exec-session-task-standing-in-for-the-sandbox)).
 - [ ] Isolate HTTP end to end on a real node: a request through netd's own TCP ingress listener (TLS and the ingress chain) to an isolate handler, and an upstream credential installed by the heartbeat's `FetchDatapathMaterial` path rather than set directly; the end-to-end test enters at the supervisor's ingress socket and installs the credential itself ([plan §12](plans/isolate-runtime-plan.md#12-testing-plan)).
 - [ ] Isolate page-out and the host cgroup on a cgroup v2 node with swap or zswap and resource enforcement on: `Reclaim{PAGE_OUT}` plus `memory.reclaim` actually moves pages, `pagedOut` counts them, the pressure response asks hosts before allocations, the forked host lands in its cgroup (placed before `exec`), and `memory.max` follows envelope resizes ([calls 31](calls/isolate-runtime-plan_calls.md#31-paging-out-is-kernel-reclaim-on-the-hosts-cgroup-not-madvise-per-isolate)).
 - [ ] Isolate Phase 1 acceptance on a real node with **release builds**: `legion session run` on a Rust component task under 2 ms end to end. Measured so far only with debug builds of the worker and the host in a 4-vCPU container: 4.8 ms p50 (min 4.4 ms) for a Rust component, 17.6 ms p50 for a Python hello world (`isolate_images::hello_world_end_to_end_timing`), which does not meet the target; also `isolate_bench` (`cargo bench -p legion-isolate --bench isolate_bench`) against the Phase 0 targets on the rig ([plan §15](plans/isolate-runtime-plan.md#15-acceptance-criteria)).
@@ -1779,6 +1796,7 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **ACL Phases 1–4** — default-deny model with one-line enforcement and the `acl_endpoints` coverage gate, SSO and admin, worker-plane hardening (join tokens via `CreateJoinToken`, `:4748` gone), operations at scale
 - **Audit 2026-10-09 security fixes** — scoped and pruned idempotency keys (S4), worker-plane identity binding (S1), browser origin allow-list (S2), private keys redacted from state queries (S3), cluster-wide `RotateMeshCa` (S5), stream re-auth (S7) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
 - **Keyring `provider test` / `root-key generate` in the capability catalog** ([calls](calls/cluster-ca-provider-plan_calls.md))
+- **A session task's generated envelope no longer makes its job host-level** — the `envelope` runtime was classified as an unknown plugin, so every job with a session task (sandbox, container, isolate) needed `host = true`; a `file://` isolate module still needs it ([calls 37](calls/isolate-runtime-plan_calls.md#37-a-session-tasks-generated-envelope-is-not-host-level-for-every-runtimes-session-tasks) · [docs](../docs/auth-and-acls.md#host-level-jobs))
 - **Namespaces, Phases 1–4** — the namespace object and ACL resource, canonical `ns/job` ids, `-n`/`-A`, namespaced services/DNS/events, cross-namespace upstreams, UI switcher and pages, namespace policies with per-band quota and admission checks ([plan](plans/namespaces-plan.md) · [calls](calls/namespaces-plan_calls.md) · [docs](../docs/namespaces.md))
 
 ## Exec & actions

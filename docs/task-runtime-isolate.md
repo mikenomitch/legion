@@ -346,7 +346,12 @@ config = {
 `source` is an `https://`, `http://`, `s3://`, `oci://`, or `file://` URL,
 fetched once per node through the worker's [artifact](artifacts.md)
 fetchers. A `file://` source makes the task host-level, as a `file://`
-artifact does. `sha256` is required (64 hex digits, or `sha256:<hex>`): a
+artifact does: the root worker reads the node's filesystem, so submitting
+the job needs a `job:write` rule with `host = true`
+([Host-level jobs](auth-and-acls.md#host-level-jobs)). Otherwise an
+isolate task is host-level only for the reasons any task is (a `file://`
+artifact, an artifact that presents the node's identity); the envelope
+generated for it never is. `sha256` is required (64 hex digits, or `sha256:<hex>`): a
 task always runs exactly the module it was submitted with. What a module may
 import and must export is in [The guest's world](#the-guests-world).
 

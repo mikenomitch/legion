@@ -29,7 +29,7 @@ belongs to the isolate runtime and does not exist without it. *Update
 `vm.acquire()` starts a child of the VM task on the isolate's node, a
 session isolate owns it as `session`, and a request or tenant isolate
 under a new owner kind, `isolate`, that managers leave to the node
-([isolate calls entry 50](../calls/isolate-runtime-plan_calls.md#50-child-vms-of-an-isolate-are-owned-per-isolate-and-judged-by-its-node)). No
+([isolate calls entry 51](../calls/isolate-runtime-plan_calls.md#51-child-vms-of-an-isolate-are-owned-per-isolate-and-judged-by-its-node)). No
 throughput benchmark was run for Phase 4; the handoff uses the datapath's
 own copy, whose numbers are the datapath plan's.
 

@@ -34,7 +34,7 @@ Public page: [docs/resize.md](../../docs/resize.md).
   ([isolate plan](isolate-runtime-plan.md)): a session isolate's `memory`
   and `memoryMax` resize live through `Worker.ResizeSession`, and `cpu`
   answers `not_supported`, because an isolate's CPU is its task's weight
-  ([isolate calls entry 54](../calls/isolate-runtime-plan_calls.md#54-admission-is-by-reservation-and-cpu-weight-enforced-by-the-host-per-invocation)). The autoscaler's vertical strategies ("Then:" in
+  ([isolate calls entry 55](../calls/isolate-runtime-plan_calls.md#55-admission-is-by-reservation-and-cpu-weight-enforced-by-the-host-per-invocation)). The autoscaler's vertical strategies ("Then:" in
   §8) are a phase of [autoscaler-v2-plan.md](autoscaler-v2-plan.md), which
   now has `ResizeTask` and `ResizeInstance` to call. Memory hotplug,
   `cores`, and devices are this plan's non-goals.
