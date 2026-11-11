@@ -11,7 +11,7 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 
 | PR | What it lands |
 | --- | --- |
-| (this PR) | The `isolate` runtime, Phases 1–5: `legion-isolate`, the `js` and `python` images, the worker's isolate supervisor and datapath, tiers and burst, `legion isolate stats`/`get` ([plan](plans/isolate-runtime-plan.md) · [calls](calls/isolate-runtime-plan_calls.md) · [docs](../docs/task-runtime-isolate.md)) |
+| [#75](https://github.com/mikenomitch/legion/pull/75) | The `isolate` runtime, Phases 1–5: `legion-isolate`, the `js` and `python` images, the worker's isolate supervisor and datapath, tiers and burst, `legion isolate stats`/`get` ([plan](plans/isolate-runtime-plan.md) · [calls](calls/isolate-runtime-plan_calls.md) · [docs](../docs/task-runtime-isolate.md)) |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again (likely closes "Plugin lockfiles are stale") |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
 | [#37](https://github.com/mikenomitch/legion/pull/37) | UI appearance picker: built-in themes and custom colors |
