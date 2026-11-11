@@ -978,7 +978,7 @@ fn validate_isolate_task(config: &JobConfig, task: &TaskConfig) -> Result<(), St
                 return Err(format!("{prefix}: config.vm.task must name a task"));
             }
         };
-        if !children.iter().any(|child| *child == vm_task) {
+        if !children.contains(&vm_task) {
             return Err(format!(
                 "{prefix}: config.vm.task \"{vm_task}\" is not in children.tasks; add it there, \
                  which is what lets this task's isolates start it"
@@ -1873,6 +1873,38 @@ mod isolate_test {
         );
         assert!(
             serde_json::from_value::<WorkerIsolateConfig>(json!({ "hostMemroy": "1GiB" })).is_err()
+        );
+    }
+
+    /// The block rides the artifacts payload to the worker, resolved; a
+    /// payload without it (an older manager) parses as "the defaults".
+    #[test]
+    fn the_worker_isolate_block_rides_the_artifacts_payload_test() {
+        let isolate = WorkerIsolateConfig {
+            slots_per_host: Some(500),
+            ..Default::default()
+        }
+        .with_defaults();
+        let payload = crate::structs::WorkerArtifactsPayload {
+            isolate: Some(isolate.clone()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_string(&payload).unwrap();
+        let parsed: crate::structs::WorkerArtifactsPayload = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed.isolate, Some(isolate));
+        let bare: crate::structs::WorkerArtifactsPayload = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            bare.isolate.unwrap_or_default(),
+            WorkerIsolateConfigFull::default()
+        );
+        let alt: crate::structs::WorkerConfigAlt = serde_json::from_value(json!({
+            "workerType": "edge",
+            "isolate": { "maxMemory": "512MiB" },
+        }))
+        .unwrap();
+        assert_eq!(
+            alt.isolate.unwrap().with_defaults().max_memory,
+            "512MiB".to_string()
         );
     }
 

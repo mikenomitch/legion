@@ -6443,15 +6443,11 @@ dependencies = [
  "hyper",
  "pin-project-lite",
  "rustix 1.1.4",
- "rustls",
  "tokio",
- "tokio-rustls",
- "tokio-util",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-io",
- "webpki-roots",
 ]
 
 [[package]]
