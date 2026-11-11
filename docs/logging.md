@@ -75,8 +75,10 @@ process of its own. The output of its HTTP and session-isolate invocations
 is appended by the worker to the **envelope allocation's** `stdout.log` and
 `stderr.log`, once per invocation when it ends, each line prefixed with
 `[isolate <id>]` (and ` tenant=<key>` when it has one), a line cut at
-16 KiB. Runs in request and tenant isolates return their output in the run's
-reply instead.
+16 KiB, control characters other than tab written as visible `\xHH`, and
+each job and task limited to 512 KiB of log per second under a per-host
+ceiling ([details](task-runtime-isolate.md#logs)). Runs in request and
+tenant isolates return their output in the run's reply instead.
 
 > **Note on custom task plugins:** a plugin captures logs automatically if it
 > spawns its work with `spawn_task_process` after calling

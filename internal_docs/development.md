@@ -352,7 +352,9 @@ config, beside the worker, env var). A worker that finds a working binary
 advertises the `isolates` capability. No release ships it yet.
 
 The worker runs `legion-isolate compile --input <file> --output <file>
---confine <isolate.confine>` once per module; `--confine` is `enforce`,
+--confine <isolate.confine> --deadline-secs 310` once per module
+(`--deadline-secs` makes the compiler kill itself after that long, 0 for
+none); `--confine` is `enforce`,
 `best-effort`, or `off` and defaults to `enforce`, so running the compiler
 by hand on a machine without unprivileged user namespaces or Landlock
 needs `--confine best-effort` (it prints `{"ok":false,"kind":"confinement",
@@ -427,12 +429,17 @@ need a real sandbox session run are ignored ("needs /dev/kvm"); the Linux
 dev sandbox backend takes no exec, so the others use an `exec` session task
 stored straight into the store as a stand-in VM task. Hosts in tests confine
 themselves with `best-effort`, which in the build container applied all
-eight layers. `LEGION_ISOLATE_SECCOMP=log` turns the host's (and the
-compiler's) seccomp kills into log entries when chasing a missing syscall;
-the allowlists were found with `strace -f --decode-pids=pidns` over the
-binary suite and both images. The test-only `--test-skip
-seccomp,pidns,scopes,mount,landlock` flag on `host` and `compile` exists
-only in a `--features confinement-test` build. The end-to-end timing
+eight layers. In a `--features confinement-test` build only,
+`LEGION_ISOLATE_SECCOMP=log` turns the host's (and the compiler's) seccomp
+kills into log entries when chasing a missing syscall (a shipping build
+ignores it, and a test build says so in the host's `Hello` notes); the
+allowlists were found with `strace -f --decode-pids=pidns` over the
+binary suite and both images. The test-only `--test-attempt` and
+`--test-skip seccomp,pidns,scopes,mount,landlock,userns,setattr` flags on
+`host` and `compile` exist only in that build too. CI's `--all-features`
+builds the hooks in, but only to test them; shipping builds (`cargo build
+--profile dist`, `cargo build -p legion-isolate`) do not enable the
+feature, and a release pipeline must not either. The end-to-end timing
 (`isolate_images::hello_world_end_to_end_timing`) prints its numbers with
 `--nocapture`; with a debug `legion-isolate` it measures debug builds, and
 the first Python run then compiles the image for about a minute.

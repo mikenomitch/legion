@@ -164,7 +164,7 @@ The [isolate runtime](task-runtime-isolate.md) has tests in three places:
   test-only hooks: `cargo test -p legion-isolate --features
   confinement-test`. Without the feature they are ignored. The hooks let a
   test make the confined host or compiler attempt a forbidden action and
-  leave chosen layers out (`--test-skip seccomp,pidns,scopes,mount,landlock`),
+  leave chosen layers out (`--test-skip seccomp,pidns,scopes,mount,landlock,userns,setattr`),
   so each layer is shown to stop its attacks on its own; they exist only in
   a build with the feature.
 - **Image tests** (`crates/isolate/tests/images.rs`) need the built images

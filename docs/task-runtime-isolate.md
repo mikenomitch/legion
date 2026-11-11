@@ -663,11 +663,15 @@ listed in the isolate task's `children.tasks`. A `vm` run is a
 [session run](session-runs.md) of it on the same node the router picked for
 the isolate task:
 
-- the entry (the run's, or the task's `config.entry`) is staged as
-  `/legion/run/main.py` (`python`) or `/legion/run/main.mjs` (`js`), the
-  other files under their own names, and `--input` as `input.json`;
+- the entry (the run's, or the task's `config.entry`) is always staged
+  under a fixed name: `/legion/run/main.py` (`python`),
+  `/legion/run/main.mjs` (`js`), or `/legion/run/main` (a module task); the
+  other files keep their own names, and `--input` is `input.json`. A run
+  file that has the fixed name while an entry is staged there is refused
+  (`file main has the name the VM tier stages the run's entry under;
+  rename it`);
 - `--arg` values are appended to the VM task's own `run.command` **only
-  when that command ends with the entry's path**
+  when its last element is exactly that fixed entry path**
   (`["python3", "/legion/run/main.py"]`), after that path. What the
   command does with them is the job author's design: an interpreter passes
   them to the script, but a tool that takes the entry as an operand (a
@@ -907,10 +911,13 @@ output directory (writable, not executable), Landlock on those two paths,
 enforce|best-effort|off`, `enforce` by default); under `enforce` a layer
 that cannot apply fails the compile, and the task's `problem` reads `the
 module failed to compile (confinement): ...`. Each compile reads a
-private copy of its input, at most two compiles run at once on a node,
-and a compile is limited to 300 seconds and a 16 GiB address space
-(virtual memory, not a cgroup: the compiler has no memory cgroup of its
-own).
+private copy of its input, and at most two compiles run at once on a
+node. A compile is limited to 300 seconds (the worker kills it then, and
+passes `--deadline-secs 310`, which the compiler enforces on itself, so it
+never outlives a worker that died) and to a 16 GiB address space (virtual
+memory). With resource enforcement on and cgroup v2 it also runs in a
+short-lived cgroup of its own with `memory.max` 4 GiB and `pids.max` 256;
+elsewhere the address-space limit is its only memory bound.
 
 ## HTTP handlers
 
@@ -1084,7 +1091,7 @@ close-on-exec. Then, in order:
 | --- | --- | --- |
 | User namespace | uid and gid map to 65534 inside it, and every capability is dropped. The kernel still sees the worker's uid (normally root) for file permissions; the host does not switch to an unprivileged user. New mount, IPC, and UTS namespaces too | `userns` |
 | Network namespace | no interface but an unconfigured loopback that is down | `netns` |
-| Mount root | `/` is an empty, read-only tmpfs holding only the compiled-artifact directories, bound read-only, `nosuid`, `nodev`, at their own paths. No `/proc`, `/sys`, or `/dev`: every other path on the node does not exist for the host (`ENOENT`, for `open`, `stat`, and `readlink` alike) | `mount-root` |
+| Mount root | `/` is an empty, read-only tmpfs holding only the compiled-artifact directories, bound read-only, `nosuid`, `nodev`, at their own paths, with any mount nested inside them read-only too (`enforce` refuses a host where that cannot be done). No `/proc`, `/sys`, or `/dev`: every other path on the node does not exist for the host (`ENOENT`, for `open`, `stat`, and `readlink` alike) | `mount-root` |
 | PID namespace | the host is PID 1 of its own namespace and can name no process outside it (below) | `pid-ns` |
 | `no_new_privs` | | `no-new-privs` |
 | Landlock | read-only access beneath the artifact directories, nothing else on the filesystem; no TCP bind or connect | `landlock` |
@@ -1113,11 +1120,16 @@ only). Under `enforce` every layer above is required except
 the layers in force for every host process (`confinement`); a layer
 missing from the list did not apply.
 
+Without a user namespace (only possible under `best-effort`) the host
+still drops every capability, but runs as the worker's uid.
+
 With resource enforcement on and cgroup v2, each host process also runs in
-its own cgroup (`<cgroupParent>/isolate-hosts/<cordon>-<replica>`, with
-every character of the cordon name other than a letter, digit or `-`
-written as `_`, so `ns:default` is `ns_default-0`), with `memory.max` the
-sum of the cordon's envelopes on the node and `pids.max` 1024. The worker
+its own cgroup under `<cgroupParent>/isolate-hosts/`. The leaf's name is a
+readable prefix of the cordon name (letters, digits, `.` and `-` kept,
+anything else written as `_`), the first 12 hex digits of the SHA-256 of
+the exact cordon name, and the replica, so two cordons never share a
+leaf. `memory.max` is the sum of the cordon's envelopes on the node and
+`pids.max` 1024. The worker
 creates the cgroup and puts the process in it before `exec`, so the
 forked host starts inside it; if that fails, the worker logs a warning and
 the host runs in the worker's cgroup. `memory.max` follows the cordon:
@@ -1129,8 +1141,15 @@ reaches nothing but the two sockets its worker gave it, and every request it
 makes of the worker names a task, which the worker checks against the
 cordon it started that process for. Child-VM calls must also name an
 isolate the worker issued to that cordon: a session it holds, or an
-invocation it has in flight, for that job and task. A compromised host can
-act only as the jobs and isolates of its own cordon.
+invocation it has in flight, for that job and task; log lines are kept
+only for those isolates too, and every request's job, task, isolate id,
+and tenant are checked for length and form before the worker acts on it.
+What a compromised host can still do: act as any session or in-flight
+invocation of its own cordon (on any of the cordon's replicas), write log
+lines under an invocation's id for 30 seconds after it ends, and send
+requests through its tasks' upstreams with their injected credentials. It
+cannot reach another cordon's isolates or children, and it never holds a
+credential (one an upstream echoes back excepted, as above).
 
 ### Bounds
 
@@ -1150,9 +1169,11 @@ What a host can make its worker hold:
 | Bound | Value |
 | --- | --- |
 | A hibernation checkpoint | checked before any byte is kept: a session the worker holds for that job and task, at most 1 MiB of state plus 256 KiB |
-| Calls at once | 256 per host connection |
+| One call's message | `max(isolate.maxBodyBytes, 16 MiB) + 1 MiB` (17 MiB by default); a child VM `put` or `exec` stdin larger than that fails |
+| Calls at once | 8 per shard of the host, at least 16 and at most 64 |
+| Bodies held across an await (egress, child VM) | `max(64 MiB, 4 × the message limit)` per host; past it a call answers `RESOURCE_EXHAUSTED` |
 | A line of the host's own stderr | 4 KiB; the rest of the line is skipped |
-| Guest log lines | 4,096 per batch, 16 KiB per line, 1 MiB/s per host with an 8 MiB burst ([Logs](#logs)) |
+| Guest log lines | 4,096 per batch and 1 MiB of text, 16 KiB per line, 512 KiB/s per job and task (4 MiB burst) under 2 MiB/s per host (16 MiB burst) ([Logs](#logs)) |
 
 Buffered request and response bodies live in the host's memory, outside
 the isolates' accounts: they are **not** counted against `memoryMax`. A
@@ -1374,9 +1395,29 @@ isolate (and tenant):
 ```
 
 Read them with `legion job logs <JOB> --allocation <envelope allocation
-id>`. Runs in request and tenant isolates are not logged there. A long-running invocation's
-output reaches the log only when it ends. The host's own logs go to the
-worker's.
+id>`. Runs in request and tenant isolates are not logged there. A
+long-running invocation's output reaches the log only when it ends. The
+host's own logs go to the worker's.
+
+- **Who wrote a line.** The prefix comes from the worker's own record of
+  the isolate and its tenant, never from the host's word, and lines are
+  kept only for an isolate the worker gave that host: a session it holds,
+  or an invocation in flight or ended within the last 30 seconds.
+- **Control characters are escaped.** Carriage returns, escape sequences,
+  and other control characters except tab are written as visible `\xHH`,
+  so no line can overwrite or imitate another on a terminal; coloured
+  output shows as `\x1b[31m`.
+- **Limits.** A guest line is cut at 16 KiB, and one invocation's batch at
+  4,096 lines and 1 MiB of text. Each job and task may log 512 KiB per
+  second (bursts up to 4 MiB) within a per-host ceiling of 2 MiB per
+  second (16 MiB bursts); tenants of one task share its budget. Dropped
+  lines are replaced by one line saying how many:
+
+  ```text
+  [isolate 7c1e... tenant=acme] 1200 lines dropped: over the task's log rate or the batch limit
+  ```
+
+- The log files rotate as other task logs do, checked after every batch.
 
 ### Failure modes
 
@@ -1485,7 +1526,8 @@ it is not known.
 - **Replicas only grow** while a cordon has tasks; an uneven load can refuse
   on one replica while another has room.
 - **Host cgroups have no `cpu.weight`**, and their placement, `memory.max`
-  updates, and page-out have not run on a cgroup v2 node.
+  updates, page-out, and the compiler's cgroup have not run on a cgroup v2
+  node.
 - **No per-isolate attribution** in `legion net denials`.
 - **Engine and memory layout**: MPK is not an operator-validated default;
   anonymous executable memory is not denied (no LSM).

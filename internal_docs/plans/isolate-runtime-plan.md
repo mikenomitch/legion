@@ -110,7 +110,9 @@ Deferred, deliberately not built in this round:
   builds (calls 75);
 - dropping the host's kernel uid (calls 18); denying anonymous executable
   memory, which needs an LSM; tracking in-flight invocations per replica
-  rather than per cordon (calls 28);
+  rather than per cordon (calls 28); bounding a host call's bytes while it
+  is decoded (calls 46); running the host and compile cgroups on a cgroup
+  v2 node;
 - a release-build end-to-end measurement against the Phase 1 target of
   under 2 ms (the debug-build measurement missed it, §15).
 
@@ -2224,6 +2226,14 @@ build container, as reported by the agents that ran them:
   `legion.state` kept across hibernation, and the end-to-end timing.
 - **The VM tier** ran with an `exec` session task standing in for the
   sandbox (calls entry 66).
+
+After the second hardening round (as reported): the `binary` tests with
+the feature, 24 passed and 2 ignored; worker isolate unit tests 99 passed;
+integration `isolate::` and `isolate_control::` 25 passed, 2 ignored (the
+KVM tests); the ignored image tests (`images` 20, and both images through
+the confined binary) passed; `http.rs`'s
+`a_warm_instance_cannot_leave_a_request_running_after_its_call_test` is
+flaky (2 of 4 runs failed; it races, the code it tests was not changed).
 
 Not covered end to end: netd's own TCP ingress listener in front of the
 supervisor's socket; the heartbeat path that installs an upstream
