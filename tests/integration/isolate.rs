@@ -1616,3 +1616,42 @@ mod http_e2e {
         assert!(!log.contains(TOKEN));
     }
 }
+
+// REPRO-ENVELOPES (temporary investigation)
+fn repro_exec_session(name: &str) -> Value {
+    let mut task = machine("exec");
+    task["name"] = json!(name);
+    task
+}
+
+fn repro_placed(cluster: &Cluster) -> Vec<(String, Vec<String>)> {
+    let mut placed: Vec<(String, Vec<String>)> = cluster
+        .store()
+        .task_allocation_nodes(&[JOB.to_string()])
+        .unwrap()
+        .into_iter()
+        .map(|((_, _, task), nodes)| (task, nodes))
+        .collect();
+    placed.sort();
+    placed
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repro_three_exec_session_tasks() -> legion::prelude::R<()> {
+    let cluster = Cluster::start(
+        Images::Fixture("runner.wasm"),
+        json!([
+            repro_exec_session("a"),
+            repro_exec_session("b"),
+            repro_exec_session("c")
+        ]),
+    )
+    .await?;
+    eprintln!("REPRO placed after submit: {:?}", repro_placed(&cluster));
+    for task in ["a", "b", "c"] {
+        let r = cluster.wait_for(task, false).await;
+        eprintln!("REPRO wait_for {task}: {r:?}");
+    }
+    eprintln!("REPRO placed at end: {:?}", repro_placed(&cluster));
+    Ok(())
+}
