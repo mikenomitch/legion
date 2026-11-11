@@ -836,8 +836,8 @@ pub fn default_checkpoint_kind(task: &crate::structs::TaskConfig) -> SnapshotKin
 
 /// The bytes a memory checkpoint of this task is expected to take, when its
 /// `suspend` block checkpoints memory: the guest's memory size
-/// (`config.memory_mib`, which submit pins for a sandbox, else
-/// `resources.memoryMax`, else `resources.memory`). An upper bound, since a
+/// (`resources.memoryMax`, else `resources.memory`, else the sandbox's
+/// 512 MiB default). An upper bound, since a
 /// checkpoint of a guest that never touched its memory can be smaller.
 /// `None` for every other task, which the snapshot budget never constrains.
 pub fn expected_memory_checkpoint_bytes(task: &crate::structs::TaskConfig) -> Option<u64> {
@@ -846,8 +846,7 @@ pub fn expected_memory_checkpoint_bytes(task: &crate::structs::TaskConfig) -> Op
         return None;
     }
     let number = |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_f64);
-    let mib = number(task.config.get("memory_mib"))
-        .or_else(|| number(task.resources.get(crate::resources::MEMORY_MAX_KEY)))
+    let mib = number(task.resources.get(crate::resources::MEMORY_MAX_KEY))
         .or_else(|| number(task.resources.get("memory")))
         .unwrap_or(512.0);
     Some((mib.max(0.0) * 1024.0 * 1024.0) as u64)
@@ -1888,8 +1887,10 @@ mod tests {
 
     #[test]
     fn the_expected_checkpoint_is_the_guest_memory_of_a_memory_suspend() {
-        let mut sandbox = task("sandbox", true, serde_json::json!({}));
-        sandbox.config["memory_mib"] = serde_json::json!(1024);
+        let sandbox = with_resources(
+            task("sandbox", true, serde_json::json!({})),
+            serde_json::json!({ "memory": 1024 }),
+        );
         assert_eq!(
             expected_memory_checkpoint_bytes(&sandbox),
             Some(1024 * 1024 * 1024)

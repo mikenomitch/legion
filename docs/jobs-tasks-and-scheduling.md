@@ -945,6 +945,35 @@ changes (its versions, allocations, or task outcomes), and
 `legion job info web --index <revision>` waits for the next such change. See
 [Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
 
+### Listing a job's allocations
+
+`legion ledger --job web` lists the job's allocations, grouped by the node
+each runs on: id, task config, status, reserved resources, and a resize
+override when one is set. `-j` returns the same rows as JSON. The allocation
+ids it prints are what `legion alloc resize` and
+`legion job logs --allocation` take. A namespaced job is named
+`namespace/name` (or with `-n`):
+
+```console
+$ legion ledger --job web
+Ledger:
+- Node node-a (status: ready, availability: eligible)
+  • Allocation 812 (task 41, job web): status running
+    Resources: {
+  "cpu": 500,
+  "memory": 268435456
+}
+```
+
+`legion ledger` without `--job` lists every node, including nodes with no
+allocations. It reads the manager's GetLedger, which needs `node:read` and
+leaves out nodes in pools the caller cannot read, and `--job` filters on the
+client: the reply carries every readable node, so on a large fleet do not
+poll it in a loop. A job with no allocation prints
+`No allocations for job <name>.`. Allocations the manager has removed are not
+in the ledger; `legion job logs <name> --include-removed` shows those removed
+in the last 24 hours.
+
 ## Job Versions and Compare-and-Set
 
 `Job.version` is the job's spec version: the version of its latest config,

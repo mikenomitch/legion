@@ -367,8 +367,8 @@ async fn a_report_for_another_nodes_allocation_is_ignored() -> R<()> {
 }
 
 /// A sandbox that declares no memory reserves and boots the runtime's own
-/// 512 MiB, even when the cluster default is smaller, and the guest size is
-/// pinned into the stored config so it never changes under the job.
+/// 512 MiB, even when the cluster default is smaller. The guest is sized by
+/// the stored `resources`; nothing is written into the config.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sandbox_without_memory_keeps_its_512_mib_guest() -> R<()> {
     let dir = tempfile::Builder::new()
@@ -398,7 +398,7 @@ async fn a_sandbox_without_memory_keeps_its_512_mib_guest() -> R<()> {
     let stored = store.get_job_config("box")?;
     let task = &stored.tasks[0];
     assert_eq!(task.resources["memory"], json!(512));
-    assert_eq!(task.config["memory_mib"], json!(512));
+    assert!(task.config.get("memory_mib").is_none());
 
     // Other runtimes still take the cluster default.
     let stored = store.get_job_config("svc")?;

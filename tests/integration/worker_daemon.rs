@@ -109,7 +109,9 @@ async fn a_restarted_worker_rejoins_on_its_persisted_node_token() -> R<()> {
     // take over the node while it is live (the node token is what proves
     // a restart)...
     state.save_node_token("lgn_not_a_real_token")?;
-    let fallback = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret)));
+    let fallback = Arc::new(WorkerCredentials::with_join_secret(Some(
+        join_secret.clone(),
+    )));
     assert!(fallback.restore_from(&state));
     fallback.persist_to(state.clone());
     pre_register_self(client.clone(), "default".into(), &fallback).await?;
@@ -126,6 +128,42 @@ async fn a_restarted_worker_rejoins_on_its_persisted_node_token() -> R<()> {
     register_self(client.clone(), &payload, &fallback).await?;
     let replaced = state.load_node_token().context("replacement persisted")?;
     assert_ne!(replaced, "lgn_not_a_real_token");
+
+    // A lost node is rejoined only with a token for the pool it was in: a
+    // token pinned to `default` may not claim a node lost from `gpu`.
+    store.insert_node(legion::structs::NodeMsg {
+        id: "w2".into(),
+        pool: "gpu".into(),
+        status: "lost".into(),
+        availability: "available".into(),
+        config_attrs: "{}".into(),
+        fingerprint_attrs: "{}".into(),
+        dynamic_attrs: "{}".into(),
+        health_checks: "[]".into(),
+        last_heartbeat: "2026-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
+    })?;
+    let other_pool = RegistrationPayload {
+        name: "w2".into(),
+        pool: "default".into(),
+        config_attrs: "{}".into(),
+        fingerprint_attrs: "{}".into(),
+        health_checks: "[]".into(),
+        capabilities: Vec::new(),
+        join_attributes: HashMap::new(),
+    };
+    let joiner = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret)));
+    let err = register_self(client.clone(), &other_pool, &joiner)
+        .await
+        .expect_err("a join token may not rejoin a node lost from another pool");
+    let status = err
+        .downcast_ref::<tonic::Status>()
+        .context("the refusal is the manager's status")?;
+    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{err:#}");
+    assert!(
+        status.message().contains("is lost from pool \"gpu\""),
+        "{err:#}"
+    );
 
     // Neither credential valid: the refusal surfaces.
     state.save_node_token("lgn_not_a_real_token")?;

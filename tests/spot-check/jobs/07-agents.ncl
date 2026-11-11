@@ -35,7 +35,6 @@ let images = (import "lib/images.ncl") vars in
         command = ["/usr/local/bin/agent"],
         env = { AGENT_TASK = "refactor the payments module" },
         vcpus = 1,
-        memory_mib = 512,
         hypervisor = "cloud-hypervisor",
       },
       resources = { cpu = 1000, memory = 512 },

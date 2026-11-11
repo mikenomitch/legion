@@ -624,7 +624,7 @@ work that was already admitted:
 | Moment | Checks |
 | --- | --- |
 | `job run`, `job plan`, `RunJobTemplate` | job rules, runtimes, pools, host volumes, quota (devices included), `maxJobs` |
-| `job validate` | job rules, when the caller can read the policies (`acl:read`); otherwise it warns that they were not checked |
+| `job validate` | job rules, when the caller can read the policies that govern the job's namespace (`namespace:read` there, or `acl:read`); otherwise it warns that they were not checked |
 | `job scale` out | quota (scale-in is never refused) |
 | `instance create` (keyed, named sessions) | quota, for the new instances |
 | `namespace create` | `maxNamespaces` |
@@ -735,7 +735,12 @@ jobRules = [
   written in.
 - A rule that does not evaluate to `true` refuses the job, naming each
   failing rule, at `job run`, `job plan`, and `RunJobTemplate`, and at `job
-  validate` when the caller can read the policies:
+  validate` (and the `legion_job_validate` MCP tool) when the caller can
+  read the policies that govern the job's namespace: `namespace:read` on it,
+  through `legion namespace get`, which shows those policies whole, or
+  `acl:read`. A caller with neither, or with no manager reachable, gets a
+  warning that the rules were not checked; `job plan` checks them on the
+  manager:
 
   ```text
   the job breaks 1 job rule(s): namespace policy 'house-rules' jobRules[0]: pin images by tag or digest, not :latest

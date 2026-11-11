@@ -362,13 +362,15 @@ impl std::error::Error for EvalSlotsBusy {}
 /// How many template evaluations may occupy a thread at once: half the
 /// cores, between 1 and 4.
 ///
-/// Nickel's evaluator has no step limit or cancellation hook (checked
-/// against nickel-lang-core 0.18), so a timed-out evaluation cannot be
-/// stopped — its thread keeps spinning until the program finishes or the
-/// process exits. The slot is held by the evaluation thread itself, not by
-/// the request, so abandoned evaluations keep counting against this budget.
-/// That caps what hostile or runaway templates can take from the manager at
-/// half its cores, leaving the rest for raft heartbeats and RPCs.
+/// Nickel's evaluator has no cancellation hook (checked against
+/// nickel-lang-core 0.18), so a timed-out evaluation cannot be stopped from
+/// outside: its thread runs on until the program finishes or spends
+/// [`config_lang::EVAL_STEP_BUDGET`], which ends a runaway with an error
+/// instead of letting it spin forever. The slot is held by the evaluation
+/// thread itself, not by the request, so abandoned evaluations keep counting
+/// against this budget until then. That caps what hostile or runaway
+/// templates can take from the manager at half its cores, leaving the rest
+/// for raft heartbeats and RPCs.
 fn max_concurrent_evals() -> usize {
     std::thread::available_parallelism()
         .map(|cores| cores.get() / 2)

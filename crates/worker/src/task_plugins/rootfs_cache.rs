@@ -904,6 +904,11 @@ mod tests {
             &dir.path().join("alloc-3/tree"),
         )?;
         assert!(matches!(outcome, Outcome::Built(_)), "{outcome:?}");
+        // Let a background fill land before `dir` goes: one still running
+        // would write the cache entry into a deleted temp dir, recreating it.
+        if matches!(outcome, Outcome::Built(Fill::Background)) {
+            wait_for_entry(&cache, &inputs("bbb").key());
+        }
         Ok(())
     }
 

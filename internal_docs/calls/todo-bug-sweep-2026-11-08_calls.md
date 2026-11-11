@@ -73,6 +73,19 @@ kind of operation:
   losing `delete_namespace_policy` are still not covered (open in TODO).
 - **Why:** an agent retrying with a key needs the truth about what ran, and that
   differs by operation. [docs](../../docs/agent-readiness.md)
+- **Update (2026-11):** the three left over now commit with their record.
+  `insert_app_recorded` and `delete_app_recorded` claim the key *first*, in a
+  savepoint inside their one replicated entry, and return whether they won
+  (`bool` / `Option`); a loser writes nothing (no second purge, no duplicate
+  name refusal) and the handler replays the winner's reply. A refused insert
+  rolls its key back with it. `delete_namespace_policy_recorded` deletes and
+  records in one entry, so a loser that finds the row gone finds the record
+  and is answered `deduplicated` instead of `NOT_FOUND`. An uninstall that
+  finds no app also checks for a winner's record before answering
+  `NOT_FOUND`. Alternative: the snapshot handler's shape (insert first, and
+  on a duplicate-name error look for the winner's record) — rejected because
+  it keys the replay on an error string's cause and still runs the loser's
+  purge twice.
 
 ## 4. `onChange = "none"` moves allocations in place
 

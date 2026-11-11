@@ -984,10 +984,23 @@ impl ManagerDaemonService {
             record.job_id()
         );
         // The record and the idempotency key land in one entry: a retry
-        // after a crash finds both or neither.
-        self.store
+        // after a crash finds both or neither, and a concurrent install
+        // with the same key that loses the key is handed the first reply.
+        let inserted = self
+            .store
             .insert_app_recorded(record.clone(), &idempotency_key, &message)
             .map_err(|e| map_store_error("Error installing the app", e))?;
+        if !inserted {
+            return Ok(Response::new(InstallAppReply {
+                app: self.current_app(&name)?,
+                message: self
+                    .idempotency_winner(&idempotency_key)?
+                    .unwrap_or(message),
+                deduplicated: true,
+                prompt,
+                uncovered: String::new(),
+            }));
+        }
         let record = self
             .store
             .get_app(&name)
@@ -1321,30 +1334,25 @@ impl ManagerDaemonService {
             inner.idempotency_key.as_deref(),
             &inner,
         );
-        if !inner.dry_run {
-            if let Some(stored) = self
-                .store
-                .idempotency_lookup(&idempotency_key)
-                .map_err(|e| map_store_error("Error checking idempotency", e))?
-            {
-                // The first reply, whole.
-                let mut reply: UninstallAppReply =
-                    serde_json::from_str(&stored).unwrap_or_else(|_| UninstallAppReply {
-                        message: stored.clone(),
-                        ..Default::default()
-                    });
-                reply.deduplicated = true;
-                return Ok(Response::new(reply));
-            }
+        if let Some(reply) = self.uninstall_replay(&idempotency_key, inner.dry_run)? {
+            return Ok(Response::new(reply));
         }
         // By name: a record that does not decode is removed like any other
         // (its jobspec keys were never in force, and a bundled app's is
         // seeded again from this build).
-        let row = self
+        let row = match self
             .store
             .get_app_row(&name)
             .map_err(|e| map_store_error("Error loading the app", e))?
-            .ok_or_else(|| not_found(&name))?;
+        {
+            Some(row) => row,
+            // A concurrent uninstall with this key may have won between the
+            // lookup above and here: its record lands with the deletion.
+            None => match self.uninstall_replay(&idempotency_key, inner.dry_run)? {
+                Some(reply) => return Ok(Response::new(reply)),
+                None => return Err(not_found(&name)),
+            },
+        };
         let (enabled, using) = match &row {
             Ok(record) => {
                 if record.is_bundled() {
@@ -1506,7 +1514,7 @@ impl ManagerDaemonService {
         };
         // The record's deletion, the purge, and the idempotency key (with
         // the whole reply, so a retry gets it back) in one entry.
-        let purged = self
+        let Some(purged) = self
             .store
             .delete_app_recorded(
                 &name,
@@ -1514,7 +1522,18 @@ impl ManagerDaemonService {
                 &idempotency_key,
                 &serde_json::to_string(&reply).unwrap_or_default(),
             )
-            .map_err(|e| map_store_error("Error uninstalling the app", e))?;
+            .map_err(|e| map_store_error("Error uninstalling the app", e))?
+        else {
+            // A concurrent uninstall with this key recorded first: its
+            // reply is the one this key names.
+            return Ok(Response::new(
+                self.uninstall_replay(&idempotency_key, false)?
+                    .unwrap_or(UninstallAppReply {
+                        deduplicated: true,
+                        ..reply
+                    }),
+            ));
+        };
         // Its kinds stay as orphaned while they have objects.
         self.sync_object_kinds_for(&name)?;
         if !purged.is_empty() {
@@ -1528,6 +1547,29 @@ impl ManagerDaemonService {
             .app_uninstalled(&name, &identity.principal, revoked);
         info!(app = %name, by = %identity.principal, revoked, purge = inner.purge, "Uninstalled app");
         Ok(Response::new(reply))
+    }
+
+    /// The reply an uninstall recorded under `key`, marked `deduplicated`;
+    /// `None` when none is recorded or for a dry run (which records
+    /// nothing and is never replayed).
+    fn uninstall_replay(
+        &self,
+        key: &str,
+        dry_run: bool,
+    ) -> Result<Option<UninstallAppReply>, Status> {
+        if dry_run {
+            return Ok(None);
+        }
+        Ok(self.idempotency_winner(key)?.map(|stored| {
+            // The first reply, whole.
+            let mut reply: UninstallAppReply =
+                serde_json::from_str(&stored).unwrap_or_else(|_| UninstallAppReply {
+                    message: stored.clone(),
+                    ..Default::default()
+                });
+            reply.deduplicated = true;
+            reply
+        }))
     }
 
     pub(super) async fn set_app_enabled_rpc(

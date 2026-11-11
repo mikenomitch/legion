@@ -140,6 +140,29 @@ jobs:
           CLANG: clang-18
         run: bpf/build.sh --check
 
+  # The network-plugin test modules are checked in as built .wasm
+  # (tests/netplugins/*.wasm) so `cargo test` needs no WASM target. This
+  # rebuilds them from their sources with the toolchain, lockfiles, and path
+  # remapping tests/netplugins/build.sh pins, and fails when a committed
+  # module is stale. The toolchain here must match NETPLUGIN_TOOLCHAIN's
+  # default in that script.
+  netplugin-wasm:
+    name: Net Plugin Modules Are Current
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          targets: wasm32-wasip1
+
+      - name: Rebuild and compare
+        run: tests/netplugins/build.sh --check
+
   # The kernel classifier's tests load the programs into the runner's
   # kernel, attach them to scratch cgroups, and dial from child processes,
   # so they need root. They are `#[ignore]`d in the ordinary run.

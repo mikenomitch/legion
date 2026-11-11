@@ -1647,6 +1647,13 @@ shape, not the plan's `command`/`args` pair.
 
 **Trade-off.** `config get` output is not idiomatic Nickel.
 
+**Update (2026-11).** The `config get` half is reversed: it now prints
+Nickel, as plan §6.1 had it (`-j` keeps the JSON envelope), through
+`config_lang::json_to_nickel`, a printer whose output a unit test
+evaluates back to the same JSON. The printer was small once written, and
+JSON output was the one CLI read that was not readable. The bundled-manifest
+half stands.
+
 **Why (simplicity).** No JSON-to-Nickel printer exists, and JSON is valid
 input for every Nickel-reading command. Keeping the bundled manifest in
 Nickel keeps it reviewable next to the docs, and a unit test evaluates and

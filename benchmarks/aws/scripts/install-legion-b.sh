@@ -7,6 +7,10 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 load_rig
 
+# The manager's schedulingPolicy; see install-legion-a.sh.
+SCHEDULING_POLICY="$(rig_scheduling_policy)"
+log "installing legion-b (streaming persistence, schedulingPolicy=$SCHEDULING_POLICY)"
+
 "$(dirname "$0")/wipe-control-plane.sh"
 
 # A fresh Legion B campaign must not adopt a previous campaign's replica.
@@ -22,7 +26,8 @@ for idx in 0 1 2; do
     # has to be THIS box's private ip. Sharing one rendered config would
     # hand every worker the same (wrong) manager address.
     BUCKET="$BUCKET" REGION="$REGION" PRIVATE_IP="${CP_PRIVATE_IPS[$idx]}" \
-        render_tpl BUCKET REGION PRIVATE_IP \
+        SCHEDULING_POLICY="$SCHEDULING_POLICY" \
+        render_tpl BUCKET REGION PRIVATE_IP SCHEDULING_POLICY \
         <"$AWS_BENCH_ROOT/configs/legion/manager-b.ncl.tpl" >"$STAGE/manager.ncl"
     log "installing legion (streaming) on cp-$idx ($ip)"
     rsh "$ip" "

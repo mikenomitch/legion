@@ -223,6 +223,13 @@ them fails with an error that names all three. Memory reclaim from a running
 guest (free page reporting) needs a kernel built with `CONFIG_PAGE_REPORTING`;
 see [docs/task-runtime-sandbox.md](task-runtime-sandbox.md#guest-memory-under-pressure).
 
+The reference kernel is built for every kind of guest (the build Legion's
+AWS measurements used is 48 MB), and the VMM loads it into guest memory on
+every boot. On a node that starts many
+sandboxes, a kernel built with only what Legion needs saves host CPU and
+guest memory on every start: [A smaller guest kernel](task-runtime-sandbox.md#a-smaller-guest-kernel)
+lists the options and a build recipe.
+
 ### 4. Check it
 
 When the worker starts, it logs which backend sandboxes will use:

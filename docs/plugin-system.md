@@ -403,8 +403,13 @@ Three build scripts, one per job:
 - The root `build.rs` builds the plugins, and only when
   `LEGION_BUILD_PLUGINS=1`.
 - Plugin builds are skipped if `LEGION_SKIP_PLUGIN_BUILD` is set.
-- When `build.rs` builds plugins, it uses a separate `CARGO_TARGET_DIR`
-  under `target/plugin-build/...`.
+- When `build.rs` builds plugins, every plugin builds into one shared
+  `CARGO_TARGET_DIR`, `target/plugin-build/shared/`, so the dependencies
+  they have in common (Legion itself among them) compile once rather than
+  once per plugin. Each plugin's own outputs (its dylib, or the binary of
+  an exec-style plugin such as `aws-asg`) are then copied to
+  `target/plugin-build/<kind>/<name>/release/`. A plugin that fails to
+  build is reported as a `cargo:warning` naming it.
 - At runtime, dynamic loading still looks in plugin crate-local paths such as
   `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
 - `crates/worker/build.rs` records the `rustc` version, crate version,

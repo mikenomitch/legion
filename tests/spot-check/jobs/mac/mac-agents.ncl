@@ -21,7 +21,6 @@
         image = "spot-check-agent:dev",
         command = ["/usr/local/bin/agent"],
         env = { AGENT_TASK = "summarize the changelog" },
-        memory_mib = 512,
       },
       resources = { memory = 512 },
       constraints = { os = "macos" },

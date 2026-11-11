@@ -462,6 +462,35 @@ impl Store {
         })
     }
 
+    /// Delete a policy and, when it existed, record the delete's idempotency
+    /// `key` with `reply`, both in one replicated entry. `false` when none
+    /// had the name, and then nothing is recorded. Because the two land
+    /// together, a concurrent delete with the same key that finds the row
+    /// gone also finds the winner's record (`DeleteNamespacePolicy` replays
+    /// it rather than answering `NOT_FOUND`).
+    #[instrument(err, skip_all, fields(policy = name))]
+    pub fn delete_namespace_policy_recorded(&self, name: &str, key: &str, reply: &str) -> R<bool> {
+        let name = name.to_owned();
+        let key = key.to_owned();
+        let reply = reply.to_owned();
+        self.replicated(Lane::Control, "delete_namespace_policy", move |s| {
+            let deleted = {
+                let conn = s.write_connection()?;
+                conn.execute(
+                    "DELETE FROM namespace_policy WHERE name = ?;",
+                    [name.as_str()],
+                )? > 0
+            };
+            if deleted {
+                // A losing record cannot happen here: the row is gone for
+                // everyone after the first delete, so only the first
+                // delete reaches this line.
+                s.idempotency_record(&key, "delete_namespace_policy", &reply)?;
+            }
+            Ok(deleted)
+        })
+    }
+
     /// Every namespace's charged usage (see the module docs): the figure a
     /// quota is checked against.
     #[instrument(err, skip_all)]
@@ -608,6 +637,27 @@ mod namespace_policy_store_test {
         assert_eq!(store.list_namespace_policies()?.len(), 1);
         assert!(store.delete_namespace_policy("payments")?);
         assert!(!store.delete_namespace_policy("payments")?);
+        Ok(())
+    }
+
+    /// The keyed delete records its key with the deletion, so the second
+    /// of two concurrent deletes with one key, finding nothing to delete,
+    /// finds the first one's record; a delete of a missing policy records
+    /// nothing.
+    #[test]
+    fn keyed_delete_records_its_key_with_the_deletion() -> R<()> {
+        let store = setup_store()?;
+        store.apply_namespace_policy(policy(json!({
+            "name": "payments", "namespaces": ["payments-*"], "maxJobs": 3
+        })))?;
+        assert!(store.delete_namespace_policy_recorded("payments", "del/k", "payments")?);
+        assert!(!store.delete_namespace_policy_recorded("payments", "del/k", "payments")?);
+        assert_eq!(
+            store.idempotency_lookup("del/k")?.as_deref(),
+            Some("payments")
+        );
+        assert!(!store.delete_namespace_policy_recorded("payments", "del/other", "payments")?);
+        assert_eq!(store.idempotency_lookup("del/other")?, None);
         Ok(())
     }
 

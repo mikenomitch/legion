@@ -440,7 +440,12 @@ resize by moving.
 ## Known limitations
 
 - **No hotplug.** A sandbox cannot grow past the memory it booted with,
-  on either VMM, and its vCPU count never changes while it runs.
+  on either VMM, and its vCPU count never changes while it runs. A restart
+  boots it at its new size.
+- **A sandbox resized and then suspended resumes cold.** Its memory
+  checkpoint holds the guest at the size it booted with, and the resume
+  boots at the resized size, so the shapes differ and the restore is
+  refused; `onRestoreFailure` decides (a cold boot by default).
 - **`cores` and devices do not resize.** A task that reserves whole cores
   (`resources.cores`) keeps them; GPUs and other devices are fixed at
   placement.

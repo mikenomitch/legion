@@ -1,7 +1,8 @@
-use crate::cmd::helpers::{connect_manager_client, json_flag};
+use crate::cmd::helpers::{connect_manager_client, job_arg, json_flag, namespace_flag};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, LedgerNodeExt, Node};
+use clap::Arg;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -75,13 +76,32 @@ impl From<&LedgerEntry> for LedgerJsonEntry {
 
 pub fn config() -> Command {
     Command::new("ledger")
-        .about("Shows the current state of the ledger")
+        .about(
+            "\
+            Shows the current state of the ledger: every node and the allocations on it\n\
+            \n\
+            With --job, only that job's allocations, and only the nodes that run one.\n\
+            \n\
+            Examples:\n\
+              legion ledger\n\
+              legion ledger --job web -j\n\
+              legion ledger --job payments/api\
+            ",
+        )
+        .arg(
+            Arg::new("job")
+                .long("job")
+                .value_name("JOB")
+                .help("Only this job's allocations (`name`, or `namespace/name`)"),
+        )
+        .arg(namespace_flag())
         .arg(json_flag())
 }
 
 #[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    let job = job_arg(matches, "job")?;
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetLedgerRequest {});
     let response = output::resolve(
@@ -103,10 +123,13 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         })
         .collect();
 
-    let ledger: Vec<LedgerEntry> = ledger_nodes
+    let mut ledger: Vec<LedgerEntry> = ledger_nodes
         .into_iter()
         .map(|node| node.into_entry())
         .collect::<R<Vec<_>>>()?;
+    if let Some(job) = job.as_deref() {
+        filter_to_job(&mut ledger, job);
+    }
 
     if format.is_json() {
         let mut json_entries: Vec<LedgerJsonEntry> =
@@ -119,7 +142,10 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         }
         output::print_success(&json_entries);
     } else if ledger.is_empty() {
-        println!("No nodes registered in the ledger.");
+        match job.as_deref() {
+            Some(job) => println!("No allocations for job {job}."),
+            None => println!("No nodes registered in the ledger."),
+        }
     } else {
         println!("Ledger:");
         for entry in ledger {
@@ -153,4 +179,69 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
     }
 
     Ok(())
+}
+
+/// Keeps only `job`'s allocations, and only the nodes that hold one.
+fn filter_to_job(ledger: &mut Vec<LedgerEntry>, job: &str) {
+    for entry in ledger.iter_mut() {
+        entry
+            .allocations
+            .retain(|allocation| allocation.job_id == job);
+    }
+    ledger.retain(|entry| !entry.allocations.is_empty());
+}
+
+#[cfg(test)]
+mod ledger_filter_test {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(node: &str, jobs: &[(i64, &str)]) -> LedgerEntry {
+        let node: Node = serde_json::from_value(json!({
+            "id": node, "status": "ready", "pool": "default", "availability": "eligible",
+            "lastHeartbeat": "", "configAttrs": {}, "fingerprintAttrs": {},
+            "dynamicAttrs": {}, "healthChecks": {},
+        }))
+        .expect("node");
+        let allocations = jobs
+            .iter()
+            .map(|(id, job)| Allocation {
+                id: *id,
+                status: "running".into(),
+                resources: json!({}),
+                node_id: node.id.clone(),
+                job_config_id: "1".into(),
+                task_config_id: 1,
+                job_id: (*job).into(),
+                instance_id: None,
+                network: None,
+            })
+            .collect();
+        LedgerEntry { node, allocations }
+    }
+
+    #[test]
+    fn job_filter_keeps_only_that_jobs_allocations_and_their_nodes_test() {
+        let mut ledger = vec![
+            entry("a", &[(1, "web"), (2, "db")]),
+            entry("b", &[(3, "db")]),
+            entry("c", &[]),
+            entry("d", &[(4, "payments/web"), (5, "web")]),
+        ];
+        filter_to_job(&mut ledger, "web");
+        let kept: Vec<(String, Vec<i64>)> = ledger
+            .iter()
+            .map(|e| {
+                (
+                    e.node.id.clone(),
+                    e.allocations.iter().map(|a| a.id).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("a".to_string(), vec![1]), ("d".to_string(), vec![5])],
+            "a namespaced job of the same name is a different job"
+        );
+    }
 }

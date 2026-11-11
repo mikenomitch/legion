@@ -9127,6 +9127,19 @@ mod tests {
         let full = start("").expect_err("the envelope is full");
         assert!(full.downcast_ref::<SessionRefusal>().is_some(), "{full:#}");
 
+        // Each launch runs on its own thread and holds its slot until it is
+        // done. Wait for them: a launch still running when the test returns
+        // creates the session's log and allocation directories inside a temp
+        // dir that is already gone, which recreates it and leaks it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pool.in_use() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launches never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         let mut guard = manager.lock().expect("task manager");
         let status = guard
             .session_status(&minted.session_id)
@@ -13746,6 +13759,38 @@ mod tests {
                 Some(owner_ref(OWNER_SESSION, "agent-1")),
                 "manager",
             )?;
+            // A session is registered before its launch thread records the
+            // process, and the log skips a session with no pid. Under load
+            // (the full suite) the pid can still be missing here, so wait.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let guard = manager.lock().expect("task manager");
+                let has_pid = |local_key: i64| {
+                    guard
+                        .claims
+                        .by_local_key(local_key)
+                        .map(|claim| {
+                            guard
+                                .session_row(
+                                    claim,
+                                    crate::worker::session_log::SessionLogState::Running,
+                                )
+                                .process
+                                .and_then(|process| process.pid)
+                                .is_some()
+                        })
+                        .unwrap_or(false)
+                };
+                if has_pid(owner.local_key) && has_pid(child.local_key) {
+                    break;
+                }
+                drop(guard);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the sessions never recorded a process"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
             let mut guard = manager.lock().expect("task manager");
             // The launch thread logs a session after it registers it; log
             // both here so the sync below cannot run ahead of that.

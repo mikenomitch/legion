@@ -723,7 +723,7 @@ pub trait TaskPlugin: Send + Sync {
     /// Only built-in runtimes are consulted ([`normalize_runtime_task`]):
     /// normalization runs inside the submit transaction, which must not
     /// load a dylib. The `sandbox` runtime uses it to default `memory` to
-    /// its own 512 MiB and pin its guest size.
+    /// its own 512 MiB, the size its guest boots without one.
     fn normalize_task(&self, task: &mut TaskConfig) {
         let _ = task;
     }
@@ -732,9 +732,8 @@ pub trait TaskPlugin: Send + Sync {
     /// `Err` rejects the job, and each returned string is a submit warning
     /// (appended to the `job run` reply). The default has nothing to say.
     ///
-    /// For runtimes whose own config also sizes the workload: the `sandbox`
-    /// runtime warns when an explicit `memory_mib` disagrees with the guest
-    /// size `resources` imply.
+    /// For runtimes that size their workload from `resources`: the `sandbox`
+    /// runtime refuses a guest too small to boot.
     fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
         let _ = task;
         Ok(Vec::new())

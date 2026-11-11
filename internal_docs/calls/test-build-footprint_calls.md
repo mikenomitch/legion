@@ -176,3 +176,27 @@ Pointing `TMPDIR` at `/dev/shm` to skip `fsync` changed the unit suite from
 
 **Trade-off.** None taken; recorded so the next person does not re-measure
 from scratch. On a runner with slower disks the result could differ.
+
+## 9. Stale scratch roots are swept by pid at the next root's creation
+
+**Call.** A scratch root is named `legion-tests-<pid>-<random>`, and creating
+one (`test_scratch::create_root`, used by both the unit and the integration
+roots) first removes every `legion-tests-*` root whose pid is not running
+and whose directory has been idle for an hour. A root with no pid in its
+name (made by a build before this) goes once it is a day old.
+
+**Alternatives.** (a) Sweep by age alone. (b) A `cargo xtask clean-tests`
+for people to run by hand. (c) A signal handler that removes the root on
+Ctrl-C.
+
+**Trade-off.** A killed run's root stays until the next test process starts
+and an hour has passed. The pid check is meaningless across pid namespaces,
+which the hour of idleness covers: a live run creates directories in its
+root constantly. A pid reused by an unrelated process keeps a dead root
+until that process ends.
+
+**Why (simplicity).** (a) cannot tell a long-running suite from a dead one
+without a long threshold. (b) relies on someone remembering it. (c) misses
+SIGKILL and timeouts, the cases that leak, and a handler in a test binary
+fights the test harness's own. The sweep is a dozen lines, runs once per
+test process, and needs no one to do anything.

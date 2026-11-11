@@ -267,9 +267,12 @@ For the fastest starts:
   with `-m reflink=1`, the default in current `mkfs.xfs`, or btrfs). A
   root disk is then a reflink of its base, in about a millisecond, instead
   of a copy of every allocated block.
-- **Keep the guest kernel small.** cloud-hypervisor copies the kernel into
-  guest memory on every boot, and a kernel with fewer drivers boots and
-  probes faster. The 48 MB reference kernel is generous.
+- **Keep the guest kernel small.** The VMM loads the kernel image into
+  guest memory on every boot, so every start pays a copy that grows with
+  the kernel, and a kernel with fewer drivers also probes less while it
+  boots. cloud-hypervisor's reference kernel (the one measured above) is
+  48 MB. [A smaller guest kernel](#a-smaller-guest-kernel) lists what a
+  kernel needs for Legion and how to build one.
 - **Expect metal to be faster than the numbers above.** Nested
   virtualization makes every VM exit costlier.
 
@@ -649,13 +652,15 @@ Optional:
 | `env` | `{}` | Environment exported inside the sandbox (merged over the image's env, task wins). |
 | `cwd` | image's `WorkingDir` | Working directory in the guest. |
 | `vcpus` | `1` | Guest vCPUs. |
-| `memory_mib` | derived from `resources` | Guest RAM (minimum 64). Leave it unset: the manager fills it at submit from `resources.memoryMax`, else `resources.memory`, else 512 ([Guest size](#guest-size)). An explicit value still wins in this release, with a submit warning when it disagrees. |
 | `rootfs_headroom_mib` | `256` | Writable space added to the ephemeral root disk beyond the image contents. |
 | `hypervisor` | `auto` | `auto`, `cloud-hypervisor`, `firecracker`, `dev`. |
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
 | `kernel_args` | none | Appended to Legion's kernel cmdline, after Legion's own arguments, so a later setting wins: `loglevel=7` gives a Firecracker guest its full boot log back. |
 | `network` | `{ mode: 'none' }` | `{ mode: 'tap', bridge: 'br0' }` gives the guest a NIC on a TAP device Legion creates per instance on that host bridge, with an address leased from the bridge's pool. See [Networking](#networking). |
 | `memory_restore` | `lazy` | How a memory checkpoint's guest RAM comes back on a restore: `lazy` runs the guest first and loads each page on first touch, `eager` reads all of it first. See [How memory comes back](#how-memory-comes-back). |
+
+Guest RAM is not part of the runtime config either: it is the task's
+`resources` ([Guest size](#guest-size)). There is no `memory_mib`.
 
 Persistent state is not part of the runtime config. Declare
 `stateful.storage` (or `volumes[]`) on the task with `mode = "block"`. See
@@ -679,11 +684,11 @@ reserves and what the VM boots with can't drift apart:
   otherwise resize every guest. The scheduler reserves the same 512 MiB the
   guest boots with.
 
-The size is fixed when the job is submitted: the manager writes it into the
-stored config as `memory_mib`, and the worker boots exactly that. A job
-stored by an older manager (no `memory_mib`) keeps booting at 512 MiB.
-Resubmitting such a job pins the size and its reservation (now 512 MiB
-instead of the old 256 MiB default), so the resubmit shows as a new version.
+The worker reads the size from the resources each unit launches with, so a
+unit always boots at the size it is scheduled at: a [session](session-mode.md)
+at its admitted size, and an instance [resized](resize.md) past its boot
+size at the new size when it restarts. A guest under 64 MiB fails at submit
+(or, for a session's admitted size, at start).
 
 With enforcement on, the allocation's cgroup ceiling is the guest size plus
 the worker's `sandbox.vmmOverheadMiB` (default 64). See
@@ -693,21 +698,17 @@ The guest's vCPU count is `config.vcpus` (default 1), independent of
 `resources.cpu` and `cores`, which only govern the VMM's threads on
 the host.
 
-**Upgrading from `memory_mib`.** Before this rule, `config.memory_mib` sized
-the guest (default 512) and nothing tied it to `resources.memory`. An
-explicit `memory_mib` keeps working in this release. When it disagrees with
-`resources`, `job run` warns:
+**No `memory_mib`.** An older release sized the guest with
+`config.memory_mib`, apart from `resources`. That field is gone, and submit
+refuses it with the fix:
 
 ```console
-warning: task workspace sets config.memory_mib = 1024, but its resources size the guest at
-512 MiB (resources.memoryMax, else resources.memory). This release still boots 1024 MiB, and
-a future release rejects the mismatch. Drop memory_mib and set resources.memoryMax = 1024 to
-burst to it, or resources.memory = 1024 to reserve it. See docs/task-runtime-sandbox.md
+Error: task workspace config invalid: sandbox `config.memory_mib` is gone: a sandbox guest
+boots with the task's resources.memoryMax, else resources.memory (default 512 MiB)
+Hint: drop memory_mib and set resources.memory = 1024 to reserve and boot 1024 MiB, or
+resources.memoryMax = 1024 to boot 1024 MiB while reserving less
+(docs/task-runtime-sandbox.md, "Guest size")
 ```
-
-A `memory_mib` with no `resources.memory` is compared with the 512 MiB
-default, so `memory_mib = 1024` alone also warns. A derived guest under
-64 MiB fails at submit.
 
 ### Guest kernel
 
@@ -729,6 +730,82 @@ cloud-hypervisor publishes guest kernels that work here on its
 (`vmlinux-x86_64`). [Installing Legion and Its Runtimes](installation.md#3-install-a-guest-kernel)
 has the commands, along with installing cloud-hypervisor and checking
 `/dev/kvm`.
+
+#### A smaller guest kernel
+
+Legion does not ship a guest kernel; any `vmlinux` with the options below
+works. The reference kernels are built to boot many kinds of guest, so
+they carry drivers and features a Legion sandbox never uses, and the
+VMM copies all of the kernel's loadable image into guest memory on every
+boot. On a node starting sandboxes continuously that copy is a steady
+share of host CPU, and the loaded kernel also takes guest memory the
+workload could otherwise use. A kernel trimmed to what Legion needs
+removes both costs without any change to Legion's configuration.
+
+What the guest needs, by what uses it:
+
+| Used for | Kernel options |
+| --- | --- |
+| Booting at all | `CONFIG_64BIT`, `CONFIG_SMP` (guests with more than one vCPU), `CONFIG_BINFMT_ELF`, `CONFIG_BINFMT_SCRIPT` (`/legion/init` is a shell script) |
+| The KVM clock, rather than calibrating a timer at boot | `CONFIG_HYPERVISOR_GUEST`, `CONFIG_PARAVIRT`, `CONFIG_KVM_GUEST` |
+| cloud-hypervisor's direct kernel boot (x86_64) | `CONFIG_PVH` |
+| Devices on cloud-hypervisor | `CONFIG_PCI`, `CONFIG_VIRTIO_PCI` |
+| Devices on Firecracker | `CONFIG_VIRTIO_MMIO`, `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` |
+| The root disk and block volumes | `CONFIG_VIRTIO_BLK`, `CONFIG_EXT4_FS` (plus the filesystem of any volume with another `params.fs`) |
+| The identity disk of a sandbox launched for memory checkpoints | `CONFIG_VIRTIO_BLK` (the guest reads it raw) |
+| The console (`console=hvc0` on cloud-hypervisor, `console=ttyS0` on Firecracker) | `CONFIG_VIRTIO_CONSOLE`; `CONFIG_SERIAL_8250`, `CONFIG_SERIAL_8250_CONSOLE` |
+| What `/legion/init` mounts | `CONFIG_PROC_FS`, `CONFIG_SYSFS`, `CONFIG_DEVTMPFS`, `CONFIG_TMPFS`, `CONFIG_UNIX98_PTYS` |
+| The [guest agent](#the-guest-agent) (exec, `running`) | `CONFIG_VSOCKETS`, `CONFIG_VIRTIO_VSOCKETS` |
+| A `tap` NIC and its [address](#addressing) | `CONFIG_NET`, `CONFIG_INET`, `CONFIG_VIRTIO_NET`, `CONFIG_IP_PNP` |
+| [Guest memory under pressure](#guest-memory-under-pressure) | `CONFIG_VIRTIO_BALLOON`, `CONFIG_PAGE_REPORTING` |
+
+The table is Legion's floor, not a workload's. One way to build it is to
+start from `make allnoconfig`, which turns off every optional feature but
+keeps the kernel's default system-call surface (futexes, epoll, timers,
+`shmem`), and add the options above:
+
+```bash
+make allnoconfig
+scripts/config \
+  -e 64BIT -e SMP -e PVH -e BINFMT_ELF -e BINFMT_SCRIPT \
+  -e HYPERVISOR_GUEST -e PARAVIRT -e KVM_GUEST \
+  -e PCI -e VIRTIO_MENU -e VIRTIO -e VIRTIO_PCI -e VIRTIO_MMIO -e VIRTIO_MMIO_CMDLINE_DEVICES \
+  -e BLOCK -e BLK_DEV -e VIRTIO_BLK -e EXT4_FS \
+  -e TTY -e PRINTK -e HVC_DRIVER -e VIRTIO_CONSOLE -e SERIAL_8250 -e SERIAL_8250_CONSOLE \
+  -e PROC_FS -e SYSFS -e DEVTMPFS -e TMPFS -e UNIX98_PTYS \
+  -e NET -e INET -e VSOCKETS -e VIRTIO_VSOCKETS -e NETDEVICES -e NET_CORE -e VIRTIO_NET -e IP_PNP \
+  -e MEMORY_BALLOON -e VIRTIO_BALLOON -e PAGE_REPORTING
+make olddefconfig
+make -j"$(nproc)" vmlinux
+sudo install -m 0644 vmlinux /var/lib/legion/kernels/vmlinux
+```
+
+`allnoconfig` also turns off features many programs expect, so add what
+your workloads use: `-e UNIX` (Unix domain sockets), `-e SYSVIPC`,
+`-e POSIX_MQUEUE`, `-e CGROUPS` and `-e NAMESPACES` (a container runtime
+inside the guest), `-e NETFILTER` (a firewall), `-e HW_RANDOM_VIRTIO`, or
+the filesystem of a volume. `make olddefconfig` drops any option whose
+dependencies are not met rather than failing, so check the result before
+installing it:
+`grep -E 'CONFIG_(PVH|VIRTIO_BLK|VIRTIO_VSOCKETS|EXT4_FS)=' .config` should
+print every option you need as `=y`. Set the options to `=y`, not `=m`:
+nothing in the guest loads modules. Start one sandbox on the new kernel
+before rolling it out. Most failures show in the allocation's
+`stdout.log`, the guest console:
+
+| Missing | What a start shows |
+| --- | --- |
+| `CONFIG_PVH` | cloud-hypervisor exits without booting the guest, and the task fails |
+| `CONFIG_VIRTIO_BLK`, the root filesystem, or the device transport | `VFS: Unable to mount root fs` in `stdout.log`, then `panic=1` reboots the guest |
+| `CONFIG_BINFMT_SCRIPT` | `No working init found` in `stdout.log` |
+| The console driver | an empty `stdout.log`, so every other failure is silent too; fix this first |
+| vsock | the sandbox is reported `running` only after the 10-second fallback, with a warning in the worker log, and `exec` fails |
+| `CONFIG_IP_PNP` | a `tap` guest boots with no address |
+
+The kernel is chosen per task (`config.kernel`), per worker
+(`LEGION_SANDBOX_KERNEL`), or by the file at
+`/var/lib/legion/kernels/vmlinux`, so a smaller kernel can be tried on one
+job before a node uses it for everything.
 
 Images reach the root disk through the same node
 [image cache](task-runtime-container.md#image-cache) the `container` runtime
@@ -1273,8 +1350,11 @@ A checkpoint records the values it was taken under, and a node must match all
 of them exactly. VMM versions compare by release: a leading `v`, a missing
 patch number, and a build suffix (`-dirty`, a git describe) are ignored, so
 `v51.2` and `51.2.0` match while `51.2.0` and `51.3.0` do not. A version that
-does not parse as `MAJOR.MINOR[.PATCH]` must match as written. Restoring into a task whose `vcpus` or `memory_mib` changed is
-refused with an error naming both shapes.
+does not parse as `MAJOR.MINOR[.PATCH]` must match as written. Restoring into a task whose `vcpus` or guest memory
+(`resources.memoryMax`, else `memory`) changed is refused with an error
+naming both shapes. That includes an instance [resized](resize.md) between
+its capture and its restore: the restore boots at its new size, so the
+checkpoint does not fit, and `onRestoreFailure` decides.
 
 A `local` checkpoint restores only on the node that took it. A published one
 (`suspend.durability = "store"`, or `snapshot create --publish`) restores on
