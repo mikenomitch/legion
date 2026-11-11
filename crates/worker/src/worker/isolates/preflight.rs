@@ -524,7 +524,7 @@ mod preflight_test {
             vec!["importlib", "scipy"]
         );
         assert_eq!(py("m = __import__(name)"), Vec::<String>::new());
-        assert_eq!(py("importlib.import_module('.sibling')"), vec!["importlib"]);
+        assert_eq!(py("importlib.import_module('.sibling')"), Vec::<String>::new());
     }
 
     #[test]

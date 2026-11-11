@@ -40,8 +40,6 @@ use tonic::Status;
 use wasmtime::component::Component;
 use wasmtime::{Engine, Store};
 
-const IGNORE: &str = "needs built images: crates/isolate/images/build.sh";
-
 // ---------------------------------------------------------------------------
 // Loading the images
 // ---------------------------------------------------------------------------
@@ -494,7 +492,7 @@ fn p50(mut v: Vec<u128>) -> (u128, u128) {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_hello_and_exit_codes_test() {
-    let _ = IGNORE;
+    let _g = shared();
     let mut i = instance(python(), Opts::default()).await;
     let ran = i.src("main.py", "print('hello from python')\n").await;
     ran.ok();
@@ -556,6 +554,7 @@ async fn python_hello_and_exit_codes_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_input_result_and_files_test() {
+    let _g = shared();
     let mut i = instance(python(), Opts::default()).await;
     let src = r#"
 import json, os, sys, legion
@@ -589,7 +588,7 @@ with open("result.json", "w") as f:
     ran.ok();
     assert_eq!(ran.result, None);
     assert_eq!(ran.result_json.as_deref(), Some(r#"{"ok": true}"#));
-    assert_eq!(ran.stdout, "written ['main.py', 'out', 'result.json']\n");
+    assert_eq!(ran.stdout, "written ['main.py', 'out']\n");
 
     // A helper module in the run directory imports, and the next run sees
     // the next run's file, not the cached module.
@@ -622,6 +621,7 @@ with open("result.json", "w") as f:
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_globals_persist_per_instance_test() {
+    let _g = shared();
     let src = "try:\n    count += 1\nexcept NameError:\n    count = 1\nresult = count\n";
     let mut a = instance(
         python(),
@@ -642,6 +642,7 @@ async fn python_globals_persist_per_instance_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_unsupported_stops_the_run_test() {
+    let _g = shared();
     let cases = [
         ("import subprocess\nsubprocess.run(['ls'])\n", "subprocess.run: processes are not available in an isolate"),
         ("import subprocess\nsubprocess.check_output(['ls'])\n", "subprocess.check_output: processes are not available in an isolate"),
@@ -685,6 +686,7 @@ async fn python_unsupported_stops_the_run_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_state_test() {
+    let _g = shared();
     let src = r#"
 import legion
 before = legion.state.get("count")
@@ -735,6 +737,7 @@ except legion.StateError as e:
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_fetch_test() {
+    let _g = shared();
     let src = r#"
 import legion, json, urllib.request, urllib.error, http.client
 r = legion.fetch("http://payments/v1/charge?x=1", method="POST", headers={"X-Test": "1"}, body='{"a":1}')
@@ -783,6 +786,7 @@ result = out
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_vm_test() {
+    let _g = shared();
     let src = r#"
 import legion
 m = legion.vm.acquire()
@@ -849,6 +853,7 @@ result = {"id": m.id, "exit": r.exit, "stdout": r.stdout.decode(), "stderr": r.s
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_restore_hygiene_test() {
+    let _g = shared();
     let src = "import random, os, uuid, secrets\n\
                result = [random.random(), os.urandom(8).hex(), str(uuid.uuid4()), secrets.token_hex(8), random.getrandbits(64)]\n";
     let mut seen = Vec::new();
@@ -870,43 +875,585 @@ async fn python_restore_hygiene_test() {
 
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
-async fn python_probe_test() {
+async fn python_stdlib_test() {
+    let _g = shared();
     let mut i = instance(python(), Opts::default()).await;
+    // Modules the standard library imports lazily inside functions must be
+    // in the image too (time.strptime imports _strptime on first use).
+    let src = r#"
+import asyncio, datetime, time, xml.etree.ElementTree as ET, email.mime.text, sqlite3, zlib, decimal
+async def main():
+    await asyncio.sleep(0)
+    return 5
+db = sqlite3.connect(":memory:")
+db.execute("create table t (x)")
+db.execute("insert into t values (41)")
+result = {
+    "asyncio": asyncio.run(main()),
+    "strptime": datetime.datetime.strptime("2026-11-11", "%Y-%m-%d").year,
+    "time_strptime": time.strptime("2026", "%Y").tm_year,
+    "xml": ET.fromstring("<a><b>x</b></a>").find("b").text,
+    "email": email.mime.text.MIMEText("hi")["Content-Type"],
+    "sqlite": db.execute("select x + 1 from t").fetchone()[0],
+    "zlib": len(zlib.compress(b"a" * 100)) < 100,
+    "decimal": str(decimal.Decimal("1.1") + decimal.Decimal("2.2")),
+}
+"#;
+    let ran = i.src("main.py", src).await;
+    let v: serde_json::Value = serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"asyncio": 5, "strptime": 2026, "time_strptime": 2026, "xml": "x",
+            "email": "text/plain; charset=\"us-ascii\"", "sqlite": 42, "zlib": true, "decimal": "3.3"})
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// JavaScript
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_hello_and_exit_codes_test() {
+    let _g = shared();
+    let mut i = instance(js(), Opts::default()).await;
+    let ran = i.src("main.js", "console.log('hello from js');\n").await;
+    ran.ok();
+    assert_eq!(ran.stdout, "hello from js\n");
+    assert_eq!(ran.result, None);
+
     let ran = i
-        .src(
-            "main.py",
-            "import asyncio, sys, os\n\
-             async def main():\n    await asyncio.sleep(0)\n    return 5\n\
-             print('asyncio', asyncio.run(main()))\n\
-             print(sys.version)\n",
-        )
+        .src("main.js", "console.log('bye');\nconsole.error('oops');\nprocess.exit(3);\nconsole.log('not reached');\n")
         .await;
-    println!("{ran:#?}");
+    assert_eq!(ran.exit, Some(3));
+    assert_eq!(ran.stdout, "bye\n");
+    assert_eq!(ran.stderr, "oops\n");
+
+    let src = "function f(x) {\n  throw new Error('boom ' + x);\n}\nconsole.log('before');\nf(1);\n";
+    let ran = i.src("snippet.js", src).await;
+    assert_eq!(ran.exit, Some(1), "{ran:?}");
+    assert_eq!(ran.stdout, "before\n");
+    let lines: Vec<&str> = ran.stderr.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", ran.stderr);
+    assert_eq!(lines[0], "Uncaught Error: boom 1");
+    assert_eq!(lines[1], "    at f (snippet.js:2:9)");
+    assert!(lines[2].starts_with("    at <anonymous> (snippet.js:5:"), "{}", ran.stderr);
+
+    // A rejected await is an uncaught error too.
+    let ran = i
+        .src("main.js", "await Promise.reject(new TypeError('nope'));\n")
+        .await;
+    assert_eq!(ran.exit, Some(1));
+    assert!(ran.stderr.starts_with("Uncaught TypeError: nope\n"), "{}", ran.stderr);
+
+    let ran = i.src("main.js", "throw 'a string';\n").await;
+    assert_eq!(ran.exit, Some(1));
+    assert_eq!(ran.stderr, "Uncaught a string\n");
+
+    let ran = i.src("main.js", "let x = (;\n").await;
+    assert_eq!(ran.exit, Some(1));
+    assert!(ran.stderr.starts_with("Uncaught SyntaxError: "), "{}", ran.stderr);
+    assert!(ran.stderr.contains("main.js:1:"), "{}", ran.stderr);
+
+    let ran = i.run(&[], None, None, &[]).await;
+    assert_eq!(ran.exit, Some(2));
+    assert!(ran.stderr.contains("no entry file was given"), "{}", ran.stderr);
+    let ran = i.run(&[], Some("missing.js"), None, &[]).await;
+    assert_eq!(ran.exit, Some(2));
+    assert!(ran.stderr.contains("can't open file"), "{}", ran.stderr);
 }
 
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
-async fn js_probe_test() {
-    for _ in 0..2 {
+async fn js_input_result_and_files_test() {
+    let _g = shared();
+    let mut i = instance(js(), Opts::default()).await;
+    // `return` from the entry is the result; top-level await works.
+    let src = "await new Promise((r) => setTimeout(r, 0));\n\
+               const fromFile = JSON.parse(legion.fs.readText('input.json')).n;\n\
+               return { n: legion.input.n * 2, argv: process.argv, env: process.env.IMAGE_TEST,\n\
+                        runDir: process.env.LEGION_RUN_DIR, fromFile };\n";
+    let ran = i
+        .run(&[("main.js", src)], Some("main.js"), Some(r#"{"n": 21}"#), &["a", "b"])
+        .await;
+    let v: serde_json::Value = serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"n": 42, "argv": ["js", "/legion/run/main.js", "a", "b"],
+                           "env": "from-the-host", "runDir": "/legion/run", "fromFile": 21})
+    );
+    // A top-level `result` binding, and `globalThis.result`.
+    let ran = i.src("main.js", "const result = { a: [1, 2] };\n").await;
+    assert_eq!(ran.ok().result.as_deref(), Some(r#"{"a":[1,2]}"#));
+    let ran = i.src("main.js", "globalThis.result = 'g';\n").await;
+    assert_eq!(ran.ok().result.as_deref(), Some(r#""g""#));
+    // No result at all: the host falls back to result.json.
+    let src = "legion.fs.mkdir('out/deep', { recursive: true });\n\
+               legion.fs.writeFile('out/deep/note.txt', 'written');\n\
+               legion.fs.writeFile('/legion/run/result.json', JSON.stringify({ ok: true }));\n\
+               legion.fs.writeFile('gone.txt', new Uint8Array([1, 2]));\n\
+               legion.fs.remove('gone.txt');\n\
+               let missing;\n\
+               try { legion.fs.readFile('nope.txt'); } catch (e) { missing = [e.name, e.code]; }\n\
+               console.log(legion.fs.readText('out/deep/note.txt'), JSON.stringify(legion.fs.list()),\n\
+                           legion.fs.exists('gone.txt'), JSON.stringify(missing));\n";
+    let ran = i.src("main.js", src).await;
+    ran.ok();
+    assert_eq!(ran.result, None);
+    assert_eq!(ran.result_json.as_deref(), Some(r#"{"ok":true}"#));
+    assert_eq!(
+        ran.stdout,
+        "written [\"main.js\",\"out\",\"result.json\"] false [\"LegionFsError\",\"no-entry\"]\n"
+    );
+    // A result that is not JSON is not reported.
+    let ran = i.src("main.js", "return 10n;\n").await;
+    ran.ok();
+    assert_eq!(ran.result, None);
+    assert!(ran.stderr.contains("not JSON-serializable"), "{}", ran.stderr);
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_globals_persist_per_instance_test() {
+    let _g = shared();
+    let src = "globalThis.count = (globalThis.count ?? 0) + 1;\nreturn count;\n";
+    let mut a = instance(
+        js(),
+        Opts {
+            lifetime: Lifetime::Tenant,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(a.src("main.js", src).await.ok().result.as_deref(), Some("1"));
+    assert_eq!(a.src("main.js", src).await.ok().result.as_deref(), Some("2"));
+    assert_eq!(a.src("main.js", "let x = 1;\n").await.ok().result, None);
+    let mut b = instance(js(), Opts::default()).await;
+    assert_eq!(b.src("main.js", src).await.ok().result.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_unsupported_stops_the_run_test() {
+    let _g = shared();
+    let cases = [
+        ("require('child_process').execSync('ls');", "require('child_process'): Node builtins are not available in an isolate"),
+        ("require('node:fs').readFileSync('x');", "require('fs'): Node builtins are not available in an isolate"),
+        ("const net = require('net');", "require('net'): Node builtins are not available in an isolate"),
+        ("require('node:worker_threads');", "require('worker_threads'): Node builtins are not available in an isolate"),
+        ("require('os').cpus();", "require('os'): Node builtins are not available in an isolate"),
+        ("new Worker('w.js');", "new Worker: workers are not available in an isolate"),
+        ("import fs from 'node:fs';\nfs.readFileSync('x');", "ES module syntax (import/export): modules are not available in an isolate; write the entry as a script or run with --tier vm"),
+        ("export const x = 1;", "ES module syntax (import/export): modules are not available in an isolate; write the entry as a script or run with --tier vm"),
+    ];
+    for (src, detail) in cases {
         let mut i = instance(js(), Opts::default()).await;
         let ran = i
-            .run(
-                &[
-                    ("mod.mjs", "export const x = 41;\n"),
-                    (
-                        "main.js",
-                        "console.log('hello', Math.random(), crypto.randomUUID());\nconsole.error('to stderr');\n\
-                         let m; try { m = await import('/legion/run/mod.mjs'); console.log('import abs', m.x); } catch (e) { console.log('import failed', String(e)); }\n\
-                         try { m = await import('./mod.mjs'); console.log('import rel', m.x); } catch (e) { console.log('import rel failed', String(e)); }\n\
-                         console.log(typeof setTimeout, typeof fetch, typeof Worker, Date.now());\n\
-                         function f() { throw new Error('boom'); }\nf();\n",
-                    ),
-                ],
-                Some("main.js"),
-                Some("{\"a\":1}"),
-                &[],
-            )
+            .src("main.js", &format!("console.log('started');\n{src}\nconsole.log('not reached');\n"))
             .await;
-        println!("{ran:#?}");
+        assert_stopped(&ran, detail);
+        let expect = if src.starts_with("import") || src.starts_with("export") { "" } else { "started\n" };
+        assert_eq!(ran.stdout, expect, "{src}");
     }
+    // A package is a normal error the code can catch.
+    let mut i = instance(js(), Opts::default()).await;
+    let ran = i
+        .src("main.js", "try { require('lodash'); } catch (e) { return e.message; }\n")
+        .await;
+    assert_eq!(
+        ran.ok().result.as_deref(),
+        Some("\"Cannot find module 'lodash' (packages are not installed in an isolate; bundle them or run with --tier vm)\"")
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_state_test() {
+    let _g = shared();
+    let src = "const before = legion.state.get('count');\n\
+               const n = Number(before ? new TextDecoder().decode(before) : '0') + 1;\n\
+               legion.state.set('count', String(n));\n\
+               legion.state.set('blob', new Uint8Array([0, 1]));\n\
+               legion.state.delete('missing');\n\
+               const info = legion.info();\n\
+               const out = { n, keys: legion.state.keys().sort(), blob: [...legion.state.get('blob')],\n\
+                             lifetime: info.lifetime, session: info.session, tenant: info.tenant, resumed: info.resumed };\n\
+               try { legion.state.set('big', new Uint8Array(10000)); } catch (e) { out.quota = [e.name, e.kind, e.quota]; }\n\
+               return out;\n";
+    let mut i = instance(
+        js(),
+        Opts {
+            lifetime: Lifetime::Session,
+            ..Default::default()
+        },
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(i.src("main.js", src).await.ok().result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"n": 1, "keys": ["blob", "count"], "blob": [0, 1], "lifetime": "session",
+                           "session": "s-1", "tenant": null, "resumed": false,
+                           "quota": ["LegionStateError", "quota", 4096]})
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(i.src("main.js", src).await.ok().result.as_deref().unwrap()).unwrap();
+    assert_eq!(v["n"], 2);
+    assert_eq!(i.state().get("count").map(Vec::as_slice), Some(&b"2"[..]));
+
+    let mut r = instance(js(), Opts::default()).await;
+    let ran = r
+        .src("main.js", "try { legion.state.get('k'); } catch (e) { return [e.kind, e instanceof LegionStateError]; }\n")
+        .await;
+    assert_eq!(ran.ok().result.as_deref(), Some(r#"["not-available",true]"#));
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_fetch_test() {
+    let _g = shared();
+    let src = "const r = await fetch('http://payments/v1/charge?x=1', { method: 'POST', headers: { 'X-Test': '1' }, body: '{\"a\":1}' });\n\
+               const echo = await r.json();\n\
+               const out = { status: r.status, upstream: r.headers.get('x-upstream'), method: echo.method, url: echo.url,\n\
+                             body: echo.body, hdr: echo.headers['x-test'] };\n\
+               const missing = await fetch('https://api.example.com/missing');\n\
+               out.missing = missing.status;\n\
+               try { await fetch('https://denied.example/'); } catch (e) { out.denied = e.name; }\n\
+               return out;\n";
+    let mut i = instance(js(), Opts::default()).await;
+    let ran = i.src("main.js", src).await;
+    let v: serde_json::Value = serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap();
+    assert_eq!(v["status"], 200, "{v}");
+    assert_eq!(v["upstream"], "fake");
+    assert_eq!(v["method"], "POST");
+    assert_eq!(v["url"], "http://payments/v1/charge?x=1");
+    assert_eq!(v["body"], r#"{"a":1}"#);
+    assert_eq!(v["hdr"], "1");
+    assert_eq!(v["missing"], 404);
+    assert_eq!(v["denied"], "TypeError", "{v}");
+    assert_eq!(i.worker.egress.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_vm_test() {
+    let _g = shared();
+    let src = "const m = legion.vm.acquire();\n\
+               const r = m.exec(['echo', 'hi'], { stdin: 'in' });\n\
+               m.put('/work/a.txt', 'data');\n\
+               const got = new TextDecoder().decode(m.get('/work/a.txt'));\n\
+               const resp = m.fetch(8080, { method: 'post', path: '/x', headers: { a: 'b' }, body: 'body' });\n\
+               m.resize({ memoryMib: 512 });\n\
+               const again = legion.vm.attach(m.id);\n\
+               let gone;\n\
+               try { legion.vm.attach('gone'); } catch (e) { gone = [e.kind, e.message, e instanceof LegionVmError]; }\n\
+               m.release();\n\
+               const d = new TextDecoder();\n\
+               return { id: m.id, exit: r.exit, stdout: d.decode(r.stdout), stderr: d.decode(r.stderr), timedOut: r.timedOut,\n\
+                        got, fetch: [resp.status, await resp.text(), resp.headers.get('x-vm')], again: again.id, gone };\n";
+    let mut i = instance(
+        js(),
+        Opts {
+            has_vm: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(i.src("main.js", src).await.ok().result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"id": "child-1", "exit": 7, "stdout": "ran echo hi", "stderr": "in",
+            "timedOut": false, "got": "file from vm", "fetch": [201, "vm body", "yes"],
+            "again": "child-1", "gone": ["child-gone", "legion.vm.attach: child-gone: no such child", true]})
+    );
+    assert_eq!(
+        *i.worker.vm.lock().unwrap(),
+        vec![
+            "acquire",
+            "exec child-1 echo hi",
+            "put /work/a.txt data",
+            "get /work/a.txt",
+            "fetch 8080",
+            "resize 512",
+            "attach child-1",
+            "attach gone",
+            "release child-1"
+        ]
+    );
+    let mut n = instance(js(), Opts::default()).await;
+    let ran = n
+        .src("main.js", "try { legion.vm.acquire(); } catch (e) { return [e.kind, e.message]; }\n")
+        .await;
+    assert_eq!(
+        ran.ok().result.as_deref(),
+        Some(r#"["not-configured","legion.vm.acquire: this task has no VM task (set config.vm.task)"]"#)
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_restore_hygiene_test() {
+    let _g = shared();
+    let src = "return [Math.random(), Math.random(), [...crypto.getRandomValues(new Uint8Array(8))].join(','), crypto.randomUUID()];\n";
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let mut i = instance(js(), Opts::default()).await;
+        let v: Vec<serde_json::Value> =
+            serde_json::from_str(i.src("main.js", src).await.ok().result.as_deref().unwrap())
+                .unwrap();
+        seen.push(v);
+    }
+    for k in 0..seen[0].len() {
+        assert_ne!(seen[0][k], seen[1][k], "value {k} repeated across instances: {seen:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Measurements (container numbers: a shared 4-vCPU VM, debug host build)
+// ---------------------------------------------------------------------------
+
+/// Tests share the process; the memory measurement must not.
+fn shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    LOCK.read().unwrap_or_else(|e| e.into_inner())
+}
+
+static LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn private_dirty_kib() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+    s.lines()
+        .find(|l| l.starts_with("Private_Dirty:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap()
+}
+
+/// About 10 KB of small function definitions and calls.
+fn ten_kb(js: bool) -> String {
+    let mut s = String::new();
+    let mut calls = Vec::new();
+    let mut n = 0;
+    while s.len() < 10_000 {
+        if js {
+            s.push_str(&format!("function f{n}(x) {{ const y = x * {n} + {}; return y % 1000; }}\n", n % 7));
+        } else {
+            s.push_str(&format!("def f{n}(x):\n    y = x * {n} + {}\n    return y % 1000\n", n % 7));
+        }
+        calls.push(format!("f{n}({n})"));
+        n += 1;
+    }
+    if js {
+        s.push_str(&format!("const result = {};\n", calls.join(" + ")));
+    } else {
+        s.push_str(&format!("result = {}\n", calls.join(" + ")));
+    }
+    s
+}
+
+struct Timing {
+    fresh_p50: u128,
+    fresh_p99: u128,
+    warm_p50: u128,
+}
+
+async fn time_runs(image: &Image, name: &str, src: &str, runs: usize) -> Timing {
+    let mut fresh = Vec::new();
+    for _ in 0..runs {
+        let t = Instant::now();
+        let mut i = instance(image, Opts::default()).await;
+        i.src(name, src).await.ok();
+        fresh.push(t.elapsed().as_micros());
+    }
+    let mut warm = Vec::new();
+    let mut i = instance(image, Opts::default()).await;
+    i.src(name, src).await.ok();
+    for _ in 0..runs {
+        warm.push(i.src(name, src).await.ok().micros);
+    }
+    let (fresh_p50, fresh_p99) = p50(fresh);
+    Timing {
+        fresh_p50,
+        fresh_p99,
+        warm_p50: p50(warm).0,
+    }
+}
+
+/// Private memory per idle instance: `IDLE_N` instances, each called once
+/// with a hello-world, held alive; the `Private_Dirty` delta over N.
+async fn idle_private_bytes(image: &Image, name: &str, hello: &str) -> u64 {
+    // Warm up: the first instance pays for lazily built host state.
+    let mut w = instance(image, Opts::default()).await;
+    w.src(name, hello).await.ok();
+    drop(w);
+    let before = private_dirty_kib();
+    let mut held = Vec::with_capacity(IDLE_N);
+    for _ in 0..IDLE_N {
+        let mut i = instance(image, Opts::default()).await;
+        i.src(name, hello).await.ok();
+        // Empty the scratch tree: the measure is the instance, not its files.
+        i.store.data_mut().scratch.clear();
+        held.push(i);
+    }
+    let after = private_dirty_kib();
+    drop(held);
+    (after.saturating_sub(before) * 1024) / IDLE_N as u64
+}
+
+struct Measured {
+    hello: Timing,
+    ten_kb: Timing,
+    idle_private_bytes: u64,
+}
+
+async fn measure(image: &Image) -> Measured {
+    let _g = LOCK.write().unwrap_or_else(|e| e.into_inner());
+    let js = image.name == "js";
+    let (name, hello) = if js {
+        ("main.js", "console.log('hello');\n")
+    } else {
+        ("main.py", "print('hello')\n")
+    };
+    let hello_t = time_runs(image, name, hello, 50).await;
+    let ten = ten_kb(js);
+    let ten_t = time_runs(image, name, &ten, 50).await;
+    let idle = idle_private_bytes(image, name, hello).await;
+    let m = Measured {
+        hello: hello_t,
+        ten_kb: ten_t,
+        idle_private_bytes: idle,
+    };
+    println!(
+        "[container measurement] {} image: hello world fresh instance p50 {} µs p99 {} µs, warm instance p50 {} µs; \
+         {}-byte snippet fresh p50 {} µs p99 {} µs, warm p50 {} µs (50 runs each); \
+         idle private memory {} KiB per instance (N={IDLE_N})",
+        image.name,
+        m.hello.fresh_p50,
+        m.hello.fresh_p99,
+        m.hello.warm_p50,
+        ten.len(),
+        m.ten_kb.fresh_p50,
+        m.ten_kb.fresh_p99,
+        m.ten_kb.warm_p50,
+        m.idle_private_bytes / 1024
+    );
+    m
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn python_measurements_test() {
+    measure(python()).await;
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn js_measurements_test() {
+    measure(js()).await;
+}
+
+// ---------------------------------------------------------------------------
+// manifest.json
+// ---------------------------------------------------------------------------
+
+/// The image's own list of importable top-level modules: every name in
+/// `sys.stdlib_module_names`, `sys.builtin_module_names` and
+/// `pkgutil.iter_modules()` (outside the image's internals), kept when
+/// `import name` succeeds in a fresh instance of the image.
+async fn python_modules() -> Vec<String> {
+    let list = r#"
+import sys, pkgutil
+names = set(sys.stdlib_module_names) | set(sys.builtin_module_names)
+for m in pkgutil.iter_modules():
+    if getattr(m.module_finder, "path", "").startswith("/python"):
+        names.add(m.name)
+result = sorted(n for n in names if "." not in n)
+"#;
+    let mut i = instance(python(), Opts::default()).await;
+    let names: Vec<String> =
+        serde_json::from_str(i.src("main.py", list).await.ok().result.as_deref().unwrap()).unwrap();
+    // `ctypes` is a stub the runner installs so that using it stops the run
+    // by name; it is not a module code can use, so it is not listed.
+    let stubs = ["ctypes"];
+    let mut ok = vec!["legion".to_string()];
+    for n in names {
+        if stubs.contains(&n.as_str()) {
+            continue;
+        }
+        let mut i = instance(python(), Opts::default()).await;
+        let ran = i.src("main.py", &format!("import {n}\n")).await;
+        if ran.exit == Some(0) {
+            ok.push(n);
+        }
+    }
+    ok.sort();
+    ok
+}
+
+#[tokio::test]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn manifest_write_test() {
+    let dir = images_dir();
+    let write = std::env::var_os("LEGION_ISOLATE_MANIFEST_WRITE").is_some();
+    let mut images = serde_json::Map::new();
+    for name in ["python", "js"] {
+        let wasm = dir.join(format!("{name}.wasm"));
+        if !wasm.exists() {
+            continue;
+        }
+        let image = if name == "python" { python() } else { js() };
+        let bytes = std::fs::read(&wasm).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        let measured = measure(image).await;
+        let (extensions, vm_entry, modules, runtime) = if name == "python" {
+            let modules = python_modules().await;
+            println!("python image: {} importable top-level modules", modules.len());
+            (
+                vec![".py"],
+                "main.py",
+                modules,
+                format!("CPython {} (componentize-py 0.25.1)", python_version().await),
+            )
+        } else {
+            // The js image resolves no module specifiers by itself: no
+            // packages, no Node builtins, and no ES modules from source.
+            (
+                vec![".js", ".mjs"],
+                "main.mjs",
+                Vec::new(),
+                "StarlingMonkey (componentize-js 0.23.0)".to_string(),
+            )
+        };
+        images.insert(
+            name.to_string(),
+            serde_json::json!({
+                "file": format!("{name}.wasm"),
+                "sha256": sha,
+                "extensions": extensions,
+                "vmEntry": vm_entry,
+                "modules": modules,
+                "initialMemoryBytes": module::initial_memory_bytes(&image.component),
+                "idlePrivateBytes": measured.idle_private_bytes,
+                "runtime": runtime,
+            }),
+        );
+    }
+    assert!(!images.is_empty(), "no images in {}", dir.display());
+    let manifest = serde_json::json!({ "images": images });
+    let text = serde_json::to_string_pretty(&manifest).unwrap() + "\n";
+    if write {
+        legion_isolate::compile::write_atomic(&dir.join("manifest.json"), text.as_bytes()).unwrap();
+        println!("wrote {}", dir.join("manifest.json").display());
+    } else {
+        println!("manifest (not written; set LEGION_ISOLATE_MANIFEST_WRITE=1):\n{text}");
+    }
+}
+
+async fn python_version() -> String {
+    let mut i = instance(python(), Opts::default()).await;
+    let ran = i
+        .src("main.py", "import sys\nresult = '%d.%d.%d' % sys.version_info[:3]\n")
+        .await;
+    serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap()
 }

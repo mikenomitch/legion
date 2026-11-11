@@ -1,0 +1,26 @@
+# A reactor component exporting `wasi:http/incoming-handler`; the host's
+# HTTP tests drive it. Paths: `/echo` (method, path, headers, body back),
+# `/count` (a global counter), `/fetch?<url>` (an outbound request through
+# the worker), `/big` (a large streamed body), `/trap`. Not a workspace
+# member: built into `tests/fixtures/handler.wasm` (checked in).
+[package]
+name = "handler"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+wit-bindgen = "0.63"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

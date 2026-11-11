@@ -507,8 +507,8 @@ pub fn net_status(
                 && !resolver_ready =>
             {
                 problems.push(
-                "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
-            )
+                    "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
+                )
             }
             _ => {}
         }
@@ -658,7 +658,7 @@ mod tests {
                 "resolver": "127.42.0.1",
                 "vipBlock": "127.42.0.0/24",
                 "ports": [{ "name": "http", "hostPort": 20000 }],
-                "upstreams": [{ "key": "openai", "localPort": 20001, "vip": "127.42.0.2", "canonicalPort": 443 }],
+                "upstreams": [{ "key": "openai", "localPort": 20001, "balance": "round_robin", "vip": "127.42.0.2", "canonicalPort": 443 }],
             })
             .to_string(),
             ..TaskAllocation::default()
@@ -679,7 +679,10 @@ mod tests {
         );
         assert_eq!(upstreams[0].vip, None, "an isolate has no VIPs");
         assert_eq!(upstreams[0].credentials.len(), 1);
-        assert!(dns_specs(&desired, root).is_empty(), "the worker resolves for it");
+        assert!(
+            dns_specs(&desired, root).is_empty(),
+            "the worker resolves for it"
+        );
         let ingress = ingress_specs(&desired, root);
         assert_eq!(ingress.len(), 1);
         assert_eq!(ingress[0].dial, TaskDial::Isolate { dir: dir.clone() });

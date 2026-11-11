@@ -78,7 +78,9 @@ impl TaskDial {
     pub fn gated(&self) -> bool {
         matches!(
             self,
-            TaskDial::Loopback { netns: Some(_) } | TaskDial::Vsock { .. } | TaskDial::Isolate { .. }
+            TaskDial::Loopback { netns: Some(_) }
+                | TaskDial::Vsock { .. }
+                | TaskDial::Isolate { .. }
         )
     }
 }
@@ -156,18 +158,16 @@ impl TaskTarget {
             }
             TaskDial::Isolate { dir } => {
                 let path = crate::worker::netd::attach::isolate_ingress_socket(dir, &self.label);
-                let stream = tokio::time::timeout(
-                    TASK_DIAL_TIMEOUT,
-                    tokio::net::UnixStream::connect(&path),
-                )
-                .await
-                .map_err(|_| anyhow!("connect {}: timed out", path.display()))?
-                .with_context(|| {
-                    format!(
-                        "connect {} (the isolate task is not prepared on this node yet)",
-                        path.display()
-                    )
-                })?;
+                let stream =
+                    tokio::time::timeout(TASK_DIAL_TIMEOUT, tokio::net::UnixStream::connect(&path))
+                        .await
+                        .map_err(|_| anyhow!("connect {}: timed out", path.display()))?
+                        .with_context(|| {
+                            format!(
+                                "connect {} (the isolate task is not prepared on this node yet)",
+                                path.display()
+                            )
+                        })?;
                 Ok(TaskStream::Unix(stream))
             }
         }

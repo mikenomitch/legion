@@ -139,7 +139,9 @@ impl NetdEgress {
                     Err(err) => {
                         return failure(
                             EgressErrorKind::EgressUnavailable,
-                            format!("the listener of upstream {upstream} is not reachable: {err:#}"),
+                            format!(
+                                "the listener of upstream {upstream} is not reachable: {err:#}"
+                            ),
                         )
                     }
                 };
@@ -329,7 +331,10 @@ impl NetdEgress {
             }
         }
         if !body.is_empty() {
-            request_headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(body.len()));
+            request_headers.insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from(body.len()),
+            );
         }
         let request = match builder.body(Full::new(body)) {
             Ok(request) => request,
@@ -402,7 +407,11 @@ impl EgressBackend for NetdEgress {
             }
             Err(_) => failure(
                 EgressErrorKind::EgressTimeout,
-                format!("{} did not answer within {}ms", redact_url(&url), timeout.as_millis()),
+                format!(
+                    "{} did not answer within {}ms",
+                    redact_url(&url),
+                    timeout.as_millis()
+                ),
             ),
         }
     }
@@ -503,7 +512,9 @@ impl Target {
             Some(url::Host::Ipv6(ip)) => ip.to_string(),
             None => return Err(format!("{raw:?} names no host")),
         };
-        let port = url.port_or_known_default().unwrap_or(if https { 443 } else { 80 });
+        let port = url
+            .port_or_known_default()
+            .unwrap_or(if https { 443 } else { 80 });
         let authority = match url.port() {
             Some(port) => format!("{}:{port}", bracket(&host)),
             None => bracket(&host),
@@ -573,7 +584,7 @@ const ISOLATE_ROUTING: &[&str] = &["legion-tenant", "legion-session"];
 /// Whether a header is hop-by-hop: listed, or named by `Connection`.
 pub(crate) fn is_hop_by_hop(name: &str, connection: &[String]) -> bool {
     let name = name.to_ascii_lowercase();
-    HOP_BY_HOP.contains(&name.as_str()) || connection.iter().any(|named| *named == name)
+    HOP_BY_HOP.contains(&name.as_str()) || connection.contains(&name)
 }
 
 /// The header names a `Connection` header lists.
@@ -656,7 +667,10 @@ where
     match Limited::new(body, limit).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(err) => {
-            if err.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
                 Err(BodyError::TooLarge)
             } else {
                 Err(BodyError::Read(err.to_string()))
@@ -796,8 +810,13 @@ mod tests {
 
     /// A TLS origin for `secure.test` with a fresh self-signed certificate,
     /// and a connector that trusts only that certificate.
-    async fn tls_origin() -> (u16, mpsc::UnboundedReceiver<String>, tokio_rustls::TlsConnector) {
-        let certified = rcgen::generate_simple_self_signed(vec!["secure.test".to_string()]).unwrap();
+    async fn tls_origin() -> (
+        u16,
+        mpsc::UnboundedReceiver<String>,
+        tokio_rustls::TlsConnector,
+    ) {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["secure.test".to_string()]).unwrap();
         let cert = certified.cert.der().clone();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
@@ -809,9 +828,8 @@ mod tests {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).unwrap();
-        let connector = tokio_rustls::TlsConnector::from(
-            crate::worker::netd::tls::pinned_client_config(roots),
-        );
+        let connector =
+            tokio_rustls::TlsConnector::from(crate::worker::netd::tls::pinned_client_config(roots));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -932,7 +950,9 @@ mod tests {
             Some("openai")
         );
         assert_eq!(
-            Target::parse("http://api.openai.com/").unwrap().upstream_key(),
+            Target::parse("http://api.openai.com/")
+                .unwrap()
+                .upstream_key(),
             Some("api.openai.com"),
             "a candidate name; the task's upstream list decides"
         );
@@ -1003,11 +1023,10 @@ mod tests {
         let (port, mut seen) = origin().await;
         let dir = tempfile::tempdir().unwrap();
         let (forwarder, _denials) = datapath(dir.path(), &[port]).await;
-        let credentials: Vec<crate::structs::UpstreamCredential> =
-            serde_json::from_value(json!([
-                { "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } },
-            ]))
-            .unwrap();
+        let credentials: Vec<crate::structs::UpstreamCredential> = serde_json::from_value(json!([
+            { "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } },
+        ]))
+        .unwrap();
         forwarder
             .sync(&[UpstreamSpec {
                 allocation_id: ENVELOPE,
@@ -1043,7 +1062,10 @@ mod tests {
         let guest = request(
             "POST",
             "http://api/v1/chat?x=1",
-            &[("Content-Type", "application/json"), ("Legion-Tenant", "acme")],
+            &[
+                ("Content-Type", "application/json"),
+                ("Legion-Tenant", "acme"),
+            ],
             b"{\"q\":1}",
         );
         let guest_text = format!("{guest:?}");
@@ -1053,9 +1075,15 @@ mod tests {
         assert_eq!(reply.body, b"ok");
         let names: Vec<String> = reply.headers.iter().map(|h| h.name.clone()).collect();
         assert!(names.contains(&"x-origin".to_string()), "{names:?}");
-        assert!(!names.iter().any(|n| n == "connection" || n == "keep-alive"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "connection" || n == "keep-alive"),
+            "{names:?}"
+        );
         let received = seen.recv().await.unwrap();
-        assert!(received.starts_with("POST /v1/chat?x=1 HTTP/1.1"), "{received}");
+        assert!(
+            received.starts_with("POST /v1/chat?x=1 HTTP/1.1"),
+            "{received}"
+        );
         assert!(
             received
                 .to_ascii_lowercase()
@@ -1063,13 +1091,19 @@ mod tests {
             "{received}"
         );
         assert!(received.ends_with("{\"q\":1}"), "{received}");
-        assert!(!received.to_ascii_lowercase().contains("legion-tenant"), "{received}");
+        assert!(
+            !received.to_ascii_lowercase().contains("legion-tenant"),
+            "{received}"
+        );
         assert!(!guest_text.contains("secret-token"));
         assert!(!format!("{reply:?}").contains("secret-token"), "{reply:?}");
 
         // The `<key>.svc.legion` form reaches the same listener.
         let reply = egress
-            .fetch(&task(), request("GET", "http://api.svc.legion/v2", &[], b""))
+            .fetch(
+                &task(),
+                request("GET", "http://api.svc.legion/v2", &[], b""),
+            )
             .await;
         assert_eq!(reply.status, 200, "{reply:?}");
         assert!(seen.recv().await.unwrap().starts_with("GET /v2 HTTP/1.1"));
@@ -1109,9 +1143,18 @@ mod tests {
                 request("GET", &format!("http://denied.test:{port}/x"), &[], b""),
             )
             .await;
-        assert_eq!(kind(&reply), Some(EgressErrorKind::EgressDenied), "{reply:?}");
+        assert_eq!(
+            kind(&reply),
+            Some(EgressErrorKind::EgressDenied),
+            "{reply:?}"
+        );
         assert!(
-            reply.error.as_ref().unwrap().message.starts_with("denied by "),
+            reply
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .starts_with("denied by "),
             "{reply:?}"
         );
         let recorded = denials.drain();
@@ -1130,7 +1173,11 @@ mod tests {
                 request("GET", &format!("http://allowed.test:{port}/big"), &[], b""),
             )
             .await;
-        assert_eq!(kind(&reply), Some(EgressErrorKind::EgressTooLarge), "{reply:?}");
+        assert_eq!(
+            kind(&reply),
+            Some(EgressErrorKind::EgressTooLarge),
+            "{reply:?}"
+        );
     }
 
     /// `https://` is a CONNECT to the proxy, judged by host and port, then
@@ -1166,7 +1213,11 @@ mod tests {
                 request("GET", &format!("https://secure.test:{port}/"), &[], b""),
             )
             .await;
-        assert_eq!(kind(&reply), Some(EgressErrorKind::EgressConnect), "{reply:?}");
+        assert_eq!(
+            kind(&reply),
+            Some(EgressErrorKind::EgressConnect),
+            "{reply:?}"
+        );
 
         // A CONNECT the policy refuses is a denial, before any TLS.
         let reply = egress
@@ -1175,6 +1226,10 @@ mod tests {
                 request("GET", &format!("https://denied.test:{port}/"), &[], b""),
             )
             .await;
-        assert_eq!(kind(&reply), Some(EgressErrorKind::EgressDenied), "{reply:?}");
+        assert_eq!(
+            kind(&reply),
+            Some(EgressErrorKind::EgressDenied),
+            "{reply:?}"
+        );
     }
 }

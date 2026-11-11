@@ -443,7 +443,7 @@ impl Cluster {
                     "resources": { "cpu": 10, "memory": 2, "memoryMax": 128 },
                     "stateful": {
                         "mode": "session",
-                        "envelope": { "resources": { "cpu": 2000, "memory": 2048 } },
+                        "envelope": { "resources": { "cpu": 800, "memory": 2048 } },
                     },
                     "children": { "tasks": [VM_TASK], "max": 1 },
                 },
@@ -453,7 +453,7 @@ impl Cluster {
                     "resources": { "cpu": 500, "memory": 512 },
                     "stateful": {
                         "mode": "session",
-                        "envelope": { "resources": { "cpu": 2000, "memory": 2048 } },
+                        "envelope": { "resources": { "cpu": 800, "memory": 2048 } },
                     },
                     "run": { "command": ["python3", "/legion/run/main.py"], "wall": "5m" },
                 },
@@ -1054,7 +1054,10 @@ async fn a_disabled_isolate_runtime_keeps_the_envelope_and_auto_runs_test() -> R
         .await
         .expect_err("the isolate tier is disabled");
     assert_eq!(err.code(), Code::Unavailable, "{err:?}");
-    assert!(err.message().contains("runtime_disabled"), "{err:?}");
+    assert!(
+        err.message().contains("runtime \"isolate\" is disabled"),
+        "{err:?}"
+    );
     assert_eq!(cluster.runs().len(), 1);
     Ok(())
 }

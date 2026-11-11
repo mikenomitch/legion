@@ -978,8 +978,10 @@ impl Host {
             // The worker admitted the change against the envelope already;
             // the host's own count follows it.
             let delta = reservation as i64 - live.charge.units as i64;
-            *task.resident.lock().unwrap() =
-                (*task.resident.lock().unwrap() as i64 + delta).max(0) as u64;
+            {
+                let mut used = task.resident.lock().unwrap();
+                *used = (*used as i64 + delta).max(0) as u64;
+            }
             live.charge.units = reservation;
             task.resident_freed.notify_waiters();
         }
@@ -1724,6 +1726,8 @@ impl Job {
         if self.holder.is_none() || (self.module.command.is_some() && !self.module.exports.runner) {
             keep = false;
         }
+        // `resumed` holds for the first call after a restore only.
+        live.store.data_mut().resumed = false;
         let memory_peak = live.store.data().account().peak();
         let memory_now = live.memory_bytes();
         let park = live.store.data().park;

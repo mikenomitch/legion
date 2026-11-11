@@ -219,6 +219,10 @@ pub struct IsolateSupervisor {
     rates: Mutex<Rates>,
     deltas: Mutex<Deltas>,
     runtime: Mutex<Option<tokio::runtime::Handle>>,
+    /// Where envelope socket dirs are, for ingress.
+    alloc_root: Mutex<Option<PathBuf>>,
+    /// Ingress sockets served per task (dropped to stop serving).
+    ingress: Mutex<HashMap<TaskKey, Vec<super::ingress::IngressServer>>>,
 }
 
 impl std::fmt::Debug for IsolateSupervisor {
@@ -278,6 +282,8 @@ impl IsolateSupervisor {
             rates: Mutex::new(Rates::default()),
             deltas: Mutex::new(Deltas::default()),
             runtime: Mutex::new(tokio::runtime::Handle::try_current().ok()),
+            alloc_root: Mutex::new(None),
+            ingress: Mutex::new(HashMap::new()),
         })
     }
 
@@ -289,6 +295,12 @@ impl IsolateSupervisor {
     /// discovery).
     pub fn attach(&self, task_manager: &Arc<Mutex<WorkerTaskManager>>) {
         *lock(&self.task_manager) = Some(Arc::downgrade(task_manager));
+    }
+
+    /// Where the node keeps allocation directories: ingress sockets go in
+    /// the envelope's.
+    pub fn set_alloc_root(&self, alloc_root: PathBuf) {
+        *lock(&self.alloc_root) = Some(alloc_root);
     }
 
     fn task_manager(&self) -> Option<Arc<Mutex<WorkerTaskManager>>> {
@@ -551,12 +563,43 @@ impl IsolateSupervisor {
         if let Some(task) = lock(&self.state).tasks.get(&key) {
             task.readiness.send_replace(Readiness::Ready);
         }
+        self.serve_ingress(&key).await;
         info!(
             job_id = %job_id,
             task = %task_name,
             millis = started.elapsed().as_millis() as u64,
             "Isolate task ready on this node"
         );
+    }
+
+    /// Serve the task's ingress ports on its envelope's sockets, where the
+    /// node's ingress listener dials.
+    async fn serve_ingress(&self, key: &TaskKey) {
+        let Some(alloc_root) = lock(&self.alloc_root).clone() else {
+            return;
+        };
+        let Some((allocation, labels)) = lock(&self.state).tasks.get(key).map(|task| {
+            (
+                task.envelope_allocation_id,
+                task.task
+                    .network
+                    .as_ref()
+                    .map(|network| network.ports.iter().map(|port| port.name.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        }) else {
+            return;
+        };
+        if labels.is_empty() {
+            return;
+        }
+        let max_body = self.config.max_body_bytes().unwrap_or(16 << 20);
+        match super::ingress::serve_ports(&alloc_root, allocation, &labels, &key.0, &key.1, max_body, self.arc()).await {
+            Ok(servers) => {
+                lock(&self.ingress).insert(key.clone(), servers);
+            }
+            Err(err) => warn!(job_id = %key.0, task = %key.1, error = %format!("{err:#}"), "Isolate ingress not served"),
+        }
     }
 
     fn fail_task(&self, key: &TaskKey, problem: String) {
@@ -929,6 +972,7 @@ impl IsolateSupervisor {
     /// isolates, and stop the cordon's hosts when it was the last.
     async fn remove_task(&self, key: TaskKey, cordon: &str) {
         info!(job_id = %key.0, task = %key.1, "Isolate task left this node");
+        lock(&self.ingress).remove(&key);
         for replica in self.replicas(cordon) {
             if let Some(conn) = replica.conn() {
                 let mut client = conn.client.clone();

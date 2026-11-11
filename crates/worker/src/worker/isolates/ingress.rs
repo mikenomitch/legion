@@ -139,10 +139,7 @@ async fn answer(served: &Served, request: Request<Incoming>) -> Response<Full<By
     let tenant = header_text(TENANT_HEADER);
     if !tenant.is_empty() {
         if let Err(err) = validate_tenant_key(&tenant) {
-            return plain(
-                StatusCode::BAD_REQUEST,
-                &format!("{TENANT_HEADER}: {err}"),
-            );
+            return plain(StatusCode::BAD_REQUEST, &format!("{TENANT_HEADER}: {err}"));
         }
     }
     let session_id = header_text(SESSION_HEADER);
@@ -164,7 +161,13 @@ async fn answer(served: &Served, request: Request<Incoming>) -> Response<Full<By
     let call = http_call(&parts, body);
     match served
         .target
-        .handle(&served.job_id, &served.task_name, &tenant, &session_id, call)
+        .handle(
+            &served.job_id,
+            &served.task_name,
+            &tenant,
+            &session_id,
+            call,
+        )
         .await
     {
         Ok(outcome) => respond(outcome),
@@ -324,9 +327,13 @@ mod tests {
                 request,
             ));
             match path.as_str() {
-                "/full" => Err(tonic::Status::resource_exhausted("the task is at max_active")),
+                "/full" => Err(tonic::Status::resource_exhausted(
+                    "the task is at max_active",
+                )),
                 "/gone" => Err(tonic::Status::not_found("no session s-9")),
-                "/broken" => Err(tonic::Status::failed_precondition("module failed to compile")),
+                "/broken" => Err(tonic::Status::failed_precondition(
+                    "module failed to compile",
+                )),
                 "/down" => Err(tonic::Status::unavailable("host restarting")),
                 "/slow" => Err(tonic::Status::deadline_exceeded("wall limit")),
                 "/weird" => Ok(HttpOutcome {
@@ -390,12 +397,20 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 201"), "{response}");
-        assert!(response.to_ascii_lowercase().contains("x-guest: 1"), "{response}");
+        assert!(
+            response.to_ascii_lowercase().contains("x-guest: 1"),
+            "{response}"
+        );
         assert!(response.ends_with("made"), "{response}");
         let calls = target.calls.lock().unwrap();
         let (job, task, tenant, session, call) = &calls[0];
         assert_eq!(
-            (job.as_str(), task.as_str(), tenant.as_str(), session.as_str()),
+            (
+                job.as_str(),
+                task.as_str(),
+                tenant.as_str(),
+                session.as_str()
+            ),
             ("agents", "run", "acme", "s-1")
         );
         assert_eq!(call.method, "POST");
@@ -406,7 +421,10 @@ mod tests {
         let names: Vec<&str> = call.headers.iter().map(|h| h.name.as_str()).collect();
         assert!(names.contains(&"x-keep"), "{names:?}");
         for gone in ["legion-tenant", "legion-session", "connection", "x-hop"] {
-            assert!(!names.contains(&gone), "{gone} reached the guest: {names:?}");
+            assert!(
+                !names.contains(&gone),
+                "{gone} reached the guest: {names:?}"
+            );
         }
         drop(calls);
 
@@ -420,7 +438,7 @@ mod tests {
         // A bad tenant key: 400 naming the header.
         let response = send(
             &socket,
-            "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nLegion-Tenant: a\x7fb\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nLegion-Tenant: a b\r\n\r\n",
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");

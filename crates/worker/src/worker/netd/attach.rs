@@ -174,7 +174,9 @@ impl Attachment {
     pub fn fronts_every_port(&self) -> bool {
         matches!(
             self,
-            Attachment::GuestVsock { .. } | Attachment::GuestTap { .. } | Attachment::Isolate { .. }
+            Attachment::GuestVsock { .. }
+                | Attachment::GuestTap { .. }
+                | Attachment::Isolate { .. }
         )
     }
 
@@ -390,7 +392,10 @@ mod tests {
             attachment.listen(ip, 1080),
             ListenAddr::Unix("/allocs/9/.isolate/net.sock_1080".into())
         );
-        assert_eq!(attachment.task_dial(), TaskDial::Isolate { dir: dir.clone() });
+        assert_eq!(
+            attachment.task_dial(),
+            TaskDial::Isolate { dir: dir.clone() }
+        );
         assert!(attachment.task_dial().gated());
         assert_eq!(
             isolate_ingress_socket(&dir, "http"),
@@ -417,7 +422,10 @@ mod tests {
             Attachment::Host
         );
         assert!(Attachment::Host.wants_resolver());
-        assert!(Attachment::GuestVsock { scratch: "/s".into() }.wants_resolver());
+        assert!(Attachment::GuestVsock {
+            scratch: "/s".into()
+        }
+        .wants_resolver());
     }
 
     #[test]

@@ -56,7 +56,7 @@ fn origin(job: &str, task: &str, session: &str) -> Origin {
 impl IsolateHost for FakeHost {
     async fn hello(&self, _: Request<HelloRequest>) -> Result<Response<HelloReply>, Status> {
         Ok(Response::new(HelloReply {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: crate::structs::isolate_host::PROTOCOL_VERSION,
             engine_version: "wasmtime-fake".into(),
             compat_key: "fake".into(),
             pid: self.pid,
@@ -131,7 +131,10 @@ impl IsolateHost for FakeHost {
             .map(|f| f.content.clone())
             .unwrap_or_default();
         if entry == b"hang" {
+            // Until the process is "killed": the call never gets an answer
+            // from the host, only the broken connection.
             self.hang.notified().await;
+            return Err(Status::internal("h2 protocol error: connection reset"));
         }
         let mut start = "fresh".to_string();
         let mut stdout = entry.clone();
@@ -392,9 +395,9 @@ impl HostLauncher for FakeLauncher {
         let exit = exit_tx.clone();
         let hang = host.hang.clone();
         let kill: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = exit.send(Some("was killed".into()));
             abort.abort();
             hang.notify_waiters();
-            let _ = exit.send(Some("was killed".into()));
         });
         self.hosts
             .lock()

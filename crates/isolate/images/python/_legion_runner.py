@@ -124,19 +124,6 @@ def _install_stubs():
     ):
         setattr(socket, name, _stub("socket." + name, SOCKETS))
 
-    # `ctypes` is not built for WASI (no `_ctypes`). A stub package stands in
-    # so that using it, not importing it, stops the run; it is left out of
-    # the image's module list, so the pre-flight check still sends code
-    # that imports it to a VM when the task has one.
-    ctypes = types.ModuleType("ctypes", "Not available in an isolate: %s." % NATIVE)
-
-    def _ctypes_getattr(name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        legion.unsupported("ctypes.%s: %s" % (name, NATIVE))
-
-    ctypes.__getattr__ = _ctypes_getattr
-    sys.modules["ctypes"] = ctypes
 
 
 # ---------------------------------------------------------------------------
@@ -245,19 +232,90 @@ def _install_http():
 _install_stubs()
 _install_http()
 
-# Common pure-Python modules, imported into the snapshot so a run does not
-# pay for them (crates/isolate/images/README.md, "Preloaded modules").
-PRELOAD = (
-    "base64", "collections", "csv", "dataclasses", "datetime", "decimal",
-    "functools", "hashlib", "io", "itertools", "json", "math", "random", "re",
-    "statistics", "string", "textwrap", "time", "typing", "uuid",
-)
-for _name in PRELOAD:
-    importlib.import_module(_name)
-del _name
+# The standard library is only what is imported here. componentize-py
+# snapshots the interpreter after this module ran and does not ship the
+# library's files: at run time `/python` is not there, so a module that was
+# not imported while the image was built cannot be imported at all. So the
+# image imports every standard-library module and submodule that imports
+# cleanly under WASI, minus the ones below (README.md, "The standard
+# library").
+SKIP = {
+    # Not code a run can use: the test suite, IDLE, Tk, turtle demos,
+    # installers, and modules that only print or open a browser.
+    "test", "idlelib", "tkinter", "turtle", "turtledemo", "ensurepip", "venv",
+    "pydoc_data", "antigravity", "this", "__hello__", "__phello__", "lib2to3",
+    # The runner installs a stub in its place (below).
+    "ctypes",
+}
+SKIP_PREFIXES = tuple(n + "." for n in SKIP)
+
+
+def _preload():
+    import pkgutil
+    import warnings
+
+    loaded, failed = [], []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        names = sorted(set(sys.stdlib_module_names) | set(sys.builtin_module_names))
+        for name in names:
+            if name in SKIP or name in sys.modules:
+                continue
+            try:
+                importlib.import_module(name)
+                loaded.append(name)
+            except BaseException:
+                failed.append(name)
+        for name in names:
+            mod = sys.modules.get(name)
+            path = getattr(mod, "__path__", None)
+            if not path or name in SKIP:
+                continue
+            for info in pkgutil.walk_packages(path, name + ".", onerror=lambda _n: None):
+                sub = info.name
+                if sub.startswith(SKIP_PREFIXES) or ".test" in sub or sub in sys.modules:
+                    continue
+                try:
+                    importlib.import_module(sub)
+                    loaded.append(sub)
+                except BaseException:
+                    failed.append(sub)
+    return loaded, failed
+
+
+PRELOADED, NOT_PRELOADED = _preload()
+
+
+def _install_ctypes_stub():
+    # `ctypes` is not built for WASI (no `_ctypes`). A stub package stands in
+    # so that using it, not importing it, stops the run; it is left out of
+    # the image's module list, so the pre-flight check still sends code
+    # that imports it to a VM when the task has one.
+    ctypes = types.ModuleType("ctypes", "Not available in an isolate: %s." % NATIVE)
+
+    def _ctypes_getattr(name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        legion.unsupported("ctypes.%s: %s" % (name, NATIVE))
+
+    ctypes.__getattr__ = _ctypes_getattr
+    sys.modules["ctypes"] = ctypes
+
+
+# Installed after the preload: a standard-library module that tries ctypes
+# while it is imported (_ios_support) then fails to import, as it would
+# without the stub, instead of stopping the image build.
+_install_ctypes_stub()
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
+
+# Everything imported so far is shared, read-mostly image memory: keep the
+# cyclic GC from walking (and so writing to) it in every instance.
+import gc  # noqa: E402
+
+gc.collect()
+gc.freeze()
 
 # ---------------------------------------------------------------------------
 # Per instance

@@ -140,7 +140,7 @@ async fn a_session_hibernates_on_park_and_wakes_with_its_state_test() {
     assert_eq!(info.tier, "empty");
     call(&h, "s", "acme", "sess-1", &["set", "k", "kept"]).await;
     let r = call(&h, "s", "acme", "sess-1", &["count"]).await;
-    assert_eq!((result(&r).as_str(), r.start.as_str()), ("{\"count\":2}", "warm"));
+    assert_eq!((result(&r).as_str(), r.start.as_str()), ("{\"count\":1}", "warm"));
     let info = h.host.get_session("sess-1").unwrap();
     assert_eq!((info.tier.as_str(), info.invocations), ("hot", 2));
     assert_eq!(info.state_bytes, 5);

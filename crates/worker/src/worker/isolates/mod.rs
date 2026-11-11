@@ -13,6 +13,7 @@ pub mod service;
 pub mod sessions;
 pub mod stats;
 pub mod supervisor;
+pub mod supervisor_setup;
 pub mod tier;
 pub mod vm;
 

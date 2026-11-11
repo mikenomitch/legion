@@ -196,7 +196,7 @@ pub struct RegistrationPayload {
 /// What this worker advertises at registration: it always takes
 /// checkpoints and fetches published snapshot parts it does not hold, and it
 /// publishes snapshot parts when a `contentStore` is configured (and usable).
-fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
+fn worker_capabilities(publishing: bool, edge_sessions: bool, isolates: bool) -> Vec<String> {
     let mut capabilities = vec![
         crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string(),
         crate::structs::snapshot::CHECKPOINT_FETCH_CAPABILITY.to_string(),
@@ -221,6 +221,12 @@ fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
     // it as not accepting edge starts.
     if edge_sessions {
         capabilities.push(crate::structs::session::EDGE_SESSIONS_CAPABILITY.to_string());
+    }
+    // Runs `isolate` tasks (docs/task-runtime-isolate.md): the node found a
+    // `legion-isolate` binary that speaks its protocol. An isolate task's
+    // envelope requires it.
+    if isolates {
+        capabilities.push(crate::structs::isolate::ISOLATES_CAPABILITY.to_string());
     }
     capabilities
 }
@@ -774,6 +780,27 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     ));
     let _ = workload_launch_pool.set(launch_pool.clone());
 
+    // The isolate runtime (docs/task-runtime-isolate.md), where this node
+    // has a `legion-isolate` binary that speaks its protocol.
+    let isolate_config = parse_isolate_payload(&config.artifacts);
+    let isolate_supervisor = crate::worker::isolates::supervisor_setup::start(
+        &task_manager,
+        &name,
+        isolate_config.clone(),
+        humantime::parse_duration(&edge_boot_config.queue_timeout)
+            .unwrap_or(Duration::from_secs(1)),
+        &enforcement_config,
+    )
+    .await;
+    if let Some(isolates) = isolate_supervisor.as_ref() {
+        isolates.set_vm_backend(Arc::new(crate::worker::isolates::vm::ChildVms::new(
+            task_manager.clone(),
+            name.clone(),
+            launch_pool.clone(),
+            isolate_config.max_body_bytes().unwrap_or(16 << 20),
+        )));
+    }
+
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
     // source of truth for what volume drivers exist in the cluster: it backs
@@ -944,6 +971,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 .content_publishing()
                 .is_some(),
             edge_boot_config.accept_claims,
+            isolate_supervisor.is_some(),
         ),
         join_attributes,
     };
@@ -1055,6 +1083,12 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             .with_proxies(net_proxies)
             .with_ingress(net_ingress),
     );
+    if let Some(isolates) = isolate_supervisor.as_ref() {
+        isolates.set_egress_backend(Arc::new(crate::worker::isolates::egress::NetdEgress::new(
+            forwarder.clone(),
+            isolate_config.max_body_bytes().unwrap_or(16 << 20),
+        )));
+    }
     let alloc_root = task_manager
         .lock()
         .expect("task manager")
@@ -1174,6 +1208,14 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         } => {}
         signal = worker_shutdown_signal() => {
+            // Hibernate session isolates and stop the hosts first.
+            let isolates = shutdown_task_manager
+                .lock()
+                .ok()
+                .and_then(|manager| manager.isolates());
+            if let Some(isolates) = isolates {
+                isolates.shutdown().await;
+            }
             stop_worker_daemon(
                 shutdown_task_manager,
                 signal,
@@ -2071,6 +2113,15 @@ fn parse_sessions_payload(raw: &str) -> crate::structs::WorkerSessionsConfig {
 /// The worker config's `devices` block, from the artifacts payload it rides
 /// in (none when absent or unreadable: an unreadable block is logged, and
 /// the node reports no devices rather than refusing to start).
+/// The resolved `isolate` block of the worker config payload
+/// (`WorkerArtifactsPayload.isolate`); defaults when absent.
+fn parse_isolate_payload(raw: &str) -> crate::structs::isolate::WorkerIsolateConfigFull {
+    serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(raw)
+        .ok()
+        .and_then(|payload| payload.isolate)
+        .unwrap_or_default()
+}
+
 fn parse_devices_payload(raw: &str) -> crate::devices::plugin::WorkerDevicesConfig {
     if raw.trim().is_empty() {
         return Default::default();
@@ -2834,11 +2885,17 @@ pub async fn heartbeat_tick(
         let runtime_gate = task_manager.lock().expect("task manager").runtime_gate();
         let runtime_refusals = runtime_gate.take_refusals();
         let runtime_refusals_for_redrive = runtime_refusals.clone();
+        // One aggregate per isolate task, polled from the hosts now
+        // (docs/task-runtime-isolate.md, "Observing").
+        let isolates = task_manager.lock().expect("task manager").isolates();
+        let (isolate_tasks, isolate_hosts) = match isolates {
+            Some(isolates) => isolates.stats("", "").await,
+            None => (Vec::new(), Vec::new()),
+        };
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             runtime_refusals,
-            // Filled by the isolate supervisor (docs/task-runtime-isolate.md).
-            isolate_tasks: Vec::new(),
-            isolate_hosts: Vec::new(),
+            isolate_tasks,
+            isolate_hosts,
             // What the node holds of its endpoint feed, so the reply carries
             // only what changed (mesh-control-path plan §6.1).
             endpoint_feed: Some(netd.feed_report()),
@@ -4412,7 +4469,7 @@ mod tests {
                 config_attrs: "{}".into(),
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
-                capabilities: worker_capabilities(false, false),
+                capabilities: worker_capabilities(false, false, false),
                 join_attributes: HashMap::new(),
             },
             Arc::new(Netd::new(

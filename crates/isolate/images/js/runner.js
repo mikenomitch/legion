@@ -427,10 +427,20 @@ globalThis.LegionVmError = LegionVmError;
 // Running an entry
 // ---------------------------------------------------------------------------
 
+// This file's name as the engine reports it in stacks.
 const RUNNER_FILE = (() => {
   const m = /@(.*?):\d+:\d+/.exec(new Error().stack || '');
   return m ? m[1] : '';
 })();
+
+/** Frames of the caller's code: the entry (a relative name) and files in
+ * the run directory, not the runner's or the generated bindings'. */
+function callerFrame(file) {
+  if (file === RUNNER_FILE) return false;
+  return !file.startsWith('/') || file.startsWith(RUN_DIR + '/');
+}
+
+const MODULE_SYNTAX = /^\s*(?:import\s*(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*))/m;
 
 function formatError(e) {
   if (!(e instanceof Error)) {
@@ -443,12 +453,12 @@ function formatError(e) {
     return `Uncaught ${text}`;
   }
   const lines = [`Uncaught ${e.name}: ${e.message}`];
-  if (e instanceof SyntaxError && e.fileName && e.fileName !== RUNNER_FILE) {
+  if (e instanceof SyntaxError && e.fileName && callerFrame(e.fileName)) {
     lines.push(`    at ${e.fileName}:${e.lineNumber}:${e.columnNumber}`);
   }
   for (const frame of String(e.stack || '').split('\n')) {
     const m = /^(.*?)@(.*):(\d+):(\d+)$/.exec(frame);
-    if (!m || m[2] === RUNNER_FILE || m[2].startsWith(RUNNER_FILE + ' line')) continue;
+    if (!m || !callerFrame(m[2])) continue;
     const fn = m[1] || '<anonymous>';
     lines.push(`    at ${fn} (${m[2]}:${m[3]}:${m[4]})`);
   }
@@ -511,9 +521,21 @@ async function run(req) {
     // line so line numbers match the file. A top-level `result` binding
     // (let/const/var, or the global) is the result unless the entry
     // returned a value first.
-    const fn = (0, eval)(
-      `(async function () {${source}\n;return typeof result === 'undefined' ? undefined : result;\n})\n//# sourceURL=${entry}`,
-    );
+    let fn;
+    try {
+      fn = (0, eval)(
+        `(async function () {${source}\n;return typeof result === 'undefined' ? undefined : result;\n})\n//# sourceURL=${entry}`,
+      );
+    } catch (e) {
+      // StarlingMonkey cannot link a module from source at run time
+      // (import() of a file fails too), so module syntax is reported by name.
+      if (e instanceof SyntaxError && MODULE_SYNTAX.test(source)) {
+        unsupported(
+          'ES module syntax (import/export): modules are not available in an isolate; write the entry as a script or run with --tier vm',
+        );
+      }
+      throw e;
+    }
     value = await fn();
   } catch (e) {
     if (e instanceof ProcessExit) {

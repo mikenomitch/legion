@@ -150,7 +150,9 @@ impl ChildVms {
                 };
                 return failure(kind, status.message().to_string());
             }
-            Err(err) => return failure(VmErrorKind::VmFailed, format!("the start panicked: {err}")),
+            Err(err) => {
+                return failure(VmErrorKind::VmFailed, format!("the start panicked: {err}"))
+            }
         };
         let id = started.session_id;
         info!(
@@ -167,10 +169,7 @@ impl ChildVms {
                 self.stop(&id, "did not start in time").await;
                 return failure(
                     VmErrorKind::VmFailed,
-                    format!(
-                        "child {id} did not start within {}s",
-                        START_WAIT.as_secs()
-                    ),
+                    format!("child {id} did not start within {}s", START_WAIT.as_secs()),
                 );
             }
             Err(err) => {
@@ -459,7 +458,10 @@ impl ChildVms {
                 response: Some(response),
                 ..Default::default()
             },
-            Ok(Err(message)) => failure(VmErrorKind::VmFailed, format!("fetch {id}:{port}: {message}")),
+            Ok(Err(message)) => failure(
+                VmErrorKind::VmFailed,
+                format!("fetch {id}:{port}: {message}"),
+            ),
             Err(_) => failure(
                 VmErrorKind::VmFailed,
                 format!(
@@ -768,7 +770,9 @@ fn failure(kind: VmErrorKind, message: impl Into<String>) -> VmReply {
     }
 }
 
-fn lock(task_manager: &Arc<Mutex<WorkerTaskManager>>) -> std::sync::MutexGuard<'_, WorkerTaskManager> {
+fn lock(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+) -> std::sync::MutexGuard<'_, WorkerTaskManager> {
     task_manager.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -885,7 +889,14 @@ mod tests {
             .await
     }
 
-    async fn exec(vms: &ChildVms, who: &IsolateTaskRef, id: &str, argv: &[&str], stdin: &[u8], timeout_millis: u32) -> VmReply {
+    async fn exec(
+        vms: &ChildVms,
+        who: &IsolateTaskRef,
+        id: &str,
+        argv: &[&str],
+        stdin: &[u8],
+        timeout_millis: u32,
+    ) -> VmReply {
         use crate::structs::isolate_host::{vm_request::Op, VmExec};
         vms.call(
             who,
@@ -938,7 +949,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let vms = node(&temp);
         let reply = vms
-            .call(&isolate("inv-1", false), None, op(Op::Acquire(VmAcquire {})))
+            .call(
+                &isolate("inv-1", false),
+                None,
+                op(Op::Acquire(VmAcquire {})),
+            )
             .await;
         assert_eq!(kind(&reply), Some(VmErrorKind::VmNotConfigured));
     }
@@ -959,11 +974,27 @@ mod tests {
         assert_eq!(vms.child_count(JOB, "run"), 1);
         let status = lock(&vms.task_manager).session_status(&id).unwrap();
         let owner = status.owner.expect("the child carries its owner");
-        assert_eq!((owner.kind.as_str(), owner.id.as_str()), (OWNER_ISOLATE, "inv-1"));
+        assert_eq!(
+            (owner.kind.as_str(), owner.id.as_str()),
+            (OWNER_ISOLATE, "inv-1")
+        );
 
-        let ran = exec(&vms, &me, &id, &["sh", "-c", "cat; echo oops >&2; exit 3"], b"hi", 10_000).await;
+        let ran = exec(
+            &vms,
+            &me,
+            &id,
+            &["sh", "-c", "cat; echo oops >&2; exit 3"],
+            b"hi",
+            10_000,
+        )
+        .await;
         let result = ran.exec.expect("an exec result");
-        assert_eq!(result.exit, 3, "{:?}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(
+            result.exit,
+            3,
+            "{:?}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert_eq!(result.stdout, b"hi");
         assert_eq!(result.stderr, b"oops\n");
         assert!(!result.timed_out);
@@ -1019,7 +1050,11 @@ mod tests {
 
         // `children.max = 1`: a second child is refused, retryably.
         let second = acquire(&vms, &me).await;
-        assert_eq!(kind(&second), Some(VmErrorKind::VmResourceExhausted), "{second:?}");
+        assert_eq!(
+            kind(&second),
+            Some(VmErrorKind::VmResourceExhausted),
+            "{second:?}"
+        );
 
         // Another isolate cannot reach this one's child.
         let other = isolate("inv-2", false);
@@ -1033,12 +1068,20 @@ mod tests {
         assert_eq!(kind(&stolen), Some(VmErrorKind::VmChildGone));
         assert!(message(&stolen).contains("no child"), "{stolen:?}");
         let attached = vms
-            .call(&me, Some("machine"), op(Op::Attach(VmAttach { id: id.clone() })))
+            .call(
+                &me,
+                Some("machine"),
+                op(Op::Attach(VmAttach { id: id.clone() })),
+            )
             .await;
         assert_eq!(attached.id, id);
 
         let released = vms
-            .call(&me, Some("machine"), op(Op::Release(VmRelease { id: id.clone() })))
+            .call(
+                &me,
+                Some("machine"),
+                op(Op::Release(VmRelease { id: id.clone() })),
+            )
             .await;
         assert!(released.error.is_none(), "{released:?}");
         let after = exec(&vms, &me, &id, &["true"], b"", 1000).await;
@@ -1047,7 +1090,11 @@ mod tests {
         assert_eq!(vms.child_count(JOB, "run"), 0);
         // Releasing again is done, not an error.
         let again = vms
-            .call(&me, Some("machine"), op(Op::Release(VmRelease { id: id.clone() })))
+            .call(
+                &me,
+                Some("machine"),
+                op(Op::Release(VmRelease { id: id.clone() })),
+            )
             .await;
         assert!(again.error.is_none(), "{again:?}");
     }
@@ -1073,10 +1120,17 @@ mod tests {
         assert!(kept.error.is_none(), "{kept:?}");
         let status = lock(&vms.task_manager).session_status(&kept.id).unwrap();
         let owner = status.owner.unwrap();
-        assert_eq!((owner.kind.as_str(), owner.id.as_str()), (OWNER_SESSION, "run-sess1"));
+        assert_eq!(
+            (owner.kind.as_str(), owner.id.as_str()),
+            (OWNER_SESSION, "run-sess1")
+        );
         lock(&vms.task_manager).reconcile_children();
         let alive = exec(&vms, &session, &kept.id, &["true"], b"", 5000).await;
-        assert_eq!(alive.exec.map(|r| r.exit), Some(0), "the registered owner keeps its child");
+        assert_eq!(
+            alive.exec.map(|r| r.exit),
+            Some(0),
+            "the registered owner keeps its child"
+        );
 
         // The supervisor forgot the session without ending it (a host
         // crash): the next reconcile ends its children as orphans.
@@ -1114,7 +1168,10 @@ mod tests {
             )
             .await;
         assert_eq!(kind(&reply), Some(VmErrorKind::VmFailed), "{reply:?}");
-        assert!(message(&reply).contains("shares the node's network"), "{reply:?}");
+        assert!(
+            message(&reply).contains("shares the node's network"),
+            "{reply:?}"
+        );
         vms.owner_ended(&me, "done").await;
     }
 }

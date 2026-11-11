@@ -213,9 +213,10 @@ impl WorkerTaskManager {
                 OWNER_SESSION,
                 session_id,
             )))
-            || self.claims
-            .by_instance(session_id)
-            .is_some_and(|claim| claim.is_session())
+            || self
+                .claims
+                .by_instance(session_id)
+                .is_some_and(|claim| claim.is_session())
             || self
                 .idle_sessions
                 .get(session_id)
@@ -846,7 +847,10 @@ impl WorkerTaskManager {
             }
             // An isolate owner is this node's to judge, by its registration.
             if link.owner.kind == OWNER_ISOLATE && !link.remote {
-                if !self.isolate_owners.contains_key(&children::owner_label(&link.owner)) {
+                if !self
+                    .isolate_owners
+                    .contains_key(&children::owner_label(&link.owner))
+                {
                     orphans.push(child);
                 }
                 continue;

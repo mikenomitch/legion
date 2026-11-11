@@ -235,15 +235,23 @@ _METHODS = {
 _CHUNK = 4096
 
 
+# Headers wasi:http refuses on a request; the node sets what they would.
+_FORBIDDEN = {"host", "connection", "keep-alive", "proxy-connection", "te",
+              "transfer-encoding", "upgrade", "http2-settings"}
+
+
 def _header_pairs(headers):
     if headers is None:
         return []
     items = headers.items() if hasattr(headers, "items") else headers
     out = []
     for k, v in items:
+        k = str(k).lower()
+        if k in _FORBIDDEN:
+            continue
         if isinstance(v, str):
             v = v.encode("latin-1")
-        out.append((str(k).lower(), bytes(v)))
+        out.append((k, bytes(v)))
     return out
 
 
