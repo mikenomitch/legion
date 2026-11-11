@@ -593,3 +593,40 @@ async fn reclaim_can_be_limited_to_one_job_or_task_test() {
         .unwrap();
     assert_eq!(r.start, "fresh");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_keeps_its_own_tenant_whatever_a_call_names_test() {
+    let h = host_with(runner_spec("s", Lifetime::Session));
+    open(&h, "s", "sess-t").await; // opened for tenant "acme"
+                                   // A caller who knows the session id names another tenant: the call
+                                   // runs (routing is by session), attributed to the session's tenant.
+    let r = call(&h, "s", "evil", "sess-t", &["info"]).await;
+    assert!(result(&r).contains("\"tenant\":\"acme\""), "{}", result(&r));
+    // Also after the instance is made again from a checkpoint.
+    call(&h, "s", "evil", "sess-t", &["park"]).await;
+    for _ in 0..50 {
+        if h.host.get_session("sess-t").is_err() {
+            break;
+        }
+        sleep_ms(10).await;
+    }
+    let r = call(&h, "s", "evil", "sess-t", &["info"]).await;
+    assert!(result(&r).contains("\"tenant\":\"acme\""), "{}", result(&r));
+    assert!(result(&r).contains("\"resumed\":true"), "{}", result(&r));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifetime_refusal_names_the_jobspec_word_test() {
+    let h = start(config());
+    h.load("cmd");
+    let mut s = spec("j", "c", "cmd");
+    s.lifetime = Lifetime::Tenant as i32;
+    let e = h.host.configure_task(s).unwrap_err();
+    assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        e.message().contains("lifetime \"tenant\""),
+        "{}",
+        e.message()
+    );
+    assert!(!e.message().contains("LIFETIME_"), "{}", e.message());
+}

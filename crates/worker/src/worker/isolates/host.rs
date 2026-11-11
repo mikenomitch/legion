@@ -460,10 +460,7 @@ mod bounded_lines_test {
         while let Some(line) = lines.next().await {
             got.push(line);
         }
-        assert_eq!(
-            got,
-            vec!["short", "xxxxxxxxxxxxxxxx [cut]", "next", "tail"]
-        );
+        assert_eq!(got, vec!["short", "xxxxxxxxxxxxxxxx [cut]", "next", "tail"]);
     }
 }
 

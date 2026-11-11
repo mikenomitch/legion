@@ -155,7 +155,10 @@ fn main() -> ExitCode {
             let mut plan = match compiler_plan(&input, &output) {
                 Ok(p) => p,
                 Err(e) => {
-                    println!("{}", serde_json::json!({ "ok": false, "kind": "io", "error": e }));
+                    println!(
+                        "{}",
+                        serde_json::json!({ "ok": false, "kind": "io", "error": e })
+                    );
                     return ExitCode::from(1);
                 }
             };
@@ -163,9 +166,10 @@ fn main() -> ExitCode {
             {
                 plan.skip = test_skip;
             }
-            let (input, output) = (plan.read_files[0].clone(), plan.write_dirs[0].join(
-                output.file_name().unwrap_or_default(),
-            ));
+            let (input, output) = (
+                plan.read_files[0].clone(),
+                plan.write_dirs[0].join(output.file_name().unwrap_or_default()),
+            );
             let mut notes = Vec::new();
             if level != Confine::Off {
                 if let Err(e) = confine::limit_address_space(COMPILE_ADDRESS_SPACE) {
@@ -214,8 +218,8 @@ const COMPILE_ADDRESS_SPACE: u64 = 64 << 30;
 /// seccomp allowlist, in its own user, network, PID, mount, IPC, and UTS
 /// namespaces.
 fn compiler_plan(input: &Path, output: &Path) -> Result<confine::Plan, String> {
-    let input = std::fs::canonicalize(input)
-        .map_err(|e| format!("reading {}: {e}", input.display()))?;
+    let input =
+        std::fs::canonicalize(input).map_err(|e| format!("reading {}: {e}", input.display()))?;
     let dir = output
         .parent()
         .filter(|d| !d.as_os_str().is_empty())

@@ -210,3 +210,87 @@ async fn egress_is_refused_locally_when_the_task_has_none_test() {
     );
     assert!(h.worker.egress_seen.lock().unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// What one guest can make the host and the worker hold (review finding 6).
+// ---------------------------------------------------------------------------
+
+fn in_flight(h: &TestHost) -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering;
+    (
+        h.worker.egress_in_flight.load(Ordering::SeqCst),
+        h.worker.egress_max_in_flight.load(Ordering::SeqCst),
+        h.worker.egress_cancelled.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_invocation_has_at_most_eight_outgoing_requests_in_flight_test() {
+    let h = start(config());
+    h.task(spec("j", "cmd", "cmd"));
+    *h.worker.egress_delay.lock().unwrap() = Some(std::time::Duration::from_millis(100));
+    let r = h
+        .run("j", "cmd", &["fetch-many", "20", "http://up/x"])
+        .await;
+    // Every request is answered: the ones past the cap waited their turn.
+    assert_eq!(stdout(&r).trim(), "ok=20", "{r:?}");
+    let (now, max, cancelled) = in_flight(&h);
+    assert_eq!(
+        max,
+        legion_isolate::guest::MAX_EGRESS_IN_FLIGHT,
+        "never more than the cap in flight at the worker"
+    );
+    assert_eq!((now, cancelled), (0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_requests_end_with_the_invocation_test() {
+    let h = start(config());
+    *h.worker.egress_delay.lock().unwrap() = Some(std::time::Duration::from_secs(30));
+    // A wall limit cuts a command waiting on three slow requests.
+    let mut s = spec("j", "cmd", "cmd");
+    s.limits.as_mut().unwrap().wall_micros = 300_000;
+    h.task(s);
+    let r = h
+        .run("j", "cmd", &["fetch-many", "3", "http://slow/x"])
+        .await;
+    assert_eq!(stopped(&r).1, "wall");
+    let wait_cancelled = |n: usize| async move {
+        for _ in 0..100 {
+            if in_flight(&h).2 >= n {
+                break;
+            }
+            sleep_ms(10).await;
+        }
+        in_flight(&h)
+    };
+    let (now, _, cancelled) = wait_cancelled(3).await;
+    assert_eq!((now, cancelled), (0, 3), "the worker calls were dropped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_warm_instance_cannot_leave_a_request_running_after_its_call_test() {
+    let h = start(config());
+    *h.worker.egress_delay.lock().unwrap() = Some(std::time::Duration::from_secs(30));
+    let mut s = spec("j", "t", "runner");
+    s.lifetime = Lifetime::Tenant as i32;
+    h.task(s);
+    let r = h
+        .run_with("j", "t", "acme", "", run(&["fetch-leave", "http://slow/x"]))
+        .await
+        .unwrap();
+    assert_eq!(outcome(&r).result, "\"left\"", "{r:?}");
+    for _ in 0..100 {
+        if in_flight(&h).2 >= 1 {
+            break;
+        }
+        sleep_ms(10).await;
+    }
+    assert_eq!(in_flight(&h), (0, 1, 1), "cancelled when the call returned");
+    // The instance is still warm and usable.
+    let r = h
+        .run_with("j", "t", "acme", "", run(&["count"]))
+        .await
+        .unwrap();
+    assert_eq!(r.start, "warm");
+}

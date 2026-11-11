@@ -9,6 +9,12 @@ use legion::isolate::{control, state, vm};
 
 static COUNT: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// Outgoing requests left pending across calls (`fetch-leave`).
+    static LEFT: std::cell::RefCell<Vec<wasi::http::types::FutureIncomingResponse>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct Runner;
 
 fn ok(result: String) -> Outcome {
@@ -104,6 +110,26 @@ impl Guest for Runner {
                 std::fs::write("leftover.txt", "x").unwrap();
                 std::fs::write("result.json", format!("{{\"entry\":{entry:?},\"body\":{body:?},\"input\":{input:?},\"leftover\":{leftover}}}")).unwrap();
                 Outcome { exit: 0, result: None }
+            }
+            // Send a request and return without waiting for it: the
+            // future stays in this (warm) instance's resource table.
+            "fetch-leave" => {
+                use wasi::http::types::{Fields, Method, OutgoingRequest, Scheme};
+                let url = arg(1);
+                let rest = url.strip_prefix("http://").unwrap_or(&url);
+                let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+                let req = OutgoingRequest::new(Fields::new());
+                req.set_method(&Method::Get).unwrap();
+                req.set_scheme(Some(&Scheme::Http)).unwrap();
+                req.set_authority(Some(authority)).unwrap();
+                req.set_path_with_query(Some(&format!("/{path}"))).unwrap();
+                match wasi::http::outgoing_handler::handle(req, None) {
+                    Ok(fut) => {
+                        LEFT.with(|l| l.borrow_mut().push(fut));
+                        ok("\"left\"".into())
+                    }
+                    Err(e) => ok(format!("\"{e:?}\"")),
+                }
             }
             other => {
                 eprintln!("unknown mode {other}");

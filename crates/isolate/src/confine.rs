@@ -336,7 +336,11 @@ fn supervise(child: libc::pid_t, keep: i32, me: u32) -> ! {
 /// Close every descriptor not in `keep` (`close_range`, else one by one up
 /// to the descriptor limit).
 pub fn close_fds_except(keep: &[i32]) {
-    let mut keep: Vec<u32> = keep.iter().filter(|f| **f >= 0).map(|f| *f as u32).collect();
+    let mut keep: Vec<u32> = keep
+        .iter()
+        .filter(|f| **f >= 0)
+        .map(|f| *f as u32)
+        .collect();
     keep.sort_unstable();
     keep.dedup();
     let mut lo: u32 = 0;
@@ -363,7 +367,7 @@ fn close_range(first: u32, last: u32) {
     };
     // SAFETY: valid pointer.
     unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
-    let end = (lim.rlim_cur.min(1 << 20) as u64).min(last as u64 + 1);
+    let end = lim.rlim_cur.min(1 << 20).min(last as u64 + 1);
     for fd in first as u64..end {
         // SAFETY: as above.
         unsafe { libc::close(fd as i32) };
@@ -377,7 +381,10 @@ fn close_range(first: u32, last: u32) {
 /// Whether read-only artifact directories are mounted `noexec`. wasmtime
 /// maps a `.cwasm` from its file and makes the text section executable
 /// with `mprotect`, which a `noexec` mount refuses (`VM_MAYEXEC` is cleared
-/// for mappings of its files), so artifact directories keep exec.
+/// for mappings of its files: LoadModule then fails with "unable to make
+/// memory executable: Permission denied", tried), so artifact directories
+/// keep exec. They are read-only, and only the worker's compiler writes
+/// them.
 const READ_DIRS_NOEXEC: bool = false;
 
 struct Bind {
@@ -517,17 +524,10 @@ fn mount_root(plan: &Plan) -> Result<(), String> {
             }
             std::fs::write(&at, b"").map_err(|e| format!("creating {}: {e}", at.display()))?;
         } else {
-            std::fs::create_dir_all(&at)
-                .map_err(|e| format!("creating {}: {e}", at.display()))?;
+            std::fs::create_dir_all(&at).map_err(|e| format!("creating {}: {e}", at.display()))?;
         }
         let src = PathBuf::from(format!("/proc/self/fd/{}", b.source.as_raw_fd()));
-        mount(
-            Some(&src),
-            &at,
-            None,
-            libc::MS_BIND | libc::MS_REC,
-            None,
-        )?;
+        mount(Some(&src), &at, None, libc::MS_BIND | libc::MS_REC, None)?;
         let mut flags = libc::MS_REMOUNT
             | libc::MS_BIND
             | libc::MS_NOSUID
@@ -745,7 +745,10 @@ pub const ALLOWED: &[(&str, i64)] = &[
 /// The compiler's allowlist (x86-64), found the same way from
 /// `legion-isolate compile` runs over the test fixtures and both language
 /// images: Cranelift's worker threads, reading the input, writing the
-/// output to a temporary file, and renaming it into place.
+/// output to a temporary file, and renaming it into place (unlinking the
+/// temporary file on failure). `exit`, `rt_sigreturn`, `clock_gettime`
+/// (the vDSO's fallback), `writev`, and `fstat`/`newfstatat` are kept for
+/// paths the runs did not take.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const COMPILER_ALLOWED: &[(&str, i64)] = &[
     ("mmap", libc::SYS_mmap),
@@ -772,21 +775,14 @@ pub const COMPILER_ALLOWED: &[(&str, i64)] = &[
     ("read", libc::SYS_read),
     ("write", libc::SYS_write),
     ("writev", libc::SYS_writev),
-    ("pread64", libc::SYS_pread64),
     ("close", libc::SYS_close),
     ("openat", libc::SYS_openat),
     ("fstat", libc::SYS_fstat),
     ("newfstatat", libc::SYS_newfstatat),
     ("statx", libc::SYS_statx),
-    ("lseek", libc::SYS_lseek),
     ("fsync", libc::SYS_fsync),
-    ("fdatasync", libc::SYS_fdatasync),
     ("rename", libc::SYS_rename),
-    ("renameat", libc::SYS_renameat),
-    ("renameat2", libc::SYS_renameat2),
     ("unlink", libc::SYS_unlink),
-    ("unlinkat", libc::SYS_unlinkat),
-    ("ftruncate", libc::SYS_ftruncate),
     ("clone3", libc::SYS_clone3),
 ];
 
@@ -800,10 +796,7 @@ pub const FCNTL_ALLOWED: &[(&str, i32)] = &[
 ];
 
 /// `ioctl` requests either process may use.
-pub const IOCTL_ALLOWED: &[(&str, u64)] = &[
-    ("FIONBIO", libc::FIONBIO as u64),
-    ("FIOCLEX", libc::FIOCLEX as u64),
-];
+pub const IOCTL_ALLOWED: &[(&str, u64)] = &[("FIONBIO", libc::FIONBIO), ("FIOCLEX", libc::FIOCLEX)];
 
 /// `prctl` options either process may use.
 pub const PRCTL_ALLOWED: &[(&str, i32)] = &[("PR_SET_NAME", libc::PR_SET_NAME)];
@@ -832,7 +825,12 @@ mod filters {
     }
 
     fn eq(arg: u8, v: u64) -> Result<SeccompRule, String> {
-        rule(vec![cond(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, v)?])
+        rule(vec![cond(
+            arg,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            v,
+        )?])
     }
 
     /// The argument-filtered calls both the host and the compiler make.
@@ -855,7 +853,12 @@ mod filters {
             .map(|(_, c)| eq(1, *c as u64))
             .collect::<Result<Vec<_>, _>>()?;
         fcntl.push(rule(vec![
-            cond(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, libc::F_SETFL as u64)?,
+            cond(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::F_SETFL as u64,
+            )?,
             cond(
                 2,
                 SeccompCmpArgLen::Dword,

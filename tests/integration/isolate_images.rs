@@ -15,8 +15,8 @@
 
 use crate::isolate::cluster::{isolate_task, main_py, Cluster, Images, JOB};
 use legion::prelude::*;
-use legion::structs::{RunFile, RunSessionRequest, RunSessionResponse};
 use legion::structs::manager_server::Manager as _;
+use legion::structs::{RunFile, RunSessionRequest, RunSessionResponse};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -100,12 +100,11 @@ async fn the_language_images_run_through_the_manager() -> R<()> {
         json!([
             python_task("run", "request", true),
             python_task("bare", "request", false),
-            js_task(),
             machine(),
         ]),
     )
     .await?;
-    for task in ["run", "bare", "js"] {
+    for task in ["run", "bare"] {
         cluster.wait_for(task, true).await?;
     }
     cluster.wait_for("machine", false).await?;
@@ -118,35 +117,29 @@ async fn the_language_images_run_through_the_manager() -> R<()> {
         main_py("import json\nprint('hello')\nresult = {'n': 2, 'ok': True}\n"),
     )
     .await;
-    println!("first python run (compile included): {:?}", started.elapsed());
+    println!(
+        "first python run (compile included): {:?}",
+        started.elapsed()
+    );
     assert_eq!(reply.exit, Some(0), "{reply:?} {}", text(&reply.stderr));
     assert_eq!(text(&reply.stdout), "hello\n");
-    assert_eq!(serde_json::from_str::<Value>(&reply.result)?, json!({ "n": 2, "ok": true }));
+    assert_eq!(
+        serde_json::from_str::<Value>(&reply.result)?,
+        json!({ "n": 2, "ok": true })
+    );
     assert_eq!(reply.tier, "isolate");
 
     // sys.exit(3)
     let reply = run(&cluster, "run", main_py("import sys\nsys.exit(3)\n")).await;
     assert_eq!(reply.exit, Some(3), "{reply:?}");
 
-    // JavaScript: console.log and the returned value.
-    let reply = run(
-        &cluster,
-        "js",
-        RunFile {
-            path: "main.js".into(),
-            content: b"console.log('hi from js');\nreturn { n: 1 + 1 };\n".to_vec(),
-            executable: false,
-        },
-    )
-    .await;
-    assert_eq!(reply.exit, Some(0), "{reply:?} {}", text(&reply.stderr));
-    assert_eq!(text(&reply.stdout), "hi from js\n");
-    assert_eq!(serde_json::from_str::<Value>(&reply.result)?, json!({ "n": 2 }));
-
     // A CPU-bound loop is stopped by the CPU limit.
     let reply = run(&cluster, "run", main_py("while True:\n    pass\n")).await;
     let stopped = reply.stopped.clone().expect("stopped");
-    assert_eq!((stopped.reason.as_str(), stopped.limit.as_str()), ("limits", "cpu"));
+    assert_eq!(
+        (stopped.reason.as_str(), stopped.limit.as_str()),
+        ("limits", "cpu")
+    );
     assert_eq!(reply.next_tier, "vm", "the task has a VM task");
 
     // subprocess.run is unsupported, with the documented detail; next_tier
@@ -190,16 +183,23 @@ async fn the_language_images_run_through_the_manager() -> R<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn a_python_session_isolate_keeps_state_across_hibernation() -> R<()> {
-    let cluster = Cluster::start(built_images(), json!([python_task("run", "session", false)]))
-        .await?;
+    let cluster = Cluster::start(
+        built_images(),
+        json!([python_task("run", "session", false)]),
+    )
+    .await?;
     cluster.wait_for("run", true).await?;
+    // A session start waits less long than a compile of the image may take.
+    cluster.wait_ready("run", Duration::from_secs(900)).await?;
     let started = cluster
         .svc
-        .create_instance(tonic::Request::new(legion::structs::CreateInstanceRequest {
-            job_id: JOB.into(),
-            task: Some("run".into()),
-            ..Default::default()
-        }))
+        .create_instance(tonic::Request::new(
+            legion::structs::CreateInstanceRequest {
+                job_id: JOB.into(),
+                task: Some("run".into()),
+                ..Default::default()
+            },
+        ))
         .await?
         .into_inner();
     let id = started.instance_id;
@@ -263,8 +263,11 @@ async fn hello_p50(cluster: &Cluster, file: RunFile, n: usize) -> (Duration, Dur
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn hello_world_end_to_end_timing() -> R<()> {
     const RUNS: usize = 30;
-    let python = Cluster::start(built_images(), json!([python_task("run", "request", false)]))
-        .await?;
+    let python = Cluster::start(
+        built_images(),
+        json!([python_task("run", "request", false)]),
+    )
+    .await?;
     python.wait_for("run", true).await?;
     let hello = main_py("print('hello')\n");
     run(&python, "run", hello.clone()).await;
@@ -273,7 +276,9 @@ async fn hello_world_end_to_end_timing() -> R<()> {
 
     let component = Cluster::start(
         Images::Fixture("cmd.wasm"),
-        json!([isolate_task(json!({ "image": "python", "lifetime": "request" }))]),
+        json!([isolate_task(
+            json!({ "image": "python", "lifetime": "request" })
+        )]),
     )
     .await?;
     component.wait_for("run", true).await?;
@@ -285,5 +290,31 @@ async fn hello_world_end_to_end_timing() -> R<()> {
          python hello p50 {p50_py:?} (min {min_py:?}); Rust cmd component p50 {p50_cmd:?} \
          (min {min_cmd:?})"
     );
+    Ok(())
+}
+
+/// The `js` image through the manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn the_js_image_runs_through_the_manager() -> R<()> {
+    let cluster = Cluster::start(built_images(), json!([js_task()])).await?;
+    cluster.wait_for("js", true).await?;
+    let reply = run(
+        &cluster,
+        "js",
+        RunFile {
+            path: "main.js".into(),
+            content: b"console.log('hi from js');\nreturn { n: 1 + 1 };\n".to_vec(),
+            executable: false,
+        },
+    )
+    .await;
+    assert_eq!(reply.exit, Some(0), "{reply:?} {}", text(&reply.stderr));
+    assert_eq!(text(&reply.stdout), "hi from js\n");
+    assert_eq!(
+        serde_json::from_str::<Value>(&reply.result)?,
+        json!({ "n": 2 })
+    );
+
     Ok(())
 }

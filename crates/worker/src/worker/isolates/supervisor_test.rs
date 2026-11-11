@@ -331,9 +331,10 @@ impl IsolateHost for FakeHost {
                 .iter()
                 .filter(|(_, (_, resident))| *resident)
                 .map(|(id, (counter, _))| {
-                    let (job, task) = state.session_tasks.get(id).cloned().unwrap_or_else(|| {
-                        state.tasks.keys().next().cloned().unwrap_or_default()
-                    });
+                    let (job, task) =
+                        state.session_tasks.get(id).cloned().unwrap_or_else(|| {
+                            state.tasks.keys().next().cloned().unwrap_or_default()
+                        });
                     (id.clone(), *counter, job, task)
                 })
                 .filter(|(id, _, job, task)| {
@@ -1403,7 +1404,10 @@ async fn suspending_one_session_isolate_hibernates_only_that_one() {
     }
     assert!(host_resident(&h, "run-a.1") && host_resident(&h, "run-b.1"));
     h.supervisor.hibernate("run-a.1").await.unwrap();
-    assert!(!host_resident(&h, "run-a.1"), "the named session hibernated");
+    assert!(
+        !host_resident(&h, "run-a.1"),
+        "the named session hibernated"
+    );
     assert!(host_resident(&h, "run-b.1"), "the other stays resident");
     assert_eq!(
         h.supervisor.session_status("run-b.1").unwrap().state,
@@ -1465,7 +1469,10 @@ async fn a_drain_hibernates_only_the_covered_jobs_session_isolates() {
     h.supervisor
         .reclaim(ReclaimLevel::ReclaimHibernate, 0, Duration::ZERO, None, "")
         .await;
-    assert!(!host_resident(&h, "run-b.1"), "pressure hibernates every idle session");
+    assert!(
+        !host_resident(&h, "run-b.1"),
+        "pressure hibernates every idle session"
+    );
 }
 
 #[tokio::test]
@@ -1526,10 +1533,18 @@ async fn hosts_may_name_only_isolates_the_worker_issued() {
         tenant: String::new(),
         session,
     };
-    assert!(h.supervisor.issued("ns", &named("ns/app", "run", "run-own.1", true)));
-    assert!(!h.supervisor.issued("ns", &named("ns/app", "run", "run-nope.1", true)));
-    assert!(!h.supervisor.issued("ns", &named("ns/other", "run", "run-own.1", true)));
-    assert!(!h.supervisor.issued("ns", &named("ns/app", "web", "run-own.1", true)));
+    assert!(h
+        .supervisor
+        .issued("ns", &named("ns/app", "run", "run-own.1", true)));
+    assert!(!h
+        .supervisor
+        .issued("ns", &named("ns/app", "run", "run-nope.1", true)));
+    assert!(!h
+        .supervisor
+        .issued("ns", &named("ns/other", "run", "run-own.1", true)));
+    assert!(!h
+        .supervisor
+        .issued("ns", &named("ns/app", "web", "run-own.1", true)));
     // Invocations: only while in flight, only on their cordon and task.
     let key = ("ns/app".to_string(), "run".to_string());
     let invocation = named("ns/app", "run", "inv-1", false);
@@ -1538,10 +1553,17 @@ async fn hosts_may_name_only_isolates_the_worker_issued() {
         let _open = h.supervisor.inflight("ns", &key, "inv-1");
         assert!(h.supervisor.issued("ns", &invocation));
         assert!(!h.supervisor.issued("shared", &invocation));
-        assert!(!h.supervisor.issued("ns", &named("ns/app", "web", "inv-1", false)));
-        assert!(!h.supervisor.issued("ns", &named("ns/x", "run", "inv-1", false)));
+        assert!(!h
+            .supervisor
+            .issued("ns", &named("ns/app", "web", "inv-1", false)));
+        assert!(!h
+            .supervisor
+            .issued("ns", &named("ns/x", "run", "inv-1", false)));
     }
-    assert!(!h.supervisor.issued("ns", &invocation), "ended with the call");
+    assert!(
+        !h.supervisor.issued("ns", &invocation),
+        "ended with the call"
+    );
 }
 
 /// A call in a session uses the session's tenant; naming another is
@@ -1566,7 +1588,10 @@ async fn a_session_call_naming_another_tenant_is_refused() {
     };
     let err = h.supervisor.run(call("user-2"), None).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("belongs to tenant \"user-1\""), "{err:?}");
+    assert!(
+        err.message().contains("belongs to tenant \"user-1\""),
+        "{err:?}"
+    );
     h.supervisor.run(call("user-1"), None).await.unwrap();
     h.supervisor.run(call(""), None).await.unwrap();
 }

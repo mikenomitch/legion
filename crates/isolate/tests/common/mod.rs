@@ -77,12 +77,44 @@ pub struct FakeWorker {
     pub checkpoints: Mutex<HashMap<String, (CheckpointHeader, Vec<u8>)>>,
     pub saves: Mutex<u64>,
     pub logs: Mutex<Vec<LogBatch>>,
+    /// Egress waits this long before answering (when set).
+    pub egress_delay: Mutex<Option<Duration>>,
+    /// Egress calls running now, the most ever at once, and how many were
+    /// dropped (cancelled by the host) before they answered.
+    pub egress_in_flight: std::sync::atomic::AtomicUsize,
+    pub egress_max_in_flight: std::sync::atomic::AtomicUsize,
+    pub egress_cancelled: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts an egress call while it runs; a drop before `done` is a cancel.
+struct InFlight<'a>(&'a FakeWorker, bool);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.0.egress_in_flight.fetch_sub(1, Ordering::SeqCst);
+        if !self.1 {
+            self.0.egress_cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[async_trait]
 impl WorkerApi for FakeWorker {
     async fn egress(&self, req: EgressRequest) -> Result<EgressReply, Status> {
         self.egress_seen.lock().unwrap().push(req.clone());
+        {
+            use std::sync::atomic::Ordering;
+            let now = self.egress_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.egress_max_in_flight.fetch_max(now, Ordering::SeqCst);
+        }
+        let mut guard = InFlight(self, false);
+        let delay = *self.egress_delay.lock().unwrap();
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
+        guard.1 = true;
+        drop(guard);
         if let Some(r) = self.egress_reply.lock().unwrap().clone() {
             return Ok(r);
         }

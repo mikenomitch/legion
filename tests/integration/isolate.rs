@@ -11,8 +11,8 @@
 use legion::content_store::{ContentStore, ContentStoreConfig};
 use legion::prelude::*;
 use legion::structs::isolate::{ConfineMode, WorkerIsolateConfigFull};
-use legion::structs::{RunFile, RunSessionRequest, TaskConfig};
 use legion::structs::manager_server::Manager as _;
+use legion::structs::{RunFile, RunSessionRequest, TaskConfig};
 use legion::worker::isolates::binary::{self, ImageCatalog, ImageEntry, IsolateBinary};
 use legion::worker::isolates::host::ProcessLauncher;
 use legion::worker::isolates::modules::{Compiler, ModuleSource, ModuleWant};
@@ -388,10 +388,43 @@ async fn a_killed_host_is_restarted_and_the_next_run_succeeds() {
     node.supervisor.run(run("ns/a", &[]), None).await.unwrap();
     let (_, hosts) = node.supervisor.stats("", "").await;
     let pid = hosts[0].pid;
+    // The host forks at start into its own PID namespace: the process the
+    // worker spawned (`pid`) waits for the real host, its child.
+    let children = |pid: u32| -> Vec<u32> {
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|list| {
+                list.split_whitespace()
+                    .filter_map(|p| p.parse().ok())
+                    .collect::<Vec<u32>>()
+            })
+            .collect()
+    };
+    let real_hosts = children(pid);
     // SAFETY: killing the host process this test's supervisor started.
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
     }
+    // Killing it kills the real host too (its parent-death signal).
+    let gone = |pid: u32| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| stat.contains(") Z "))
+            .unwrap_or(true)
+    };
+    for _ in 0..100 {
+        if real_hosts.iter().all(|c| gone(*c)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        real_hosts.iter().all(|c| gone(*c)),
+        "the forked host outlived the process the worker killed: {real_hosts:?}"
+    );
+    println!("killed host {pid}; its forked host(s) {real_hosts:?} are gone too");
     let mut last = None;
     for _ in 0..100 {
         match node.supervisor.run(run("ns/a", &[]), None).await {
@@ -624,8 +657,7 @@ pub(crate) mod cluster {
         /// needs a job the `JobSubmit` RPC would refuse (an `exec` VM task
         /// standing in for a sandbox) says so where it builds it.
         pub fn submit(&self, tasks: Value) -> R<()> {
-            let config: JobConfig =
-                serde_json::from_value(json!({ "name": JOB, "tasks": tasks }))?;
+            let config: JobConfig = serde_json::from_value(json!({ "name": JOB, "tasks": tasks }))?;
             tokio::task::block_in_place(|| -> R<()> {
                 self.store().handle_job_submit(
                     &config,
@@ -654,22 +686,73 @@ pub(crate) mod cluster {
         /// Wait until the worker runs `task`'s envelope (and, for an isolate
         /// task, the supervisor has prepared it).
         pub async fn wait_for(&self, task: &str, isolate: bool) -> R<()> {
-            for _ in 0..400 {
+            for _ in 0..2400 {
                 let envelope = self
                     .task_manager
                     .lock()
                     .expect("task manager")
                     .session_spec(JOB, task)
                     .is_some();
-                if envelope && (!isolate || {
-                    self.supervisor.sync_from_task_manager();
-                    self.supervisor.has_task(JOB, task)
-                }) {
+                if envelope
+                    && (!isolate || {
+                        self.supervisor.sync_from_task_manager();
+                        self.supervisor.has_task(JOB, task)
+                    })
+                {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            anyhow::bail!("the worker never ran the envelope of {JOB}/{task}")
+            let held: Vec<String> = self
+                .task_manager
+                .lock()
+                .expect("task manager")
+                .isolate_envelopes()
+                .into_iter()
+                .map(|e| e.spec.task.name)
+                .collect();
+            let stats = self.supervisor.stats(JOB, "").await.0;
+            let events: Vec<String> = self
+                .store()
+                .list_scheduler_events(&legion::storage::events::SchedulerEventFilter {
+                    job_id: Some(JOB.into()),
+                    limit: Some(100),
+                    ..Default::default()
+                })
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .filter(|e| e.level != "info")
+                        .map(|e| format!("{}: {}", e.kind, e.message))
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!("scheduler events for {JOB}: {events:#?}");
+            anyhow::bail!(
+                "the worker never ran the envelope of {JOB}/{task} (isolate envelopes here: \
+                 {held:?}; tasks: {:?})",
+                stats.iter().map(|t| (&t.task_name, &t.problem)).collect::<Vec<_>>()
+            )
+        }
+
+        /// Wait until an isolate task's module is compiled and loaded (its
+        /// stats show no problem), up to `limit`.
+        pub async fn wait_ready(&self, task: &str, limit: Duration) -> R<()> {
+            let started = std::time::Instant::now();
+            loop {
+                let (tasks, _) = self.supervisor.stats(JOB, task).await;
+                match tasks.first() {
+                    Some(stats) if stats.problem.is_empty() => return Ok(()),
+                    Some(stats) if !stats.problem.contains("still compiling") => {
+                        anyhow::bail!("task {task}: {}", stats.problem)
+                    }
+                    _ => {}
+                }
+                if started.elapsed() > limit {
+                    anyhow::bail!("task {task} was not ready within {limit:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
 
         pub async fn run(&self, request: RunSessionRequest) -> Result<RunSessionResponse, Status> {
@@ -781,7 +864,9 @@ use cluster::{isolate_task, main_py, Cluster, Images, JOB};
 async fn a_run_through_the_manager_reaches_a_real_host() -> legion::prelude::R<()> {
     let cluster = Cluster::start(
         Images::Fixture("runner.wasm"),
-        json!([isolate_task(json!({ "image": "python", "lifetime": "request" }))]),
+        json!([isolate_task(
+            json!({ "image": "python", "lifetime": "request" })
+        )]),
     )
     .await?;
     cluster.wait_for("run", true).await?;
@@ -803,12 +888,16 @@ async fn a_run_through_the_manager_reaches_a_real_host() -> legion::prelude::R<(
     assert_eq!(result["body"], "print('hi')\n", "{result}");
     assert_eq!(result["input"], "{\"n\":1}", "{result}");
     assert!(reply.cpu_micros > 0 && reply.wall_micros > 0, "{reply:?}");
-    assert!(cluster.sessions().is_empty(), "an isolate run takes no session");
+    assert!(
+        cluster.sessions().is_empty(),
+        "an isolate run takes no session"
+    );
     // A request isolate's output is in its reply, never in the task log.
     assert!(String::from_utf8_lossy(&reply.stdout).contains("ran entry"));
     let logs = cluster.logs("stdout").await?;
     assert!(
-        logs.iter().all(|(_, content)| !content.contains("[isolate")),
+        logs.iter()
+            .all(|(_, content)| !content.contains("[isolate")),
         "{logs:?}"
     );
     Ok(())
@@ -820,17 +909,21 @@ async fn a_run_through_the_manager_reaches_a_real_host() -> legion::prelude::R<(
 async fn a_session_isolates_output_is_in_the_job_logs() -> legion::prelude::R<()> {
     let cluster = Cluster::start(
         Images::Fixture("runner.wasm"),
-        json!([isolate_task(json!({ "image": "python", "lifetime": "session" }))]),
+        json!([isolate_task(
+            json!({ "image": "python", "lifetime": "session" })
+        )]),
     )
     .await?;
     cluster.wait_for("run", true).await?;
     let started = cluster
         .svc
-        .create_instance(tonic::Request::new(legion::structs::CreateInstanceRequest {
-            job_id: JOB.into(),
-            task: Some("run".into()),
-            ..Default::default()
-        }))
+        .create_instance(tonic::Request::new(
+            legion::structs::CreateInstanceRequest {
+                job_id: JOB.into(),
+                task: Some("run".into()),
+                ..Default::default()
+            },
+        ))
         .await?
         .into_inner();
     let id = started.instance_id.clone();
@@ -935,8 +1028,8 @@ async fn vm_cluster(runtime: &str, lifetime: &str, children_max: Option<u32>) ->
 
 async fn vm_cluster_with(isolate: Value, machine: Value) -> Cluster {
     let cluster = Cluster::start(Images::Fixture("runner.wasm"), json!([isolate, machine]))
-    .await
-    .expect("cluster");
+        .await
+        .expect("cluster");
     cluster.wait_for("run", true).await.expect("isolate task");
     cluster.wait_for("machine", false).await.expect("VM task");
     cluster
@@ -1000,11 +1093,7 @@ async fn check_vm_tier_runs(cluster: &Cluster) {
 /// `auto` with the isolate runtime disabled for the job goes to the VM.
 async fn check_disabled_runtime_goes_to_the_vm(cluster: &Cluster) {
     use legion::structs::runtime_state::{RuntimeDisable, RuntimeDisableSet};
-    let gate = cluster
-        .task_manager
-        .lock()
-        .unwrap()
-        .runtime_gate();
+    let gate = cluster.task_manager.lock().unwrap().runtime_gate();
     gate.replace(RuntimeDisableSet::new(vec![RuntimeDisable {
         runtime: "isolate".into(),
         reason: "CVE-2026-0001".into(),
@@ -1229,7 +1318,11 @@ async fn vm_tier_args_need_a_command_that_ends_with_the_entry() {
             .run(vm_run_request(tier, &["--rm", "-rf"], "echo hi"))
             .await
             .expect_err("args refused");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{tier}: {err:?}");
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "{tier}: {err:?}"
+        );
         assert!(
             err.message()
                 .contains("run.command does not end with /legion/run/main.py"),
@@ -1249,4 +1342,274 @@ async fn vm_tier_args_need_a_command_that_ends_with_the_entry() {
         "env=[]\nargv=\n",
         "{reply:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP in and out with the real host. Not through netd's TCP ingress
+// listener (that needs the worker daemon's datapath, which the harness does
+// not run): the supervisor's ingress socket (`isolates::ingress::serve`,
+// the socket netd's listener dials for an isolate envelope) takes the
+// request, and egress goes through the real `NetdEgress` over a forwarder
+// built here (policy, host guard, upstream listener with credential
+// injection), as the worker builds it.
+// ---------------------------------------------------------------------------
+
+mod http_e2e {
+    use super::*;
+    use legion::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
+    use legion::structs::AllocNetPolicy;
+    use legion::worker::forwarder::{
+        ForwarderContext, SecretValue, UpstreamForwarder, UpstreamSpec,
+    };
+    use legion::worker::netd::attach::Attachment;
+    use legion::worker::netd::proxy::{EgressProxies, ProxySpec};
+    use legion::worker::netd::{Denials, NetPolicyCache};
+    use std::net::{IpAddr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The envelope allocation `envelope()` gives the task.
+    const ENVELOPE: i64 = 9;
+    const TOKEN: &str = "eyJ.isolate-e2e-secret";
+
+    /// `*.test` names are loopback.
+    struct TestResolver;
+
+    #[tonic::async_trait]
+    impl legion::worker::netd::guard::Resolver for TestResolver {
+        async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            if host.ends_with(".test") {
+                return Ok(vec![SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port)]);
+            }
+            Err(std::io::Error::other(format!("no such host {host}")))
+        }
+    }
+
+    /// An origin that sends every request it reads on the channel and
+    /// answers `ok`.
+    async fn origin() -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 << 10];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nX-Origin: yes\r\nConnection: close\r\n\r\norigin",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    async fn datapath(dir: &Path, port: u16) -> Arc<UpstreamForwarder> {
+        let cache = Arc::new(NetPolicyCache::new());
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "p", "enforcement": "require",
+            "egress": { "protocol": "http", "allow": ["origin.test"] }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: ENVELOPE,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+        let guard = legion::structs::host_guard::HostGuard::new(
+            &legion::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{port}")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache, Arc::new(Denials::new()))
+                .with_resolver(Arc::new(TestResolver))
+                .with_host_guard(Arc::new(guard)),
+        );
+        let proxies = Arc::new(EgressProxies::new(context.clone()));
+        let forwarder = Arc::new(UpstreamForwarder::with_context(context).with_proxies(proxies));
+        let attachment = Attachment::Isolate {
+            dir: dir.to_path_buf(),
+        };
+        forwarder
+            .proxies()
+            .unwrap()
+            .sync(&[ProxySpec {
+                allocation_id: ENVELOPE,
+                attachment: attachment.clone(),
+                listen: None,
+            }])
+            .await;
+        let credentials: Vec<legion::structs::UpstreamCredential> = serde_json::from_value(json!([
+            { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/api" } },
+        ]))
+        .unwrap();
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: ENVELOPE,
+                service: "api".into(),
+                local_port: Some(20020),
+                http_protocol: true,
+                balance: "round_robin".into(),
+                to: Some(format!("http://origin.test:{port}")),
+                http: None,
+                handlers: Vec::new(),
+                credentials,
+                ca: None,
+                vip: None,
+                canonical_port: None,
+                attachment,
+            }])
+            .await;
+        // What the manager's FetchDatapathMaterial hands the node for the
+        // envelope (the KV value), as the heartbeat would install it.
+        forwarder.context().set_credential(
+            ENVELOPE,
+            "api",
+            "authorization",
+            "kv secrets/api",
+            4_000_000_000,
+            SecretValue::new(TOKEN),
+        );
+        forwarder
+    }
+
+    async fn send(socket: &Path, raw: &str) -> String {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    fn get(path: &str, headers: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: app.test\r\nConnection: close\r\n{headers}\r\n")
+    }
+
+    fn body(response: &str) -> &str {
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or("")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_in_and_out_through_a_real_host() {
+        let node = node("handler.wasm");
+        let logs = node._dir.path().join("logs");
+        node.supervisor.set_log_root(logs.clone());
+        let mut tenant_task = task("run", "tenant", "namespace");
+        tenant_task.network =
+            Some(serde_json::from_value(json!({ "ports": [{ "name": "http" }] })).unwrap());
+        node.supervisor.sync(vec![envelope("ns/a", tenant_task)]);
+        let (port, mut seen) = origin().await;
+        let netdir = node._dir.path().join("envelope-net");
+        std::fs::create_dir_all(&netdir).unwrap();
+        let forwarder = datapath(&netdir, port).await;
+        node.supervisor.set_egress_backend(Arc::new(
+            legion::worker::isolates::egress::NetdEgress::new(forwarder, 1 << 20),
+        ));
+        let socket = node._dir.path().join("ingress.sock_http");
+        let target: Arc<dyn legion::worker::isolates::IngressTarget> = node.supervisor.clone();
+        let _server = legion::worker::isolates::ingress::serve(
+            socket.clone(),
+            "ns/a",
+            "run",
+            1 << 20,
+            target,
+        )
+        .await
+        .unwrap();
+
+        // In: the request reaches the isolate, the response comes back.
+        // `Legion-Tenant` picks the tenant's warm instance (its own
+        // counter) and the guest never sees the header.
+        let count = |tenant: &'static str| {
+            let socket = socket.clone();
+            async move {
+                body(
+                    &send(
+                        &socket,
+                        &get("/count", &format!("Legion-Tenant: {tenant}\r\n")),
+                    )
+                    .await,
+                )
+                .to_string()
+            }
+        };
+        assert_eq!(count("acme").await, "1");
+        assert_eq!(count("acme").await, "2");
+        assert_eq!(
+            count("globex").await,
+            "1",
+            "another tenant, another instance"
+        );
+        assert_eq!(count("acme").await, "3");
+        let echo = send(
+            &socket,
+            &get("/echo", "Legion-Tenant: acme\r\nX-Mine: 1\r\n"),
+        )
+        .await;
+        assert!(echo.starts_with("HTTP/1.1 200"), "{echo}");
+        assert!(body(&echo).contains("x-mine=1"), "{echo}");
+        assert!(
+            !body(&echo).to_ascii_lowercase().contains("legion-tenant"),
+            "the guest never sees the routing header: {echo}"
+        );
+
+        // Out: an upstream named by key gets the credential the node
+        // injects; the guest's view never contains it.
+        let fetched = send(
+            &socket,
+            &get("/fetch?http://api/v1/models", "Legion-Tenant: acme\r\n"),
+        )
+        .await;
+        assert!(fetched.starts_with("HTTP/1.1 200"), "{fetched}");
+        assert!(body(&fetched).starts_with("upstream 200\n"), "{fetched}");
+        assert!(body(&fetched).ends_with("origin"), "{fetched}");
+        assert!(!fetched.contains(TOKEN), "the guest's view: {fetched}");
+        let received = seen.recv().await.unwrap();
+        assert!(
+            received.starts_with("GET /v1/models HTTP/1.1"),
+            "{received}"
+        );
+        assert!(
+            received.to_ascii_lowercase().contains(&format!(
+                "authorization: bearer {}",
+                TOKEN.to_ascii_lowercase()
+            )),
+            "the origin got the injected credential: {received}"
+        );
+        // A host the egress policy does not allow fails in the guest.
+        let denied = send(
+            &socket,
+            &get(&format!("/fetch?http://denied.test:{port}/x"), ""),
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 502"), "{denied}");
+        assert!(body(&denied).contains("Denied"), "{denied}");
+        assert!(seen.try_recv().is_err(), "nothing reached the origin");
+
+        // A handler's output goes to the envelope's task log.
+        let stdout = logs.join(ENVELOPE.to_string()).join("stdout.log");
+        for _ in 0..100 {
+            if std::fs::read_to_string(&stdout).is_ok_and(|log| log.contains("echo /echo")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let log = std::fs::read_to_string(&stdout).unwrap_or_default();
+        assert!(log.contains("tenant=acme] echo /echo"), "{log}");
+        assert!(!log.contains(TOKEN));
+    }
 }

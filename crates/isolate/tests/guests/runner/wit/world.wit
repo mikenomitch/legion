@@ -2,4 +2,5 @@ package legion-test:runner;
 
 world runner {
   include legion:isolate/image@0.1.0;
+  import wasi:http/outgoing-handler@0.2.12;
 }

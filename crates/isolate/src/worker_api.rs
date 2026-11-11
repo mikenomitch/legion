@@ -99,19 +99,39 @@ impl GrpcWorker {
             .await
             .map_err(|e| Status::internal(format!("worker call task failed: {e}")))?
     }
+
+    /// As `on_io`, but dropping the returned future aborts the call (the
+    /// gRPC stream is reset, so the worker drops its side too): an egress
+    /// or VM call whose invocation ended does not run on.
+    async fn on_io_cancellable<F, T>(&self, f: F) -> Result<T, Status>
+    where
+        F: std::future::Future<Output = Result<T, Status>> + Send + 'static,
+        T: Send + 'static,
+    {
+        struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+        impl<T> Drop for AbortOnDrop<T> {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let mut h = AbortOnDrop(self.rt.spawn(f));
+        (&mut h.0)
+            .await
+            .map_err(|e| Status::internal(format!("worker call task failed: {e}")))?
+    }
 }
 
 #[async_trait]
 impl WorkerApi for GrpcWorker {
     async fn egress(&self, req: EgressRequest) -> Result<EgressReply, Status> {
         let mut c = self.client.clone();
-        self.on_io(async move { Ok(c.egress(req).await?.into_inner()) })
+        self.on_io_cancellable(async move { Ok(c.egress(req).await?.into_inner()) })
             .await
     }
 
     async fn vm(&self, req: VmRequest) -> Result<VmReply, Status> {
         let mut c = self.client.clone();
-        self.on_io(async move { Ok(c.vm(req).await?.into_inner()) })
+        self.on_io_cancellable(async move { Ok(c.vm(req).await?.into_inner()) })
             .await
     }
 

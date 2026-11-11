@@ -194,6 +194,9 @@ message HelloReply {
   // same value `legion-isolate engine-info` prints). An artifact compiled
   // under another key is refused by `LoadModule`.
   string compat_key = 3;
+  // The process id the worker spawned. That process is a supervising
+  // parent: the host itself is its only child, PID 1 of its own PID
+  // namespace, and dies with it.
   uint32 pid = 4;
   uint32 shards = 5;
   uint32 slots = 6;
@@ -373,7 +376,8 @@ message Stopped {
   // `limits`, `unsupported`, `trap`, or `ended` (its session was closed or
   // the host drained under it).
   string reason = 1;
-  // For `limits`: `cpu`, `wall`, `memory`, or `output`.
+  // For `limits`: `cpu`, `wall`, or `memory`. (The output budget
+  // truncates; it never stops an invocation.)
   string limit = 2;
   // What happened, in a sentence.
   string detail = 3;

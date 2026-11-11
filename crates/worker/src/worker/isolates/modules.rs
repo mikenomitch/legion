@@ -399,9 +399,7 @@ pub fn read_beneath(root: &Path, relative: &Path, cap: u64) -> Result<Vec<u8>, S
             Component::Normal(part) => parts.push(part.to_os_string()),
             Component::CurDir => {}
             Component::ParentDir => return Err("its path contains \"..\"".into()),
-            Component::RootDir | Component::Prefix(_) => {
-                return Err("its path is absolute".into())
-            }
+            Component::RootDir | Component::Prefix(_) => return Err("its path is absolute".into()),
         }
     }
     let Some((last, dirs)) = parts.split_last() else {
@@ -411,7 +409,11 @@ pub fn read_beneath(root: &Path, relative: &Path, cap: u64) -> Result<Vec<u8>, S
         let name = CString::new(name.as_bytes()).map_err(|_| "a NUL in its path".to_string())?;
         // SAFETY: `name` is a valid C string; the result is checked.
         let fd = unsafe {
-            libc::openat(at, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            libc::openat(
+                at,
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
         };
         if fd < 0 {
             let err = std::io::Error::last_os_error();

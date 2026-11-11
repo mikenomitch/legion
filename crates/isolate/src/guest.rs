@@ -41,7 +41,8 @@ use crate::world::{control, state, vm};
 pub struct Stop {
     /// `limits`, `unsupported`, `trap`, or `ended`.
     pub reason: &'static str,
-    /// For `limits`: `cpu`, `wall`, `memory`, or `output`.
+    /// For `limits`: `cpu`, `wall`, or `memory` (`limits.output` never stops a
+    /// run: output past it is cut and `truncated` set).
     pub limit: &'static str,
     pub detail: String,
 }
@@ -112,7 +113,30 @@ pub struct Invocation {
     pub slice_ns: u64,
     pub turns: AtomicU64,
     stop: Mutex<Option<Stop>>,
+    /// Outgoing requests in flight ([`MAX_EGRESS_IN_FLIGHT`]).
+    egress: Arc<tokio::sync::Semaphore>,
+    /// Set when the invocation is over (any way); wakes what waits on it.
+    ended: std::sync::atomic::AtomicBool,
+    ended_notify: tokio::sync::Notify,
 }
+
+/// Outgoing HTTP requests one invocation may have in flight at once. A
+/// further `outgoing-handler.handle` returns its future at once, but the
+/// request is not read or sent until one in flight finishes (it waits, at
+/// most until the invocation ends). Bounds the request and response bodies
+/// the host and the worker buffer for one guest to this many times
+/// `max_body_bytes`.
+pub const MAX_EGRESS_IN_FLIGHT: usize = 8;
+
+/// Entries one instance's resource table may hold (wasmtime's default is
+/// 1,000,000): handles to streams, fields, requests, files. A guest past it
+/// gets a trap ("resource table has no free keys").
+pub const MAX_TABLE_ENTRIES: usize = 4096;
+
+/// Bytes one `wasi:http` fields resource (a header set) may hold, as
+/// wasmtime-wasi-http measures them (names and values plus per-entry
+/// overhead). wasmtime-wasi-http's default is 128 KiB.
+pub const MAX_FIELDS_BYTES: usize = 64 << 10;
 
 impl Invocation {
     pub fn new(origin: Origin, cpu_limit: Duration, wall_limit: Duration, slice: Duration) -> Self {
@@ -125,6 +149,33 @@ impl Invocation {
             slice_ns: slice.as_nanos().max(1) as u64,
             turns: AtomicU64::new(0),
             stop: Mutex::new(None),
+            egress: Arc::new(tokio::sync::Semaphore::new(MAX_EGRESS_IN_FLIGHT)),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            ended_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// The invocation is over: what still waits on it (outgoing requests a
+    /// warm instance's guest left pending) is cancelled.
+    pub fn end(&self) {
+        self.ended.store(true, Ordering::Release);
+        self.ended_notify.notify_waiters();
+    }
+
+    pub fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Resolves when [`Invocation::end`] is called.
+    pub async fn ended(&self) {
+        loop {
+            let n = self.ended_notify.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.has_ended() {
+                return;
+            }
+            n.await;
         }
     }
 
@@ -492,9 +543,17 @@ impl Ctx {
         let inv = Arc::new(Invocation::unlimited(Origin::default()));
         Self {
             wasi: b.build(),
-            table: ResourceTable::new(),
+            table: {
+                let mut t = ResourceTable::new();
+                t.set_max_capacity(MAX_TABLE_ENTRIES);
+                t
+            },
             scratch: Scratch::new(account.clone()),
-            http: WasiHttpCtx::new(),
+            http: {
+                let mut h = WasiHttpCtx::new();
+                h.set_field_size_limit(MAX_FIELDS_BYTES);
+                h
+            },
             hooks: EgressHooks {
                 worker: setup.worker.clone(),
                 inv: inv.clone(),
@@ -655,6 +714,47 @@ impl WasiHttpHooks for EgressHooks {
             if !enabled {
                 return Err(HttpErr::HttpRequestDenied);
             }
+            let ended = inv.clone();
+            let work = async move {
+                // Wait for room (see MAX_EGRESS_IN_FLIGHT); the body is read
+                // only once there is.
+                let _permit = inv
+                    .egress
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| HttpErr::InternalError(None))?;
+                send_egress(worker, inv.clone(), max, request, options).await
+            };
+            tokio::select! {
+                r = work => r,
+                // The invocation ended (returned, hit a limit, was cut) with
+                // this request pending: stop it, worker call included.
+                _ = ended.ended() => Err(HttpErr::InternalError(Some(
+                    "the invocation ended before the response arrived".into(),
+                ))),
+            }
+        })
+    }
+}
+
+type EgressResult = Result<
+    (
+        http::Response<WasiBody>,
+        Box<dyn std::future::Future<Output = Result<(), HttpErr>> + Send>,
+    ),
+    HttpErr,
+>;
+
+async fn send_egress(
+    worker: Arc<dyn WorkerApi>,
+    inv: Arc<Invocation>,
+    max: u64,
+    request: http::Request<WasiBody>,
+    options: Option<wasmtime_wasi_http::RequestOptions>,
+) -> EgressResult {
+    {
+        {
             let (parts, body) = request.into_parts();
             let body = match collect_body(body, max).await {
                 Ok(b) => b,
@@ -705,7 +805,7 @@ impl WasiHttpHooks for EgressHooks {
                 resp,
                 Box::new(async { Ok(()) }) as Box<dyn std::future::Future<Output = _> + Send>,
             ))
-        })
+        }
     }
 }
 

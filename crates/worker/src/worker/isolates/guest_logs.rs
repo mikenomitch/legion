@@ -52,7 +52,11 @@ pub fn render(prefix: &str, lines: &[LogLine]) -> (Vec<u8>, Vec<u8>) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     for line in lines {
-        let out = if line.stderr { &mut stderr } else { &mut stdout };
+        let out = if line.stderr {
+            &mut stderr
+        } else {
+            &mut stdout
+        };
         let mut text: &[u8] = &line.line;
         while let Some(rest) = text.strip_suffix(b"\n") {
             text = rest;
@@ -66,9 +70,7 @@ pub fn render(prefix: &str, lines: &[LogLine]) -> (Vec<u8>, Vec<u8>) {
             out.extend_from_slice(prefix.as_bytes());
             if part.len() > MAX_LINE_BYTES {
                 out.extend_from_slice(&part[..MAX_LINE_BYTES]);
-                out.extend_from_slice(
-                    format!(" [line cut at {MAX_LINE_BYTES} bytes]").as_bytes(),
-                );
+                out.extend_from_slice(format!(" [line cut at {MAX_LINE_BYTES} bytes]").as_bytes());
             } else {
                 out.extend_from_slice(part);
             }
@@ -96,12 +98,7 @@ impl GuestLogs {
     }
 
     /// Append one batch (blocking file I/O: call from a blocking thread).
-    pub fn append(
-        &self,
-        envelope_allocation_id: i64,
-        prefix: &str,
-        lines: &[LogLine],
-    ) -> R<()> {
+    pub fn append(&self, envelope_allocation_id: i64, prefix: &str, lines: &[LogLine]) -> R<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -164,8 +161,8 @@ mod guest_logs_test {
             &[line("two\nlines", false)],
         )
         .unwrap();
-        let read = crate::worker::logs::read_allocation_logs(&logs.dir(42), "", 0, 0, false)
-            .unwrap();
+        let read =
+            crate::worker::logs::read_allocation_logs(&logs.dir(42), "", 0, 0, false).unwrap();
         assert_eq!(read[0].stream, "stdout");
         assert_eq!(
             read[0].content,
@@ -187,8 +184,12 @@ mod guest_logs_test {
         let logs = GuestLogs::with_config(dir.path().to_path_buf(), config);
         let long = "x".repeat(MAX_LINE_BYTES * 2);
         for i in 0..1000 {
-            logs.append(7, &line_prefix(&format!("inv-{i}"), ""), &[line(&long, false)])
-                .unwrap();
+            logs.append(
+                7,
+                &line_prefix(&format!("inv-{i}"), ""),
+                &[line(&long, false)],
+            )
+            .unwrap();
         }
         let total: u64 = std::fs::read_dir(logs.dir(7))
             .unwrap()
@@ -199,7 +200,11 @@ mod guest_logs_test {
         assert!(total < 3 * (4096 + MAX_LINE_BYTES as u64 + 128), "{total}");
         // Every batch passed the cap, so each was rotated out at once.
         let rotated = std::fs::read_to_string(logs.dir(7).join("stdout.log.1")).unwrap();
-        assert!(rotated.starts_with("[isolate inv-999] xxx"), "{}", &rotated[..40]);
+        assert!(
+            rotated.starts_with("[isolate inv-999] xxx"),
+            "{}",
+            &rotated[..40]
+        );
         assert!(rotated.ends_with(" [line cut at 16384 bytes]\n"));
     }
 }

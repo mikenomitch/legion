@@ -131,6 +131,27 @@ fn main() {
                 std::process::exit(3);
             }
         },
+        // `fetch-many <n> <url>`: start n requests at once, then wait for
+        // each; prints how many succeeded.
+        "fetch-many" => {
+            let n: usize = arg.parse().unwrap_or(1);
+            let url = args.get(3).cloned().unwrap_or_default();
+            let futs: Vec<_> = (0..n).map(|_| start(&url)).collect();
+            let mut ok = 0;
+            for f in futs {
+                let Ok(f) = f else { continue };
+                let r = loop {
+                    match f.get() {
+                        Some(r) => break r,
+                        None => f.subscribe().block(),
+                    }
+                };
+                if matches!(r, Ok(Ok(_))) {
+                    ok += 1;
+                }
+            }
+            println!("ok={ok}");
+        }
         "stdin" => {
             let mut s = String::new();
             let _ = std::io::stdin().read_to_string(&mut s);
@@ -202,6 +223,20 @@ fn fetch(url: &str) -> Result<Fetched, String> {
         }
     }
     Ok((status, headers, out))
+}
+
+fn start(url: &str) -> Result<wasi::http::types::FutureIncomingResponse, String> {
+    let rest = url.strip_prefix("http://").ok_or("only http:// URLs")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let req = OutgoingRequest::new(Fields::new());
+    req.set_method(&Method::Get).unwrap();
+    req.set_scheme(Some(&Scheme::Http)).unwrap();
+    req.set_authority(Some(authority)).unwrap();
+    req.set_path_with_query(Some(path)).unwrap();
+    wasi::http::outgoing_handler::handle(req, None).map_err(code)
 }
 
 fn code(e: ErrorCode) -> String {

@@ -696,6 +696,22 @@ impl Host {
             Some(h) => self.0.shards[h.shard].clone(),
             None => self.pick_shard(),
         };
+        // A session's tenant is the one it was opened (or restored) with:
+        // a call naming another one is attributed to the session's, so
+        // egress, logs, and `control.info().tenant` never take the caller's
+        // word over the session's record.
+        let tenant = match (&holder, life) {
+            (Some(h), Lifetime::Session) => {
+                if !req.tenant.is_empty() && req.tenant != h.tenant {
+                    debug!(
+                        session = %req.session_id,
+                        "ignoring the call's tenant on a session isolate: the session's own applies"
+                    );
+                }
+                h.tenant.clone()
+            }
+            _ => req.tenant.clone(),
+        };
         let origin = Origin {
             job_id: req.job_id.clone(),
             task_name: req.task_name.clone(),
@@ -704,7 +720,7 @@ impl Host {
             } else {
                 req.invocation_id.clone()
             },
-            tenant: req.tenant.clone(),
+            tenant: tenant.clone(),
             session: life == Lifetime::Session,
         };
         let limits = spec.limits.unwrap_or_default();
@@ -721,11 +737,7 @@ impl Host {
             nz(limits.wall_micros, DEFAULT_WALL),
             Duration::from_millis(self.0.cfg.slice_millis as u64),
         ));
-        let flow = (
-            req.job_id.clone(),
-            req.task_name.clone(),
-            req.tenant.clone(),
-        );
+        let flow = (req.job_id.clone(), req.task_name.clone(), tenant);
         let weight = spec.cpu_weight.max(1);
         let job = Job {
             host: self.0.clone(),
@@ -853,9 +865,6 @@ impl Host {
         meta.session_id = req.session_id.clone();
         meta.job_id = req.job_id.clone();
         meta.task_name = req.task_name.clone();
-        if meta.tenant.is_empty() {
-            meta.tenant = req.tenant.clone();
-        }
         let h = self.new_session(meta, StateMap::from_map(cp.state), true);
         let mut s = self.0.sessions.lock().unwrap();
         Ok(s.entry(req.session_id.clone()).or_insert(h).clone())
@@ -1421,6 +1430,15 @@ impl Job {
     }
 
     async fn run(self) -> Result<InvokeReply, Status> {
+        // However the invocation ends (reply, limit, cut, the caller gone),
+        // what it left pending is cancelled.
+        struct EndOnDrop(Arc<Invocation>);
+        impl Drop for EndOnDrop {
+            fn drop(&mut self) {
+                self.0.end();
+            }
+        }
+        let _end = EndOnDrop(self.inv.clone());
         let counters = &self.task.counters;
         let permit = self.admit().await;
         counters.queued.fetch_sub(1, Ordering::Relaxed);

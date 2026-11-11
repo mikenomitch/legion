@@ -200,8 +200,7 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
     let sigio = |setup: &dyn Fn(i32) -> Vec<(&'static str, i32, i32)>| {
         let mut sv = [0i32; 2];
         // SAFETY: valid two-int array.
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0
-        {
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
             return report(format!("socketpair failed errno {}", errno()));
         }
         let steps = setup(sv[0]);

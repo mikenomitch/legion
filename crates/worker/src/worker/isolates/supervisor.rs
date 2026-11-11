@@ -827,8 +827,7 @@ impl IsolateSupervisor {
             };
             let path = cgroup.join("memory.max");
             let written =
-                tokio::task::spawn_blocking(move || std::fs::write(&path, bytes.to_string()))
-                    .await;
+                tokio::task::spawn_blocking(move || std::fs::write(&path, bytes.to_string())).await;
             match written {
                 Ok(Ok(())) => {
                     debug!(%cordon, replica = replica.index, bytes, "Isolate host memory.max follows its envelopes")
@@ -2968,8 +2967,14 @@ impl IsolateSupervisor {
                 me.maintain().await;
                 if !page_out_after.is_zero() && last_page_out.elapsed() >= page_out_after {
                     last_page_out = Instant::now();
-                    me.reclaim(host::ReclaimLevel::ReclaimPageOut, 0, page_out_after, None, "")
-                        .await;
+                    me.reclaim(
+                        host::ReclaimLevel::ReclaimPageOut,
+                        0,
+                        page_out_after,
+                        None,
+                        "",
+                    )
+                    .await;
                 }
             }
         });

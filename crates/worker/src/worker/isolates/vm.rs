@@ -1172,7 +1172,10 @@ mod tests {
             };
             let stolen = exec(&vms, &thief, &child.id, &["true"], b"", 1000).await;
             assert_eq!(kind(&stolen), Some(VmErrorKind::VmChildGone), "{stolen:?}");
-            assert!(message(&stolen).contains("belongs to another task"), "{stolen:?}");
+            assert!(
+                message(&stolen).contains("belongs to another task"),
+                "{stolen:?}"
+            );
             let more = acquire(&vms, &thief).await;
             assert_eq!(kind(&more), Some(VmErrorKind::VmChildGone), "{more:?}");
         }

@@ -112,7 +112,9 @@ impl WorkerService {
 }
 
 fn lock_budget(budget: &Mutex<LogBudget>) -> std::sync::MutexGuard<'_, LogBudget> {
-    budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    budget
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 type ChunkStream =
@@ -148,7 +150,11 @@ impl IsolateWorker for WorkerService {
             );
             return Err(Status::permission_denied(format!(
                 "{} {} of task {}/{} is not an isolate this worker gave the host",
-                if task.session { "session" } else { "invocation" },
+                if task.session {
+                    "session"
+                } else {
+                    "invocation"
+                },
                 task.isolate_id,
                 task.job_id,
                 task.task_name
@@ -298,8 +304,7 @@ impl IsolateWorker for WorkerService {
             let prefix = super::guest_logs::line_prefix(&task.isolate_id, &task.tenant);
             let envelope = task.envelope_allocation_id;
             let written =
-                tokio::task::spawn_blocking(move || logs.append(envelope, &prefix, &lines))
-                    .await;
+                tokio::task::spawn_blocking(move || logs.append(envelope, &prefix, &lines)).await;
             if let Ok(Err(err)) = written {
                 warn!(
                     job_id = %task.job_id,

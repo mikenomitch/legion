@@ -7,7 +7,9 @@ mod common;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnix;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::CommandExt;
+#[cfg(feature = "confinement-test")]
+use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -893,10 +895,16 @@ async fn killing_the_pid_the_worker_knows_kills_the_host_test() {
     let cs = unsafe { inherited(OwnedFd::from(control).into_raw_fd_for_test()) }.unwrap();
     let mut client = IsolateHostClient::new(channel_over(cs).await.unwrap());
     let hello = client.hello(HelloRequest {}).await.unwrap().into_inner();
-    assert_eq!(hello.pid, child.id(), "Hello reports the pid the worker spawned");
+    assert_eq!(
+        hello.pid,
+        child.id(),
+        "Hello reports the pid the worker spawned"
+    );
     let c = hello.confinement.unwrap();
     if !c.pid_namespace {
         eprintln!("LAYER UNAVAILABLE HERE: pid namespace ({:?})", c.notes);
+        let _ = child.kill();
+        let _ = child.wait();
         return;
     }
     // The serving process is the spawned one's only child.
@@ -904,7 +912,11 @@ async fn killing_the_pid_the_worker_knows_kills_the_host_test() {
     let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
     let host: u32 = children.trim().parse().unwrap();
     let ns = |p: u32| std::fs::read_link(format!("/proc/{p}/ns/pid")).ok();
-    assert_ne!(ns(host), ns(std::process::id()), "the host has its own PID namespace");
+    assert_ne!(
+        ns(host),
+        ns(std::process::id()),
+        "the host has its own PID namespace"
+    );
     child.kill().unwrap();
     child.wait().unwrap();
     let t = Instant::now();
@@ -914,7 +926,10 @@ async fn killing_the_pid_the_worker_knows_kills_the_host_test() {
         if state.is_empty() || state.contains(") Z") {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(5), "the host outlived its parent: {state}");
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the host outlived its parent: {state}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(client.hello(HelloRequest {}).await.is_err());
@@ -938,7 +953,10 @@ fn compile_attempt(what: &str) -> (std::process::ExitStatus, String) {
         .args(["--test-attempt", what])
         .output()
         .unwrap();
-    (out.status, String::from_utf8_lossy(&out.stdout).into_owned())
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
 #[test]
@@ -993,14 +1011,30 @@ fn the_compiler_is_refused_what_the_host_is_refused_test() {
     {
         let c = hello_confinement();
         if c.seccomp {
-            for what in ["socket", "execve", "fork", "ptrace", "sigio-fcntl:1", "kill:1"] {
+            for what in [
+                "socket",
+                "execve",
+                "fork",
+                "ptrace",
+                "sigio-fcntl:1",
+                "kill:1",
+            ] {
                 let (status, out) = compile_attempt(what);
-                assert_eq!(status.signal(), Some(libc::SIGSYS), "{what}: {status:?} {out}");
+                assert_eq!(
+                    status.signal(),
+                    Some(libc::SIGSYS),
+                    "{what}: {status:?} {out}"
+                );
             }
         }
         let enoent = format!("Some({})", libc::ENOENT);
         if c.mount_root {
-            for what in ["open-outside", "open-proc", "stat-outside", "readlink-outside"] {
+            for what in [
+                "open-outside",
+                "open-proc",
+                "stat-outside",
+                "readlink-outside",
+            ] {
                 let (status, out) = compile_attempt(what);
                 // `readlink` is not on the compiler's allowlist at all.
                 if what == "readlink-outside" && c.seccomp {
@@ -1020,7 +1054,10 @@ fn the_compiler_is_refused_what_the_host_is_refused_test() {
             "the input is read-only: {out}"
         );
         let (_, out) = compile_attempt("write-output");
-        assert!(out.contains("wrote"), "the output directory is writable: {out}");
+        assert!(
+            out.contains("wrote"),
+            "the output directory is writable: {out}"
+        );
         let (_, out) = compile_attempt("pid");
         if c.pid_namespace {
             assert_eq!(out.trim(), "pid 1");
@@ -1028,4 +1065,130 @@ fn the_compiler_is_refused_what_the_host_is_refused_test() {
         let (_, out) = compile_attempt("fds");
         assert_eq!(out.trim(), "fds: 0,1,2", "{out}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The language images through the real, confined binary (compiler and host).
+// ---------------------------------------------------------------------------
+
+fn images_dir() -> std::path::PathBuf {
+    match std::env::var_os("LEGION_ISOLATE_IMAGES") {
+        Some(d) => d.into(),
+        None => {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/isolate-images")
+        }
+    }
+}
+
+/// `tests/images.rs` drives the images in-process; this runs them where a
+/// worker does: compiled by `legion-isolate compile --confine enforce`,
+/// served by a host under `CONFINE_ENFORCE` (every seccomp argument filter,
+/// the mount root, the PID namespace), with file I/O, an exception, and an
+/// outgoing request over the worker socket. A syscall either path needs
+/// that the allowlists lack shows up here as a SIGSYS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs built images: crates/isolate/images/build.sh"]
+async fn both_language_images_run_in_the_confined_binary_test() {
+    let images = images_dir();
+    let out = tempfile::tempdir().unwrap();
+    for name in ["python", "js"] {
+        let o = Command::new(BIN)
+            .args(["compile", "--confine", "enforce", "--input"])
+            .arg(images.join(format!("{name}.wasm")))
+            .arg("--output")
+            .arg(out.path().join(format!("{name}.cwasm")))
+            .output()
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{name}: {e}: {o:?}"));
+        assert_eq!(v["ok"], true, "{name}: {v} {o:?}");
+        assert_eq!(v["confinement"]["seccomp"], true, "{v}");
+    }
+    let mut cfg = bin_config(Confine::Enforce);
+    cfg.read_dirs = vec![out.path().display().to_string()];
+    cfg.async_stack_bytes = 1 << 20;
+    let mut h = spawn(cfg).await;
+    let hello = h.client.hello(HelloRequest {}).await.unwrap().into_inner();
+    eprintln!("confinement: {:?}", hello.confinement);
+    for (name, task) in [("python", "py"), ("js", "js")] {
+        h.client
+            .load_module(LoadModuleRequest {
+                module_id: name.into(),
+                artifact_path: out
+                    .path()
+                    .join(format!("{name}.cwasm"))
+                    .display()
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        let mut s = spec("j", task, name);
+        s.memory_max_bytes = 128 << 20;
+        s.limits.as_mut().unwrap().cpu_micros = 20_000_000;
+        s.limits.as_mut().unwrap().wall_micros = 30_000_000;
+        h.client.configure_task(s).await.unwrap();
+    }
+    let run_src = |task: &str, file: &str, src: &str| InvokeRequest {
+        job_id: "j".into(),
+        task_name: task.into(),
+        invocation_id: next_id(),
+        call: Some(invoke_request::Call::Run(RunCall {
+            files: vec![File {
+                path: file.into(),
+                content: src.as_bytes().to_vec(),
+                ..Default::default()
+            }],
+            entry: file.into(),
+            input: Some("{\"n\":2}".into()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let py = r#"
+import json, os, urllib.request
+with open("note.txt", "w") as f:
+    f.write("written")
+os.makedirs("out/deep", exist_ok=True)
+os.rename("note.txt", "out/deep/note.txt")
+try:
+    1 / 0
+except ZeroDivisionError:
+    caught = True
+body = urllib.request.urlopen("http://up/py").read().decode()
+print("hello from python")
+result = {"read": open("out/deep/note.txt").read(), "caught": caught, "body": body,
+          "n": json.load(open("input.json"))["n"]}
+"#;
+    let r = h.client.invoke(run_src("py", "main.py", py)).await;
+    let r = r
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr_of(&mut h.child)))
+        .into_inner();
+    assert!(r.stopped.is_none(), "{r:?}");
+    assert_eq!(stdout(&r), "hello from python\n", "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&outcome(&r).result).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"read": "written", "caught": true, "body": "hello from http://up/py", "n": 2})
+    );
+    let js = "let caught = false;\n\
+              try { JSON.parse('{'); } catch (e) { caught = e instanceof SyntaxError; }\n\
+              const r = await fetch('http://up/js');\n\
+              console.log('hello from js');\n\
+              return { status: r.status, body: await r.text(), caught };\n";
+    let r = h.client.invoke(run_src("js", "main.js", js)).await;
+    let r = r
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr_of(&mut h.child)))
+        .into_inner();
+    assert!(r.stopped.is_none(), "{r:?}");
+    assert!(stdout(&r).contains("hello from js"), "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&outcome(&r).result).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"status": 200, "body": "hello from http://up/js", "caught": true})
+    );
+    assert!(
+        h.child.try_wait().unwrap().is_none(),
+        "{}",
+        stderr_of(&mut h.child)
+    );
 }
