@@ -1314,8 +1314,14 @@ async fn idle_private_bytes(image: &Image, name: &str, hello: &str) -> u64 {
 struct Measured {
     hello: Timing,
     ten_kb: Timing,
+    imports: Option<Timing>,
     idle_private_bytes: u64,
 }
+
+/// A run that imports the commonly used standard-library modules.
+const PY_IMPORTS: &str = "import json, re, datetime, collections, math, random, base64, hashlib, csv, io, \
+                          itertools, functools, string, textwrap, dataclasses, typing, decimal, statistics, uuid, time\n\
+                          print(json.dumps({'n': len(re.findall('a', 'banana'))}))\n";
 
 async fn measure(image: &Image) -> Measured {
     let _g = LOCK.write().unwrap_or_else(|e| e.into_inner());
@@ -1328,10 +1334,16 @@ async fn measure(image: &Image) -> Measured {
     let hello_t = time_runs(image, name, hello, 50).await;
     let ten = ten_kb(js);
     let ten_t = time_runs(image, name, &ten, 50).await;
+    let imports = if js {
+        None
+    } else {
+        Some(time_runs(image, name, PY_IMPORTS, 50).await)
+    };
     let idle = idle_private_bytes(image, name, hello).await;
     let m = Measured {
         hello: hello_t,
         ten_kb: ten_t,
+        imports,
         idle_private_bytes: idle,
     };
     println!(
@@ -1348,6 +1360,12 @@ async fn measure(image: &Image) -> Measured {
         m.ten_kb.warm_p50,
         m.idle_private_bytes / 1024
     );
+    if let Some(t) = &m.imports {
+        println!(
+            "[container measurement] {} image: importing 20 common stdlib modules, fresh instance p50 {} µs p99 {} µs, warm p50 {} µs",
+            image.name, t.fresh_p50, t.fresh_p99, t.warm_p50
+        );
+    }
     m
 }
 

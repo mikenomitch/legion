@@ -27,8 +27,9 @@ const { component } = await componentize({
   sourcePath,
   witPath,
   worldName: 'js',
-  // weval AOT measured no gain for dynamic source (README, "Measurements").
-  enableAot: false,
+  // weval AOT measured no gain for dynamic source (README, "Measurements");
+  // LEGION_JS_AOT=1 builds the AOT variant to measure it again.
+  enableAot: process.env.LEGION_JS_AOT === '1',
 });
 await writeFile(out, component);
 console.log(`js: componentize-js ${version}, ${component.length} bytes in ${Date.now() - started} ms`);

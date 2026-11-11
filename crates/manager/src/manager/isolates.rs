@@ -227,7 +227,7 @@ pub fn check_run_fields(
                     task.name,
                     task.runtime,
                     match set.as_slice() {
-                        [one] => format!("{one}"),
+                        [one] => one.to_string(),
                         _ => "them".to_string(),
                     }
                 ),

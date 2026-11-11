@@ -95,7 +95,8 @@ pub fn run(args: Args) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("isolate-io")
-        .enable_all()
+        .enable_io()
+        .enable_time()
         .build()
     {
         Ok(rt) => rt,

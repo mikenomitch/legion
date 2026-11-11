@@ -287,6 +287,20 @@ fn seccomp() -> Result<(), String> {
         libc::SYS_clone,
         vec![SeccompRule::new(vec![thread]).map_err(|e| e.to_string())?],
     );
+    // socketpair: Unix pairs only. tokio's signal driver makes one at
+    // start (it is part of the I/O driver whenever tokio has signal
+    // support compiled in); a connected pair reaches nothing.
+    let unix = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        libc::AF_UNIX as u64,
+    )
+    .map_err(|e| e.to_string())?;
+    rules.insert(
+        libc::SYS_socketpair,
+        vec![SeccompRule::new(vec![unix]).map_err(|e| e.to_string())?],
+    );
     let allow: BpfProgram = SeccompFilter::new(
         rules,
         mismatch,

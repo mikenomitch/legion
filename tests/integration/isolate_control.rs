@@ -1261,16 +1261,18 @@ async fn an_isolate_tasks_credential_is_fetched_for_its_envelope_test() -> R<()>
         .context("the envelope allocation")?;
     let reply = cluster
         .svc
-        .fetch_datapath_material(Request::new(legion::structs::FetchDatapathMaterialRequest {
-            node_id: "w-1".into(),
-            refs: vec![legion::structs::MaterialRef {
-                kind: legion::structs::source::MATERIAL_CREDENTIAL.into(),
-                allocation_id: allocation.id,
-                key: "openai".into(),
-                part: "authorization".into(),
-                version: 0,
-            }],
-        }))
+        .fetch_datapath_material(Request::new(
+            legion::structs::FetchDatapathMaterialRequest {
+                node_id: "w-1".into(),
+                refs: vec![legion::structs::MaterialRef {
+                    kind: legion::structs::source::MATERIAL_CREDENTIAL.into(),
+                    allocation_id: allocation.id,
+                    key: "openai".into(),
+                    part: "authorization".into(),
+                    version: 0,
+                }],
+            },
+        ))
         .await?
         .into_inner();
     let material = &reply.materials[0];

@@ -23,6 +23,11 @@ import types
 
 import legion
 
+# The import system's own classes: importlib.util and importlib.machinery
+# are loaded through the finders below, so the finders cannot use them.
+from _frozen_importlib import ModuleSpec as _ModuleSpec
+from _frozen_importlib_external import PathFinder as _PathFinder
+
 from wit_world import exports
 from wit_world.exports.runner import Outcome
 from wit_world.imports import environment as _environment
@@ -139,9 +144,7 @@ class _LibraryFinder:
         entry = _LIBRARY_INDEX.get(name)
         if entry is None:
             return None
-        import importlib.util
-
-        spec = importlib.util.spec_from_loader(name, _LibraryLoader, origin=entry[3], is_package=entry[2])
+        spec = _ModuleSpec(name, _LibraryLoader, origin=entry[3], is_package=entry[2])
         spec.has_location = True
         if entry[2]:
             spec.submodule_search_locations = [os.path.dirname(entry[3])]
@@ -436,9 +439,8 @@ PRELOAD = (
     "functools", "hashlib", "io", "itertools", "json", "math", "random", "re",
     "statistics", "string", "textwrap", "time", "typing", "uuid",
 )
-for _name in PRELOAD:
-    importlib.import_module(_name)
-del _name
+for _module in PRELOAD:
+    importlib.import_module(_module)
 
 
 def _install_ctypes_stub():
@@ -509,13 +511,11 @@ class _RunDirFinder:
 
     @classmethod
     def find_spec(cls, name, path=None, target=None):
-        import importlib.machinery
-
         if path is None:
             path = [RUN_DIR]
         elif not any(str(p).startswith(RUN_DIR) for p in path):
             return None
-        spec = importlib.machinery.PathFinder.find_spec(name, path, target)
+        spec = _PathFinder.find_spec(name, path, target)
         if spec is not None:
             cls.names.add(name)
         return spec
