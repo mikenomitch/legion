@@ -1286,12 +1286,6 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
       alone: `raft_durability::leader_loss_mid_burst`,
       `raft_write_path::every_log_purge_fsyncs_the_state_db_first` and
       `proxy_hand_offs_cross_nodes_only_over_the_mesh_test`.
-      `worker::task_manager::tests::a_restarted_worker_keeps_its_owner_references_test`
-      fails about 1 run in 8 under CPU load and never alone (2026-11-11, 30/30
-      alone, 35/40 with six busy loops): the restarted worker finds no owner
-      link for the child, so a launch thread's late session-log write likely
-      lands after the test's own sync. Neither the test nor the session log
-      changed in the isolate work.
 - [ ] **Crate split follow-ups** ([plan § 8](plans/workspace-crate-split-plan.md#8-implementation-phases)):
   - [ ] **The store out of `legion-manager`.** It is the largest compile
         (3.8 GB, 4.5 GB with tests). `storage` has 28 references into

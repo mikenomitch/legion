@@ -13503,7 +13503,14 @@ mod tests {
         loop {
             {
                 let mut guard = manager.lock().expect("task manager");
-                if guard.instances.contains_key(&admitted.local_key) {
+                // Started means the launch finished: while it runs, the
+                // instance is a placeholder with no pid (and `launching`
+                // holds the key), and the session is not yet in the session
+                // log. Returning on the placeholder let a slow launch log the
+                // session after a test had synced the log and restarted.
+                if guard.instances.contains_key(&admitted.local_key)
+                    && !guard.launching.contains_key(&admitted.local_key)
+                {
                     guard.set_claim_stage(&admitted.claim_id, ClaimStage::Serving);
                     return Ok(admitted);
                 }
