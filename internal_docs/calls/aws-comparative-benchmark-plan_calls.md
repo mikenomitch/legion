@@ -1248,3 +1248,57 @@ fails rather than tears down.
 
 **Why.** Simplicity. The bug was a silent exit that left the rig billing;
 a loud refusal fixes that without making a destroy happen on a guess.
+
+## 43. Legion runs the scenario's `scheduling_policy`; Nomad and K8s keep their defaults
+
+**Call.** `run-campaign.sh` reads the campaign's scenario `scheduling_policy`
+(or `--scheduling-policy bin_pack|spread`) into `LEGION_SCHEDULING_POLICY`,
+the installers render it as the manager's `schedulingPolicy`, the translator
+records it in `manifest.json`, and `run-step.sh` refuses a Legion cell whose
+running manager disagrees. Before, both manager templates hardcoded
+`bin_pack`, so `web_fleet`, `dense_fleet`, and `unit_fleet` (all `spread`)
+were measured under the other policy.
+
+```text
+the manager runs schedulingPolicy 'bin_pack', this cell wants 'spread'
+  It is set at install time: reinstall with LEGION_SCHEDULING_POLICY=spread
+```
+
+**Alternatives.** (a) Keep `bin_pack` everywhere and document that the rig
+ignores the scenario, matching "each system runs its own default". (b) A
+per-job policy carried by the translated jobspec; Legion has no such field.
+
+**Trade-off.** A Legion `spread` cell now runs a non-default policy next to
+Nomad's binpack, which the fairness record has to name. A hand-run
+`install-legion-a.sh` renders `bin_pack`, so a hand-run `run-step.sh` of a
+`spread` scenario is refused until it is reinstalled with the policy.
+
+**Why.** The scenario is the workload's definition, shared with the
+in-process scheduler bench, which already applies its policy; (a) would keep
+the AWS and in-process numbers measuring different placements under one
+name. The override keeps "measure both" one flag away.
+
+## 44. `stop-sim-fleet.sh` forgets the sim nodes with `--force`, one CLI call each
+
+**Call.** After stopping the sim units, `stop-sim-fleet.sh` lists every
+`sim-*` node with `legion state query` and runs `legion node forget <id>
+--force` for each, 16 in flight, then reports how many rows remain.
+`SIM_FORGET=0` skips it; `reset-control-plane.sh` sets that, since its wipe
+removes the rows anyway. The campaign still resets the control plane first,
+and node names stay reused run to run.
+
+**Alternatives.** (a) Wait for the nodes to go `lost` and forget without
+`--force`. (b) A batch forget RPC. (c) Drop the per-campaign reset now that
+the forget exists, and give each run a unique name prefix.
+
+**Trade-off.** One process and RPC per node: minutes for a 10,000-node fleet.
+`--force` releases each node's allocations for rescheduling at once, the same
+churn a node loss raises later. The reset stays, at its couple of minutes per
+campaign.
+
+**Why.** (a) waits a heartbeat timeout per stop and still refuses nodes with
+allocations. (b) is a new RPC for a benchmark script. (c) would make a failed
+forget leak a whole fleet into the next campaign, which the reset rules out
+for the price of one reinstall; unique prefixes are now safe to adopt, but
+nothing needs them yet.
+

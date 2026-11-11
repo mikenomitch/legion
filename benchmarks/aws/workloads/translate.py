@@ -29,6 +29,14 @@ Constraint mapping (scenario constraints are attr-equality):
   k8s    : nodeSelector labels (KWOK nodes are labeled from the same
            node_profiles file)
 
+Scheduling policy: the scenario's `scheduling_policy` (bin_pack|spread)
+is a manager setting in Legion (`schedulingPolicy`), not a jobspec field,
+so no artifact carries it. The manifest records it, run-campaign.sh
+renders it into the manager config at install time, and run-step.sh
+refuses a Legion cell whose running manager disagrees. Nomad and K8s run
+their own default placement policy (binpack and LeastAllocated); the
+fairness record names it rather than tuning them toward the scenario.
+
 Usage:
   translate.py --scenario ../scheduler/scenarios/web_fleet.json \
       --system legion --out out/legion [--count-multiplier 2.0]
@@ -48,6 +56,20 @@ def load_scenario(path):
     with open(path) as f:
         scenario = json.load(f)
     return scenario
+
+
+SCHEDULING_POLICIES = ("bin_pack", "spread")
+
+
+def scheduling_policy(scenario):
+    """The scenario's placement policy, as Legion's `schedulingPolicy` spells it."""
+    policy = scenario.get("scheduling_policy")
+    if policy not in SCHEDULING_POLICIES:
+        raise ValueError(
+            f"scenario {scenario.get('name')}: scheduling_policy must be one of "
+            f"{', '.join(SCHEDULING_POLICIES)}, got {policy!r}"
+        )
+    return policy
 
 
 def effective_job_types(scenario):
@@ -350,6 +372,7 @@ def translate(scenario, system, out_dir, multiplier, jobspec_format="json"):
     manifest = {
         "scenario": scenario.get("name"),
         "system": system,
+        "scheduling_policy": scheduling_policy(scenario),
         "count_multiplier": multiplier,
         "jobs": [],
     }

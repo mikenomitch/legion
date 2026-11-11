@@ -9127,6 +9127,19 @@ mod tests {
         let full = start("").expect_err("the envelope is full");
         assert!(full.downcast_ref::<SessionRefusal>().is_some(), "{full:#}");
 
+        // Each launch runs on its own thread and holds its slot until it is
+        // done. Wait for them: a launch still running when the test returns
+        // creates the session's log and allocation directories inside a temp
+        // dir that is already gone, which recreates it and leaks it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pool.in_use() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launches never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         let mut guard = manager.lock().expect("task manager");
         let status = guard
             .session_status(&minted.session_id)

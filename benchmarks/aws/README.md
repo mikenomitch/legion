@@ -219,6 +219,28 @@ actually ran. `legion-a` only; passing it to another system is an error
 rather than a silent no-op, because a cell archived as a 16-thread result
 whose config says 4 is worse than a failed run.
 
+### Scheduling policy (the scenario's own)
+
+Every scenario names a `scheduling_policy`: `web_fleet`, `dense_fleet`,
+and `unit_fleet` are `spread`; `batch_burst` and `mixed_heterogeneous` are
+`bin_pack`. In Legion that is the manager's `schedulingPolicy`, not a
+jobspec field, so `run-campaign.sh` reads it from the campaign's scenario
+and the installers render it into `configs/legion/manager-{a,b}.ncl.tpl`
+(through `LEGION_SCHEDULING_POLICY`; a hand-run installer gets `bin_pack`,
+Legion's default). The translator records it in each cell's
+`manifest.json`, `pre-cell.json` records what the manager actually ran,
+and `run-step.sh` refuses a Legion cell whose running manager disagrees.
+To measure one workload under the other policy:
+
+```bash
+scripts/run-campaign.sh --system legion-a --scenarios web_fleet --scheduling-policy bin_pack
+```
+
+Like `--eval-threads`, it is one value per campaign and needs the
+control-plane reset. Nomad and K8s keep their own default placement
+(Nomad binpack, the K8s `LeastAllocated` score); the fairness record
+names it rather than tuning them toward the scenario.
+
 ### Heartbeat cadence (adaptive, the default)
 
 Run scale steps with Legion's default heartbeat cadence, which is adaptive.
@@ -255,12 +277,13 @@ against a fixed 2s. See
 
 `run-campaign.sh` wipes and reinstalls the control plane before its first
 step (`scripts/reset-control-plane.sh`, `--no-reset-control-plane` to opt
-out). This is load-bearing, not hygiene: **Legion cannot deregister a
-node**, so `stop-sim-fleet.sh` leaves every node record behind and the
-node table becomes a high-water mark of every fleet the boxes have ever
-carried. A 1,000-node cell run after a 4,000-node experiment otherwise
-measures a scheduler holding 3,000 corpses while reporting itself as a
-1,000-node result. Every cell now also gates on an exact node census —
+out). `stop-sim-fleet.sh` forgets every `sim-*` node it stops
+(`legion node forget --force`, 16 in flight; `SIM_FORGET=0` skips it), but
+a fleet stopped any other way, or a forget that failed, leaves its rows,
+and a 1,000-node cell run after a 4,000-node experiment would then measure
+a scheduler holding 3,000 corpses while reporting itself as a 1,000-node
+result. The reset rules that out and clears the previous run's jobs and
+evals too. Every cell now also gates on an exact node census —
 right count, all active and available, all named from this fleet's
 slices — and refuses to run otherwise, printing what it actually saw.
 
@@ -1003,13 +1026,13 @@ and tear it down when the campaign is over.
   `run-step.sh` supplies one (`CELL_START_EPOCH`), and falls back to a
   trailing 2h superset otherwise; the fairness record says which. The
   driver's own timestamps remain authoritative for the reported numbers.
-- **Nothing removes node records.** There is no deregistration RPC
-  (`Store::remove_node` has no production caller), so a fleet's nodes
-  outlive it and only a control-plane reset clears them. Node names are
-  therefore reused run to run on purpose — a unique per-run prefix would
-  make every run leak its whole fleet instead of overwriting the last
-  one's. The consequences are handled by the reset at campaign start and
-  the per-cell census gate, but the underlying gap is real.
+- **Forgetting a fleet costs one RPC per node.** `stop-sim-fleet.sh`
+  forgets each `sim-*` node with `legion node forget --force`; there is no
+  batch forget, so a 10,000-node fleet takes a few minutes to clear, and
+  the forced forget releases each node's allocations for rescheduling (the
+  same churn a node loss raises). Node names are still reused run to run;
+  with the forget in place a unique per-run prefix would no longer leak a
+  fleet, but nothing uses one yet.
 - **Fleet churn contaminates the cell that follows it.** Every fleet
   stop/start marks thousands of nodes lost and raises a reschedule eval
   per node (measured: 5,760 reschedules against 2,503 job submissions at

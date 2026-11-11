@@ -141,8 +141,9 @@ UNIT
     # An EXACT census, not `registered >= TOTAL`.
     #
     # The old lower bound passed against the wrong population twice over.
-    # `SELECT COUNT(*) FROM node` counts every row the control plane has
-    # ever seen — nothing in Legion removes a node record — so a 4000-node
+    # `SELECT COUNT(*) FROM node` counts every row still in the store —
+    # before stop-sim-fleet.sh forgot its nodes, that was every row the
+    # control plane had ever seen — so a 4000-node
     # experiment's orphans satisfied a 1000-node fleet's wait instantly,
     # and the "fleet" the next cell measured was 1000 live nodes plus 3000
     # corpses. It also ignores health, so a fleet where every node had

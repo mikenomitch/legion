@@ -89,8 +89,15 @@ let dir = tempfile::Builder::new()
 
 The root is removed when the test process exits. A directory kept directly
 in the system temp dir is never removed; at ~1.7 MB per store, a full run
-used to leave over a gigabyte behind. A run killed before it exits (Ctrl-C)
-still leaves its one `legion-tests-*` root in `$TMPDIR`.
+used to leave over a gigabyte behind. A run killed before it exits (Ctrl-C,
+a timeout) skips that removal, so each root is named for its process,
+`legion-tests-<pid>-<random>`, and the next test process to create a root
+removes those whose process is gone and that have gone untouched for an
+hour (a root with no pid in its name, from an older build, after a day).
+
+A test whose code starts a background thread (a cache fill, a session
+launch) must wait for it before its `TempDir` drops: a thread that writes
+afterwards recreates the deleted directory, and nothing removes it again.
 
 ### Real clusters and their task processes
 

@@ -368,3 +368,25 @@ heartbeat.
 **Why (performance at scale).** Every heartbeat of every node takes the
 index's write lock. Measured after the change, a heartbeat costs about 8 µs
 at a million sessions.
+
+## 18. The small guest kernel is documented, not shipped
+
+**Call.** `docs/task-runtime-sandbox.md` ("A smaller guest kernel") lists the
+kernel options Legion's guests use, by what uses them, with an
+`allnoconfig`-based build recipe and what each missing option looks like at
+start. Legion still ships no kernel and no `.config`.
+
+**Alternatives.** (a) Check in a minimal `.config` (or a fragment) and a
+build script. (b) Publish a built `vmlinux` as a release artifact.
+
+**Trade-off.** Every operator builds their own; the doc's recipe is not
+exercised by CI, so a kernel release that renames an option can leave it
+behind. The doc names no CPU figure for the copy, since the repository holds
+no measurement of it.
+
+**Why.** The plan's non-goal stands: "the kernel's size is the operator's".
+(a) and (b) make Legion the owner of a kernel's version, CVEs, and arm64
+build, for a cost (one copy per boot) the operator can remove in an
+afternoon. The options table is the part only Legion can write, and it is
+the part that changes when Legion adds a device.
+
