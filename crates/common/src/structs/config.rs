@@ -4112,7 +4112,11 @@ mod tests {
         };
         // The default: 10% of the disk, at least 1 GiB, at most 20 GiB.
         assert_eq!(derived(None, 100 * GIB)?, 10 * GIB);
-        assert_eq!(derived(None, 4 * GIB)?, GIB);
+        assert_eq!(derived(None, 8 * GIB)?, GIB);
+        // A disk too small for every class's floor: the floor gives way,
+        // never below the 10% share.
+        let small = derived(None, 4 * GIB)?;
+        assert!((4 * GIB / 10..GIB).contains(&small), "{small}");
         assert_eq!(derived(None, 4000 * GIB)?, 20 * GIB);
         // An operator's share has no clamp, and a size is a size.
         assert_eq!(derived(Some("15%"), 1000 * GIB)?, 150 * GIB);

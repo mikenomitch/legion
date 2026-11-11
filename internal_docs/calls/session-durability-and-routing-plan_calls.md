@@ -1001,3 +1001,33 @@ start's cost, below the job lookup, the CA reads, and the round trip
 itself. A reference would be a wire-format change, and it would make a
 manager-routed start depend on the node holding the envelope's current
 spec, for a saving inside the noise.
+
+## 48. `legion session start --resume-id` forces a move only after the node refuses, and only past a node a manager lists down or lost
+
+**Call.** The CLI's edge move first asks the node without `force_move`.
+Only when the node answers `UNAVAILABLE running_elsewhere` (the old node
+did not answer its probe) does it call `ListSessionNodes` for the job and
+task; if the node named in the refusal's `[winner node=<id> ...]` is listed
+`down` or `lost`, it retries once with `force_move` and says so on stderr.
+A manager that cannot be reached, or any other listing, leaves the refusal
+as it was.
+
+```console
+Node w-17 did not answer and is listed lost; moving the session with --force-move
+workspace-q4n7c2rd.01jbx... on w-18 (running, resumed from store, moved from w-17)
+```
+
+**Alternatives.** (a) Call `ListSessionNodes` before every `--resume-id`
+start and set `force_move` up front. (b) Put a `forceMove` hint on each
+`SessionNode` in the listing, for the picker to copy. (c) Leave it to the
+caller, as before.
+
+**Trade-off.** A forced move after the refusal costs the node's 2 s probe
+and one more round trip. The refusal's node id is parsed from the message
+text, the same `[winner node=...]` tail the other move refusals carry.
+
+**Why (simplicity).** The happy path stays manager-free, which is what an
+edge start is for (a). The listing already says `down` or `lost` in
+`reason`, so a hint field would repeat it (b). The manager-routed move
+already forces past a node marked down (entry 30), and the edge form now
+behaves the same (c).

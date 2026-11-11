@@ -418,15 +418,65 @@ impl ContentStoreSettings {
                 ),
             }
         };
+        let mut budgets = ContentBudgets {
+            artifacts: size(ContentClass::Artifacts, self.budgets.artifacts)?,
+            snapshots: size(ContentClass::Snapshots, self.budgets.snapshots)?,
+            derived: size(ContentClass::Derived, self.budgets.derived)?,
+        };
+        if let Some(total) = filesystem_bytes {
+            fit_floors_to_disk(&mut budgets, &self.budgets, total);
+        }
         Ok(ContentStoreConfig {
-            budgets: ContentBudgets {
-                artifacts: size(ContentClass::Artifacts, self.budgets.artifacts)?,
-                snapshots: size(ContentClass::Snapshots, self.budgets.snapshots)?,
-                derived: size(ContentClass::Derived, self.budgets.derived)?,
-            },
+            budgets,
             ttl: self.ttl,
             min_free_disk: self.min_free_disk,
         })
+    }
+}
+
+/// On a disk too small for the share floors (the defaults' 1 GiB artifacts,
+/// 2 GiB snapshots, and 1 GiB derived come to 4 GiB), the floors give way
+/// until the budgets fit the filesystem: each budget a floor lifted above
+/// its plain share is lowered toward that share, all in proportion to how
+/// far their floors lifted them. No budget drops below its share, and fixed
+/// sizes are never touched, so budgets that fit already are unchanged.
+fn fit_floors_to_disk(
+    budgets: &mut ContentBudgets,
+    specs: &ContentBudgetSpecs,
+    filesystem_bytes: u64,
+) {
+    let total: u128 = [budgets.artifacts, budgets.snapshots, budgets.derived]
+        .into_iter()
+        .map(u128::from)
+        .sum();
+    if total <= u128::from(filesystem_bytes) {
+        return;
+    }
+    let mut slots = [
+        (&mut budgets.artifacts, specs.artifacts),
+        (&mut budgets.snapshots, specs.snapshots),
+        (&mut budgets.derived, specs.derived),
+    ];
+    // How far each budget's floor lifted it above its share (capped at its
+    // ceiling); 0 for a fixed size or a budget the floor did not lift.
+    let lifts: Vec<u128> = slots
+        .iter()
+        .map(|(budget, spec)| match *spec {
+            BudgetSpec::Share { percent, max, .. } => {
+                let share = ((filesystem_bytes as f64 * percent / 100.0) as u64).min(max);
+                u128::from(budget.saturating_sub(share))
+            }
+            BudgetSpec::Bytes(_) => 0,
+        })
+        .collect();
+    let lifted: u128 = lifts.iter().sum();
+    if lifted == 0 {
+        return;
+    }
+    let excess = (total - u128::from(filesystem_bytes)).min(lifted);
+    for ((budget, _), lift) in slots.iter_mut().zip(lifts) {
+        let cut = (lift * excess).div_ceil(lifted).min(lift);
+        **budget -= cut as u64;
     }
 }
 
@@ -2029,6 +2079,55 @@ mod tests {
             DEF_CONTENT_ARTIFACTS_BUDGET.to_string(),
             "50% of the disk, at least 1 GiB"
         );
+        Ok(())
+    }
+
+    /// On a disk smaller than the floors, the default budgets give way until
+    /// they fit the filesystem, never below their plain shares; a disk the
+    /// floors fit is untouched, and fixed sizes never move.
+    #[test]
+    fn default_budgets_fit_a_disk_too_small_for_their_floors_test() -> R<()> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let defaults = ContentStoreSettings {
+            budgets: ContentBudgetSpecs::default(),
+            ttl: None,
+            min_free_disk: 0,
+        };
+        let budgets =
+            |disk: u64| -> R<ContentBudgets> { Ok(defaults.config_for(Some(disk))?.budgets) };
+        let sum = |b: ContentBudgets| b.artifacts + b.snapshots + b.derived;
+
+        // The 3a.2 loop filesystem: 1 GiB + 2 GiB + 1 GiB of floors on 1.2 GB.
+        let disk = 1_200_000_000;
+        let small = budgets(disk)?;
+        assert!(sum(small) <= disk, "{small:?}");
+        assert!(
+            sum(small) > disk - 8,
+            "the floors give way only as far as needed"
+        );
+        assert!((disk / 2..GIB).contains(&small.artifacts), "{small:?}");
+        assert!((disk / 5..2 * GIB).contains(&small.snapshots), "{small:?}");
+        assert!((disk / 10..GIB).contains(&small.derived), "{small:?}");
+
+        // 8 GiB holds every floor (4 + 2 + 1 GiB): unchanged.
+        let fits = budgets(8 * GIB)?;
+        assert_eq!(
+            (fits.artifacts, fits.snapshots, fits.derived),
+            (4 * GIB, 2 * GIB, GIB)
+        );
+
+        // A fixed size stays put; only the floors give way around it.
+        let fixed = ContentStoreSettings {
+            budgets: ContentBudgetSpecs {
+                artifacts: BudgetSpec::Bytes(3 * GIB),
+                ..ContentBudgetSpecs::default()
+            },
+            ..defaults.clone()
+        };
+        let around = fixed.config_for(Some(4 * GIB))?.budgets;
+        assert_eq!(around.artifacts, 3 * GIB);
+        assert!(around.snapshots >= (4 * GIB) / 5, "{around:?}");
+        assert!(around.derived >= (4 * GIB) / 10, "{around:?}");
         Ok(())
     }
 

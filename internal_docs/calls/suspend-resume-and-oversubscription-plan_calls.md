@@ -759,6 +759,25 @@ nobody asked for, the same silent change. Pinning at submit also keeps old
 and new workers in agreement, since both read `memory_mib`. The warning text comes from a new `TaskPlugin::check_resources` hook, so
 any runtime that sizes its own workload can do the same.
 
+**Update: `memory_mib` is gone, and nothing is pinned (the §10 follow-up).**
+`config.memory_mib` is refused at submit (`sandbox \`config.memory_mib\` is
+gone ... Hint: drop memory_mib and set resources.memory = N ..., or
+resources.memoryMax = N ...`) and is no longer in the schema. Submit still
+defaults `resources.memory` to 512 MiB, but writes nothing into the config:
+the worker sizes the guest from the resources each unit launches with
+(`memoryMax`, else `memory`, else 512), for the VM, the cgroup ceiling, and
+the restore shape; a resize reads the boot size from the balloon record.
+Rejected: (f) keep pinning under an internal key, refusing only an authored
+`memory_mib`. A pin is a field the user sees in `job get` and may not write;
+it left session sandboxes (whose tasks skip normalization) booting 512 MiB
+whatever their size, and it made a restart after `needs_restart` boot the old
+size, against docs/resize.md. The cost: (d)'s silent shrink no longer
+matters (no installed base), but a sandbox resized below its boot size and
+then suspended now resumes cold, because the checkpoint holds the boot-size
+guest and the resume asks for the resized one (docs/resize.md, "Known
+limitations"). Why (simplicity): one memory number per unit, read in one
+place, with no second copy that can drift from a resize or a session size.
+
 ## 27. `cpus` stays an alias for `cpu` in MHz, with a submit warning under 10 (integration)
 
 *Found while writing the agent sandboxes guide.*
@@ -3485,3 +3504,65 @@ structured field is something a client can branch on. (b) trades a visible
 loss for a locked-out user, which the plan rejected for the default. (c)
 would make every state check in every client learn a new value for what is
 a property of the last resume, not a lifecycle state.
+
+## 141. The reserved-memory gauge reads the store; PSI and content-store bytes ride the reports
+
+*Metrics follow-up (§6.13), implementation.*
+
+**Call.** `legion_node_memory_reserved_bytes{node}` is a `GROUP BY node_id`
+over live allocations on the manager's gauge tick, so it covers every node
+with a live allocation, and every manager reports the same value (take
+`max`, not `sum`). `legion_node_memory_pressure_some_avg10{node}` is set
+from the usage report beside the other usage gauges, as a fractional gauge
+in percent (a new `FloatGaugeVec`). The content-store gauges
+(`legion_content_store_{bytes,pinned_bytes,budget_bytes}{class}`) are worker
+metrics set from the class read the heartbeat already does for the
+`snapshots` budget. Manual capture and restore latency are new histograms
+(`legion_snapshot_capture_seconds{kind}`,
+`legion_snapshot_restore_seconds{kind}`) rather than new `kind` or `reason`
+labels on the suspend and resume histograms.
+
+**Alternatives.** (a) Reserved memory per node from the heartbeat, only
+for nodes that report usage, so it lines up with the usage gauges and sums
+the same way. (b) PSI scaled into the integer gauge (hundredths of a
+percent). (c) Content-store bytes reported to the manager and exported
+there per node. (d) A `purpose` label on `legion_instance_suspend_seconds`.
+
+**Trade-off.** The reserved gauge sums differently from its neighbours in
+the same doc section, costs one aggregate query per manager tick (the
+namespace gauges already run one like it), and like every per-node family
+folds past 256 nodes into `"other"`. The restore histogram costs one
+snapshot row read per successful restore report, since the outcome does
+not carry the kind.
+
+**Why (simplicity, performance).** (a) would cost a store read per usage
+report (every 10 seconds per node), or leave reservations invisible on
+nodes without enforcement, which is where an operator most needs them. (b)
+breaks the rule `FloatGauge` exists for: the series reads in the unit the
+docs state. (c) adds per-node series on the manager for a number each
+worker can export itself. (d) changes the meaning of an existing series a
+dashboard may already plot; separate families keep `instance_*` for
+suspend and resume and `snapshot_*` for the snapshot verbs, matching
+`legion_checkpoint_publish_*`.
+
+## 142. Published parts are expired by an age-based bucket rule the docs spell out, not by Legion
+
+**Call.** Call 62 stands: Legion deletes nothing from the bucket. "Expiring
+published parts" in `docs/suspend-and-resume.md` gives the recipe: pick N, the
+longest a checkpoint must stay restorable; expire `manifests/` after N days
+and `sealed/` after N plus the largest `dedupWindow`, rounded up to days;
+with S3, MinIO, and `file://` examples.
+
+**Alternatives.** (a) A mark-and-sweep collector over snapshot rows, session
+manifests, and archive manifests. (b) A rule on `sealed/` alone.
+
+**Trade-off.** N becomes a ceiling Legion does not know about: a suspended
+instance or a named snapshot older than N fails its restore (or boots cold
+under `onRestoreFailure = "cold"`), with no warning first.
+
+**Why.** The dedup window already makes an age rule safe, so (a) buys
+precision at the price of a subsystem with a delete race. (b) keeps every
+archive manifest forever, so a `manifestOnly` instance never ends and its
+manifest outlives the parts it names; expiring `manifests/` one window
+before `sealed/` ends the instance before its parts can go missing.
+
