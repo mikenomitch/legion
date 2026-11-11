@@ -542,7 +542,6 @@ rig runs for everything below live in the verify list.
   - [ ] Phase 2: sandboxes with file, tree, or layer artifacts (and artifact
         kernels) still build their disk in full each start (calls 5).
   - [ ] Phase 3: `container` still extracts every image per allocation.
-  - [ ] Phase 4: show the cache in `legion node content`; count hits/misses.
 - [ ] **Gated sandboxes by default, with memory checkpoints**
       ([plan](plans/gated-sandbox-checkpoints-plan.md) ·
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md)); Phases 1–5
@@ -1286,6 +1285,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 
 ### Task runtimes
 
+- [ ] Run the new sandbox paths on KVM, both VMMs: the `#[ignore]`d tests for a session run with files in and `--get` out, balloon resize down and back up and `needs_restart` above boot size, `suspendWithOwner`, a `store` session's `--move`, and `runtime disable --drain` suspending a keyed sandbox ([session-runs](plans/session-runs-plan.md) · [resize](plans/resize-plan.md) · [child-sessions](plans/child-sessions-plan.md)).
 - [ ] Run the sandbox-boot cases on Firecracker and with TAP guests (~1 h, ~$1) to decide whether `auto` should prefer Firecracker ([docs](../docs/task-runtime-sandbox.md#choosing-a-vmm), [calls 15](calls/sandbox-boot-throughput-plan_calls.md)).
 - [ ] Measure root-disk-bound boot throughput on a node type with local NVMe ([results](../benchmarks/aws/sandbox-boot/RESULTS.md)).
 - [ ] Run the lazy-memory restore matrix (1/4/8 GiB, lazy vs eager, cloud-hypervisor v51–v53 and Firecracker, first read after resume, no-userfaultfd fallback, and once with `LEGION_SANDBOX_GATED_DEFAULT=1`) on a ≥32 GiB c5.metal; record numbers in the sandbox doc's "Restore time", RESULTS.md, and [plan §9](plans/lazy-memory-restore-plan.md#9-testing-plan).
@@ -1400,6 +1400,10 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 
 ## Task runtimes
 
+- **Runtime disable, Phases 1–2** — `legion operator runtime disable|enable|status`: a replicated switch that refuses every start of a runtime cluster-wide or per namespace glob, blocks and wakes evals, and `--drain` suspends or stops what is running ([plan](plans/runtime-disable-plan.md) · [calls](calls/runtime-disable-plan_calls.md) · [docs](../docs/runtime-disable.md))
+- **Session runs, Phases 1–2** — `legion session run` / `RunSession` on `exec`, `container` and `sandbox` session tasks: one call, a single-use session, output and result back ([plan](plans/session-runs-plan.md) · [calls](calls/session-runs-plan_calls.md) · [docs](../docs/session-runs.md)); prepared-VM starts wait on sandbox-scaling Phase 8
+- **Child sessions, Phases 1–4** — a unit owns sessions or keyed instances of a sibling task; cascade, promotion, identity claims on keyed children, connection handoff, starts from inside a task with no token ([plan](plans/child-sessions-plan.md) · [calls](calls/child-sessions-plan_calls.md) · [docs](../docs/child-sessions.md))
+- **Resize, Phases 1–4** — in-place `alloc resize` / `instance resize`, the `job resize` task override, `--move`; sizes stay with instances across suspend and resume ([plan](plans/resize-plan.md) · [calls](calls/resize-plan_calls.md) · [docs](../docs/resize.md))
 docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 - **Runtimes** — the task-runtime plugin framework, the "task kind" → "task runtime" rename ([plan](plans/task-runtime-rename-plan.md)), and the [noop](../docs/task-runtime-noop.md), [exec](../docs/task-runtime-exec.md), [container](../docs/task-runtime-container.md) (Apple `container` / runc or crun, no Docker) and [sandbox](../docs/task-runtime-sandbox.md) runtimes
@@ -1449,6 +1453,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 ## Artifacts
 
+- **Derived content, Phase 1** — the `derived` class of the node content store; sandbox root disk bases on it, listed in `legion node content` with hit and build metrics (closes root disk cache Phase 4); `content.budgets.derived` replaces `LEGION_SANDBOX_ROOTFS_CACHE` ([plan](plans/derived-content-plan.md) · [calls](calls/derived-content-plan_calls.md) · [docs](../docs/artifacts.md#derived-content)); the `cwasm`, `preinit-*` and `vm-base` kinds arrive with their consumers
 [plan](plans/artifact-system-plan.md) · [docs](../docs/artifacts.md)
 
 - **Artifact basics** — `oci://` fetcher and ORAS, KV-backed fetch auth, https/file/git/s3 fetchers with checksums and safe unpack, fetcher plugins, OCI layout → runtime bundle
