@@ -1264,6 +1264,11 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
 - [ ] **Spot-check papercuts** ([findings](launch-spot-check-findings.md#re-run-2026-10-12)):
   - [ ] **Stopping the macOS manager leaves its Apple containers running** — closed by
         [#39](https://github.com/mikenomitch/legion/pull/39).
+  - [ ] **Orphaned Apple containers are never reaped.** A container labeled
+        `legion.node=<this node>` whose allocation no longer exists (a crash, or
+        a stop from before #39) keeps its published ports, so a new allocation
+        of the job cannot bind them. Sweep this node's labeled containers at
+        worker start; `container system stop`/`start` clears a hung one.
   - [ ] **A count=1 job got repeated second placements after a KV env-change
         restart.** Not root-caused; check `job_config_unwanted_reason`.
   - [ ] **Pressure evictions still loop forever by default** (unlimited `move_count`,
