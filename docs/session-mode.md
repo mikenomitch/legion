@@ -300,7 +300,10 @@ starts an unnamed session. The reply carries `mode = "session"`,
 
 A create that finds no room is refused rather than queued, so size
 envelopes for the peak you want to absorb, or make them
-[elastic](#elastic-envelopes).
+[elastic](#elastic-envelopes). `legion_sessions_envelope_free{job}` says how
+many more sessions fit the job's envelopes right now; each manager reports
+the nodes that heartbeat to it, so sum it across managers
+([metrics](metrics.md#sessions)).
 
 ## Listing sessions
 
@@ -745,7 +748,12 @@ names with the same ticket (`GetSession`, 2 seconds): when the session
 runs there, it claims the next generation, asks that node to stop its copy
 (`StopSession`), and launches. When that node does not answer, it refuses
 `UNAVAILABLE` unless the request sets `--force-move`; a picker sets it when
-`legion session nodes` lists the old node as `down` or `lost`. A
+`legion session nodes` lists the old node as `down` or `lost`. `legion
+session start --resume-id` is such a picker: on that refusal it asks a
+manager (`ListSessionNodes`, with your token) how the old node is listed
+and, when it is `down` or `lost`, retries once with `force_move` (a text-mode
+run says so on stderr). When no manager answers, or the node is listed any other way,
+the refusal stands. A
 `StartSession` that resumes answers with `resumedFrom = "store"` (or
 `"cold"`), the `generation` it claimed, and `movedFrom`.
 
@@ -974,6 +982,9 @@ outcome}` counts resizes on the managers ([metrics](metrics.md#sessions)).
   envelope.
 - Watch `legion_session_starts_total{outcome}`: a rising `no_room` or
   `refused` count means the envelopes are too small for the arrival rate.
+- Watch `legion_sessions_envelope_free{job}`, summed across managers: the
+  sessions the envelopes can still take. Alert before it reaches the burst
+  you expect, rather than on refusals after it.
 - Watch `legion_worker_launch_refusals_total` on the nodes: a rising count
   means starts arrive faster than `edgeBoot.launchConcurrency` launches
   finish. Raise it if the runtime's boot is I/O-bound, or add nodes.

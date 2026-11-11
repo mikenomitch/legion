@@ -232,8 +232,8 @@ fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
 ```
 
 An `Err` rejects the job, and each returned string is a warning on the
-`job run` reply. `sandbox` uses it to warn when `config.memory_mib`
-disagrees with the guest size `resources` imply.
+`job run` reply. `sandbox` uses it to refuse a guest that `resources`
+size below what a Linux kernel boots in.
 Every governed task, whatever its mode, is also measured and reported as
 usage ([resource-enforcement.md](resource-enforcement.md#measuring-usage)).
 

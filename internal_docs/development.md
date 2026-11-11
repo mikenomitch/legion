@@ -121,8 +121,9 @@ down now, and what to keep doing:
 - **Temp dirs.** Store helpers that `keep()` a `TempDir` create it under the
   per-process scratch root (`crates/common/src/test_scratch.rs`,
   `tests/integration/support.rs`), which is removed when the test process
-  exits. A run killed with Ctrl-C leaves its one `legion-tests-*` directory in
-  `$TMPDIR`; delete those by hand if they pile up.
+  exits. A run killed with Ctrl-C leaves its one `legion-tests-<pid>-*`
+  directory in `$TMPDIR`, and the next test process removes it once that pid
+  is gone and the root has been idle for an hour.
 - **Build scripts.** The root `build.rs` re-runs only when itself or the
   plugin env vars change; `proto/build.rs` only when `proto/` changes. It used
   to watch the whole repository, so editing a doc or a UI file rebuilt the

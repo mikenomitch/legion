@@ -2396,6 +2396,22 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
+    // Reservations per node, from the replicated store: the same on every
+    // manager, unlike the usage gauges beside it (docs/metrics.md, "Node
+    // usage"). A node whose last live allocation ended drops to 0.
+    match store.node_reserved_memory_mib() {
+        Ok(reserved) => {
+            let entries: Vec<(Vec<String>, i64)> = reserved
+                .into_iter()
+                .map(|(node_id, mib)| (vec![node_id], (mib * 1024.0 * 1024.0) as i64))
+                .collect();
+            telemetry.node_memory_reserved_bytes.set_all(&entries);
+        }
+        Err(err) => debug!(error = ?err, "Failed refreshing node reservation gauge"),
+    }
+    // Free envelope room per session job (docs/metrics.md, "Sessions"),
+    // throttled inside: it reads each session job's envelopes.
+    crate::manager::sessions::refresh_envelope_free_gauge(store);
     match store.namespace_usage() {
         Ok(usage) => {
             // Every namespace that exists gets a series, so an emptied one

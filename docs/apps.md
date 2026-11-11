@@ -430,10 +430,16 @@ app rollback`; to go back, upgrade with the previous manifest.
 
 ```console
 $ legion app config schema autoscaler     # JSON Schema
-$ legion app config get autoscaler        # JSON, valid input for `config set`
+$ legion app config get autoscaler        # Nickel, valid input for `config set`; -j for JSON
 $ legion app config set autoscaler -f autoscaler.ncl
 autoscaler: config changed; its job rolls with the new config
 ```
+
+`config get` prints the config as a Nickel record under a comment that
+says how to apply it, so the round trip is
+`legion app config get autoscaler > autoscaler.ncl`, edit, `config set`.
+With `-j` it prints the standard envelope,
+`{ "ok": true, "data": { "app": "autoscaler", "config": { … } } }`.
 
 The config lives on the app record. `config set` replaces it whole,
 validated against the manifest's schema, and the reconciler resubmits the
@@ -2034,8 +2040,6 @@ them, and which allocation answered. The MCP server exposes
   `legion-system` jobs directly gets `FailedPrecondition` for installed
   apps' jobs: drive apps through `legion app` (or `InstallApp`,
   `UpdateAppSettings`, `SetAppConfig`) instead.
-- **`config get` prints JSON**, not Nickel. JSON is valid input for `config
-  set`.
 - **Uninstall leaves the stopped job, and the app's KV.** `legion job
   destroy legion-system/<app>` removes the job; `--purge` removes the KV
   under `legion/apps/<app>/` (or `legion kv delete` later).

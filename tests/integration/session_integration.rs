@@ -801,6 +801,33 @@ async fn a_refusing_node_sends_the_session_to_the_next_test() -> R<()> {
     Ok(())
 }
 
+/// `legion_sessions_envelope_free{job}` (docs/metrics.md, "Sessions"): the
+/// sessions the job's envelopes can still take, on the nodes this manager
+/// indexes, counting its own starts before the nodes report them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envelope_free_counts_the_sessions_the_envelopes_can_still_take_test() -> R<()> {
+    let cluster = Cluster::new("agents-free", &["n1", "n2"]).await?;
+    let free = || -> R<Option<u64>> {
+        Ok(
+            legion::manager::sessions::envelope_free_by_job(cluster.store())?
+                .get(&cluster.job)
+                .copied(),
+        )
+    };
+    cluster.report("n1").await?;
+    cluster.report("n2").await?;
+    assert_eq!(free()?, Some(8), "four sessions per empty envelope");
+
+    for _ in 0..3 {
+        cluster.create(None).await?;
+    }
+    assert_eq!(free()?, Some(5), "the router's own starts count at once");
+    cluster.report("n1").await?;
+    cluster.report("n2").await?;
+    assert_eq!(free()?, Some(5), "and the nodes' reports agree");
+    Ok(())
+}
+
 /// Child sessions, placement (docs/child-sessions.md): a child goes to its
 /// owner's node first, and the router falls back to another node with room
 /// when that node refuses it.

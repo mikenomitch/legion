@@ -727,9 +727,16 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     ));
     warnings.extend(crate::task_plugins::container_security_warnings(&config));
     // Namespace policy job rules (docs/namespaces.md, "Job rules"), when this
-    // caller can read the policies. `job plan` and `job run` always check
-    // them, on the manager.
-    match job_rules_refusal(arg_matches, &rendered, &config).await {
+    // caller can read the policies that govern the job's namespace
+    // (`namespace:read` there, or `acl:read`). `job plan` and `job run`
+    // always check them, on the manager.
+    match job_rules_refusal(
+        crate::cmd::helpers::active_namespace(arg_matches),
+        &rendered,
+        &config,
+    )
+    .await
+    {
         Ok(None) => {}
         Ok(Some(refusal)) => {
             let (message, hint) = crate::cmd::helpers::split_hint(&refusal);
@@ -780,25 +787,20 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
 
 /// `job validate`'s check of namespace policy `jobRules` (PLG4): the
 /// refusal the manager would give, `None` when the job passes, or why the
-/// rules could not be read (no manager, or no `acl:read`).
-async fn job_rules_refusal(
-    matches: &ArgMatches,
+/// rules could not be read. `active_namespace` is `-n` (or the CLI's
+/// default namespace), used when the spec names none. The governing policies come from the job's
+/// namespace (`GetNamespace`, `namespace:read` there, which a tenant holds
+/// and which already shows every governing policy whole), else from the
+/// full list (`ListNamespacePolicies`, `acl:read`), which also covers a
+/// namespace that does not exist yet.
+pub(crate) async fn job_rules_refusal(
+    active_namespace: Option<String>,
     rendered: &str,
     config: &JobConfig,
 ) -> Result<Option<String>, String> {
     let mut client = connect_manager_client()
         .await
         .map_err(|err| format!("no manager: {err:#}"))?;
-    let reply = client
-        .list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {})
-        .await
-        .map_err(|status| status.message().to_string())?
-        .into_inner();
-    let policies: Vec<crate::structs::namespace_policy::NamespacePolicy> = reply
-        .policies
-        .iter()
-        .filter_map(|policy| serde_json::from_str(&policy.object_json).ok())
-        .collect();
     // The namespace the submit would use: the jobspec's own, else -n, else
     // `default`.
     let declared = serde_json::from_str::<Value>(rendered)
@@ -815,8 +817,46 @@ async fn job_rules_refusal(
                 })
         });
     let namespace = declared
-        .or_else(|| crate::cmd::helpers::active_namespace(matches))
+        .or(active_namespace)
         .unwrap_or_else(|| crate::structs::namespace::DEFAULT_NAMESPACE.to_string());
+    let decode = |policy: &crate::structs::NamespacePolicy| {
+        serde_json::from_str::<crate::structs::namespace_policy::NamespacePolicy>(
+            &policy.object_json,
+        )
+        .ok()
+    };
+    let policies: Vec<crate::structs::namespace_policy::NamespacePolicy> = match client
+        .get_namespace(crate::structs::GetNamespaceRequest {
+            name: namespace.clone(),
+        })
+        .await
+    {
+        Ok(reply) => reply
+            .into_inner()
+            .policies
+            .iter()
+            .filter_map(|status| status.policy.as_ref())
+            .filter_map(decode)
+            .collect(),
+        Err(by_namespace) => match client
+            .list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {})
+            .await
+        {
+            Ok(reply) => reply
+                .into_inner()
+                .policies
+                .iter()
+                .filter_map(decode)
+                .collect(),
+            Err(by_list) => {
+                return Err(format!(
+                    "reading them needs `namespace:read` on {namespace} or `acl:read`: {}; {}",
+                    by_namespace.message(),
+                    by_list.message()
+                ))
+            }
+        },
+    };
     let mut job = config.clone();
     job.name = crate::structs::namespace::job_id(
         &namespace,

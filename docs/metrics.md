@@ -432,9 +432,27 @@ across them by `node`.
   over the node's governed allocations.
 - **`legion_node_cpu_used_millicores{node}`** (gauge): CPU used by governed
   allocations over the last interval, in thousandths of a core.
+- **`legion_node_memory_pressure_some_avg10{node}`** (gauge): the node's
+  memory pressure, PSI `some avg10` from `/proc/pressure/memory`, in percent:
+  the share of the last 10 seconds in which at least one task stalled
+  waiting for memory. It is the number the node's
+  [pressure response](resource-enforcement.md#memory-pressure) compares with
+  `memoryPressure.maxStall`, and the `stall` figure in the `PRESSURE` column
+  of `legion node usage`. Reads `0` on a kernel without PSI.
 
-One series per reporting node. Reservations aren't exported as gauges. Read
-them with `legion node usage`.
+One series per reporting node.
+
+- **`legion_node_memory_reserved_bytes{node}`** (gauge): memory the live
+  allocations placed on the node reserve: every allocation that is not
+  complete or failed, including a suspended instance that holds its
+  reservation (`suspend.reserve`). Unlike the gauges above it is read from
+  the replicated store every few seconds, so it covers every node with a
+  live allocation, enforcement or not, and every manager reports the same
+  value: take `max` across managers, not `sum`. A node whose last live
+  allocation ends drops to `0`. Against `legion_node_memory_physical_bytes`
+  it shows how far a node is oversubscribed, and against
+  `legion_node_memory_used_bytes` how much of what is reserved is in use.
+  CPU reservations are not exported. Read them with `legion node usage`.
 
 - **`legion_node_pressure_actions_total{node,step}`** (counter): actions a
   node's memory pressure response reported, by `step` (`reclaim`, `suspend`,
@@ -458,6 +476,16 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   not included. What a memory restore waits for depends on its
   `memory_restore` mode (see
   [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)).
+- **`legion_snapshot_capture_seconds{kind}`** (histogram): how long each
+  successful manual snapshot capture (`legion snapshot create`,
+  `CreateSnapshot`) took on its node, by `kind`. Suspends are
+  `legion_instance_suspend_seconds`, and fork captures are not observed.
+  Buckets run from 25 ms to 60 s.
+- **`legion_snapshot_restore_seconds{kind}`** (histogram): how long each
+  successful restore from a snapshot (`legion snapshot restore`, or an
+  instance [created from one](suspend-and-resume.md#create-from-a-snapshot))
+  took on its node, by the snapshot's `kind`. Resuming a suspended instance is
+  `legion_instance_resume_seconds`. Placement time is not included.
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
   by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
   `pressure` (a node's `suspend` pressure step), `park` (the workload
@@ -516,6 +544,19 @@ across them. See [session-mode.md](session-mode.md).
   [disabled](runtime-disable.md)). None of them
   writes the replicated store. A rising `no_room` or `refused` rate means
   the envelopes are too small for the arrival rate.
+- **`legion_sessions_envelope_free{job}`** (gauge): how many more sessions
+  of their task's size fit the job's envelopes right now: each envelope's
+  room less what its sessions hold, divided by one session's `resources`
+  (on the tightest key) and summed over the job's nodes and session tasks.
+  It is the burst a job can take before creates are refused with
+  `RESOURCE_EXHAUSTED`. Unlike the counters in this section it is a gauge
+  over the nodes whose heartbeats this manager holds, since that is where
+  their session reports land, so **sum it across managers**. Refreshed
+  every 10 seconds, from the sessions' last reports and this manager's own
+  starts since. An [elastic envelope](session-mode.md#elastic-envelopes)
+  counts at its current size, so the gauge can read low while the envelope
+  is about to grow. A job whose envelopes are gone (stopped, or not placed
+  yet) reads `0`. Alert on it falling toward the burst you need to absorb.
 - **`legion_session_stops_total{reason}`** (counter): sessions this manager
   ended on their nodes, by `reason`: `stop`, `destroy`, or `duplicate` (the
   later copy of a session id running on two nodes).
@@ -1033,6 +1074,21 @@ that has never taken a provisional start.
   already on the node. Hits against builds is the class's hit rate.
 - **`legion_derived_bytes`** (gauge): disk the derived class holds, in
   allocated blocks. Compare it with `content.budgets.derived`.
+- **`legion_content_store_bytes{class}`** (gauge): bytes the node
+  [content store](artifacts.md) holds, by `class`: `artifacts` (fetched
+  artifacts and image layers), `snapshots` (checkpoint parts, local
+  snapshots and suspends included), and `derived`. Refreshed on every
+  heartbeat, so it lags a write by at most one interval. For `derived` it
+  is the same number as `legion_derived_bytes` (allocated blocks), which is
+  updated on every change instead.
+- **`legion_content_store_pinned_bytes{class}`** (gauge): of those, the
+  bytes held by a pin (a snapshot's parts, content a task is using). Budget,
+  TTL, and `minFreeDisk` eviction cannot free them. A class whose pinned
+  bytes reach its budget refuses new content.
+- **`legion_content_store_budget_bytes{class}`** (gauge): each class's
+  budget (`content.budgets.<class>`). Alert on `bytes / budget` for
+  `snapshots` to see a node running out of room for checkpoints before
+  `legion node usage` reports it full.
 - **`legion_runtime_disabled_refusals_total{runtime}`** (counter): starts
   this worker refused because their runtime is
   [disabled](runtime-disable.md): placements, session starts, claims,

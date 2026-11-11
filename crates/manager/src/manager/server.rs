@@ -3569,7 +3569,10 @@ impl ManagerDaemonService {
                         // them could register as a live peer, rotate away its
                         // token, and mint its certificates. A node that has
                         // gone `lost` (a worker that lost its disk) can be
-                        // joined again under its name.
+                        // joined again under its name, but only by a token
+                        // for the pool it was in: a lost node keeps its
+                        // node-local volumes and identity, which a token
+                        // pinned to another pool was never issued for.
                         match self.store.get_node(name) {
                             Ok(existing) if existing.status != "lost" => Some(format!(
                                 "node {name:?} is registered and live ({}); a join token may \
@@ -3577,6 +3580,12 @@ impl ManagerDaemonService {
                                  its own state directory (it holds the node's token), give it \
                                  another name, or wait until the old node is marked lost",
                                 existing.status
+                            )),
+                            Ok(existing) if existing.pool != pinned.pool => Some(format!(
+                                "node {name:?} is lost from pool {:?}; a join token for pool \
+                                 {:?} may not rejoin it. Give the worker another name, or \
+                                 forget the old node first (`legion node forget {name}`)",
+                                existing.pool, pinned.pool
                             )),
                             _ => None,
                         }

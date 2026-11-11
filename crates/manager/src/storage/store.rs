@@ -2959,6 +2959,26 @@ impl Store {
         Ok(conn.query_row("SELECT COUNT(*) FROM allocation;", [], |row| row.get(0))?)
     }
 
+    /// Memory, in MiB, that each node's live allocations reserve, for the
+    /// `legion_node_memory_reserved_bytes` gauge. Live is what the namespace
+    /// gauges count: anything not complete or failed, so a suspended
+    /// instance holding its reservation (`suspend.reserve`) counts. Nodes
+    /// with no live allocation are absent.
+    pub fn node_reserved_memory_mib(&self) -> R<Vec<(String, f64)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT node_id,
+                    COALESCE(SUM(CAST(json_extract(resources, '$.memory') AS REAL)), 0)
+             FROM allocation
+             WHERE status NOT IN ('{}', '{}') AND json_valid(resources)
+             GROUP BY node_id;",
+            crate::constants::ALLOCATION_STATUS_COMPLETE,
+            crate::constants::ALLOCATION_STATUS_FAILED,
+        ))?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Self::collect_rows(rows)
+    }
+
     #[instrument(err, skip_all)]
     fn db_path(store_path: &str) -> R<std::path::PathBuf> {
         // let conn = Connection::open_in_memory()?;

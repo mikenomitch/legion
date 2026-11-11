@@ -157,6 +157,36 @@ fn job_rules_refuse_at_plan_and_run() -> R<()> {
     cluster
         .run(container_job("web", "nginx:1.27", json!({})))
         .map_err(|status| anyhow::anyhow!("a pinned image is admitted: {status}"))?;
+
+    // `job validate` without `acl:read` reads the governing policies from
+    // `GetNamespace` (`namespace:read`): they arrive whole, rules included,
+    // and give the refusal the manager gives.
+    let reply =
+        cluster
+            .runtime
+            .block_on(cluster.svc.get_namespace(Request::new(
+                legion::structs::GetNamespaceRequest {
+                    name: "default".into(),
+                },
+            )))
+            .map_err(|status| anyhow::anyhow!("get namespace: {status}"))?
+            .into_inner();
+    let policies: Vec<legion::structs::namespace_policy::NamespacePolicy> = reply
+        .policies
+        .iter()
+        .filter_map(|status| status.policy.as_ref())
+        .map(|policy| serde_json::from_str(&policy.object_json))
+        .collect::<Result<_, _>>()?;
+    let governing = legion::structs::namespace_policy::governing(&policies, "default");
+    let mut job: legion::structs::JobConfig =
+        serde_json::from_str(&container_job("default/web", "nginx:latest", json!({})))?;
+    job.name = "default/web".into();
+    let refusal = legion::structs::namespace_policy::check_job_rules(&governing, &job)
+        .expect_err("the rule refuses :latest");
+    assert!(
+        refusal.contains("namespace policy 'house-rules' jobRules[0]: pin images"),
+        "{refusal}"
+    );
     Ok(())
 }
 

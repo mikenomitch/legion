@@ -12,7 +12,7 @@ use crate::storage::session_index::Usage;
 use crate::storage::store::Store;
 use crate::structs::edge_boot::Gate;
 use crate::structs::session::{
-    envelope_serves, resource_amounts, session_claim_id, SessionPlacement, ENVELOPE_RUNTIME,
+    envelope_serves, resource_amounts, session_claim_id, SessionPlacement,
 };
 use crate::structs::{
     Allocation, IndexedSession, InstanceInfo, JobConfig, ProvisionalAllocation, QuerySessionsReply,
@@ -938,8 +938,28 @@ pub fn envelope_nodes(store: &Store, job_id: &str, task_name: &str) -> R<Vec<Str
 }
 
 fn placed_envelopes(store: &Store, job_id: &str, task_name: &str) -> R<Vec<Envelope>> {
+    Ok(placed_envelopes_by_task(store, job_id)?
+        .remove(task_name)
+        .map(|task| task.envelopes)
+        .unwrap_or_default())
+}
+
+/// One session task's placed envelopes, and the size of one of its
+/// sessions.
+#[derive(Debug, Clone, Default)]
+struct TaskEnvelopes {
+    envelopes: Vec<Envelope>,
+    /// The session task's `resources`, from the job config of its newest
+    /// envelope.
+    needs: BTreeMap<String, f64>,
+    needs_from: i64,
+}
+
+/// Every session task of a job with the envelopes placed for it, by task
+/// name, from one read of the job's allocations.
+fn placed_envelopes_by_task(store: &Store, job_id: &str) -> R<BTreeMap<String, TaskEnvelopes>> {
     let mut configs: HashMap<String, std::sync::Arc<Vec<(i64, TaskConfig)>>> = HashMap::new();
-    let mut envelopes: BTreeMap<String, Envelope> = BTreeMap::new();
+    let mut tasks: BTreeMap<String, TaskEnvelopes> = BTreeMap::new();
     for allocation in store.allocs_for_job(job_id)? {
         if !crate::constants::allocation_status_is_dispatchable(&allocation.status) {
             continue;
@@ -950,34 +970,157 @@ fn placed_envelopes(store: &Store, job_id: &str, task_name: &str) -> R<Vec<Envel
                 store.shared_task_configs_for_job_config(&allocation.job_config_id)?,
             );
         }
-        let serves = configs[&allocation.job_config_id]
+        let config = &configs[&allocation.job_config_id];
+        let Some(task_name) = config
             .iter()
             .find(|(id, _)| *id == allocation.task_config_id)
-            .is_some_and(|(_, task)| {
-                task.runtime == ENVELOPE_RUNTIME && envelope_serves(task) == Some(task_name)
-            });
-        if !serves {
+            .and_then(|(_, task)| envelope_serves(task))
+        else {
             continue;
+        };
+        let task = tasks.entry(task_name.to_string()).or_default();
+        if allocation.id > task.needs_from {
+            if let Some((_, session)) = config.iter().find(|(_, task)| task.name == task_name) {
+                task.needs = resource_amounts(&session.resources);
+                task.needs_from = allocation.id;
+            }
         }
         // During a job update a node can briefly hold two. The node admits
         // against the newest, and an elastic envelope's size is its own, so
         // the newest is the room.
-        if envelopes
-            .get(&allocation.node_id)
-            .is_some_and(|held| held.allocation_id > allocation.id)
+        if let Some(held) = task
+            .envelopes
+            .iter_mut()
+            .find(|held| held.node_id == allocation.node_id)
         {
+            if held.allocation_id < allocation.id {
+                held.allocation_id = allocation.id;
+                held.room = resource_amounts(&allocation.resources);
+            }
             continue;
         }
-        envelopes.insert(
-            allocation.node_id.clone(),
-            Envelope {
-                node_id: allocation.node_id.clone(),
-                allocation_id: allocation.id,
-                room: resource_amounts(&allocation.resources),
-            },
-        );
+        task.envelopes.push(Envelope {
+            node_id: allocation.node_id.clone(),
+            allocation_id: allocation.id,
+            room: resource_amounts(&allocation.resources),
+        });
     }
-    Ok(envelopes.into_values().collect())
+    for task in tasks.values_mut() {
+        task.envelopes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    }
+    Ok(tasks)
+}
+
+/// What an envelope has left once `used` (its node's sessions of the task)
+/// is taken out, never below zero.
+fn free_room(envelope: &Envelope, used: Option<&BTreeMap<String, f64>>) -> BTreeMap<String, f64> {
+    envelope
+        .room
+        .iter()
+        .map(|(name, amount)| {
+            let taken = used.and_then(|used| used.get(name)).copied().unwrap_or(0.0);
+            (name.clone(), (amount - taken).max(0.0))
+        })
+        .collect()
+}
+
+/// How often [`refresh_envelope_free_gauge`] reads the envelopes again.
+/// Sessions report on heartbeats, so a shorter period would only repeat
+/// the same numbers.
+const ENVELOPE_FREE_EVERY: Duration = Duration::from_secs(10);
+
+/// Refresh `legion_sessions_envelope_free{job}` (docs/metrics.md,
+/// "Sessions") from [`envelope_free_by_job`], at most once per
+/// [`ENVELOPE_FREE_EVERY`]. A job whose envelopes are all gone reads 0.
+pub fn refresh_envelope_free_gauge(store: &Store) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|at| at.elapsed() < ENVELOPE_FREE_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    match envelope_free_by_job(store) {
+        Ok(free) => {
+            let entries: Vec<(Vec<String>, i64)> = free
+                .into_iter()
+                .map(|(job_id, slots)| (vec![job_id], i64::try_from(slots).unwrap_or(i64::MAX)))
+                .collect();
+            crate::manager::telemetry::metrics()
+                .sessions_envelope_free
+                .set_all(&entries);
+        }
+        Err(err) => debug!(error = ?err, "Failed refreshing the envelope free gauge"),
+    }
+}
+
+/// For every job with live envelopes, how many more sessions of their
+/// task's size fit its envelopes on the nodes this manager's session index
+/// covers (the nodes that heartbeat to it), summed over the job's session
+/// tasks. Each node counts on one manager, so the cluster's headroom is the
+/// sum across managers. Reads this manager's index only: no peer is asked.
+pub fn envelope_free_by_job(store: &Store) -> R<BTreeMap<String, u64>> {
+    let now = Instant::now();
+    let mut free = BTreeMap::new();
+    for job_id in store.envelope_job_ids()? {
+        let tasks = placed_envelopes_by_task(store, &job_id)?;
+        if tasks.is_empty() {
+            continue;
+        }
+        let mut slots = 0u64;
+        for (task_name, task) in tasks {
+            let reply = store.sessions().query(
+                &QuerySessionsRequest {
+                    job_id: job_id.clone(),
+                    task_name,
+                    usage_only: true,
+                    ..Default::default()
+                },
+                now,
+            );
+            let covered: HashSet<String> = reply
+                .covered_nodes
+                .into_iter()
+                .map(|covered| covered.node_id)
+                .collect();
+            let used: HashMap<String, BTreeMap<String, f64>> = reply
+                .node_usage
+                .into_iter()
+                .map(|usage| {
+                    (
+                        usage.node_id,
+                        serde_json::from_str(&usage.resources).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            slots = slots.saturating_add(free_slots(&task.envelopes, &used, &covered, &task.needs));
+        }
+        free.insert(job_id, slots);
+    }
+    Ok(free)
+}
+
+/// Sessions needing `needs` that still fit `envelopes` on the `covered`
+/// nodes, given what each node's sessions use. A session that sizes
+/// nothing is not bounded by its envelope and counts as `u32::MAX` per
+/// node, as [`fits`] reports it.
+fn free_slots(
+    envelopes: &[Envelope],
+    used: &HashMap<String, BTreeMap<String, f64>>,
+    covered: &HashSet<String>,
+    needs: &BTreeMap<String, f64>,
+) -> u64 {
+    envelopes
+        .iter()
+        .filter(|envelope| covered.contains(&envelope.node_id))
+        .map(|envelope| {
+            u64::from(fits(
+                &free_room(envelope, used.get(&envelope.node_id)),
+                needs,
+            ))
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Make sure the router holds a view of a task's envelopes, reading it
@@ -1345,17 +1488,7 @@ pub async fn session_nodes(
         .map(|envelope| {
             let node = store.get_node(&envelope.node_id).ok();
             let used = usage.get(&envelope.node_id);
-            let room: BTreeMap<String, f64> = envelope
-                .room
-                .iter()
-                .map(|(name, amount)| {
-                    let taken = used
-                        .and_then(|used| used.amounts.get(name))
-                        .copied()
-                        .unwrap_or(0.0);
-                    (name.clone(), (amount - taken).max(0.0))
-                })
-                .collect();
+            let room = free_room(&envelope, used.map(|used| &used.amounts));
             let weight = fits(&room, &needs);
             let address = node
                 .as_ref()
@@ -2634,6 +2767,39 @@ mod sessions_test {
             "a started session counts until the next refresh"
         );
         Ok(())
+    }
+
+    /// The envelope free gauge counts sessions of the task's size left in
+    /// each envelope, only on nodes this manager indexes.
+    #[test]
+    fn envelope_free_counts_session_slots_on_covered_nodes_test() {
+        let amounts = |cpu: f64, memory: f64| {
+            BTreeMap::from([("cpu".to_string(), cpu), ("memory".to_string(), memory)])
+        };
+        let envelope = |node: &str| Envelope {
+            node_id: node.into(),
+            allocation_id: 1,
+            room: amounts(2000.0, 2048.0),
+        };
+        let envelopes = vec![envelope("n1"), envelope("n2"), envelope("elsewhere")];
+        let needs = amounts(500.0, 512.0);
+        let covered: HashSet<String> = ["n1".to_string(), "n2".to_string()].into();
+        // n1 runs three sessions; n2 runs one that grew past its envelope's
+        // memory, which leaves no room rather than negative room.
+        let used = HashMap::from([
+            ("n1".to_string(), amounts(1500.0, 1536.0)),
+            ("n2".to_string(), amounts(500.0, 4096.0)),
+        ]);
+        assert_eq!(free_slots(&envelopes, &used, &covered, &needs), 1);
+        assert_eq!(
+            free_slots(&envelopes, &HashMap::new(), &covered, &needs),
+            8,
+            "four per empty envelope; the uncovered node is another manager's"
+        );
+        assert_eq!(
+            free_slots(&envelopes, &HashMap::new(), &HashSet::new(), &needs),
+            0
+        );
     }
 
     #[test]

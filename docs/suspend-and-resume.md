@@ -717,7 +717,8 @@ placed in time (no eligible instances, or a node that is down) follows
 
 Memory checkpoints live in the node content store under the `snapshots`
 budget (`content.budgets.snapshots`). By default that is 20% of the disk
-holding the worker's state directory, clamped to 2 GiB to 200 GiB (see
+holding the worker's state directory, clamped to 2 GiB to 200 GiB, with the
+floor giving way on a disk too small for every class's floor (see
 [the node content store](artifacts.md#the-node-content-store)). Every
 suspended instance's `local` checkpoint stays pinned there until it resumes
 or is destroyed, so a node full of suspended instances can run out of room
@@ -758,8 +759,8 @@ its content card.
 When a node's checkpoint room is smaller than one more checkpoint of a
 task, the scheduler does not place **new** instances of that task on the
 node. This applies only to tasks whose `suspend` block checkpoints memory. A
-checkpoint's size is estimated as the guest's memory (`config.memory_mib`,
-else `resources.memoryMax`, else `resources.memory`). Resumes and other
+checkpoint's size is estimated as the guest's memory (`resources.memoryMax`,
+else `resources.memory`). Resumes and other
 restores are never held back, since their checkpoint already exists. When no
 node has room, placement fails with a count of which limit was short:
 
@@ -921,7 +922,7 @@ if it was uploaded during the same window (`dedupWindow`, 24 hours by
 default). So no chunk a checkpoint needs is ever more than one window older
 than the checkpoint, which keeps the bucket's lifecycle rule simple: expire
 objects under `sealed/` that are older than your longest-lived checkpoint
-plus `dedupWindow`. The cost is that each sandbox uploads its non-zero
+plus `dedupWindow` ([Expiring published parts](#expiring-published-parts)). The cost is that each sandbox uploads its non-zero
 bytes in full once per window.
 
 Both settings live on the worker's `contentStore` block, and the defaults
@@ -942,6 +943,98 @@ contentStore = {
 
 Workers that share a bucket can use different settings. Their chunks simply
 do not dedupe with each other.
+
+### Expiring published parts
+
+Legion never deletes a published part from the bucket. Deleting a
+snapshot, resuming or destroying an instance, and finishing a fork all leave
+the part's index and chunks where they are, because a chunk can belong to
+several checkpoints of the job and Legion keeps no count of who uses it.
+The bucket's own lifecycle rules are what remove them. What Legion writes
+under a `contentStore.url`, and what a rule on each prefix does:
+
+| Prefix (under the `contentStore.url` path) | What is there | Expiring it |
+| --- | --- | --- |
+| `sealed/` | The index and chunks of every published part | Makes every checkpoint that names an expired object unrestorable |
+| `manifests/<namespace>/<job>/<group>/<task>/<instance>.json` | [Archive manifests](#archiving-idle-instances) | Ends an archived instance: a `manifestOnly` instance is gone, and a `slim` one's resume follows `onRestoreFailure` |
+
+An age-based rule is safe because of the [dedup window](#how-published-parts-are-stored):
+a publish reuses only chunks uploaded in the current window, so no object a
+checkpoint needs is more than one `dedupWindow` older than the checkpoint
+itself. Pick **N**, the longest any checkpoint has to stay restorable, then:
+
+- expire `manifests/` after N days;
+- expire `sealed/` after N days plus the largest `dedupWindow` of any
+  worker that publishes to the bucket, rounded up to whole days (N + 1 with
+  the default `24h`).
+
+N is a limit you are setting, not one Legion enforces, so make it at least
+as long as each of these:
+
+- **Published snapshots:** their `snapshots.ttl`. A snapshot with no `ttl`
+  never expires on its own, so set one no longer than N.
+- **Named snapshots** that new instances are created from: rebuild and
+  repoint the name more often than every N days.
+- **Suspended instances with `durability = "store"`**, archived or not:
+  Legion does not end a suspension, so N is how long an instance can stay
+  suspended and still resume with its memory. Past it, the resume follows
+  `onRestoreFailure` (`cold` boots fresh on its retained storage).
+
+A rule shorter than this deletes chunks a checkpoint still needs. The
+restore then fails with `chunk N (...) of the published part is missing
+from the content store`, which is not retried; see
+[When a part cannot be opened](#when-a-part-cannot-be-opened). Nothing warns you ahead of that, so err long: storage
+for an extra day of chunks costs less than a lost suspension.
+
+On S3, with `contentStore.url = "s3://legion-content-usw2/"`, N = 30 days,
+and the default `dedupWindow`:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "legion-sealed-parts",
+      "Filter": { "Prefix": "sealed/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 31 }
+    },
+    {
+      "ID": "legion-archive-manifests",
+      "Filter": { "Prefix": "manifests/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 30 }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket legion-content-usw2 --lifecycle-configuration file://lifecycle.json
+```
+
+`put-bucket-lifecycle-configuration` replaces the bucket's whole lifecycle
+configuration, so merge these rules into any it already has. When the
+`contentStore.url` has a path (`s3://bucket/legion/`), the prefixes carry
+it: `legion/sealed/` and `legion/manifests/`. On a versioned bucket an
+expiration only adds a delete marker; add a `NoncurrentVersionExpiration`
+to free the storage. S3 runs lifecycle rules once a day, so objects go up
+to a day after they qualify, never before.
+
+On MinIO, the same two rules:
+
+```bash
+mc ilm rule add --prefix "sealed/" --expire-days 31 myminio/legion-content
+mc ilm rule add --prefix "manifests/" --expire-days 30 myminio/legion-content
+```
+
+A `file://` content store has no lifecycle rules. Delete by modification
+time on the same schedule, for example from a daily timer:
+
+```bash
+find /mnt/store/sealed -type f -mtime +31 -delete
+find /mnt/store/manifests -type f -mtime +30 -delete
+```
 
 ### The volume has to move too
 
@@ -1618,8 +1711,8 @@ store. A chunk belongs to every checkpoint of its job that holds the same
 bytes in the same dedup window, and Legion keeps no count of who else uses
 it. Expire them with the bucket's own lifecycle rules: delete objects under
 `sealed/` that are older than your longest-lived snapshot plus the workers'
-`contentStore.dedupWindow` (see [How published parts are
-stored](#how-published-parts-are-stored)).
+`contentStore.dedupWindow` (see [Expiring published
+parts](#expiring-published-parts)).
 
 `snapshots.ttl` and `snapshots.keep` delete through the same path. They never
 touch suspend checkpoints, which belong to their instance and go when it
@@ -2230,6 +2323,8 @@ A suspend by the node's pressure response also emits `node.pressure` with
 | --- | --- | --- | --- |
 | `legion_instance_suspend_seconds` | histogram | `kind` | How long each successful suspend's capture took on its node. |
 | `legion_instance_resume_seconds` | histogram | `kind` | How long each successful resume's restore took on its node. Placement time is not included. |
+| `legion_snapshot_capture_seconds` | histogram | `kind` | How long each successful manual snapshot capture took on its node. |
+| `legion_snapshot_restore_seconds` | histogram | `kind` | How long each successful restore from a snapshot took on its node. Resumes are `legion_instance_resume_seconds`. |
 | `legion_checkpoint_bytes` | histogram | `kind` | Size of each captured checkpoint (suspends and snapshots). A disk suspend reports 0, since its volume stays in place. |
 | `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, `pressure`, `park`, or `make_room`. |
 | `legion_make_room_suspends_total` | counter | `outcome` | Make-room suspends: `started`, `failed` (could not start), or `no_room` (a round that would not have made enough room, so nothing was suspended). |
@@ -2238,6 +2333,7 @@ A suspend by the node's pressure response also emits `node.pressure` with
 | `legion_checkpoint_publish_seconds` | histogram | `kind` | How long each successful publish took on its node. |
 | `legion_instance_archived_total` | counter | `mode` | Instances archived after their checkpoint published, by `slim` (a slim row stays) or `manifestOnly` (no row stays). |
 | `legion_checkpoint_publish_total` | counter | `outcome` | Publishes reported, by `published`, `retrying` (failed, the manager asks again), or `failed` (the last attempt failed). |
+| `legion_content_store_bytes`, `legion_content_store_pinned_bytes`, `legion_content_store_budget_bytes` | gauge (worker) | `class` | What each node content store class (`artifacts`, `snapshots`, `derived`) holds, holds pinned, and may hold. `snapshots` is where local checkpoints live. |
 
 See [metrics](metrics.md#suspend-and-resume).
 
@@ -2316,8 +2412,10 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Published parts are not deleted from the store.** Deleting the snapshot
   removes the row and the node's local copy only. Use bucket lifecycle rules
   that expire `sealed/` objects older than the longest-lived checkpoint plus
-  `dedupWindow`. A shorter rule can delete a chunk a checkpoint still needs,
-  and its restore then fails naming the missing chunk.
+  `dedupWindow` ([Expiring published parts](#expiring-published-parts)). A
+  shorter rule can delete a chunk a checkpoint still needs, and its restore
+  then fails naming the missing chunk. Legion does not bound how long a
+  suspended instance stays suspended, so the rule is that bound.
 - **A restore fetches every distinct non-zero chunk of a part it lacks**,
   even when the node holds an earlier checkpoint of the same sandbox. Only
   the publish side skips what the store already holds.

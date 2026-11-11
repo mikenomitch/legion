@@ -22,17 +22,26 @@
 #
 #   run-campaign.sh --system legion-a --steps "1000 5000" --eval-threads 16
 #
+# SCHEDULING POLICY. Legion's manager runs the scenario's own
+# `scheduling_policy` (web_fleet and dense_fleet are spread, batch_burst
+# and mixed_heterogeneous bin_pack); --scheduling-policy bin_pack|spread
+# overrides it, so one workload can be measured under both:
+#
+#   run-campaign.sh --system legion-a --scenarios web_fleet --scheduling-policy bin_pack
+#
 # CONTROL-PLANE RESET. Every campaign wipes and reinstalls the control
 # plane before its first step (--no-reset-control-plane opts out). This
-# is not tidiness: Legion cannot deregister a node, so the node table
-# accumulates every fleet the boxes have ever seen, and a campaign that
-# follows a wider run measures a scheduler carrying that run's corpses
-# while reporting its own node count. See reset-control-plane.sh.
+# is not tidiness: stop-sim-fleet.sh forgets the nodes it stops, but a
+# fleet stopped any other way (by hand, a failed forget, another tool)
+# leaves its rows, and a campaign that follows a wider run would measure
+# a scheduler carrying that run's corpses while reporting its own node
+# count. The reset also clears the previous run's jobs and evals. See
+# reset-control-plane.sh.
 #
 # ONE SCENARIO PER INVOCATION. The fleet is shaped from the scenario's
 # own node_profiles, so a campaign covering several would have to reshape
-# the fleet mid-run, orphaning the previous scenario's nodes (node names
-# embed the profile name and nothing can deregister a node). Passing more
+# the fleet mid-run (node names embed the profile name, so every switch
+# is a full stop, forget, and re-register). Passing more
 # than one is refused with the commands to run instead. The plan's three
 # workloads are therefore three campaigns, with a control-plane wipe
 # between them.
@@ -71,9 +80,8 @@ ALLOCS_PER_NODE=5
 # count, one cell each. Empty means "just --allocs-per-node".
 ALLOCS_SWEEP=""
 # Wipe + reinstall the control plane before the first step. On by
-# default because it is the only way to empty the node table — see
-# reset-control-plane.sh for why, and why unique node names are not the
-# answer.
+# default because it is the only way to start from a store holding
+# nothing from earlier runs — see reset-control-plane.sh.
 RESET_CP=true
 # Scheduler eval concurrency for the system under test. Empty means "the
 # installer's default" (4), so an ordinary campaign is unaffected. Set,
@@ -83,6 +91,14 @@ RESET_CP=true
 # plane, so a value set only at install time would be reverted before
 # the first cell ran.
 EVAL_THREADS=""
+# Legion's manager schedulingPolicy. Empty means "the scenario's own
+# scheduling_policy", which is what a campaign should measure: the
+# in-process scheduler bench runs the same scenario under the same policy.
+# Set, it overrides the scenario (to measure one workload under both
+# policies). Like --eval-threads it is a control-plane setting, so it
+# needs the reset to apply, and run-step.sh refuses a cell whose running
+# manager disagrees.
+SCHEDULING_POLICY_OVERRIDE=""
 # Empty leaves the driver's own default, which differs per submission path
 # (a CLI slot is a whole process; a native slot is one in-flight RPC).
 #
@@ -183,6 +199,12 @@ while [ $# -gt 0 ]; do
         EVAL_THREADS="$2"
         shift 2
         ;;
+    --scheduling-policy)
+        # legion-a / legion-b: bin_pack or spread, overriding the
+        # scenario's scheduling_policy for this campaign.
+        SCHEDULING_POLICY_OVERRIDE="$2"
+        shift 2
+        ;;
     --storm-step)
         # Which node step runs the storm drill (default 10000). It must be
         # one of --steps, and every system in a comparison must use the same
@@ -227,6 +249,33 @@ if [ -n "$EVAL_THREADS" ]; then
     export LEGION_EVAL_THREADS="$EVAL_THREADS"
 fi
 
+# Legion's placement policy comes from the scenario (one per campaign,
+# refused below otherwise), or from --scheduling-policy. Exported for the
+# reinstall the reset performs; run-step.sh compares it with the running
+# manager before every cell.
+case "$SYSTEM" in
+legion-a | legion-b)
+    if [ -n "$SCHEDULING_POLICY_OVERRIDE" ]; then
+        LEGION_SCHEDULING_POLICY="$SCHEDULING_POLICY_OVERRIDE"
+    else
+        read -r first_scenario _ <<<"$SCENARIOS"
+        LEGION_SCHEDULING_POLICY=$(scenario_scheduling_policy "$SCENARIOS_DIR/$first_scenario.json")
+    fi
+    export LEGION_SCHEDULING_POLICY
+    rig_scheduling_policy >/dev/null || exit 1
+    if ! $RESET_CP; then
+        log "WARNING: --no-reset-control-plane keeps the installed schedulingPolicy;"
+        log "         run-step.sh refuses any cell where it is not $LEGION_SCHEDULING_POLICY"
+    fi
+    ;;
+*)
+    [ -z "$SCHEDULING_POLICY_OVERRIDE" ] || {
+        echo "--scheduling-policy applies to --system legion-a|legion-b only (got $SYSTEM)" >&2
+        exit 1
+    }
+    ;;
+esac
+
 # Release the spot fleet no matter how we leave — success, failure, or a
 # killed session. An unattended campaign that dies at 03:00 otherwise
 # leaves up to 20 spot instances running until someone notices, and the
@@ -259,16 +308,15 @@ SIM_SYSTEM=${SIM_SYSTEM%-b} # legion-a/legion-b share the legion sim fleet
 # The allocation densities this campaign runs at each step. One value is
 # the ordinary campaign; several is a saturation sweep.
 ALLOC_POINTS="${ALLOCS_SWEEP:-$ALLOCS_PER_NODE}"
-log "=== campaign $CAMPAIGN: steps [$STEPS], scenarios [$SCENARIOS], allocs/node [$ALLOC_POINTS]${EVAL_THREADS:+, evalThreads $EVAL_THREADS} ==="
+log "=== campaign $CAMPAIGN: steps [$STEPS], scenarios [$SCENARIOS], allocs/node [$ALLOC_POINTS]${EVAL_THREADS:+, evalThreads $EVAL_THREADS}${LEGION_SCHEDULING_POLICY:+, schedulingPolicy $LEGION_SCHEDULING_POLICY} ==="
 
 # Start from an empty node table.
 #
-# Nothing removes node records — there is no deregistration RPC, and
-# stop-sim-fleet.sh only stops the sim processes — so whatever ran before
-# this campaign is still in the store. That is not hypothetical: phase1.sh
-# runs the packing-density ladder (up to 4000 simulated nodes) and then a
-# campaign, with nothing in between, and the campaign's 1000-node cells
-# inherited 3000 orphan rows. The per-cell census gate below now refuses
+# stop-sim-fleet.sh forgets the nodes it stops, but anything that bypassed
+# it — or a forget that failed — leaves rows behind. That is not
+# hypothetical: before the forget existed, phase1.sh ran the
+# packing-density ladder (up to 4000 simulated nodes) and then a campaign,
+# and the campaign's 1000-node cells inherited 3000 orphan rows. The per-cell census gate below now refuses
 # to run in that state, so without this reset the campaign would simply
 # stop; with it, every campaign begins the way its results claim.
 log "staging the driver and translator on the loadgen box"
@@ -354,22 +402,22 @@ for NODES in $STEPS; do
     #
     # Cost of doing it properly: one fleet restart per cell, and because
     # node names embed the profile name (`sim-<i>-<profile>-<n>`), a
-    # change of scenario leaves the previous scenario's nodes orphaned in
-    # the store. Hence ONE SCENARIO PER CAMPAIGN, with a wiped control
-    # plane between campaigns -- there is no node-deregistration surface
-    # to clean up with (see TODO.md). Refuse rather than quietly produce
-    # a contaminated multi-scenario run.
+    # change of scenario is a full stop, forget, and re-register. Hence
+    # ONE SCENARIO PER CAMPAIGN, with a wiped control plane between
+    # campaigns -- which Legion needs anyway, because the scenario's
+    # scheduling_policy is a manager setting rendered at install time.
+    # Refuse rather than quietly produce a multi-scenario run.
     SCENARIO_COUNT=$(printf '%s\n' $SCENARIOS | wc -w | tr -d ' ')
     if [ "$SCENARIO_COUNT" -gt 1 ]; then
         echo "run-campaign.sh: --scenarios lists $SCENARIO_COUNT scenarios ($SCENARIOS)." >&2
-        echo "  Each needs a fleet shaped from its own node_profiles, and switching" >&2
-        echo "  shapes mid-campaign orphans the previous scenario's nodes. Run one" >&2
-        echo "  scenario per campaign, wiping the control plane between them:" >&2
+        echo "  Each needs a fleet shaped from its own node_profiles and, for Legion," >&2
+        echo "  a manager installed with its own scheduling_policy. Run one scenario" >&2
+        echo "  per campaign, wiping the control plane between them:" >&2
         for s in $SCENARIOS; do
             echo "    scripts/run-campaign.sh --system $SYSTEM --scenarios $s" >&2
         done
         echo "  Each of those resets the control plane before it starts, which is" >&2
-        echo "  what clears the previous scenario's orphaned node rows." >&2
+        echo "  what installs the scenario's policy and clears the previous run." >&2
         exit 1
     fi
 

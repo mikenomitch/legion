@@ -903,6 +903,15 @@ pub fn catalog() -> Vec<Capability> {
         },
         // --- Nodes ---
         Capability {
+            name: "ledger",
+            cli: "legion ledger [--job <JOB>]",
+            grpc: Some("Manager/GetLedger"),
+            summary: "List every node's allocations (status, resources, job, instance, resize \
+                 override), or with --job only that job's allocations and the nodes they run on.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "node.list",
             cli: "legion node list",
             grpc: Some("Manager/GetNodes"),
@@ -1423,7 +1432,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "app.config.get",
             cli: "legion app config get <APP>",
             grpc: Some("Manager/GetApp"),
-            summary: "Print an app's config as JSON.",
+            summary: "Print an app's config: Nickel for people (valid input for `app config set`), the JSON envelope with --json.",
             mutates: false,
             read_only_safe: true,
         },

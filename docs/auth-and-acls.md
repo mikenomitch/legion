@@ -1087,8 +1087,13 @@ When ACLs are enforced:
   still live: that registration fails with `PermissionDenied`, naming the
   node and its status, unless the request also carries that node's own
   token (a restart). Every node of a worker type holds the same join secret,
-  so without this any of them could register as a running peer. A
-  compromised worker can still claim the name of a node that is down. Treat
+  so without this any of them could register as a running peer. A lost
+  node rejoins only with a join token for the pool it was in; a token for
+  another pool gets `PermissionDenied` (`node "w2" is lost from pool "gpu";
+  a join token for pool "default" may not rejoin it`), because the node's
+  node-local volumes and identity were never issued to that pool. Give the
+  worker another name, or `legion node forget` the old node first. A
+  compromised worker can still claim the name of a lost node in its own pool. Treat
   join secrets like node credentials: give them short TTLs (minutes to a
   day, long enough to bring the hosts up) and revoke them once the fleet has
   joined. Restarts do not need them. Treat the node token file like the

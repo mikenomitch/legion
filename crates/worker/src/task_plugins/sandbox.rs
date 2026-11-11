@@ -8,7 +8,7 @@
 //!
 //! The user-facing shape is deliberately close to `container` (`image`,
 //! `command`, `env`), plus what a VM needs and a container does not: guest
-//! size (`vcpus`, `memory_mib`) and a kernel.
+//! size (`vcpus`; its memory is the task's `resources`) and a kernel.
 //!
 //! # Stateful sandboxes
 //!
@@ -100,10 +100,6 @@ struct SandboxTaskConfig {
     /// Virtual CPUs given to the microVM (default 1).
     #[serde(default)]
     vcpus: Option<u32>,
-
-    /// Guest memory in MiB (default 512).
-    #[serde(default)]
-    memory_mib: Option<u32>,
 
     /// Writable space in MiB added to the ephemeral root disk on top of the
     /// image contents (default 256). Data written outside a volume mount
@@ -425,8 +421,7 @@ fn plan_guest_resize(
 
 /// The guest size, in MiB, a task's `resources` imply: `memoryMax` when
 /// set, else `memory` (docs/task-runtime-sandbox.md, "Guest size"). `None`
-/// when neither is declared. Applied once, at submit, by
-/// [`SandboxTaskPlugin::normalize_task`].
+/// when neither is declared.
 fn resources_guest_mib(resources: &Value) -> Option<u32> {
     let declared = |key: &str| {
         resources
@@ -436,6 +431,26 @@ fn resources_guest_mib(resources: &Value) -> Option<u32> {
     };
     let mib = declared(crate::resources::MEMORY_MAX_KEY).or_else(|| declared("memory"))?;
     Some(mib.ceil().min(f64::from(u32::MAX)) as u32)
+}
+
+/// The guest's memory in MiB for a unit launched with `resources`: its
+/// `memoryMax`, else its `memory`, else the runtime's 512 MiB default. The
+/// worker reads the unit's effective resources (a resized unit's new size,
+/// a session's admitted size), so a restart boots at the size it runs at.
+fn guest_memory_mib(resources: &Value) -> u32 {
+    resources_guest_mib(resources).unwrap_or(DEFAULT_MEMORY_MIB)
+}
+
+/// A guest too small for a Linux kernel to boot, named with its source.
+fn check_guest_floor(task: &str, guest: u32) -> R<()> {
+    if guest < MIN_MEMORY_MIB {
+        bail!(
+            "task {task} would boot a {guest} MiB sandbox guest (its resources.memoryMax, else \
+             resources.memory), below the {MIN_MEMORY_MIB} MiB a Linux guest needs. Raise \
+             resources.memory or resources.memoryMax"
+        );
+    }
+    Ok(())
 }
 
 impl SandboxTaskConfig {
@@ -463,10 +478,20 @@ impl SandboxTaskConfig {
         if self.vcpus == Some(0) {
             bail!("sandbox task vcpus must be at least 1");
         }
-        if let Some(memory) = self.memory_mib {
-            if memory < MIN_MEMORY_MIB {
-                bail!("sandbox task memory_mib must be at least {MIN_MEMORY_MIB}");
-            }
+        // The guest's memory is the task's `resources` (`memoryMax`, else
+        // `memory`); a second number here could only disagree with them.
+        if let Some(raw) = self._extra.get("memory_mib") {
+            let size = raw
+                .as_u64()
+                .map(|mib| mib.to_string())
+                .unwrap_or_else(|| "N".to_string());
+            bail!(
+                "sandbox `config.memory_mib` is gone: a sandbox guest boots with the task's \
+                 resources.memoryMax, else resources.memory (default 512 MiB)\nHint: drop \
+                 memory_mib and set resources.memory = {size} to reserve and boot {size} MiB, or \
+                 resources.memoryMax = {size} to boot {size} MiB while reserving less \
+                 (docs/task-runtime-sandbox.md, \"Guest size\")"
+            );
         }
         if let Some(raw) = self.memory_restore.as_deref() {
             if sandbox_checkpoint::MemoryRestore::parse(raw).is_none() {
@@ -529,10 +554,6 @@ impl SandboxTaskConfig {
 
     fn vcpus(&self) -> u32 {
         self.vcpus.unwrap_or(DEFAULT_VCPUS)
-    }
-
-    fn memory_mib(&self) -> u32 {
-        self.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB)
     }
 
     fn rootfs_headroom_mib(&self) -> u32 {
@@ -1216,16 +1237,16 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
 
 /// Fails a macOS dev-mode start whose VM would be under Apple `container`'s
 /// floor, naming the floor and the field to raise, instead of letting
-/// `container run` fail with the reason only in the task's stderr. Only an
-/// explicit size is checked: an unsized guest gets the runtime's default.
-fn check_apple_memory_floor(task: &str, config: &SandboxTaskConfig) -> R<()> {
-    match config.memory_mib {
+/// `container run` fail with the reason only in the task's stderr. Only a
+/// declared size is checked: an unsized guest gets the runtime's default.
+fn check_apple_memory_floor(task: &str, memory_mib: Option<u32>) -> R<()> {
+    match memory_mib {
         Some(mib)
             if u64::from(mib) < crate::task_plugins::container::APPLE_CONTAINER_MIN_MEMORY_MIB =>
         {
             Err(crate::task_plugins::container::apple_memory_floor_error(
                 task,
-                "config.memory_mib, else resources.memoryMax or resources.memory",
+                "resources.memoryMax or resources.memory",
                 f64::from(mib),
             ))
         }
@@ -1236,10 +1257,12 @@ fn check_apple_memory_floor(task: &str, config: &SandboxTaskConfig) -> R<()> {
 /// Builds the dev-mode Apple `container` launch (macOS). Same shape as the
 /// container runtime's, plus the sandbox's guest sizing, with filesystem volumes
 /// bind-mounted where the microVM path would attach block devices.
+/// `memory_mib` is the guest size the task's `resources` declare, if any.
 fn build_apple_launch(
     name: &str,
     labels: &[String],
     config: &SandboxTaskConfig,
+    memory_mib: Option<u32>,
     env: &BTreeMap<String, String>,
     volumes: &[MountedVolume],
     identity_dir: Option<&Path>,
@@ -1258,7 +1281,7 @@ fn build_apple_launch(
         args.push("--cpus".to_string());
         args.push(vcpus.to_string());
     }
-    if let Some(memory) = config.memory_mib {
+    if let Some(memory) = memory_mib {
         args.push("--memory".to_string());
         args.push(format!("{memory}M"));
     }
@@ -1580,6 +1603,10 @@ impl SandboxTaskPlugin {
         );
         let vmm_config_started = std::time::Instant::now();
 
+        let guest_mib = guest_memory_mib(&task.resources);
+        // Submit checks the job's size; a session's admitted size or a
+        // resized unit's arrives here first.
+        check_guest_floor(&task.name, guest_mib)?;
         let mut spec = VmSpec {
             name: name.clone(),
             kernel,
@@ -1590,7 +1617,7 @@ impl SandboxTaskPlugin {
             root_disk,
             volume_disks: volumes.disks,
             vcpus: config.vcpus(),
-            memory_mib: config.memory_mib(),
+            memory_mib: guest_mib,
             tap,
             api_socket: scratch.join("vmm.sock"),
             vsock: Some(microvm::VsockSpec {
@@ -1708,7 +1735,8 @@ impl SandboxTaskPlugin {
         backend: &Backend,
     ) -> R<Command> {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
-        check_apple_memory_floor(&task.name, config)?;
+        let memory_mib = resources_guest_mib(&task.resources);
+        check_apple_memory_floor(&task.name, memory_mib)?;
         let name = apple_container_name(allocation);
         remove_stale_dev_sandbox(backend, &name, allocation)?;
         // Named for the usage sampler: `container stats` is how an idle
@@ -1736,6 +1764,7 @@ impl SandboxTaskPlugin {
             // What stale-container cleanup checks before it removes anything.
             &apple_container::ownership_labels(allocation),
             config,
+            memory_mib,
             &env,
             &instance.volumes,
             identity_dir.as_deref(),
@@ -1842,22 +1871,17 @@ impl TaskPlugin for SandboxTaskPlugin {
         let backend = Backend::detect(config.hypervisor.as_deref()).ok()?;
         backend
             .is_microvm()
-            .then(|| vmm_cgroup_memory_bytes(config.memory_mib(), vmm_overhead_mib()))
+            .then(|| vmm_cgroup_memory_bytes(guest_memory_mib(&task.resources), vmm_overhead_mib()))
     }
 
-    /// Fix the guest size at submit, so it can never change under a stored
-    /// job (docs/task-runtime-sandbox.md, "Guest size").
+    /// Fix the guest size at submit (docs/task-runtime-sandbox.md, "Guest
+    /// size").
     ///
     /// - An undeclared `resources.memory` becomes this runtime's own 512 MiB
-    ///   default, ahead of the manager's `taskResourceDefaults`. That is the
-    ///   size a sandbox always booted with, so the scheduler now reserves
-    ///   what the guest gets, and a cluster default tuned for small host
+    ///   default, ahead of the manager's `taskResourceDefaults`. The guest
+    ///   boots `memoryMax`, else `memory`, so the scheduler reserves what
+    ///   the guest gets, and a cluster default tuned for small host
     ///   processes cannot silently shrink every guest.
-    /// - An unset `config.memory_mib` is pinned to the derived guest size
-    ///   (`memoryMax`, else `memory`). The worker reads only `memory_mib`, so
-    ///   a job stored before this rule (no `memory_mib`) keeps booting at
-    ///   512 MiB exactly as it did, rather than shrinking to a defaulted
-    ///   reservation it never asked for.
     /// - A TAP sandbox gains `sandbox.bridges contains "<bridge>"`, so it
     ///   only places on nodes whose worker config gives its bridge an
     ///   address pool ([`constrain_to_bridge`]).
@@ -1871,19 +1895,10 @@ impl TaskPlugin for SandboxTaskPlugin {
                 .entry("memory")
                 .or_insert_with(|| Value::from(DEFAULT_MEMORY_MIB));
         }
-        let Some(config) = task.config.as_object_mut() else {
-            return;
-        };
-        if config.get("memory_mib").is_none_or(Value::is_null) {
-            if let Some(guest) = resources_guest_mib(&task.resources) {
-                config.insert("memory_mib".into(), Value::from(guest));
-            }
-        }
     }
 
-    /// A guest too small to boot is an error, and an explicit `memory_mib`
-    /// that disagrees with the size `resources` imply is a warning this
-    /// release (a future release rejects it).
+    /// A guest too small to boot is an error (the Linux floor, and Apple
+    /// `container`'s for a task pinned to macOS).
     fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
         // No device passthrough into the microVM yet (docs/devices.md,
         // "Limitations"): a GPU sandbox would boot without its GPU.
@@ -1896,46 +1911,23 @@ impl TaskPlugin for SandboxTaskPlugin {
                 task.name
             );
         }
-        let Ok(config) = SandboxTaskConfig::from_value(&task.config) else {
-            // `validate_config` reports the parse error with its own message.
-            return Ok(Vec::new());
-        };
         // An undeclared `memory` becomes this runtime's 512 MiB at submit.
-        let derived = resources_guest_mib(&task.resources).or(Some(DEFAULT_MEMORY_MIB));
+        let guest = guest_memory_mib(&task.resources);
         // A task pinned to macOS runs in dev mode on Apple `container`, which
         // refuses a VM under its floor. Known at submit only through the
         // task's constraints; any other task meets the same check at start
         // on a macOS worker.
-        if let Some(guest) = config.memory_mib.or(derived) {
-            if crate::task_plugins::container::constrained_to_macos(task)
-                && u64::from(guest) < crate::task_plugins::container::APPLE_CONTAINER_MIN_MEMORY_MIB
-            {
-                return Err(crate::task_plugins::container::apple_memory_floor_error(
-                    &task.name,
-                    "config.memory_mib, else resources.memoryMax or resources.memory",
-                    f64::from(guest),
-                ));
-            }
+        if crate::task_plugins::container::constrained_to_macos(task)
+            && u64::from(guest) < crate::task_plugins::container::APPLE_CONTAINER_MIN_MEMORY_MIB
+        {
+            return Err(crate::task_plugins::container::apple_memory_floor_error(
+                &task.name,
+                "resources.memoryMax or resources.memory",
+                f64::from(guest),
+            ));
         }
-        let mut warnings = Vec::new();
-        match (config.memory_mib, derived) {
-            (None, Some(guest)) if guest < MIN_MEMORY_MIB => bail!(
-                "task {} would boot a {guest} MiB sandbox guest (its resources.memoryMax, else \
-                 resources.memory), below the {MIN_MEMORY_MIB} MiB a Linux guest needs. Raise \
-                 resources.memory or resources.memoryMax",
-                task.name
-            ),
-            (Some(explicit), Some(guest)) if explicit != guest => warnings.push(format!(
-                "task {} sets config.memory_mib = {explicit}, but its resources size the guest at \
-                 {guest} MiB (resources.memoryMax, else resources.memory). This release still \
-                 boots {explicit} MiB, and a future release rejects the mismatch. Drop memory_mib and \
-                 set resources.memoryMax = {explicit} to burst to it, or resources.memory = \
-                 {explicit} to reserve it. See docs/task-runtime-sandbox.md",
-                task.name
-            )),
-            _ => {}
-        }
-        Ok(warnings)
+        check_guest_floor(&task.name, guest)?;
+        Ok(Vec::new())
     }
 
     fn schema(&self) -> Value {
@@ -2298,7 +2290,7 @@ impl TaskPlugin for SandboxTaskPlugin {
             task_name = %task.name,
             backend = hypervisor.label(),
             vcpus = config.vcpus(),
-            memory_mib = config.memory_mib(),
+            memory_mib = guest_memory_mib(&task.resources),
             "Starting sandbox task"
         );
         configure_task_log_capture(&mut cmd, instance)?;
@@ -2623,14 +2615,21 @@ impl TaskPlugin for SandboxTaskPlugin {
             _ => return crate::worker::resources::resize_instance_cgroup(instance, change, None),
         };
         let scratch = work_root(allocation, instance);
-        let guest_mib = u64::from(config.memory_mib());
+        let record = read_balloon_record(&scratch);
+        // The size the guest booted with: its balloon record's, else the
+        // unit's current size, which a guest with no balloon still runs at
+        // (without one, no change to its memory ceiling is ever applied).
+        let guest_mib = record
+            .as_ref()
+            .map(|record| record.guest_mib)
+            .unwrap_or_else(|| u64::from(guest_memory_mib(&task.resources)));
         let to = change.to_size();
         let whole = |mib: f64| mib.ceil().max(0.0) as u64;
         let plan = plan_guest_resize(
             &sandbox_name(allocation),
             vmm,
             guest_mib,
-            read_balloon_record(&scratch),
+            record,
             to.memory_max.or(to.memory).map(whole),
             to.memory.map(whole),
         );
@@ -2641,7 +2640,10 @@ impl TaskPlugin for SandboxTaskPlugin {
         // the guest's usable memory is the balloon's to move, and a cgroup
         // ceiling under a guest that has not handed its pages back yet
         // would kill the VMM.
-        let ceiling = vmm_cgroup_memory_bytes(config.memory_mib(), vmm_overhead_mib());
+        let ceiling = vmm_cgroup_memory_bytes(
+            u32::try_from(guest_mib).unwrap_or(u32::MAX),
+            vmm_overhead_mib(),
+        );
         let answer =
             crate::worker::resources::resize_instance_cgroup(instance, change, Some(ceiling))?;
         if answer != ResizeAnswer::Applied || change.dry_run {
@@ -2679,7 +2681,7 @@ impl TaskPlugin for SandboxTaskPlugin {
             task_name: &task.name,
             hostname: sandbox_name(allocation),
             vcpus: config.vcpus(),
-            memory_mib: config.memory_mib(),
+            memory_mib: guest_memory_mib(&task.resources),
             scratch: work_root(allocation, instance),
             memory_restore: config.memory_restore(),
             userfaultfd: sandbox_checkpoint::userfaultfd_available(),
@@ -3029,13 +3031,11 @@ mod tests {
             "command": ["/bin/sh", "-c", "sleep 60"],
             "env": { "MODE": "test" },
             "vcpus": 2,
-            "memory_mib": 1024,
             "network": { "mode": "tap", "bridge": "br0" },
         }))?;
 
         assert_eq!(parsed.image, "alpine:latest");
         assert_eq!(parsed.vcpus(), 2);
-        assert_eq!(parsed.memory_mib(), 1024);
         assert_eq!(
             parsed.tap_for(Some("user-42"), 7),
             Some(TapNet {
@@ -3094,66 +3094,77 @@ mod tests {
         task
     }
 
-    fn guest(task: &TaskConfig) -> R<u32> {
-        Ok(SandboxTaskConfig::from_value(&task.config)?.memory_mib())
+    fn guest(task: &TaskConfig) -> u32 {
+        guest_memory_mib(&task.resources)
     }
 
-    /// Guest size follows `resources` (`memoryMax`, else `memory`), fixed at
-    /// submit. An undeclared `memory` is the runtime's 512 MiB, never the
-    /// cluster default. An explicit `memory_mib` still wins this release,
-    /// with a warning when it disagrees.
+    /// Guest size follows `resources` (`memoryMax`, else `memory`). An
+    /// undeclared `memory` is the runtime's 512 MiB, never the cluster
+    /// default, and nothing is written into the config.
     #[test]
-    fn guest_size_follows_resources_and_is_fixed_at_submit() -> R<()> {
+    fn guest_size_follows_resources() -> R<()> {
         let config = json!({"image": "a", "command": ["x"]});
         let task = normalized(config.clone(), json!({ "memory": 512, "memoryMax": 4096 }));
-        assert_eq!(guest(&task)?, 4096);
+        assert_eq!(guest(&task), 4096);
+        assert_eq!(
+            task.config, config,
+            "normalize pins nothing into the config"
+        );
         assert!(SandboxTaskPlugin.check_resources(&task)?.is_empty());
 
         assert_eq!(
-            guest(&normalized(config.clone(), json!({ "memory": 768 })))?,
+            guest(&normalized(config.clone(), json!({ "memory": 768 }))),
             768
         );
 
         // Nothing declared: reserve and boot the runtime's own 512 MiB.
         let task = normalized(config.clone(), json!({}));
         assert_eq!(task.resources["memory"], json!(512));
-        assert_eq!(guest(&task)?, 512);
+        assert_eq!(guest(&task), 512);
         let task = normalized(config.clone(), Value::Null);
         assert_eq!(task.resources["memory"], json!(512));
 
-        // A job stored before the rule (no memory_mib, a defaulted 256 MiB
-        // reservation) keeps booting at 512 MiB on the worker.
-        let mut legacy = task_with(config.clone());
-        legacy.resources = json!({ "memory": 256 });
-        assert_eq!(guest(&legacy)?, DEFAULT_MEMORY_MIB);
-
-        // Explicit memory_mib wins, and a mismatch warns.
-        let explicit = json!({"image": "a", "command": ["x"], "memory_mib": 1024});
-        let mut declared = task_with(explicit.clone());
-        declared.resources = json!({ "memory": 512 });
-        let warnings = SandboxTaskPlugin.check_resources(&declared)?;
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("memory_mib = 1024"), "{}", warnings[0]);
-        assert!(warnings[0].contains("resources.memoryMax = 1024"));
+        // A unit launched at another size (a resize, a session's admitted
+        // size) boots at that size.
+        let mut resized = task_with(config.clone());
+        resized.resources = json!({ "memory": 256, "memoryMax": 2048 });
+        assert_eq!(guest(&resized), 2048);
         assert_eq!(
-            guest(&normalized(explicit.clone(), json!({ "memory": 512 })))?,
-            1024
+            SandboxTaskPlugin.enforced_memory_limit_bytes(&resized),
+            Backend::detect(None)
+                .ok()
+                .filter(Backend::is_microvm)
+                .map(|_| vmm_cgroup_memory_bytes(2048, vmm_overhead_mib()))
         );
-        // With no memory declared, the implied size is the runtime default.
-        let mut bare = task_with(explicit);
-        bare.resources = json!({});
-        assert_eq!(SandboxTaskPlugin.check_resources(&bare)?.len(), 1);
 
-        // Agreeing is fine.
-        let mut agreeing = task_with(json!({"image": "a", "command": ["x"], "memory_mib": 1024}));
-        agreeing.resources = json!({ "memory": 256, "memoryMax": 1024 });
-        assert!(SandboxTaskPlugin.check_resources(&agreeing)?.is_empty());
-
-        // Too small to boot is an error, not a warning.
+        // Too small to boot is an error.
         let mut tiny = task_with(config);
         tiny.resources = json!({ "memory": 32 });
-        assert!(SandboxTaskPlugin.check_resources(&tiny).is_err());
+        let err = SandboxTaskPlugin
+            .check_resources(&tiny)
+            .expect_err("too small");
+        assert!(err.to_string().contains("below the 64 MiB"), "{err}");
         Ok(())
+    }
+
+    /// `config.memory_mib` is gone: the guest is sized by `resources`, and
+    /// the refusal names the field to set instead.
+    #[test]
+    fn memory_mib_is_refused_with_the_resources_fix() {
+        let err = SandboxTaskPlugin
+            .validate_config(&json!({"image": "a", "command": ["x"], "memory_mib": 1024}))
+            .expect_err("memory_mib is refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("config.memory_mib` is gone"), "{message}");
+        assert!(message.contains("resources.memory = 1024"), "{message}");
+        assert!(message.contains("resources.memoryMax = 1024"), "{message}");
+        assert!(
+            !SandboxTaskPlugin
+                .schema()
+                .to_string()
+                .contains("memory_mib"),
+            "the schema no longer offers it"
+        );
     }
 
     #[test]
@@ -3187,7 +3198,6 @@ mod tests {
             "command": ["true"],
         }))?;
         assert_eq!(parsed.vcpus(), DEFAULT_VCPUS);
-        assert_eq!(parsed.memory_mib(), DEFAULT_MEMORY_MIB);
         assert_eq!(parsed.rootfs_headroom_mib(), DEFAULT_ROOTFS_HEADROOM_MIB);
         assert_eq!(parsed.tap_for(None, 1), None);
         Ok(())
@@ -3210,12 +3220,6 @@ mod tests {
 
     #[test]
     fn config_rejects_unusable_guest_sizes() {
-        let err = SandboxTaskConfig::from_value(
-            &json!({"image": "a", "command": ["x"], "memory_mib": 16}),
-        )
-        .expect_err("memory too small");
-        assert!(err.to_string().contains("memory_mib must be at least"));
-
         let err =
             SandboxTaskConfig::from_value(&json!({"image": "a", "command": ["x"], "vcpus": 0}))
                 .expect_err("zero vcpus");
@@ -3248,8 +3252,8 @@ mod tests {
                 json!({"image": "a", "command": ["x"], "state": {"path": "/w"}}),
             ),
             (
-                "guest too small to boot",
-                json!({"image": "a", "command": ["x"], "memory_mib": 16}),
+                "retired memory_mib",
+                json!({"image": "a", "command": ["x"], "memory_mib": 1024}),
             ),
             (
                 "zero vcpus",
@@ -3363,6 +3367,7 @@ mod tests {
             "legion-sbx-7",
             &[],
             &config,
+            None,
             &BTreeMap::new(),
             &[],
             Some(Path::new("/allocs/7/box/identity")),
@@ -3872,7 +3877,6 @@ mod tests {
             "image": "alpine",
             "command": ["-l", "ls"],
             "vcpus": 2,
-            "memory_mib": 1024,
             "cwd": "/workspace",
         }))?;
         let env = BTreeMap::from([("MODE".to_string(), "test".to_string())]);
@@ -3886,7 +3890,15 @@ mod tests {
             ),
             models,
         ];
-        let args = build_apple_launch("legion-sbx-7", &[], &config, &env, &volumes, None);
+        let args = build_apple_launch(
+            "legion-sbx-7",
+            &[],
+            &config,
+            Some(1024),
+            &env,
+            &volumes,
+            None,
+        );
 
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rm".to_string()));
@@ -3911,7 +3923,15 @@ mod tests {
     fn apple_launch_omits_sizing_flags_when_unset() -> R<()> {
         let config =
             SandboxTaskConfig::from_value(&json!({"image": "alpine", "command": ["true"]}))?;
-        let args = build_apple_launch("legion-sbx-7", &[], &config, &BTreeMap::new(), &[], None);
+        let args = build_apple_launch(
+            "legion-sbx-7",
+            &[],
+            &config,
+            None,
+            &BTreeMap::new(),
+            &[],
+            None,
+        );
         assert!(!args.contains(&"--cpus".to_string()));
         assert!(!args.contains(&"--memory".to_string()));
         assert!(!args.contains(&"--volume".to_string()));
@@ -3947,20 +3967,14 @@ mod tests {
     /// microVM floor (64 MiB) is unchanged for everything else.
     #[test]
     fn apple_memory_floor_applies_to_dev_mode_on_macos() -> R<()> {
-        let small = json!({ "image": "a", "command": ["x"], "memory_mib": 128 });
-        let config = SandboxTaskConfig::from_value(&small)?;
-        let err = check_apple_memory_floor("workspace", &config).expect_err("below the floor");
+        let small = json!({ "image": "a", "command": ["x"] });
+        let err = check_apple_memory_floor("workspace", Some(128)).expect_err("below the floor");
         assert!(err.to_string().contains("200 MiB"), "{err}");
-        assert!(err.to_string().contains("memory_mib"), "{err}");
-        check_apple_memory_floor(
-            "workspace",
-            &SandboxTaskConfig::from_value(
-                &json!({ "image": "a", "command": ["x"], "memory_mib": 256 }),
-            )?,
-        )?;
+        assert!(err.to_string().contains("resources.memory"), "{err}");
+        check_apple_memory_floor("workspace", Some(256))?;
+        check_apple_memory_floor("workspace", None)?;
 
-        // Not pinned to macOS: 128 MiB is a valid microVM guest (sized by
-        // `resources`, so no memory_mib mismatch warning either).
+        // Not pinned to macOS: 128 MiB is a valid microVM guest.
         let mut task = task_with(small);
         task.resources = json!({ "memory": 128 });
         assert!(SandboxTaskPlugin.check_resources(&task)?.is_empty());
@@ -4493,7 +4507,6 @@ mod tests {
         let mut task = task_with(json!({
             "image": image,
             "hypervisor": hypervisor,
-            "memory_mib": 2048,
             "command": ["/bin/sh", "-c",
                         "while true; do echo avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo); sleep 0.5; done"],
         }));

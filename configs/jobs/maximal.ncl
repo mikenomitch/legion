@@ -1345,9 +1345,9 @@
                 # Guest working directory (defaults to the image's).
                 cwd = "/workspace",
                 # Guest vCPUs (default 1), independent of resources.cpu.
-                # Guest RAM is not set here: it follows `resources` below
-                # (memoryMax, else memory). An explicit `memory_mib` still
-                # wins this release, with a submit warning when it disagrees.
+                # Guest RAM is not set here: it is `resources` below
+                # (memoryMax, else memory, else 512). There is no
+                # `memory_mib`; submit refuses one.
                 vcpus = 1,
                 # Writable scratch in the ephemeral root disk, on top of the
                 # image contents (default 256). Anything written outside the

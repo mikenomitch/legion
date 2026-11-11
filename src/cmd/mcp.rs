@@ -464,7 +464,7 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_validate",
-            description: "Validate a rendered jobspec (JSON) without submitting it. An unknown key is an error that names its path and the closest known key (`web: task web: unknown field `cuont` (did you mean `count`?)`), installed apps' keys included; fix it, or pass `allow_unknown_fields` to see what a submit with the flag would keep and drop. Values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`); offline, keys at extension points are reported as not checked (`installedKeys: unchecked`).",
+            description: "Validate a rendered jobspec (JSON) without submitting it. An unknown key is an error that names its path and the closest known key (`web: task web: unknown field `cuont` (did you mean `count`?)`), installed apps' keys included; fix it, or pass `allow_unknown_fields` to see what a submit with the flag would keep and drop. Values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`); offline, keys at extension points are reported as not checked (`installedKeys: unchecked`). It also checks the `jobRules` of the namespace policies governing the job's namespace when the caller can read them (`namespace:read` there, or `acl:read`), failing with the policy and rule named; otherwise `warnings` says they were not checked.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -3641,11 +3641,22 @@ async fn validate_tool(args: Value) -> Result<Value, String> {
     let (config, unknown_fields) = JobConfig::parse_submitted_str(&spec_json, mode, check)
         .map_err(|e| format!("jobspec is not a valid job configuration: {e:#}"))?;
     validate_job_config(&config).map_err(|e| format!("jobspec failed validation: {e}"))?;
+    let mut warnings = unknown_fields.warnings();
+    // Namespace policy job rules, as `job validate` checks them: refused
+    // when one fails, a warning when the caller cannot read the policies.
+    match crate::cmd::job::job_rules_refusal(None, &spec_json, &config).await {
+        Ok(None) => {}
+        Ok(Some(refusal)) => return Err(refusal),
+        Err(why) => warnings.push(format!(
+            "namespace policy job rules were not checked ({why}); `legion_job_plan` checks \
+             them"
+        )),
+    }
     Ok(json!({
         "valid": true,
         "job": config.name,
         "tasks": config.tasks.len(),
-        "warnings": unknown_fields.warnings(),
+        "warnings": warnings,
         "unknownFields": unknown_fields,
         "installedKeys": if registry.is_some() { "checked" } else { "unchecked" },
         "extensions": config.extensions,

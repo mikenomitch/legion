@@ -618,6 +618,11 @@ All three share `content.ttl` (an unpinned entry unused for 72 hours is
 removed), `content.minFreeDisk` (5 GiB), pinning, and a garbage collection
 pass every 10 minutes.
 
+A worker with a metrics listener exports what each class holds, holds
+pinned, and may hold as `legion_content_store_bytes{class}`,
+`legion_content_store_pinned_bytes{class}`, and
+`legion_content_store_budget_bytes{class}` ([metrics.md](metrics.md#worker)).
+
 ### Derived content
 
 Some of what a worker needs it does not fetch: it builds it, from content it
@@ -824,11 +829,16 @@ budgets = {
 },
 ```
 
-On a
-small disk the floors can add up to more than 30% of it, and then
-`minFreeDisk` is what protects the node: the store evicts unpinned content,
-then refuses new content, before free space drops below it, and the
-scheduler counts it when it checks a node's
+The floors add up to 4 GiB. On a disk too small for them, they give way
+until the budgets fit the filesystem: each budget a floor lifted above its
+plain share is lowered toward that share, in proportion to how far its floor
+lifted it, and none drops below its share. On a 1.2 GB disk the defaults
+come to about 634 MB for artifacts, 377 MB for snapshots, and 189 MB for
+derived content, 1.2 GB together. A fixed size is never lowered, and a disk
+the floors fit (8 GiB and up with the defaults) keeps the table above.
+`minFreeDisk` still protects the node on top of the budgets: the store
+evicts unpinned content, then refuses new content, before free space drops
+below it, and the scheduler counts it when it checks a node's
 [checkpoint room](suspend-and-resume.md#the-checkpoint-disk-budget).
 
 Every field is optional. A malformed size, percentage, or duration fails

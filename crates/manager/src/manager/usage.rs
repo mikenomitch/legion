@@ -202,6 +202,12 @@ fn publish_node_gauges(node_id: &str, report: Option<&UsageReport>) {
         .set(&labels, clamp(memory.map_or(0, |m| m.available_bytes)));
     metrics.node_memory_used_bytes.set(&labels, clamp(used));
     metrics.node_cpu_used_millicores.set(&labels, clamp(cpu));
+    metrics.node_memory_pressure_some_avg10.set(
+        &labels,
+        memory
+            .filter(|memory| memory.psi_available)
+            .map_or(0.0, |memory| memory.psi_some_avg10),
+    );
 }
 
 /// Build the `GetNodeUsage` reply for one node from its stored row, the
@@ -474,6 +480,42 @@ mod tests {
     fn policy() -> ResourcePolicy {
         ResourcePolicy::from_manager_config(&crate::structs::config::ManagerConfigFull::default())
             .expect("policy")
+    }
+
+    /// A report sets the node's gauges, PSI included; a node whose kernel
+    /// has no PSI reads 0; a swept node drops to 0.
+    #[test]
+    fn ingest_and_sweep_publish_the_node_gauges() {
+        let metrics = crate::manager::telemetry::metrics();
+        let mut table = UsageTable::default();
+        let start = Instant::now();
+        table.ingest("gauges-psi", report(0, vec![usage(1, 100, 0)]), start);
+        let mut no_psi = report(0, vec![]);
+        if let Some(memory) = no_psi.node_memory.as_mut() {
+            memory.psi_available = false;
+        }
+        table.ingest("gauges-no-psi", no_psi, start);
+        assert_eq!(
+            metrics.node_memory_pressure_some_avg10.get(&["gauges-psi"]),
+            0.4
+        );
+        assert_eq!(
+            metrics.node_memory_used_bytes.get(&["gauges-psi"]),
+            (100 * MIB) as i64
+        );
+        assert_eq!(
+            metrics
+                .node_memory_pressure_some_avg10
+                .get(&["gauges-no-psi"]),
+            0.0
+        );
+
+        table.sweep(start + USAGE_STALE_AFTER);
+        assert_eq!(
+            metrics.node_memory_pressure_some_avg10.get(&["gauges-psi"]),
+            0.0
+        );
+        assert_eq!(metrics.node_memory_used_bytes.get(&["gauges-psi"]), 0);
     }
 
     #[test]

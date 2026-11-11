@@ -412,6 +412,20 @@ warns instead of checking.
 **Why.** `job plan` already runs every policy check on the manager, as the
 caller; a second RPC for the same answer is surface without a new job.
 
+**Update (2026-11).** The trade-off is narrowed, still with no new RPC:
+`job validate` (and now the `legion_job_validate` MCP tool, which did not
+check rules at all) reads the governing policies from `GetNamespace` on the
+job's namespace first, which needs only `namespace:read` there, and falls
+back to `ListNamespacePolicies` (`acl:read`) when that fails (a namespace
+not created yet, say). `GetNamespace` already returned every governing
+policy whole, `jobRules` included, so nothing becomes readable that was not
+before. A job author with `job:write` and neither `namespace:read` nor
+`acl:read` still gets the warning; the rejected alternative was a
+manager-side `ValidateJob` RPC gated on `job:write`, which is the new RPC
+this call declined. Surface: `warning: namespace policy job rules were not
+checked (reading them needs `namespace:read` on <ns> or `acl:read`: …);
+`legion job plan` checks them`.
+
 ## 21. Sandboxes refuse devices at submit; MIG, MPS, and DRA are deferred
 
 **Call.** A `sandbox` task with `resources.devices` is refused at submit.

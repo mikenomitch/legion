@@ -11,7 +11,7 @@
     description = "Free-tier tasks may only GET",
     module = {
         source = "https://artifacts.example.com/netplugins/read-only-free-tier.wasm",
-        checksum = "sha256:48dc46b14d621f9952f0a1ac439330b8408e243c52df01eaced37cb1d2cfdd83",
+        checksum = "sha256:ae94b6c52e3b2517d4acfdd64e58b4268b3898e7df15b80db66a5ac8317dac53",
     },
     stages = ["request"],
     usableBy = "policies",

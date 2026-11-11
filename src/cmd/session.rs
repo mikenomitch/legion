@@ -118,7 +118,9 @@ pub fn config() -> Command {
                     .requires("resume-id")
                     .help(
                         "With --resume-id: move the session even when the node its manifest \
-                         names did not answer (only once that node is known to be down)",
+                         names did not answer (only once that node is known to be down). \
+                         Without it, a move past a silent node is forced only when the \
+                         managers list that node down or lost",
                     ),
             )
             .arg(
@@ -1221,6 +1223,45 @@ async fn start_child_of_self(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
+/// The node a `running_elsewhere` refusal names: an UNAVAILABLE that the
+/// old node did not answer, ending in `[winner node=<id> generation=<g>]`.
+fn running_elsewhere_node(status: &tonic::Status) -> Option<String> {
+    if status.code() != tonic::Code::Unavailable
+        || !status.message().starts_with("running_elsewhere:")
+    {
+        return None;
+    }
+    let (_, tail) = status.message().rsplit_once("[winner node=")?;
+    let node = tail.split([' ', ']']).next()?;
+    (!node.is_empty()).then(|| node.to_string())
+}
+
+/// `down` or `lost` when `ListSessionNodes` lists `node` that way for the
+/// session task, else `None`, including when no manager answers: without
+/// that word the move stays unforced and the node's refusal stands.
+async fn node_marked_gone(job_id: &str, task_name: &str, node: &str) -> Option<String> {
+    let mut client = connect_manager_client().await.ok()?;
+    let reply = client
+        .list_session_nodes(ListSessionNodesRequest {
+            job_id: job_id.to_string(),
+            task_name: task_name.to_string(),
+        })
+        .await
+        .ok()?
+        .into_inner();
+    gone_reason(&reply, node).map(str::to_string)
+}
+
+/// The `down`/`lost` reason `reply` gives `node`, if any.
+fn gone_reason<'a>(reply: &'a ListSessionNodesReply, node: &str) -> Option<&'a str> {
+    reply
+        .nodes
+        .iter()
+        .find(|entry| entry.node_id == node)
+        .map(|entry| entry.reason.as_str())
+        .filter(|reason| matches!(*reason, "down" | "lost"))
+}
+
 fn print_started(format: OutputFormat, reply: &crate::structs::StartSessionReply) {
     if format.is_json() {
         output::print_success(&json!({
@@ -1331,37 +1372,59 @@ async fn start(matches: &ArgMatches) -> R<()> {
             .unwrap_or_default(),
         id,
     });
+    let mut request = StartSessionRequest {
+        owner,
+        ticket: ticket(matches),
+        job_id: matches
+            .get_one::<String>("job")
+            .map(|job| crate::cmd::helpers::job_ref(matches, job))
+            .transpose()?
+            .unwrap_or_default(),
+        task_name: matches
+            .get_one::<String>("task")
+            .cloned()
+            .unwrap_or_default(),
+        idempotency_key: matches
+            .get_one::<String>("idempotency-key")
+            .cloned()
+            .unwrap_or_default(),
+        wait: matches.get_flag("no-wait").then_some(false),
+        resume_id: matches
+            .get_one::<String>("resume-id")
+            .cloned()
+            .unwrap_or_default(),
+        force_move: matches.get_flag("force-move"),
+    };
     let mut client = edge_client(matches).await?;
-    let reply = output::resolve(
-        format,
-        "Failed to start the session",
-        client
-            .start_session(StartSessionRequest {
-                owner,
-                ticket: ticket(matches),
-                job_id: matches
-                    .get_one::<String>("job")
-                    .map(|job| crate::cmd::helpers::job_ref(matches, job))
-                    .transpose()?
-                    .unwrap_or_default(),
-                task_name: matches
-                    .get_one::<String>("task")
-                    .cloned()
-                    .unwrap_or_default(),
-                idempotency_key: matches
-                    .get_one::<String>("idempotency-key")
-                    .cloned()
-                    .unwrap_or_default(),
-                wait: matches.get_flag("no-wait").then_some(false),
-                resume_id: matches
-                    .get_one::<String>("resume-id")
-                    .cloned()
-                    .unwrap_or_default(),
-                force_move: matches.get_flag("force-move"),
-            })
-            .await
-            .map(tonic::Response::into_inner),
-    )?;
+    let mut result = client
+        .start_session(request.clone())
+        .await
+        .map(tonic::Response::into_inner);
+    // A move the old node did not answer: the picker's job is to force it
+    // when the managers list that node `down` or `lost` (the manager-routed
+    // move does the same), so the caller need not pass --force-move.
+    if let Err(status) = &result {
+        if !request.resume_id.is_empty() && !request.force_move {
+            if let Some(node) = running_elsewhere_node(status) {
+                if let Some(reason) =
+                    node_marked_gone(&request.job_id, &request.task_name, &node).await
+                {
+                    if !format.is_json() {
+                        eprintln!(
+                            "Node {node} did not answer and is listed {reason}; moving the \
+                             session with --force-move"
+                        );
+                    }
+                    request.force_move = true;
+                    result = client
+                        .start_session(request.clone())
+                        .await
+                        .map(tonic::Response::into_inner);
+                }
+            }
+        }
+    }
+    let reply = output::resolve(format, "Failed to start the session", result)?;
     print_started(format, &reply);
     Ok(())
 }
@@ -1494,6 +1557,39 @@ mod session_cmd_test {
         let lines = haproxy(&reply());
         assert!(lines.contains("server w-17 10.0.1.7:4848 weight 43 ssl verify required\n"));
         assert!(lines.contains("server w-18 10.0.1.8:4848 weight 1 ssl verify required disabled\n"));
+    }
+
+    #[test]
+    fn a_move_is_forced_only_past_a_node_listed_down_or_lost_test() {
+        let refusal = tonic::Status::unavailable(
+            "running_elsewhere: session workspace-q4n7c2rd.01jbx runs on node w-17 \
+             (generation 2), which did not answer within 2s: connect refused. Retry with \
+             force_move only once that node is known to be down (`legion session nodes`) \
+             [winner node=w-17 generation=2]",
+        );
+        assert_eq!(running_elsewhere_node(&refusal).as_deref(), Some("w-17"));
+        assert_eq!(
+            running_elsewhere_node(&tonic::Status::unavailable("store unreachable")),
+            None
+        );
+        assert_eq!(
+            running_elsewhere_node(&tonic::Status::failed_precondition(
+                "running_elsewhere: [winner node=w-17 generation=2]"
+            )),
+            None
+        );
+
+        let mut nodes = reply();
+        assert_eq!(gone_reason(&nodes, "w-17"), None);
+        assert_eq!(gone_reason(&nodes, "w-18"), None, "draining is not gone");
+        nodes.nodes[0].accepting = false;
+        nodes.nodes[0].reason = "lost".into();
+        assert_eq!(gone_reason(&nodes, "w-17"), Some("lost"));
+        assert_eq!(
+            gone_reason(&nodes, "w-99"),
+            None,
+            "an unlisted node is not gone"
+        );
     }
 
     #[test]

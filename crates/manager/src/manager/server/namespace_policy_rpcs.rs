@@ -468,17 +468,24 @@ impl ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // The delete and its record land in one entry, so a concurrent
+        // request with the same key that finds the policy already gone
+        // finds the winner's record too, and is answered as a retry.
         let deleted = self
             .store
-            .delete_namespace_policy(&name)
+            .delete_namespace_policy_recorded(&name, &idempotency_key, &name)
             .map_err(|e| map_store_error("Error deleting namespace policy", e))?;
         if !deleted {
+            if self.idempotency_winner(&idempotency_key)?.is_some() {
+                return Ok(Response::new(DeleteNamespacePolicyReply {
+                    deleted: true,
+                    deduplicated: true,
+                }));
+            }
             return Err(Status::not_found(format!(
                 "namespace policy '{name}' does not exist"
             )));
         }
-        let (_, deduplicated) =
-            self.record_idempotent(&idempotency_key, "delete_namespace_policy", name.clone())?;
         info!(
             policy = %name,
             accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
@@ -486,7 +493,7 @@ impl ManagerDaemonService {
         );
         Ok(Response::new(DeleteNamespacePolicyReply {
             deleted: true,
-            deduplicated,
+            deduplicated: false,
         }))
     }
 }

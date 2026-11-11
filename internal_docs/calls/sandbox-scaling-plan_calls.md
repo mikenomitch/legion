@@ -1524,3 +1524,39 @@ separate number (Phase 8 measures density per node). (c) would leave the
 owner to extrapolate by hand, which is where unlabelled numbers come from;
 the report does it once, with the basis printed beside every figure. Open
 in TODO.md: run it on AWS.
+
+## 61. `legion_sessions_envelope_free{job}` counts sessions, per manager, summed by the reader
+
+*Follow-up to §15's capacity-planning note, implementation.*
+
+**Call.** The gauge is the number of sessions of the task's size that still
+fit the job's envelopes: per envelope, its room less what its sessions hold,
+divided by one session's `resources` on the tightest key, summed over the
+job's nodes and session tasks. Each manager reports only the nodes whose
+heartbeats it holds (its session index's covered nodes), from its own index
+plus its own unreported starts, every 10 seconds; the docs say to sum across
+managers.
+
+```promql
+sum by (job) (legion_sessions_envelope_free)
+```
+
+**Alternatives.** (a) Free amounts per resource,
+`legion_sessions_envelope_free{job,resource}`. (b) A cluster-wide number on
+every manager, from the merged view the router uses (`QuerySessions` to
+every peer). (c) Export it from the router's cached view only, refreshed by
+starts.
+
+**Trade-off.** Slots hide which key is tight, and a task whose sessions size
+nothing counts as `u32::MAX` per node. Summing is the reader's job, and a
+node that moves between managers can count on both for up to its report
+staleness window (2 minutes) after the move.
+
+**Why (simplicity, performance).** A session count is what "can I absorb
+this burst" asks, it is the unit of `legion session nodes`' `weight`, and it
+alerts with one threshold whatever the envelope's shape; the per-key amounts
+are in `legion session nodes`. (b) makes a gauge refresh fan out a peer RPC
+per session task every tick, on every manager, for a number the reader can
+sum. (c) goes stale on a manager that routes nothing, and never sees stops.
+The per-manager split is the same one `legion_node_memory_used_bytes` and the
+usage gauges already document.

@@ -76,6 +76,9 @@ pub fn advertised_set(store: Option<&ContentStore>) -> R<HashMap<String, u64>> {
 pub fn snapshot_budget(store: Option<&ContentStore>) -> Option<SnapshotBudget> {
     let store = store?;
     let usage = store.usage().ok()?;
+    // The heartbeat reads the classes for the budget anyway, so the
+    // per-class gauges ride the same read.
+    publish_class_gauges(&usage);
     // Unpinned content of every class is what `minFreeDisk` eviction can
     // free, so the manager counts it as room on the disk.
     let reclaimable_bytes = usage
@@ -93,6 +96,26 @@ pub fn snapshot_budget(store: Option<&ContentStore>) -> Option<SnapshotBudget> {
             min_free_disk_bytes: store.config().min_free_disk,
             reclaimable_bytes,
         })
+}
+
+/// `legion_content_store_bytes{class}`, `..._pinned_bytes{class}`, and
+/// `..._budget_bytes{class}` (docs/metrics.md, "Worker"), from one read of
+/// the store's classes.
+pub fn publish_class_gauges(usage: &[crate::content_store::ClassUsage]) {
+    let metrics = crate::telemetry::worker_metrics();
+    let clamp = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    for class in usage {
+        let labels = [class.class.as_str()];
+        metrics
+            .content_store_bytes
+            .set(&labels, clamp(class.used_bytes));
+        metrics
+            .content_store_pinned_bytes
+            .set(&labels, clamp(class.pinned_bytes));
+        metrics
+            .content_store_budget_bytes
+            .set(&labels, clamp(class.budget));
+    }
 }
 
 /// One report in flight, with the set it describes, so it can be
@@ -230,5 +253,46 @@ impl ContentAdvertiser {
         self.acked = pending.snapshot;
         self.acked_epoch = pending.report.epoch;
         self.needs_full = false;
+    }
+}
+
+#[cfg(test)]
+mod content_report_test {
+    use super::*;
+    use crate::content_store::{ContentStoreConfig, PutOptions};
+
+    /// The heartbeat's budget read also sets the per-class gauges, and they
+    /// agree with the budget it reports.
+    #[test]
+    fn the_snapshot_budget_read_publishes_the_class_gauges_test() -> R<()> {
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?;
+        let store = ContentStore::open(
+            dir.path().join("content"),
+            ContentStoreConfig {
+                min_free_disk: 0,
+                ..Default::default()
+            },
+        )?;
+        store.put_bytes(
+            ContentClass::Snapshots,
+            &b"checkpoint part ".repeat(4096),
+            PutOptions::default(),
+        )?;
+        let budget = snapshot_budget(Some(&store)).expect("a snapshots class");
+        assert!(budget.used_bytes > 0);
+        let metrics = crate::telemetry::worker_metrics();
+        assert_eq!(
+            metrics.content_store_bytes.get(&["snapshots"]),
+            budget.used_bytes as i64
+        );
+        assert_eq!(
+            metrics.content_store_budget_bytes.get(&["snapshots"]),
+            budget.budget_bytes as i64
+        );
+        assert_eq!(
+            metrics.content_store_pinned_bytes.get(&["snapshots"]),
+            budget.pinned_bytes as i64
+        );
+        Ok(())
     }
 }

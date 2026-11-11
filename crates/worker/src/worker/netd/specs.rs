@@ -611,8 +611,9 @@ mod tests {
 
     /// Gated plan §6.5, calls entry 29: every gated sandbox gets a resolver
     /// on its vsock socket even with no upstreams (and so no VIP block),
-    /// and never binds an address. A gated container still needs a block
-    /// (its namespace resolver gap is tracked separately).
+    /// and never binds an address. A gated container or `exec` task binds
+    /// the address its placement carries (below); a row without one gets
+    /// nothing, since there is no address to bind.
     #[test]
     fn every_gated_sandbox_gets_a_resolver_on_its_vsock_socket_test() {
         let alloc_root = std::path::Path::new("/var/lib/legion/allocs");
@@ -695,6 +696,42 @@ mod tests {
         // Denials and access logs name the isolate task, not its envelope.
         let identities = crate::worker::netd::policy::identities_from_desired(&desired);
         assert_eq!(identities[&9].task_name, "run");
+    }
+
+    /// Worker-plane-auth plan Phase 3 (§6.12): a gated `container` or `exec`
+    /// task with no upstreams, and so no VIP block, still gets a resolver.
+    /// Placement gives its network the fixed in-namespace address
+    /// (`GATED_RESOLVER_ADDR`), and the worker binds it inside the
+    /// allocation's own namespace, where it spends no VIP block.
+    #[test]
+    fn a_gated_task_without_upstreams_gets_a_resolver_in_its_namespace_test() {
+        let alloc_root = std::path::Path::new("/var/lib/legion/allocs");
+        let placed = |allocation_id: i64, runtime: &str| TaskAllocation {
+            allocation_id,
+            task_runtime: runtime.into(),
+            network: json!({
+                "mode": "gated",
+                "resolver": crate::structs::network::GATED_RESOLVER_ADDR,
+            })
+            .to_string(),
+            ..TaskAllocation::default()
+        };
+        let specs = dns_specs(&[placed(8, "container"), placed(9, "exec")], alloc_root);
+        assert_eq!(specs.len(), 2, "{specs:?}");
+        for (spec, id) in specs.iter().zip([8, 9]) {
+            assert_eq!(spec.allocation_id, id);
+            assert_eq!(
+                spec.resolver,
+                Some(std::net::Ipv4Addr::new(127, 0, 0, 53)),
+                "the fixed in-namespace address"
+            );
+            assert_eq!(
+                spec.attachment.netns(),
+                Some(crate::worker::netd::netns::netns_path(id).as_path()),
+                "bound inside the allocation's namespace, not on the host"
+            );
+            assert!(spec.names.is_empty(), "no upstreams, no names");
+        }
     }
 
     #[test]

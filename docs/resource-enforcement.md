@@ -322,9 +322,8 @@ Things to know:
 - **The guest size follows `resources`.** A sandbox boots a guest of
   `memoryMax` MiB when set, else `memory` MiB (512 when undeclared, the
   runtime's own default, ahead of `taskResourceDefaults`), so what the
-  scheduler reserves and what the VM gets can no longer drift apart. An explicit
-  `config.memory_mib` still wins in this release, and submit warns when it
-  disagrees with `resources`. A later release rejects the mismatch. See
+  scheduler reserves and what the VM gets can no longer drift apart. There
+  is no `config.memory_mib`; submit refuses one. See
   [task-runtime-sandbox.md](task-runtime-sandbox.md#guest-size).
 - **`cpu` and `cores` apply to the VMM's threads**, so a guest with more
   `vcpus` than its `cores` reservation shares those cores among its vCPUs.
@@ -699,7 +698,10 @@ allocation out of relaunch until the manager drops it from the desired set,
 and a heartbeat that fails is retried with the same report.
 
 Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
-`legion_worker_pressure_actions_total{step}` on the worker. See
+`legion_worker_pressure_actions_total{step}` on the worker, with
+`legion_node_memory_pressure_some_avg10{node}` (the stall the
+`maxStall` trigger reads) and `legion_node_memory_reserved_bytes{node}`
+(what the node's allocations reserve) beside the measured memory. See
 [metrics.md](metrics.md#node-usage).
 
 ### Limits of the response

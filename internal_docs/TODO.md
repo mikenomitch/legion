@@ -12,9 +12,13 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 | PR | What it lands |
 | --- | --- |
 | [#75](https://github.com/mikenomitch/legion/pull/75) | The `isolate` runtime, Phases 1–5: `legion-isolate`, the `js` and `python` images, the worker's isolate supervisor and datapath, tiers and burst, `legion isolate stats`/`get` ([plan](plans/isolate-runtime-plan.md) · [calls](calls/isolate-runtime-plan_calls.md) · [docs](../docs/task-runtime-isolate.md)) |
-| [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again (likely closes "Plugin lockfiles are stale") |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
 | [#37](https://github.com/mikenomitch/legion/pull/37) | UI appearance picker: built-in themes and custom colors |
+
+[#41](https://github.com/mikenomitch/legion/pull/41) (keep plugins out of the
+workspace) is superseded: the crate split ([#71](https://github.com/mikenomitch/legion/pull/71))
+landed the same `members` fix and the plugin build's exit-status check, so it
+can be closed.
 
 ---
 
@@ -318,9 +322,11 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 
 - [ ] **The node's resource ledger is never configured in production.**
       `configure_ledger` has only test callers, so `LocalLedger` admits every
-      edge claim and doc verification step 7 checks against infinite room.
-      Configure it from declared resources and track allocations, or drop the
-      step ([edge-admission-control §5.3](plans/edge-admission-control-plan.md)).
+      edge claim (the docs now say so). Sizing it alone would leak room:
+      `LocalLedger::release` has no production caller and manager-placed
+      allocations are never committed. Size it from `ResourcePool::from_node`
+      and derive usage from live allocations (`crates/worker/src/worker/claims.rs`;
+      [edge-admission-control §5.3](plans/edge-admission-control-plan.md)).
 - [ ] **Speculative dispatch and late-binding apply don't compose**: when the
       apply falls back from `candidates[0]`, the claim goes unratified and holds
       staged work until its lease expires. Dispatch to top-n, or prefer
@@ -367,17 +373,16 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 [plan](plans/aws-comparative-benchmark-plan.md) · [calls](calls/aws-comparative-benchmark-plan_calls.md) ·
 [`benchmarks/aws/`](../benchmarks/aws/README.md)
 
-- [ ] **The rig never forgets its simulated nodes.** `ForgetNode` /
-      `legion node forget` now exist, but `stop-sim-fleet.sh` leaves every node
-      and `reset-control-plane.sh` wipes the store instead. Use it, then
-      per-run name prefixes become safe.
-- [ ] **The rig runs every cell as `bin_pack`**: the manager template sets it
-      and `translate.py` drops the scenario's `spread`. Make them agree, and
-      measure conflicts under both.
+- [ ] **Measure plan-apply conflicts under both `bin_pack` and `spread` on the
+      rig.** The rig now runs each scenario's own `scheduling_policy`
+      (`run-campaign.sh --scheduling-policy` overrides); no AWS run has used it yet.
 - [ ] **Bake a rig AMI.** Control plane, loadgen, and spot workers each pay
       their own cloud-init (~10 min at bring-up, 6–8 min per ASG scale-up, which
       stalled a whole session). `scripts/rig-toolchain.sh` is written; it needs
       a `bake-rig-ami.sh` and a terraform lookup, like the operator AMI.
+- [ ] **Per-run sim node prefixes.** Now that `stop-sim-fleet.sh` forgets
+      its nodes, the per-campaign store reset and the one-scenario-per-campaign
+      rule could go; both are left as they were ([calls 43](calls/aws-comparative-benchmark-plan_calls.md)).
 - [ ] **Cache the built binary in S3, keyed on git rev.** `distfast` took 28
       min against 24.5 for full LTO (the cost is ~900 crates, not linking);
       `build-and-upload.sh` already fingerprints plugins, not the main binary.
@@ -415,9 +420,6 @@ rig runs for everything below live in the verify list.
         `web-fleet-throughput`; each needs its own measured case.
   - [ ] **A memory-snapshot start for sessions**: restore from a per-node
         template snapshot instead of booting (opt-in, falls back to a boot).
-  - [ ] **Kernel size.** cloud-hypervisor copies the 48 MB reference kernel
-        per boot (~6% of a busy node's CPU); document or ship a minimal
-        guest kernel config.
 - [ ] **Start reports wait for a heartbeat.** A health transition reaches the
       manager on the next beat (~1 s, up to 21 s on adaptive cadence), so
       rollouts and discovery wait. Carry it on a `StreamWork` report frame
@@ -463,16 +465,19 @@ rig runs for everything below live in the verify list.
       that needs it ([docs](../docs/resource-enforcement.md#not-implemented)).
 - [ ] **A delegated (non-root) cgroup hierarchy root** for non-root workers
       ([docs](../docs/resource-enforcement.md#defaults-and-turning-it-off)).
-- [ ] **`legion alloc signal`** — an on-demand signal verb over the existing
-      `TaskPlugin::signal` plumbing.
+- [ ] **`legion alloc signal`** — an on-demand signal verb. The worker side
+      exists (`WorkerTaskManager::signal_allocation`, used by template and KV
+      change modes); it needs a plan, a manager-called Worker `SignalTask`, a
+      Manager `SignalAllocation` (`job:write`, idempotent), CLI, catalog and MCP.
 - [ ] **The `sandbox` runtime cannot take on-demand signals**; only the stop
       signal reaches the guest. The guest agent would implement
       `TaskPlugin::signal` ([docs](../docs/task-runtime-sandbox.md#current-scope-and-limitations)).
-- [ ] **The container runtime's `#[ignore]`d OCI tests fail under runc
-      1.5.1.** `stop_lets_a_trapping_container_drain` and
-      `stop_force_kills_at_the_deadline` look stale (they call the hard
-      `stop()`); fix them. Three others are unexplained pending a cgroup v2
-      rerun (`crates/worker/src/task_plugins/container.rs`).
+- [ ] **Three of the container runtime's `#[ignore]`d OCI tests are
+      unexplained under runc** (`exec_runs_inside_the_container`,
+      `sees_task_dir_files_and_their_rewrites`,
+      `enforces_a_declared_memory_limit`), pending a cgroup v2 rerun
+      (`crates/worker/src/task_plugins/container.rs`). The two stop tests were
+      stale and are fixed.
 - [ ] **Two workers on one host can still collide on cgroup leaves and gated
       netns names.** OCI ids are node-scoped (2026-11-08), but the cgroup leaf
       stays `legion-<alloc>` and netns names carry no node id. The orphan-netns
@@ -666,10 +671,11 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
 
 ### Sandboxes
 
-- [ ] **Make a sandbox `memory_mib` that disagrees with `resources` a submit
-      error** (today a warning, calls 16), then drop `memory_mib` from the
-      schema ([plan](plans/suspend-resume-and-oversubscription-plan.md#10-rollout-and-backward-compatibility),
-      [docs](../docs/task-runtime-sandbox.md#guest-size)).
+- [ ] **A sandbox resized below its boot size and then suspended resumes
+      cold**: since `memory_mib` is gone the checkpoint holds the boot-size
+      guest. Restore should take the checkpoint's guest size, re-apply the
+      balloon floor, and raise the VMM cgroup ceiling to match
+      ([docs](../docs/resize.md)).
 - [ ] **Sandbox base root disk cache, later phases**
       ([plan](plans/rootfs-base-cache-plan.md) ·
       [calls](calls/rootfs-base-cache-plan_calls.md)):
@@ -693,8 +699,6 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
         restored guest (calls 14).
   - [ ] After a restore that moved a port, the new allocation's
         `LEGION_PORT_<label>` differs from the guest's real port (calls 13).
-  - [ ] Gated `container`/`exec` tasks without upstreams get no resolver
-        (worker-plane-auth Phase 3).
   - [ ] The egress proxy records service-graph bytes only when a splice
         ends (`crates/worker/src/worker/netd/proxy.rs`).
   - [ ] A gated resolver forwards queries while policy is pending
@@ -740,7 +744,6 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
         10^4 run, leader-kill check; calls 58).
   - [ ] Router locality by image (deferred; revisit once checkpoint chunks
         are shared across generations, calls 27).
-  - [ ] `legion_sessions_envelope_free{job}` gauge (plan §15).
   - [ ] Ended sessions are remembered per manager, so a retried stop on
         another manager answers `NOT_FOUND` (calls 55).
   - [ ] Batch session creates (`CreateInstance` with `count`, calls 57).
@@ -779,16 +782,13 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
       shipped; Linux/KVM checks are in the verify list. Still open:
   - [ ] Node usage lives on the manager that got the heartbeat; another
         manager reports `usage_reported: false`.
-  - [ ] No reserved-memory or node PSI Prometheus gauge.
-  - [ ] Default content budgets ignore disk size; clamp them to the
-        filesystem ([§ 3a.2](suspend-resume-linux-verification.md#3a2-minfreedisk-on-a-real-filesystem)).
   - [ ] Memory snapshots copy only the instance volume; refuse or snapshot
         attached block claims too.
   - [ ] Restore and fork are keyed-only; slot instances cannot be restored.
   - [ ] A pending restore has no `restore-pending` detail in `instance get`
         (plan §6.13).
-  - [ ] Snapshot metrics: manual capture/restore latency and content-store
-        bytes by class.
+  - [ ] `SnapshotReportOutcome::Restored` does not carry the snapshot's kind,
+        so `legion_snapshot_restore_seconds` reads the snapshot row per report.
   - [ ] Hash checkpoint parts once, on ingest (capture hashes twice and a
         memory suspend stays paused while hashing).
   - [ ] Ship a static (musl) resume handler so musl guests get the refresh.
@@ -817,8 +817,6 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
   - [ ] Chunked publish Phases 2–3: a node-local chunk index plus released
         parts kept as cache, and dirty-bitmap reuse on Firecracker
         ([plan](plans/chunked-checkpoint-publish-plan.md#8-implementation-phases)).
-  - [ ] Garbage-collect published parts (Legion never deletes from the
-        bucket, call 62), or document a lifecycle-rule recipe.
   - [ ] `snapshot publish <id>` for a snapshot whose retries are spent.
   - [ ] Check a published resume for room to fetch its parts (call 134).
   - [ ] Publish pressure checkpoints after recovery under `durability =
@@ -891,7 +889,6 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
   - [ ] Remove the manager-routed derived-id fan-out (plan §8 item 4) once measured.
   - [ ] No test for the edge move over worker-to-worker TLS, nor end-to-end
         periodic / SIGTERM checkpoints and restore after restart.
-  - [ ] `legion session nodes` should set `force_move` for a `down`/`lost` node.
   - [ ] Sweep `store` manifests whose job is gone (calls 33).
   - [ ] A moved `store` session runs the receiver's envelope version (calls 29);
         finding one scans every job and same-named tasks are ambiguous (calls 37).
@@ -955,7 +952,6 @@ Plan: [network-handlers-plan.md](plans/network-handlers-plan.md) · calls: [netw
 - [ ] **Pool `dispatch_http_call` connections** (calls 39).
 - [ ] **Plugin log lines in the allocation's logs** (calls 53).
 - [ ] **Plugin ticks and shared queues** (ticks never fire; calls 54).
-- [ ] **CI check that `tests/netplugins/*.wasm` match their sources** (calls 55).
 - [ ] **Attribute the plugin `request`-stage cost on the HTTP path** (+25–70 µs vs
       <7 µs in process; plan B1 unmet).
 - [ ] **A plugins page in the UI**; **per-rule kernel lines in `net policy show`**.
@@ -1093,7 +1089,10 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 - [ ] **Autoconfigured, auto-rotated TLS for the CLI and UI.** Plan first (public cert
       vs self-signed CA). Includes the https CA default
       (`configs/tls/rootca.pem`), which is relative to the working directory.
-- [ ] **A join secret can claim a `lost` node's name** ([calls #3](calls/architecture-audit-2026-10-09_calls.md)).
+- [ ] **A join secret can claim a `lost` node's name** in the same pool
+      ([calls #3](calls/architecture-audit-2026-10-09_calls.md)); a token for
+      another pool is refused since 2026-11-11. Closing it needs per-node
+      bootstrap credentials, which overlaps the next item.
 - [ ] **A restarted worker still needs its join token string** ([calls #6](calls/join-token-file-and-cli-timeouts_calls.md)).
 - [ ] **Push direct exec revocations** instead of waiting a heartbeat ([calls #18](calls/security-gap-closure-plan_calls.md)).
 - [ ] **Run `exec` health checks inside the task's runtime** ([calls #4](calls/security-gap-closure-plan_calls.md)).
@@ -1107,6 +1106,13 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging.md), [event-stream.md](../docs/event-stream.md)
 
 - [ ] **A trace viewer in the UI** (dev-only first).
+- [ ] **The Nickel step budget is fixed** at 1,000,000 (`EVAL_STEP_BUDGET`);
+      a legitimately heavy config (sorting thousands of generated records)
+      fails. Make it configurable if users hit it ([calls](calls/nickel-eval-budget_calls.md)).
+- [ ] **Per-node metric families fold into `"other"` past 256 nodes**
+      (`MAX_SERIES_PER_FAMILY`), so every `{node}` gauge is partial on a large
+      fleet. Needs a different cap or a per-pool aggregate. There is also no
+      per-node CPU-reservation gauge (only `legion node usage`).
 - [ ] **Cluster-wide per-task CPU/memory view** (with autoscaler scaling inputs).
 - [ ] **Usage accounting follow-ups** ([calls #10](calls/agent-governance-plan_calls.md)):
       enforcing budgets, measured usage, durable submitter attribution, device-hours.
@@ -1159,8 +1165,7 @@ Each runs as a Legion app ([plan](plans/legion-apps-plan.md) · [calls](calls/le
   - [ ] Apps have no health of their own (no Apps page, no stopped-app finding).
   - [ ] Reconciler: one serial loop, leader-local backoff, renders depend on the
         leader's build; a keyed action can run twice across leadership (calls 113, 129).
-  - [ ] CLI gaps: `app rollback`, `app set --key`, running actions, `app test`;
-        `app config get` prints JSON.
+  - [ ] CLI gaps: `app rollback`, `app set --key`, running actions, `app test`.
   - [ ] Pages only in the sidebar; UI smoke tests not in CI (calls 82, 84).
   - [ ] `WatchAppExtensions`/validate cost: per-stream polls, no caps (calls 90).
   - [ ] Free-form maps unchecked (`memroy = 512`; calls 60); no Nickel contracts for keys.
@@ -1205,7 +1210,6 @@ docs: [plugin-system.md](../docs/plugin-system.md)
 - [ ] **Eval hooks** (react to cluster events; apps are the job half).
 - [ ] **Pluggable node statuses for degradation.**
 - [ ] **A stable plugin ABI (audit M6)** ([calls #8](calls/architecture-audit-2026-10-09_calls.md)).
-- [ ] **Plugin lockfiles are stale** — likely closed by [#41](https://github.com/mikenomitch/legion/pull/41).
 - [ ] **Panic containment for task runtime dylibs** ([review PLG1](architecture-review-2026-11-07.md)).
 - [ ] **In-manager plugin hooks on the WASM layer** (`crates/worker/src/wasm/`); needs a plan.
 - [ ] **Lift a plugin quarantine without a restart**; a `legion plugin status`.
@@ -1214,18 +1218,16 @@ docs: [plugin-system.md](../docs/plugin-system.md)
       topology across nodes; usage reporting; YAML CDI; streaming health; edge starts;
       gVisor/Kata device wiring.
 - [ ] **Job mutation policies** (review PLG4); needs a plan.
-- [ ] **`job validate` checks job rules only with `acl:read`.**
+- [ ] **`job validate` can't check job rules for a caller with neither
+      `namespace:read` nor `acl:read`**: it reads the rules on the client
+      (`GetNamespace`, else `ListNamespacePolicies`) and only warns. A
+      manager-side validate RPC would close it ([namespaces.md](../docs/namespaces.md#job-rules)).
 - [ ] **A secrets provider seam** (review PLG4).
 
 ## Agent surfaces
 
 docs: [agent-readiness.md](../docs/agent-readiness.md)
 
-- [ ] **Two idempotency races are left.** `install_app`/`uninstall_app` record
-      inside `app_store.rs` and discard the result (a losing install likely
-      fails on the duplicate name), and a losing `delete_namespace_policy` gets
-      `NOT_FOUND` before it reaches the record
-      ([docs](../docs/agent-readiness.md)).
 - [ ] **Agent ergonomics:** writing a plugin, joining a worker, searching the registry.
 - [ ] **External audit sink** (syslog/webhook/S3).
 - [ ] **Inline narrowing for child tokens**; **multi-party approvals**.
@@ -1259,15 +1261,9 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
 
 ## Cross-cutting
 
-- [ ] **Nickel evaluation has no memory or step bound.** A self-referencing field
-      (`host = { oneOf = [host] }`) evaluates forever and exhausts memory, in the
-      CLI or in a manager evaluating a bundled or installed manifest
-      (`config_lang::eval_sandboxed`). A step budget or depth limit would make it
-      an error.
 - [ ] **Spot-check papercuts** ([findings](launch-spot-check-findings.md#re-run-2026-10-12)):
   - [ ] **Stopping the macOS manager leaves its Apple containers running** — closed by
         [#39](https://github.com/mikenomitch/legion/pull/39).
-  - [ ] **No CLI lists a job's allocations.**
   - [ ] **A count=1 job got repeated second placements after a KV env-change
         restart.** Not root-caused; check `job_config_unwanted_reason`.
   - [ ] **Pressure evictions still loop forever by default** (unlimited `move_count`,
@@ -1321,14 +1317,8 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
         5 MB besides `serde_json`.
   - [ ] **Re-measure macOS arm64**; the last figure (26.0 MB) is from
         2026-07-28.
-- [ ] **Log writers queue up to 128,000 lines each.**
-      `tracing_appender::non_blocking` in `crates/common/src/tracing_util.rs` uses its default
-      buffer, about 4 MB of heap per writer when full;
-      `NonBlockingBuilder::buffered_lines_limit` would cap it.
-- [ ] **Share one target dir across plugin builds** (each rebuilds ~470 crates).
 - [ ] **Decide whether the UI ships inside the binary.**
-- [ ] **Test hygiene:** sweep stale `legion-tests-*` roots; find the test leaking
-      `.tmp*`; `crates/manager/.legion/bootstrap-token` is checked in and the
+- [ ] **Test hygiene:** `crates/manager/.legion/bootstrap-token` is checked in and the
       manager's unit tests rewrite it (untrack it and write it under the scratch root); move `legion-loadgen` to its own crate
       ([development.md](development.md#keeping-builds-and-test-runs-small)); fold the
       raft-ops tests into `tests/integration/` ([calls 1](calls/test-build-footprint_calls.md)).
@@ -1348,7 +1338,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Run a real gated container end to end on a Linux node (runc and crun, default mode): stock `nginx` reachable on its advertised port, `curl` through the proxy refused with `gated-default`, then allowed after `network.egress.allow` ([worker-plane-auth plan](plans/worker-plane-auth-plan.md) §6.12).
 - [ ] Run the kernel host guard on a cgroup v2 node as root: `sudo -E cargo test --lib kernel_guard_loads -- --ignored --nocapture` (a dial to `169.254.169.254` fails with `EPERM`, counter reports it) ([plan §6.13](plans/worker-plane-auth-plan.md)).
 - [ ] Run the container privilege floor on crun: `LEGION_OCI_RUNTIME=crun cargo test --lib oci_runtime_security -- --ignored` ([calls 40](calls/worker-plane-auth-plan_calls.md)).
-- [ ] Re-run the five ignored runc tests (`oci_runtime_exec_runs_inside_the_container`, `…_sees_task_dir_files_and_their_rewrites`, `…_enforces_a_declared_memory_limit`, `…_stop_force_kills_at_the_deadline`, `…_stop_lets_a_trapping_container_drain`) on a cgroup v2 host to tell environment from bug.
+- [ ] Re-run the three ignored runc tests (`oci_runtime_exec_runs_inside_the_container`, `…_sees_task_dir_files_and_their_rewrites`, `…_enforces_a_declared_memory_limit`) on a cgroup v2 host to tell environment from bug.
 - [ ] Re-run the AWS spot check without shims (`tests/spot-check/smoke.sh` + RUNBOOK human pass), including container/exec paths on the `0710` allocation-dir grant and edge-boot speculative dispatch ([launch-spot-check-fixes plan](plans/launch-spot-check-fixes-plan.md)).
 - [ ] Rerun `05-dag.ncl` on the 3-manager rig: a DAG advances past its first step ([launch-spot-check-findings.md](launch-spot-check-findings.md)).
 - [ ] Rerun `05-dag.ncl` twice with different `run` values: the resubmit's rollout progresses ([rollouts.md](../docs/rollouts.md#lifecycle-specific-behavior)).
@@ -1446,6 +1436,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - **Nickel replaces Jsonnet** — every config surface is `.ncl` through `crates/common/src/config_lang.rs`; `vars` + `--var`/`--var-code`/`--kv-var`/`--kv-var-code`; no `.jsonnet` compatibility ([plan](plans/nickel-config-language-plan.md) · [calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md))
 - **`.json` on four of five config surfaces** — extension-dispatched, for machine-emitted config; templates stay Nickel-only ([calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md#json-for-machine-emitted-config))
 - **Local jobspecs evaluated in place** — relative imports work from `job run/plan/validate`
+- **Nickel evaluation is bounded** — a 1,000,000-step budget enforced through Nickel's cache, on a dedicated large-stack thread; a self-referencing field is an error, not a hang ([calls](calls/nickel-eval-budget_calls.md) · [docs](../docs/configuration-language.md#evaluation-limits))
 
 ## Worker nodes
 
@@ -1548,6 +1539,9 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **Track 1: agent sandboxes** — auto TAPs, microVM idle detection, identity refresh without reboot, macOS idle suspend, payload fix ([guide](../docs/guides/agent-sandboxes.md))
 - **`hint` idle signal as `suspend.park`** — workload says `busy`/`park` on the park socket ([plan](plans/park-plan.md) · [docs](../docs/park.md))
 - **Lazy memory restore, Phase 1** — on-demand restore on cloud-hypervisor v52+, `memory_restore = lazy|eager` ([plan](plans/lazy-memory-restore-plan.md) · [docs](../docs/task-runtime-sandbox.md#how-memory-comes-back))
+- **Sandbox `config.memory_mib` removed** — refused at submit; the guest boots at `resources.memoryMax`, else `memory`, else 512 MiB, read per unit at launch ([calls 26](calls/suspend-resume-and-oversubscription-plan_calls.md) · [docs](../docs/task-runtime-sandbox.md#guest-size))
+- **A smaller guest kernel, documented** — the options Legion needs and a build recipe ([docs](../docs/task-runtime-sandbox.md#a-smaller-guest-kernel) · [calls 18](calls/sandbox-boot-throughput-plan_calls.md))
+- **Container OCI stop tests drive `stop_with` then the hard stop**, and pass under runc 1.5.2
 
 ## Artifacts
 
@@ -1559,6 +1553,8 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **Disk-aware content budgets and checkpoint room** — `content.budgets.*` as size or share, workers report free/reclaimable disk, placement uses it ([calls](calls/suspend-resume-and-oversubscription-plan_calls.md#131-published-checkpoints-are-unpinned-on-their-node-content-store-follow-up) · [docs](../docs/artifacts.md#the-node-content-store))
 - **Node content store (artifact cache Phase 1 core)** — CAS + sqlite index, verified fetches written to the store, size budget + `minFreeDisk`, LRU GC, pinning, single-flight, hit/miss in `artifact_states` ([plan](plans/artifact-cache-and-prewarm-plan.md) · [docs](../docs/artifacts.md#the-node-content-store))
 - **Content locality (artifact cache Phase 3)** — heartbeat deltas into an off-raft location index, `schedulerSettings.weights.locality` scoring, and `legion snapshot warm` making a warmed node win placement ([plan](plans/suspend-resume-and-oversubscription-plan.md) · [docs](../docs/artifacts.md#content-locality))
+- **Default content budgets fit small disks** — floors give way proportionally so the budgets never add up past the filesystem ([docs](../docs/artifacts.md) · [calls](calls/todo-closeout-2026-11-11_calls.md))
+- **Published parts: a bucket lifecycle-rule recipe** — Legion still deletes nothing (call 62) ([docs](../docs/suspend-and-resume.md#expiring-published-parts) · [calls 142](calls/suspend-resume-and-oversubscription-plan_calls.md))
 
 ## Rollouts
 
@@ -1609,6 +1605,7 @@ Plans: [mesh control path](plans/mesh-control-path-plan.md) ([calls](calls/mesh-
 - **M10 `connect.templates` and `local_first`** ([plan](plans/network-handlers-plan.md))
 - **KV-held client CA for mutual ingress** — `network.ports[].tls.clients.ca = { kv }` ([plan](plans/mesh-interfaces-plan.md) · [docs](../docs/network-handlers.md#certificates-and-cas-from-kv))
 - **`connect.upstreams` from a gated `sandbox` guest** — credential injection keeps keys out of gated sandboxes via vsock relays ([calls](calls/egress-credential-injection-plan_calls.md))
+- **Every gated `container`/`exec` allocation gets the `127.0.0.53` resolver in its namespace** — already shipped with gated-by-default containers; a worker test now pins it (`specs.rs`)
 
 ## Stateful workloads & volumes
 
@@ -1636,6 +1633,7 @@ Plans: [mesh control path](plans/mesh-control-path-plan.md) ([calls](calls/mesh-
 - **No split brain for `store` sessions** — manifest create, superseded-on-write, fence list, probe-before-move, self-fencing after `stateful.fenceAfter` ([docs](../docs/session-mode.md#no-split-brain))
 - **`suspend.checkpointEvery` and `suspend.onWorkerStop = "checkpoint"`** — staggered memory checkpoints and SIGTERM checkpoint/restore ([docs](../docs/session-mode.md#idle-sessions))
 - **Volume snapshot/restore/clone ops** — in the driver contract, implemented by `local-dir`, in the conformance suite ([docs](../docs/volumes.md#snapshot-restore-and-clone))
+- **`legion session start --resume-id` forces a move past a node listed `down`/`lost`** ([calls 48](calls/session-durability-and-routing-plan_calls.md) · [docs](../docs/session-mode.md))
 
 ## Persistence
 
@@ -1702,6 +1700,7 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **Autoscaler Phases 2–4** — bundled task-autoscaling app, full policies (`prometheus`, `http`, `min = 0`, `scaling simulate`), external plugins and standalone policies ([plan](plans/autoscaler-v2-plan.md))
 - **Autoscaler Phase 5a: node-autoscaling substrate** — join-token `max_uses`/`attributes`, `ForgetNode` / `legion node forget`, `GetCapacityDemand` ([docs](../docs/autoscaling.md#capacity-demand))
 - **Autoscaler Phases 5b, 6, 7** — node groups run by the app, the UI as app views, sharded replicas with a 10,000-policy load test ([plan](plans/autoscaler-v2-plan.md))
+- **`app config get` prints Nickel** that `app config set -f` reads back; `-j` keeps the JSON envelope ([docs](../docs/apps.md))
 
 ## Auth & ACLs
 
@@ -1712,6 +1711,7 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **Keyring `provider test` / `root-key generate` in the capability catalog** ([calls](calls/cluster-ca-provider-plan_calls.md))
 - **A session task's generated envelope no longer makes its job host-level** — the `envelope` runtime was classified as an unknown plugin, so every job with a session task (sandbox, container, isolate) needed `host = true`; a `file://` isolate module still needs it ([calls 37](calls/isolate-runtime-plan_calls.md#37-a-session-tasks-generated-envelope-is-not-host-level-for-every-runtimes-session-tasks) · [docs](../docs/auth-and-acls.md#host-level-jobs))
 - **Namespaces, Phases 1–4** — the namespace object and ACL resource, canonical `ns/job` ids, `-n`/`-A`, namespaced services/DNS/events, cross-namespace upstreams, UI switcher and pages, namespace policies with per-band quota and admission checks ([plan](plans/namespaces-plan.md) · [calls](calls/namespaces-plan_calls.md) · [docs](../docs/namespaces.md))
+- **A lost node rejoins only with a token for its own pool** ([docs](../docs/auth-and-acls.md#worker-nodes-join-tokens-and-node-tokens))
 
 ## Exec & actions
 
@@ -1728,6 +1728,8 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **Task start stage timings** — `legion_task_start_stage_seconds{runtime,stage}` plus one breakdown log line per start ([plan](plans/task-start-critical-path-plan.md) · [docs](../docs/metrics.md))
 - **Simulated fleets feed `legion_worker_*` metrics** — shared telemetry listener, fleet aggregates, rig file_sd wiring ([plan](plans/worker-simulation-plan.md) · [calls](calls/worker-simulation-plan_calls.md) · [docs](../docs/worker-simulation.md))
 - **Usage accounting over time** — hourly rollups per namespace/job/token, `GetUsage`, `legion usage` (review AI9) ([plan](plans/agent-governance-plan.md) · [docs](../docs/usage-accounting.md))
+- **Session, node-memory and snapshot metrics** — `legion_sessions_envelope_free{job}`, `legion_node_memory_pressure_some_avg10{node}`, `legion_node_memory_reserved_bytes{node}`, `legion_snapshot_{capture,restore}_seconds{kind}`, worker `legion_content_store_{bytes,pinned_bytes,budget_bytes}{class}` ([docs](../docs/metrics.md) · [calls 61](calls/sandbox-scaling-plan_calls.md) · [calls 141](calls/suspend-resume-and-oversubscription-plan_calls.md))
+- **Lossy log writers queue at most 16,384 lines** (was 128,000 each) ([docs](../docs/observability.md#logging-and-tracing-setup) · [calls/todo-closeout-2026-11-11_calls.md](calls/todo-closeout-2026-11-11_calls.md))
 
 ## Job types & dependencies
 
@@ -1753,6 +1755,9 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **Agent basics** — `legion docs`/`capabilities`, `--json` envelope everywhere, proto as API source of truth, `legion mcp serve` with `--allow-write`, idempotency keys and validate/plan paths
 - **Agent governance (review AI2–AI4)** — durable audit journal (`legion audit list`), 30-day default token expiry, child tokens, approval gates and per-token rate limits, caller-aware capabilities (`--mine`), MCP 2025-06-18 with a tool per RPC ([plan](plans/agent-governance-plan.md) · [calls](calls/agent-governance-plan_calls.md) · [audit docs](../docs/audit-journal.md) · [approvals docs](../docs/approvals-and-rate-limits.md))
 - **Compare-and-set and a field diff for jobs** — `job run --expected-version`, `PlanJobReply.diff` (review AI5) ([plan](plans/revisions-and-watches-plan.md) · [docs](../docs/watches-and-blocking-queries.md#compare-and-set-on-jobs))
+- **Idempotency races closed** — `install_app`/`uninstall_app` claim their key in their own entry and replay the winner; a losing `delete_namespace_policy` is `deduplicated`, not `NOT_FOUND` ([docs](../docs/agent-readiness.md))
+- **`job validate` and `legion_job_validate` check job rules with `namespace:read`** (via `GetNamespace`, falling back to `acl:read`) ([docs](../docs/namespaces.md#job-rules) · [calls 20](calls/device-model-and-plugin-seams-plan_calls.md))
+- **`legion ledger --job <JOB>` lists a job's allocations**; the ledger is in the capability catalog ([docs](../docs/jobs-tasks-and-scheduling.md#listing-a-jobs-allocations))
 
 ## UI
 
@@ -1889,3 +1894,8 @@ judgement calls in [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-
 - **Smaller, faster test builds** — one integration binary (12.9 GB → 1.1 GB), scratch-root temp dirs, line-table debuginfo, faster migrations ([calls](calls/test-build-footprint_calls.md) · [docs](../docs/testing-and-benchmarks.md#test-layout) · [dev notes](development.md#keeping-builds-and-test-runs-small))
 - **Raft-entry-count tests read the applied marker** — `Store::raft_applied_entries` instead of lagging openraft metrics
 - **CI cache, cancellation, pinned protoc** — `rust-cache` saved from `main`, superseded runs cancelled, pinned checksummed protoc
+- **Plugin lockfiles current and one shared plugin target dir** — five stale lockfiles regenerated from the root lock; `build.rs` builds every plugin into `target/plugin-build/shared/` and copies each one's artifacts to the per-plugin layout ([docs](../docs/plugin-system.md#build-behavior) · [calls](calls/todo-closeout-2026-11-11_calls.md))
+- **CI rebuilds `tests/netplugins/*.wasm` and fails on drift** — pinned toolchain, committed lockfiles, remapped paths ([docs](../docs/network-plugins.md))
+- **Test scratch roots are swept by pid**; the `.tmp*` leakers (rootfs-cache background fill, edge-start launch threads, net-plugin store) fixed ([docs](../docs/testing-and-benchmarks.md) · [calls 9](calls/test-build-footprint_calls.md))
+- **The AWS rig forgets its sim nodes and runs each scenario's scheduling policy** — `legion node forget --force` on stop (`SIM_FORGET=0` skips it); the policy is rendered into the manager and recorded per cell ([README](../benchmarks/aws/README.md) · [calls 43–44](calls/aws-comparative-benchmark-plan_calls.md))
+

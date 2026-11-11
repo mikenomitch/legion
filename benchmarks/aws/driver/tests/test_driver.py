@@ -284,6 +284,17 @@ class TranslatorShapes(unittest.TestCase):
         # api: 2 tasks x 4 = 8 each; cron: 1 x 2 = 2 each -> 20*8 + 10*2.
         self.assertEqual(total, 180)
 
+    def test_manifest_carries_the_scenarios_scheduling_policy(self):
+        # Legion's policy is a manager setting, so the manifest is the
+        # only place the translator can hand it on; web_fleet is spread.
+        with tempfile.TemporaryDirectory() as out:
+            manifest = translate.translate(self.scenario, "legion", out, 1.0)
+            self.assertEqual(manifest["scheduling_policy"], "spread")
+            with open(os.path.join(out, "manifest.json")) as f:
+                self.assertEqual(json.load(f)["scheduling_policy"], "spread")
+        with self.assertRaises(ValueError):
+            translate.scheduling_policy({"name": "x", "scheduling_policy": "binpack"})
+
     def test_count_multiplier_scales_jobs(self):
         jobs = list(translate.iter_jobs(self.scenario, 2.0))
         self.assertEqual(len(jobs), 60)

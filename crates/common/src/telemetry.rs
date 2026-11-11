@@ -692,6 +692,71 @@ impl RenderMetric for FloatGauge {
     }
 }
 
+/// One series of a [`FloatGaugeVec`]: an `f64` stored as its bits.
+#[derive(Default)]
+pub struct FloatGaugeCell(AtomicU64);
+
+impl FloatGaugeCell {
+    pub fn set(&self, v: f64) {
+        self.0.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// Gauge family with labels and a fractional value (a percentage, a ratio),
+/// for the same reason [`FloatGauge`] exists: the series reads in the units
+/// the docs state rather than scaled into an integer.
+pub struct FloatGaugeVec {
+    meta: FamilyMeta,
+    series: Series<FloatGaugeCell>,
+}
+
+impl FloatGaugeVec {
+    pub fn set(&self, labels: &[&str], v: f64) {
+        debug_assert_eq!(labels.len(), self.meta.labels.len());
+        self.series.cell(labels, FloatGaugeCell::default).set(v);
+    }
+
+    /// Current value of a series (0 when it does not exist). Test/inspection
+    /// helper — not needed on hot paths.
+    pub fn get(&self, labels: &[&str]) -> f64 {
+        Series::find(&self.series.snapshot(), labels)
+            .map(|c| c.get())
+            .unwrap_or(0.0)
+    }
+}
+
+impl RenderMetric for FloatGaugeVec {
+    fn render_into(&self, out: &mut String) {
+        render_header(out, &self.meta, "gauge");
+        for (values, cell) in self.series.snapshot() {
+            let labels = render_label_block(self.meta.labels, &values, None);
+            out.push_str(&format!("{}{} {}\n", self.meta.name, labels, cell.get()));
+        }
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Gauge,
+            label_names: self.meta.labels,
+            samples: self
+                .series
+                .snapshot()
+                .into_iter()
+                .map(|(label_values, cell)| SampleSnapshot {
+                    label_values,
+                    value: SampleValue::GaugeF64(cell.get()),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Unlabeled histogram.
 pub struct Histogram {
     meta: FamilyMeta,
@@ -813,6 +878,13 @@ pub struct Metrics {
     pub node_memory_used_bytes: Arc<GaugeVec>,
     /// `legion_node_cpu_used_millicores{node}` (docs/metrics.md, "Node usage")
     pub node_cpu_used_millicores: Arc<GaugeVec>,
+    /// `legion_node_memory_pressure_some_avg10{node}` (docs/metrics.md, "Node
+    /// usage"): the node's memory PSI `some avg10`, in percent.
+    pub node_memory_pressure_some_avg10: Arc<FloatGaugeVec>,
+    /// `legion_node_memory_reserved_bytes{node}` (docs/metrics.md, "Node
+    /// usage"): the memory live allocations on the node reserve, from the
+    /// replicated store.
+    pub node_memory_reserved_bytes: Arc<GaugeVec>,
     /// `legion_node_pressure_actions_total{node,step}` (docs/metrics.md,
     /// "Node usage")
     pub node_pressure_actions_total: Arc<CounterVec>,
@@ -845,6 +917,17 @@ pub struct Metrics {
     /// `legion_instance_archived_total{mode}` (docs/metrics.md, "Suspend
     /// and resume"; sandbox-scaling Phase 5)
     pub instance_archived_total: Arc<CounterVec>,
+    /// `legion_snapshot_capture_seconds{kind}` (docs/metrics.md, "Suspend
+    /// and resume"): manual snapshot captures (`legion snapshot create`).
+    pub snapshot_capture_seconds: Arc<HistogramVec>,
+    /// `legion_snapshot_restore_seconds{kind}` (docs/metrics.md, "Suspend
+    /// and resume"): restores from a snapshot (`legion snapshot restore`,
+    /// create from a snapshot), not resumes.
+    pub snapshot_restore_seconds: Arc<HistogramVec>,
+    /// `legion_sessions_envelope_free{job}` (docs/metrics.md, "Sessions";
+    /// sandbox-scaling plan §15): sessions of their task's size that still
+    /// fit the job's envelopes on the nodes this manager indexes.
+    pub sessions_envelope_free: Arc<GaugeVec>,
     /// `legion_session_starts_total{outcome}` (docs/metrics.md, "Sessions";
     /// sandbox-scaling Phase 6)
     pub session_starts_total: Arc<CounterVec>,
@@ -1300,6 +1383,22 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let node_memory_pressure_some_avg10 = Arc::new(FloatGaugeVec {
+            meta: FamilyMeta {
+                name: "legion_node_memory_pressure_some_avg10",
+                help: "A node's memory pressure (PSI `some avg10` from /proc/pressure/memory), in percent: the share of the last 10 seconds in which at least one task stalled on memory. From its latest usage report; 0 on kernels without PSI and once a node stops reporting.",
+                labels: &["node"],
+            },
+            series: Series::new(),
+        });
+        let node_memory_reserved_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_node_memory_reserved_bytes",
+                help: "Memory the live allocations placed on a node reserve (suspended ones holding their reservation included), from the replicated store, so every manager reports the same value. Compare with legion_node_memory_used_bytes.",
+                labels: &["node"],
+            },
+            series: Series::new(),
+        });
         let node_pressure_actions_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_node_pressure_actions_total",
@@ -1390,6 +1489,32 @@ impl Metrics {
                 name: "legion_instance_archived_total",
                 help: "Suspended instances archived as their checkpoint was published (suspend.archive), by mode (slim|manifestOnly). An archived instance keeps no snapshot row in the store; manifestOnly keeps no row at all.",
                 labels: &["mode"],
+            },
+            series: Series::new(),
+        });
+        let snapshot_capture_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_snapshot_capture_seconds",
+                help: "How long a successful manual snapshot capture (CreateSnapshot) took on its node, by kind (memory|disk). Suspend and fork captures are not counted here. Observed when the worker's report reaches this manager.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_DURATION_BUCKETS,
+        });
+        let snapshot_restore_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_snapshot_restore_seconds",
+                help: "How long a successful restore from a snapshot (RestoreInstance, or an instance created from a snapshot) took on its node, by kind (memory|disk). Resumes of suspended instances are legion_instance_resume_seconds. Placement time is not included.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: CHECKPOINT_DURATION_BUCKETS,
+        });
+        let sessions_envelope_free = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_sessions_envelope_free",
+                help: "Sessions of their task's size that still fit a session job's envelopes, on the nodes whose heartbeats this manager holds: the burst headroom before creates are refused. Sum across managers.",
+                labels: &["job"],
             },
             series: Series::new(),
         });
@@ -2074,6 +2199,8 @@ impl Metrics {
             Arc::clone(&node_memory_available_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&node_memory_used_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&node_cpu_used_millicores) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_memory_pressure_some_avg10) as Arc<dyn RenderMetric>,
+            Arc::clone(&node_memory_reserved_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&node_pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_suspend_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_suspends_total) as Arc<dyn RenderMetric>,
@@ -2085,6 +2212,9 @@ impl Metrics {
             Arc::clone(&checkpoint_publish_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_archived_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&snapshot_capture_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&snapshot_restore_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&sessions_envelope_free) as Arc<dyn RenderMetric>,
             Arc::clone(&session_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
@@ -2199,6 +2329,8 @@ impl Metrics {
             node_memory_available_bytes,
             node_memory_used_bytes,
             node_cpu_used_millicores,
+            node_memory_pressure_some_avg10,
+            node_memory_reserved_bytes,
             node_pressure_actions_total,
             instance_suspend_seconds,
             instance_suspends_total,
@@ -2210,6 +2342,9 @@ impl Metrics {
             checkpoint_publish_seconds,
             checkpoint_publish_total,
             instance_archived_total,
+            snapshot_capture_seconds,
+            snapshot_restore_seconds,
+            sessions_envelope_free,
             session_starts_total,
             session_runs_total,
             envelope_resizes_total,
@@ -2409,6 +2544,16 @@ pub struct WorkerMetrics {
     pub child_handoffs_total: Arc<Counter>,
     /// `legion_derived_bytes` — disk the derived class holds.
     pub derived_bytes: Arc<Gauge>,
+    /// `legion_content_store_bytes{class}` — bytes the node content store
+    /// holds, by class (artifacts|snapshots|derived).
+    pub content_store_bytes: Arc<GaugeVec>,
+    /// `legion_content_store_pinned_bytes{class}` — of those, bytes held by
+    /// a pin (a snapshot's parts, content in use), which eviction cannot
+    /// free.
+    pub content_store_pinned_bytes: Arc<GaugeVec>,
+    /// `legion_content_store_budget_bytes{class}` — each class's budget
+    /// (`content.budgets.<class>`).
+    pub content_store_budget_bytes: Arc<GaugeVec>,
     /// `legion_provisional_refused_total{reason}` — ratifications refused.
     pub provisional_refused_total: Arc<CounterVec>,
     /// `legion_provisional_killed_total{cause}` — provisional work killed
@@ -2718,6 +2863,30 @@ impl WorkerMetrics {
             },
             series: Series::new(),
         });
+        let content_store_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_content_store_bytes",
+                help: "Bytes the node content store holds, by class (artifacts|snapshots|derived). Refreshed on every heartbeat.",
+                labels: &["class"],
+            },
+            series: Series::new(),
+        });
+        let content_store_pinned_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_content_store_pinned_bytes",
+                help: "Bytes of the node content store held by a pin (a snapshot's parts, content in use), by class (artifacts|snapshots|derived). Budget, TTL, and minFreeDisk eviction cannot free them.",
+                labels: &["class"],
+            },
+            series: Series::new(),
+        });
+        let content_store_budget_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_content_store_budget_bytes",
+                help: "Each node content store class's budget (content.budgets.<class>), by class (artifacts|snapshots|derived).",
+                labels: &["class"],
+            },
+            series: Series::new(),
+        });
         let session_runs_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_session_runs_total",
@@ -3014,6 +3183,9 @@ impl WorkerMetrics {
             Arc::clone(&derived_hits_total) as Arc<dyn RenderMetric>,
             Arc::clone(&child_handoffs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&derived_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&content_store_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&content_store_pinned_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&content_store_budget_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
@@ -3037,6 +3209,9 @@ impl WorkerMetrics {
             derived_hits_total,
             child_handoffs_total,
             derived_bytes,
+            content_store_bytes,
+            content_store_pinned_bytes,
+            content_store_budget_bytes,
             provisional_refused_total,
             provisional_killed_total,
             provisional_ratify_seconds,
@@ -3537,7 +3712,12 @@ mod tests {
             "legion_node_memory_available_bytes",
             "legion_node_memory_used_bytes",
             "legion_node_cpu_used_millicores",
+            "legion_node_memory_pressure_some_avg10",
+            "legion_node_memory_reserved_bytes",
             "legion_node_pressure_actions_total",
+            "legion_snapshot_capture_seconds",
+            "legion_snapshot_restore_seconds",
+            "legion_sessions_envelope_free",
             "legion_plan_apply_total",
             "legion_raft_pipeline_depth",
             "legion_raft_pipeline_wait_seconds",
@@ -3556,6 +3736,35 @@ mod tests {
             );
         }
         assert!(out.contains("legion_plan_apply_total{outcome=\"applied\"}"));
+    }
+
+    #[test]
+    fn float_gauge_vec_renders_fractional_values_per_series() {
+        let gauge = FloatGaugeVec {
+            meta: FamilyMeta {
+                name: "test_pressure",
+                help: "p",
+                labels: &["node"],
+            },
+            series: Series::new(),
+        };
+        gauge.set(&["w-2"], 0.25);
+        gauge.set(&["w-1"], 12.5);
+        gauge.set(&["w-1"], 3.75);
+        assert_eq!(gauge.get(&["w-1"]), 3.75);
+        assert_eq!(gauge.get(&["w-9"]), 0.0);
+        let mut out = String::new();
+        gauge.render_into(&mut out);
+        assert_eq!(
+            out,
+            "# HELP test_pressure p\n# TYPE test_pressure gauge\n\
+             test_pressure{node=\"w-1\"} 3.75\ntest_pressure{node=\"w-2\"} 0.25\n"
+        );
+        let family = gauge.snapshot_family();
+        assert!(matches!(
+            family.samples[0].value,
+            SampleValue::GaugeF64(v) if v == 3.75
+        ));
     }
 
     #[test]
