@@ -155,6 +155,13 @@ impl crate::structs::workload_server::Workload for AllocationWorkload {
         session_runs::workload_may_run(&caller, &target.task).map_err(Status::permission_denied)?;
         request.ticket.clear();
         request.node_id.clear();
+        // A workload's keys are its own: two allocations that pick the same
+        // key are two runs, and neither is answered with the other's reply.
+        if let Some(key) = request.idempotency_key.as_deref().map(str::trim) {
+            if !key.is_empty() {
+                request.idempotency_key = Some(format!("workload:{}:{key}", self.allocation_id));
+            }
+        }
         let launch_pool = self.channel.launch_pool.get().cloned().ok_or_else(|| {
             Status::unavailable("the worker is still starting; retry in a moment")
         })?;

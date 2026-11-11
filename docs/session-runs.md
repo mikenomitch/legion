@@ -204,7 +204,12 @@ Idempotency is **per node**:
 
 Through a manager, a key is scoped to the caller and the request, like every
 Legion idempotency key: the same key from another caller, or with different
-files, is a different run.
+files, is a different run. A node applies the same rule to calls that reach
+it directly: the request's files, input, `--get` paths, and command are part
+of the run's id, so a reused key with different content is a different run,
+and a key sent from inside a task (`--local`) belongs to that allocation
+alone. Two direct callers holding tickets for the same task who send the same
+key with identical content share one run and one reply.
 
 ## The surface
 

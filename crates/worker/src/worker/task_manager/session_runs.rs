@@ -565,6 +565,11 @@ pub async fn run_session(
     let (run_id, ticket) = if key.is_empty() {
         (crate::structs::mint_session_id("run", &node_id), None)
     } else {
+        // A key names one request, not just one string: the request's own
+        // content is part of the id, so another caller of the same job and
+        // task who reuses a key with different files or input starts its own
+        // run and is never answered with this one's stored reply.
+        let key = format!("{key}\n{}", request_fingerprint(&call.request));
         let run_id = derived_run_id(&call.job_id, &call.task_name, &key);
         match registry.begin(&run_id, crate::util::now_unix_ms()) {
             Begin::Done(reply) => {
@@ -1392,5 +1397,73 @@ mod tests {
         assert!(registry.owns("machine-a.1"));
         registry.untrack("machine-a.1");
         assert!(!registry.owns("machine-a.1"));
+    }
+}
+
+/// A digest of everything in a run request that decides what runs: its
+/// files, input, the paths to collect, and the command.
+fn request_fingerprint(request: &RunSessionRequest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    part(&(request.files.len() as u64).to_be_bytes());
+    for file in &request.files {
+        part(file.path.as_bytes());
+        part(&file.content);
+        part(&[file.executable as u8]);
+    }
+    match &request.input {
+        Some(input) => part(input.as_bytes()),
+        None => part(&[]),
+    }
+    part(&(request.get.len() as u64).to_be_bytes());
+    for path in &request.get {
+        part(path.as_bytes());
+    }
+    part(&(request.command.len() as u64).to_be_bytes());
+    for arg in &request.command {
+        part(arg.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod request_fingerprint_test {
+    use super::*;
+
+    #[test]
+    fn a_reused_key_with_different_content_is_a_different_request_test() {
+        let base = RunSessionRequest {
+            job_id: "job".into(),
+            task_name: "task".into(),
+            input: Some("{\"a\":1}".into()),
+            ..Default::default()
+        };
+        let mut other = base.clone();
+        other.input = Some("{\"a\":2}".into());
+        assert_eq!(
+            request_fingerprint(&base),
+            request_fingerprint(&base.clone())
+        );
+        assert_ne!(request_fingerprint(&base), request_fingerprint(&other));
+        let mut with_file = base.clone();
+        with_file.files.push(crate::structs::RunFile {
+            path: "main.py".into(),
+            content: b"print(1)".to_vec(),
+            executable: false,
+        });
+        assert_ne!(request_fingerprint(&base), request_fingerprint(&with_file));
+        // The key, ticket and node are not content.
+        let mut retry = base.clone();
+        retry.ticket = "t".into();
+        retry.node_id = "n".into();
+        assert_eq!(request_fingerprint(&base), request_fingerprint(&retry));
     }
 }
