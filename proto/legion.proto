@@ -1457,7 +1457,61 @@ service Manager {
   //   not run the command twice unless the first attempt never finished.
   // - DeadlineExceeded: the session did not reach `running` within
   //   `wait_timeout_seconds`. It is ended; nothing ran.
+  //
+  // On a task of the `isolate` runtime (docs/task-runtime-isolate.md) the
+  // run needs no `run` block and no session of its own: the node runs the
+  // caller's code in an isolate, which starts in microseconds, under the
+  // task's `config.limits`. Three request fields apply only there. `tier`
+  // picks where the run happens (`isolate`, `vm`, or `auto`, the default,
+  // which decides before anything runs); `tenant` says who the run is for;
+  // `session_id` runs in an existing session isolate. The reply then says
+  // where the code ran and why (`tier`, `tier_reason`) and which tier to
+  // ask for next time (`next_tier`). A run happens in exactly one place:
+  // Legion never moves a run between tiers and never runs one twice. A
+  // run stopped in an isolate by a limit or by a call isolates do not
+  // support is a successful reply with `stopped` set and, when the task
+  // has a VM task, `next_tier = "vm"`; rerunning it is the caller's
+  // decision and a second request. Isolate-only errors:
+  // - InvalidArgument: `tier`, `tenant`, or `session_id` on a task of
+  //   another runtime; an unknown `tier`; `command` on an isolate task.
+  // - FailedPrecondition: `tier = "vm"` on a task with no `config.vm`;
+  //   `session_id` on a task whose `config.lifetime` is not `session`; the
+  //   task's module does not export what a run needs.
+  // - NotFound: `session_id` names no session isolate of the task.
   rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
+
+  // Reports how many isolates each node holds for a job's `isolate` tasks
+  // and what they are doing (docs/task-runtime-isolate.md, "Observing").
+  // Isolates are never listed one by one: a node reports one aggregate per
+  // isolate task on its heartbeat, and this RPC returns the latest from
+  // every node with an envelope for the task. Counters are cumulative
+  // since each node's isolate host started; rates are computed by the node
+  // over its last reporting interval.
+  //
+  // ACL: `job:read` on the job.
+  //
+  // Errors:
+  // - InvalidArgument: no `job_id`.
+  // - NotFound: no such job.
+  // - FailedPrecondition: `task_name` names no `isolate` task of the job.
+  rpc GetIsolateStats (GetIsolateStatsRequest) returns (GetIsolateStatsReply);
+
+  // Describes one session isolate by asking the node its id names (an
+  // unnamed session's id carries a tag of its node; see
+  // docs/session-mode.md). Managers keep no record of isolates, so this is
+  // a forwarded read, not an index lookup, and a session isolate whose
+  // node is unreachable answers Unavailable rather than NotFound.
+  //
+  // ACL: `job:read`, checked coarsely before the node is asked and against
+  // the session's own job once the node answers.
+  //
+  // Errors:
+  // - InvalidArgument: no `session_id`, or an id that carries no node tag
+  //   and no `node_id` to go with it.
+  // - NotFound: no node matches the id's tag, or the node holds no such
+  //   session isolate.
+  // - Unavailable: the node could not be reached. Retryable.
+  rpc GetIsolate (GetIsolateRequest) returns (GetIsolateReply);
 
   // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
 
@@ -10093,6 +10147,231 @@ message HeartbeatRequest {
   //
   // Default: empty.
   repeated RuntimeRefusals runtime_refusals = 23;
+
+  // One aggregate per `isolate` task this node holds an envelope for
+  // (docs/task-runtime-isolate.md, "Observing"). Isolates are never
+  // reported one by one: a node can hold a hundred thousand of them, so
+  // the managers see counts, not units, and keep only the latest report
+  // per node in memory. Sent on every heartbeat by a node that runs the
+  // isolate runtime.
+  //
+  // Default: empty.
+  repeated IsolateTaskStats isolate_tasks = 24;
+
+  // This node's isolate host processes, one per cordon replica, sent with
+  // `isolate_tasks`.
+  //
+  // Default: empty.
+  repeated IsolateHostStats isolate_hosts = 25;
+}
+
+// What one node holds for one `isolate` task: gauges of now, counters
+// since the node's isolate host started, and rates over the node's last
+// reporting interval. See `HeartbeatRequest.isolate_tasks`,
+// `Manager.GetIsolateStats`, and `Worker.GetIsolateStats`.
+message IsolateTaskStats {
+  // The job and the isolate task.
+  string job_id = 1;
+  string task_name = 2;
+
+  // The cordon whose host process runs this task's isolates on the node
+  // (`config.cordon`): a namespace name, `job:<job id>`, or `shared`.
+  string cordon = 3;
+
+  // Isolates with an instance in memory on the node now: running, idle,
+  // or paged out. Each is charged `resources.memory` against the task's
+  // envelope.
+  uint32 resident = 4;
+
+  // Invocations running now.
+  uint32 active = 5;
+
+  // Resident isolates whose private pages have been pushed to swap after
+  // `isolate.pageOutAfter` of idleness. Always 0 on a node with no swap,
+  // zswap, or zram, where paging out is not possible.
+  uint32 paged_out = 6;
+
+  // Session isolates held as a checkpoint in the node's content store
+  // with no instance in memory. They hold no envelope room.
+  uint32 hibernated = 7;
+
+  // Invocations waiting for room in the envelope or for a memory slot.
+  uint32 queued = 8;
+
+  // Invocations started, since the host started.
+  uint64 invocations = 9;
+
+  // CPU the task's isolates have used, in microseconds, since the host
+  // started.
+  uint64 cpu_micros = 10;
+
+  // Invocations per second and CPU seconds per second over the node's
+  // last reporting interval.
+  double invocations_per_second = 11;
+  double cpu_seconds_per_second = 12;
+
+  // Runs sent to a VM of the task's VM task (`tier = "vm"`, or `auto`
+  // deciding so), since the worker started, and per minute over the last
+  // reporting interval.
+  uint64 vm_runs = 13;
+  double vm_runs_per_minute = 14;
+
+  // Child VMs this task's isolates own on the node now.
+  uint32 child_vms = 15;
+
+  // Invocations stopped before they finished, by reason: `limits`,
+  // `unsupported`, `trap`, `ended`.
+  map<string, uint64> stopped = 16;
+
+  // Invocations stopped by a limit, by limit: `cpu`, `wall`, `memory`,
+  // `output`.
+  map<string, uint64> limits = 17;
+
+  // Invocations refused with ResourceExhausted because the envelope or
+  // the host had no room within the queue timeout.
+  uint64 refusals = 18;
+
+  // Linear memory mapped by the task's resident isolates, in bytes: an
+  // upper bound on what they hold, since untouched and paged-out pages
+  // are counted.
+  uint64 memory_bytes = 19;
+
+  // The declared reservation of one isolate (`resources.memory`), in
+  // bytes, for comparing against `memory_bytes / resident`.
+  uint64 reservation_bytes = 20;
+
+  // Session isolates hibernated since the host started.
+  uint64 hibernations = 21;
+
+  // Why the node cannot run this task's isolates right now, when it
+  // cannot (the host process is restarting, the module failed to
+  // compile). Empty when it can.
+  string problem = 22;
+}
+
+// One isolate host process on a node. See
+// `HeartbeatRequest.isolate_hosts`.
+message IsolateHostStats {
+  // The cordon it serves, and which replica of it (0 for the first).
+  string cordon = 1;
+  uint32 replica = 2;
+
+  // The process's resident set size, in bytes.
+  uint64 rss_bytes = 3;
+
+  // Linear-memory slots the process has, and how many hold an instance.
+  uint32 slots = 4;
+  uint32 slots_used = 5;
+
+  // Shard threads.
+  uint32 shards = 6;
+
+  // The engine it runs (`wasmtime-<version>`).
+  string engine_version = 7;
+
+  // Its process id on the node.
+  uint32 pid = 8;
+
+  // When it started, in Unix milliseconds.
+  int64 started_unix_ms = 9;
+
+  // The slot layout: `guard-pages`, `mpk`, or `small`.
+  string layout = 10;
+
+  // The confinement in force, layer by layer: `userns`, `netns`,
+  // `no-new-privs`, `landlock`, `seccomp`. A layer missing from the list
+  // did not apply.
+  repeated string confinement = 11;
+
+  // Times the worker has restarted this host after it exited.
+  uint32 restarts = 12;
+}
+
+// Request payload for Manager.GetIsolateStats and Worker.GetIsolateStats.
+message GetIsolateStatsRequest {
+  // `Manager.GetIsolateStats`: the job. Required. `Worker.GetIsolateStats`:
+  // optional filter; empty returns every isolate task on the node.
+  string job_id = 1;
+
+  // The isolate task. Empty returns every isolate task of the job.
+  string task_name = 2;
+}
+
+// One node's part of an isolate stats reply.
+message IsolateNodeStats {
+  // The node.
+  string node_id = 1;
+
+  // Its aggregates, one per isolate task asked for.
+  repeated IsolateTaskStats tasks = 2;
+
+  // Its isolate host processes that serve those tasks.
+  repeated IsolateHostStats hosts = 3;
+
+  // How old the report is, in milliseconds, when it came from a heartbeat
+  // (`Manager.GetIsolateStats`). 0 from `Worker.GetIsolateStats`.
+  uint64 age_ms = 4;
+}
+
+// Reply payload for Manager.GetIsolateStats and Worker.GetIsolateStats.
+message GetIsolateStatsReply {
+  // One entry per node (exactly one from `Worker.GetIsolateStats`).
+  repeated IsolateNodeStats nodes = 1;
+}
+
+// Request payload for Manager.GetIsolate and Worker.GetIsolate.
+message GetIsolateRequest {
+  // The session isolate's id.
+  string session_id = 1;
+
+  // `Manager.GetIsolate` only: the node to ask, for an id that carries no
+  // node tag (one derived from an idempotency key).
+  string node_id = 2;
+
+  // `Worker.GetIsolate`, ticket class: the session ticket. Empty for a
+  // manager.
+  string ticket = 3;
+}
+
+// Reply payload for Manager.GetIsolate and Worker.GetIsolate.
+message GetIsolateReply {
+  // The session isolate's id.
+  string session_id = 1;
+
+  // The node that holds it.
+  string node_id = 2;
+
+  // Its job and task.
+  string job_id = 3;
+  string task_name = 4;
+
+  // The tenant key it was started for. Empty when it had none.
+  string tenant = 5;
+
+  // Where it is: `hot` (an instance in memory), `paged_out` (in memory,
+  // private pages pushed to swap), `hibernated` (a checkpoint only), or
+  // `empty` (started, not yet called).
+  string state = 6;
+
+  // When it was started and last called, in Unix milliseconds.
+  int64 started_unix_ms = 7;
+  int64 last_active_unix_ms = 8;
+
+  // Invocations it has taken.
+  uint64 invocations = 9;
+
+  // Linear memory mapped for it, in bytes (0 while hibernated).
+  uint64 memory_bytes = 10;
+
+  // Bytes it keeps in `legion:isolate/state`.
+  uint64 state_bytes = 11;
+
+  // Its checkpoint's generation and size, when it has been hibernated.
+  uint64 checkpoint_generation = 12;
+  uint64 checkpoint_bytes = 13;
+
+  // The child sessions it owns (docs/child-sessions.md).
+  repeated ChildInfo children = 14;
 }
 
 // Starts one node refused for one disabled runtime. See
@@ -14587,6 +14866,26 @@ service Worker {
   // cover the job and task. ResourceExhausted (`envelope_full`,
   // `no_envelope`, `overloaded`) is retryable on another node.
   rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
+
+  // Reports this node's isolate aggregates: one entry per `isolate` task
+  // it holds an envelope for, plus its isolate host processes. The same
+  // numbers the node sends on its heartbeat, read now rather than at the
+  // last interval (docs/task-runtime-isolate.md, "Observing").
+  //
+  // Caller class: manager.
+  //
+  // Errors: Unauthenticated without a manager certificate.
+  rpc GetIsolateStats (GetIsolateStatsRequest) returns (GetIsolateStatsReply);
+
+  // Describes one session isolate this node holds, resident or
+  // hibernated, with the child sessions it owns.
+  //
+  // Caller classes: `manager`, and `ticket` (a session ticket for the
+  // session's job and task, in `ticket`).
+  //
+  // Errors: NotFound when this node holds no such session isolate;
+  // Unauthenticated or PermissionDenied as for `Worker.GetSession`.
+  rpc GetIsolate (GetIsolateRequest) returns (GetIsolateReply);
 }
 
 // Request payload for Worker.StartSession.
@@ -14961,6 +15260,31 @@ message RunSessionRequest {
   // router would pick. A retry of a call that named a node in its reply or
   // error sets it, so an idempotency key finds the first attempt.
   string node_id = 11;
+
+  // Tasks of the `isolate` runtime only (docs/task-runtime-isolate.md):
+  // where the run happens. `isolate` runs it in an isolate. `vm` runs it
+  // in a fresh, single-use VM of the task's VM task (`config.vm.task`),
+  // with the source staged as `/legion/run/main.<ext>`. `auto`, the
+  // default when empty, decides before anything runs: it scans the
+  // source's imports against the image's module list and consults the
+  // node's memo of code that needed a VM, and it sends the run to the VM
+  // while the isolate runtime is disabled. The reply's `tier` and
+  // `tier_reason` say what was chosen and why.
+  string tier = 12;
+
+  // Tasks of the `isolate` runtime only: the tenant key, saying who the
+  // run is for. It keys the warm instance for `config.lifetime =
+  // "tenant"`, and the per-tenant queue that keeps one tenant's runs from
+  // starving another's on a busy node. Any string up to 128 bytes; empty
+  // is the task's anonymous tenant.
+  string tenant = 13;
+
+  // Tasks of the `isolate` runtime with `config.lifetime = "session"`
+  // only: run in this existing session isolate (started with
+  // `CreateInstance` or `Worker.StartSession`) instead of a fresh one.
+  // The run is routed to the node the id names, wakes the isolate if it
+  // is hibernated, and leaves it running afterwards.
+  string session_id = 14;
 }
 
 // One file staged for a run.
@@ -14994,13 +15318,20 @@ message RunOutputFile {
 // Why a run was stopped before its command exited by itself. A stopped run
 // is a successful call: the caller's code hit a limit, Legion did not fail.
 message RunStop {
-  // `wall` (the command outlived `run.wall`) or `session_ended` (the
-  // session was ended under the run: stopped by an operator, killed for
-  // memory, or its runtime exited).
+  // `wall` (the command outlived `run.wall`), `memory` (the session was
+  // killed for memory), or `session_ended` (the session was ended under
+  // the run: stopped by an operator, or its runtime exited).
+  //
+  // A run in an isolate uses `limits` (it exceeded one of the task's
+  // `config.limits` or its `resources.memoryMax`; `limit` names which),
+  // `unsupported` (the code called something an isolate does not offer,
+  // such as a subprocess; `detail` names it), `trap` (the guest crashed),
+  // or `ended` (its session isolate was stopped under it).
   string reason = 1;
 
   // The limit that stopped it, as the jobspec wrote it (`"30s"`). Empty
-  // for `session_ended`.
+  // for `session_ended`. For an isolate's `limits` it is the limit's
+  // name: `cpu`, `wall`, `memory`, or `output`.
   string limit = 2;
 
   // What happened, in a sentence.
@@ -15028,6 +15359,19 @@ message RunDryRun {
   // `run.wall` and `run.output` as they would apply.
   string wall = 5;
   uint64 output_bytes = 6;
+
+  // Isolate tasks only: the tier the run would use and why, decided the
+  // way the run itself would decide it (the pre-flight import check and
+  // the node's memo).
+  string tier = 7;
+  string tier_reason = 8;
+
+  // Isolate tasks only: the modules the source imports, as the pre-flight
+  // check read them, and those among them the task's image does not
+  // have. A non-empty `missing_imports` is what sends an `auto` run to a
+  // VM.
+  repeated string imports = 9;
+  repeated string missing_imports = 10;
 }
 
 // Reply payload for Manager.RunSession and Worker.RunSession.
@@ -15083,6 +15427,40 @@ message RunSessionResponse {
 
   // The run's id: derived from the idempotency key, or minted.
   string run_id = 15;
+
+  // Isolate tasks only: where the code ran, `isolate` or `vm`. Empty for
+  // a run on any other runtime.
+  string tier = 16;
+
+  // Isolate tasks only: why that tier, in a phrase a person can read and
+  // an agent can log (`auto: no imports outside the image`, `auto: import
+  // torch is not in image python`, `requested`, `auto: this code needed a
+  // VM 12m ago`, `auto: the isolate runtime is disabled`).
+  string tier_reason = 17;
+
+  // Isolate tasks only: the tier to ask for the next time this code runs,
+  // when the outcome showed the other one is the right place for it.
+  // `vm` after an isolate run was stopped for `unsupported` or `limits`
+  // on a task with a VM task, and after any run that went to a VM. Empty
+  // when the tier that ran it was the right one. Callers that keep it per
+  // code hash never pay for the same wrong guess twice, on any node.
+  string next_tier = 18;
+
+  // Isolate tasks only: for a run that went to a VM, the time from the
+  // decision to a VM ready to execute, in milliseconds. 0 otherwise.
+  uint64 vm_ms = 19;
+
+  // CPU and wall-clock time in microseconds, where the runtime measures
+  // them that finely (isolates do; `cpu_ms` and `wall_ms` carry the same
+  // values rounded). 0 otherwise.
+  uint64 cpu_micros = 20;
+  uint64 wall_micros = 21;
+
+  // Isolate tasks only: how the isolate that ran the code was obtained:
+  // `fresh` (a new instance), `warm` (an existing tenant or session
+  // instance), `paged` (resident, its pages faulted back in), or
+  // `hibernated` (restored from a checkpoint). Empty for a VM run.
+  string isolate_start = 22;
 }
 
 // Request payload for Worker.StopSession.

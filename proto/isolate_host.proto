@@ -1,0 +1,707 @@
+// The protocol between a worker and the `legion-isolate` host processes it
+// supervises (docs/task-runtime-isolate.md, "The host process").
+//
+// This is an internal, node-local protocol: both ends run on one node, over a
+// pair of inherited Unix sockets, and it never crosses the network. It is
+// versioned by `PROTOCOL_VERSION` (checked in `Hello`) rather than by wire
+// compatibility rules, because `legion-isolate` is upgraded with, or just
+// ahead of, the worker that starts it. It is not part of Legion's public API.
+//
+// Two services, one per socket, because both sides start calls:
+//
+// - `IsolateHost` is served by the host. The worker loads compiled modules,
+//   describes tasks, invokes isolates, and asks for memory back.
+// - `IsolateWorker` is served by the worker. The host has no network and no
+//   writable filesystem, so everything an isolate does outside its own memory
+//   goes through here: outbound HTTP, child VMs, checkpoints, and logs.
+//
+// Attribution rule: every `IsolateWorker` request carries an `Origin`. The
+// worker trusts the socket for the cordon (it started the process at the
+// other end) and checks that the origin's job belongs to that cordon. A host
+// that has been compromised can therefore act only as the jobs of its own
+// cordon, which is the trust unit the design already accepts.
+syntax = "proto3";
+
+package legion.isolate.host;
+
+// ---------------------------------------------------------------------------
+// Shared pieces
+// ---------------------------------------------------------------------------
+
+// One HTTP header. Repeated rather than a map: order and duplicates matter.
+message Header {
+  string name = 1;
+  bytes value = 2;
+}
+
+// One file in an isolate's scratch tree.
+message File {
+  // Path relative to the run directory (`main.py`, `data/in.csv`).
+  string path = 1;
+  bytes content = 2;
+  // On the way out only: the file was larger than the output budget left.
+  bool truncated = 3;
+  // On the way out only: the guest left no readable file at the path.
+  bool missing = 4;
+}
+
+// Which isolate a host-to-worker request is made for.
+message Origin {
+  string job_id = 1;
+  string task_name = 2;
+  // The session id for a session isolate; otherwise the invocation id.
+  string isolate_id = 3;
+  // The tenant key the invocation carried, when it carried one.
+  string tenant = 4;
+  // True when `isolate_id` is a session id.
+  bool session = 5;
+}
+
+// How long an instance lives (`config.lifetime`).
+enum Lifetime {
+  LIFETIME_REQUEST = 0;  // a fresh instance per invocation
+  LIFETIME_TENANT = 1;   // one warm instance per (task, tenant key)
+  LIFETIME_SESSION = 2;  // an addressable instance with a session id
+}
+
+// ---------------------------------------------------------------------------
+// Host configuration (written by the worker as JSON to the host's
+// `--config-fd`, read once before the host confines itself)
+// ---------------------------------------------------------------------------
+
+// How isolates' linear memories are laid out in the host's address space
+// (plan §6.4). A property of the cordon's host, never of a job.
+enum SlotLayout {
+  SLOT_LAYOUT_GUARD_PAGES = 0;  // wasmtime's default: 4 GiB reservation + guard
+  SLOT_LAYOUT_MPK = 1;          // memory protection keys striping; x86-64 Linux with PKU
+  SLOT_LAYOUT_SMALL = 2;        // small reservations with explicit bounds checks
+}
+
+// How strictly the host must confine itself before serving.
+enum Confine {
+  // Every layer must apply or the host exits before it loads a module.
+  CONFINE_ENFORCE = 0;
+  // Apply what the kernel offers and report the rest in `Hello`.
+  CONFINE_BEST_EFFORT = 1;
+  // Apply nothing (tests and development only).
+  CONFINE_OFF = 2;
+}
+
+message HostConfig {
+  // Must equal the host's own `PROTOCOL_VERSION`.
+  uint32 protocol_version = 1;
+  // The cordon this host serves, for logs and metrics.
+  string cordon = 2;
+  // Shard threads (one single-threaded executor each). 0 = one per CPU the
+  // process may run on.
+  uint32 shards = 3;
+  // Linear-memory slots in the pooling allocator.
+  uint32 slots = 4;
+  // The largest `memoryMax` any isolate in this host may have: the size of
+  // one slot.
+  uint64 slot_bytes = 5;
+  // How often the epoch ticker advances.
+  uint32 epoch_millis = 6;
+  // How long a turn may run before it yields to its shard.
+  uint32 slice_millis = 7;
+  // Idle time after which a resident isolate's private pages are paged out.
+  // 0 = never.
+  uint32 page_out_after_millis = 8;
+  SlotLayout layout = 9;
+  Confine confine = 10;
+  // Directories the host may read (compiled artifacts). Everything else is
+  // denied by Landlock.
+  repeated string read_dirs = 11;
+  // Largest request or response body the host buffers, in either direction.
+  uint64 max_body_bytes = 12;
+  // Fiber stack size for guests on the fiber path.
+  uint64 async_stack_bytes = 13;
+  // Spectre mitigations in generated code are a compile-time setting; the
+  // host refuses an artifact compiled without them unless this is false.
+  bool require_spectre_mitigations = 14;
+}
+
+// ---------------------------------------------------------------------------
+// IsolateHost: served by the host process
+// ---------------------------------------------------------------------------
+
+service IsolateHost {
+  // Version and capability handshake; the worker's first call.
+  rpc Hello (HelloRequest) returns (HelloReply);
+
+  // Map a compiled artifact and resolve its imports ahead of time. Loading
+  // is idempotent per `module_id`.
+  rpc LoadModule (LoadModuleRequest) returns (LoadModuleReply);
+
+  // Forget a module no task uses. Refused while a task names it.
+  rpc UnloadModule (UnloadModuleRequest) returns (UnloadModuleReply);
+
+  // Create or update a task: which module it runs, its limits, its lifetime,
+  // and how much of the node it may use. Idempotent; an update applies to
+  // invocations that start after it.
+  rpc ConfigureTask (TaskSpec) returns (ConfigureTaskReply);
+
+  // Remove a task: in-flight invocations finish, resident instances are
+  // dropped, and later invocations answer NOT_FOUND.
+  rpc RemoveTask (RemoveTaskRequest) returns (RemoveTaskReply);
+
+  // Run one invocation and return its outcome. A run that was stopped by a
+  // limit, an unsupported call, or a trap is a successful reply with
+  // `stopped` set. A gRPC error means nothing ran:
+  //   NOT_FOUND            the task or the session is unknown
+  //   RESOURCE_EXHAUSTED   no room or no slot within the queue timeout (retryable)
+  //   FAILED_PRECONDITION  the module does not export what the call needs
+  //   UNAVAILABLE          the host is draining (retryable elsewhere)
+  rpc Invoke (InvokeRequest) returns (InvokeReply);
+
+  // Create a session isolate. The instance is made on first use.
+  rpc OpenSession (OpenSessionRequest) returns (OpenSessionReply);
+
+  // End a session isolate and drop whatever of it the host holds.
+  rpc CloseSession (CloseSessionRequest) returns (CloseSessionReply);
+
+  // What the host holds of one session. NOT_FOUND when it holds nothing
+  // (the session may still exist as a checkpoint the worker keeps).
+  rpc GetSession (GetSessionRequest) returns (SessionInfo);
+
+  // Give memory back: page out idle isolates, or hibernate idle session
+  // isolates (which the host does by calling `IsolateWorker.SaveCheckpoint`).
+  rpc Reclaim (ReclaimRequest) returns (ReclaimReply);
+
+  // Counters and gauges, per task and for the process.
+  rpc Stats (StatsRequest) returns (StatsReply);
+
+  // Stop taking invocations; optionally hibernate every session isolate
+  // first. The worker stops the process after it returns.
+  rpc Drain (DrainRequest) returns (DrainReply);
+}
+
+message HelloRequest {}
+
+message HelloReply {
+  uint32 protocol_version = 1;
+  // `wasmtime-<version>`.
+  string engine_version = 2;
+  // Identifies the engine configuration compiled artifacts must match (the
+  // same value `legion-isolate engine-info` prints). An artifact compiled
+  // under another key is refused by `LoadModule`.
+  string compat_key = 3;
+  uint32 pid = 4;
+  uint32 shards = 5;
+  uint32 slots = 6;
+  SlotLayout layout = 7;
+  // The confinement that actually applied, layer by layer.
+  Confinement confinement = 8;
+}
+
+// Which confinement layers are in force in the host process.
+message Confinement {
+  bool user_namespace = 1;
+  bool network_namespace = 2;
+  bool no_new_privs = 3;
+  bool landlock = 4;
+  bool seccomp = 5;
+  // Human-readable notes for layers that did not apply (best-effort mode).
+  repeated string notes = 6;
+}
+
+message LoadModuleRequest {
+  // The worker's name for the module: its derived-content key.
+  string module_id = 1;
+  // Path of the compiled artifact (`.cwasm`), inside one of
+  // `HostConfig.read_dirs`.
+  string artifact_path = 2;
+}
+
+message LoadModuleReply {
+  // What the component exports, which decides what calls it can take.
+  bool exports_cli_run = 1;       // wasi:cli/run
+  bool exports_http_handler = 2;  // wasi:http/incoming-handler
+  bool exports_runner = 3;        // legion:isolate/runner
+  // The largest initial linear memory among the component's modules.
+  uint64 initial_memory_bytes = 4;
+  // True when the module was already loaded.
+  bool already_loaded = 5;
+}
+
+message UnloadModuleRequest {
+  string module_id = 1;
+}
+
+message UnloadModuleReply {
+  bool unloaded = 1;
+}
+
+// Per-invocation budgets (`config.limits`).
+message Limits {
+  // CPU per invocation, turns summed. Checked at every yield.
+  uint64 cpu_micros = 1;
+  // Wall clock per invocation.
+  uint64 wall_micros = 2;
+  // stdout + stderr + returned files, in bytes.
+  uint64 output_bytes = 3;
+}
+
+message TaskSpec {
+  string job_id = 1;
+  string task_name = 2;
+  string module_id = 3;
+  Lifetime lifetime = 4;
+  Limits limits = 5;
+  // The cap on one isolate's linear memory (`resources.memoryMax`).
+  uint64 memory_max_bytes = 6;
+  // What one resident isolate is charged against the envelope
+  // (`resources.memory`).
+  uint64 memory_reservation_bytes = 7;
+  // The task's environment (`config.env`, with KV-rendered values).
+  map<string, string> env = 8;
+  // The isolate's weight in the shard scheduler (`resources.cpu`).
+  uint32 cpu_weight = 9;
+  // Resident isolates this task may hold in this host: the envelope's
+  // memory over the reservation, split across the cordon's hosts.
+  uint32 max_resident = 10;
+  // Invocations of this task that may be running at once in this host.
+  uint32 max_active = 11;
+  // How long an invocation waits for room before RESOURCE_EXHAUSTED.
+  uint32 queue_timeout_millis = 12;
+  // Whether `legion:isolate/vm` may start children (`config.vm` is set).
+  bool has_vm = 13;
+  // Whether outbound HTTP is offered at all.
+  bool egress = 14;
+  // Idle time after which a session isolate is hibernated
+  // (`suspend.idle.after`). 0 = only under pressure.
+  uint64 hibernate_after_millis = 15;
+  // Idle time after which a warm tenant instance is dropped.
+  uint64 tenant_idle_millis = 16;
+  // Bytes one tenant or session may keep in `legion:isolate/state`.
+  uint64 state_quota_bytes = 17;
+  // `config.entry`: a source file staged for every invocation of an image
+  // task and named to the runner, so a handler written as a script needs no
+  // per-call upload. Empty for dynamic code and for components.
+  File entry = 18;
+}
+
+message ConfigureTaskReply {}
+
+message RemoveTaskRequest {
+  string job_id = 1;
+  string task_name = 2;
+}
+
+message RemoveTaskReply {
+  // Resident instances dropped.
+  uint32 dropped = 1;
+}
+
+// A one-shot run: `wasi:cli/run` on a command component, or
+// `legion:isolate/runner.run` on an image or a reactor component.
+message RunCall {
+  // Files placed in the run directory (`/legion/run`) before the call.
+  repeated File files = 1;
+  // A JSON document, staged as `input.json` and passed to a runner.
+  optional string input = 2;
+  // The source file to execute, relative to the run directory. Images only.
+  string entry = 3;
+  // Program arguments.
+  repeated string args = 4;
+  // Files to return from the run directory afterwards.
+  repeated string get = 5;
+}
+
+// One HTTP request for `wasi:http/incoming-handler`.
+message HttpCall {
+  string method = 1;
+  // Path and query.
+  string path = 2;
+  string authority = 3;
+  string scheme = 4;
+  repeated Header headers = 5;
+  bytes body = 6;
+}
+
+message InvokeRequest {
+  string job_id = 1;
+  string task_name = 2;
+  // Unique per invocation; names the isolate in logs and attribution.
+  string invocation_id = 3;
+  // The tenant key: who the invocation is for. Keys the warm instance for
+  // `lifetime = "tenant"` and the fairness queue for every lifetime. Empty
+  // means the task's anonymous tenant.
+  string tenant = 4;
+  // The session to run in, for `lifetime = "session"`.
+  string session_id = 5;
+  oneof call {
+    RunCall run = 6;
+    HttpCall http = 7;
+  }
+}
+
+message RunOutcome {
+  // The exit status. Unset when the run was stopped.
+  optional int32 exit = 1;
+  // `result.json` from the run directory, or the runner's returned JSON.
+  string result = 2;
+  // The files named in `RunCall.get`, in request order.
+  repeated File files = 3;
+}
+
+message HttpOutcome {
+  uint32 status = 1;
+  repeated Header headers = 2;
+  bytes body = 3;
+}
+
+// Why an invocation was stopped before it finished by itself.
+message Stopped {
+  // `limits`, `unsupported`, `trap`, or `ended` (its session was closed or
+  // the host drained under it).
+  string reason = 1;
+  // For `limits`: `cpu`, `wall`, `memory`, or `output`.
+  string limit = 2;
+  // What happened, in a sentence.
+  string detail = 3;
+}
+
+message InvokeReply {
+  oneof outcome {
+    RunOutcome run = 1;
+    HttpOutcome http = 2;
+  }
+  // Set when the invocation was stopped; `outcome` then holds what there
+  // was (a run's files, no exit).
+  Stopped stopped = 3;
+  bytes stdout = 4;
+  bytes stderr = 5;
+  // stdout or stderr was cut at the output budget.
+  bool truncated = 6;
+  // CPU the guest used, turns summed.
+  uint64 cpu_micros = 7;
+  // Wall clock from the first turn to the last.
+  uint64 wall_micros = 8;
+  // Time to a ready instance: a pool slot, the image mapped, imports bound.
+  // 0 when a warm instance was reused.
+  uint64 instantiate_micros = 9;
+  // Time spent waiting for room before the first turn.
+  uint64 queue_micros = 10;
+  // High-water mark of the isolate's linear memory.
+  uint64 memory_peak_bytes = 11;
+  // `fresh`, `warm`, `paged` (resident, pages faulted back in), or
+  // `hibernated` (restored from a checkpoint).
+  string start = 12;
+}
+
+message OpenSessionRequest {
+  string job_id = 1;
+  string task_name = 2;
+  string session_id = 3;
+  string tenant = 4;
+}
+
+message OpenSessionReply {
+  // True when the host already held this session.
+  bool existed = 1;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message CloseSessionReply {
+  // True when the host held the session.
+  bool closed = 1;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message SessionInfo {
+  string session_id = 1;
+  string job_id = 2;
+  string task_name = 3;
+  string tenant = 4;
+  // `hot`, `paged_out`, or `empty` (opened, no instance yet).
+  string tier = 5;
+  int64 last_active_unix_ms = 6;
+  uint64 invocations = 7;
+  // Linear memory currently mapped for the instance.
+  uint64 memory_bytes = 8;
+  // Bytes kept in `legion:isolate/state`.
+  uint64 state_bytes = 9;
+  // An invocation is running in it now.
+  bool active = 10;
+}
+
+enum ReclaimLevel {
+  // Push idle isolates' private pages to swap. Instances stay.
+  RECLAIM_PAGE_OUT = 0;
+  // Hibernate idle session isolates and drop idle tenant instances.
+  RECLAIM_HIBERNATE = 1;
+}
+
+message ReclaimRequest {
+  ReclaimLevel level = 1;
+  // Stop once about this much has been given back. 0 = everything idle.
+  uint64 target_bytes = 2;
+  // Only isolates idle at least this long. 0 = any idle isolate.
+  uint64 min_idle_millis = 3;
+}
+
+message ReclaimReply {
+  // Bytes of linear memory released or pushed out (an estimate: the kernel
+  // decides what paging out frees).
+  uint64 bytes = 1;
+  uint32 paged_out = 2;
+  uint32 hibernated = 3;
+  uint32 dropped = 4;
+}
+
+message StatsRequest {}
+
+// Cumulative counters and current gauges for one task in one host.
+message TaskStats {
+  string job_id = 1;
+  string task_name = 2;
+  // Gauges.
+  uint32 resident = 3;
+  uint32 active = 4;
+  uint32 paged_out = 5;
+  uint32 queued = 6;
+  // Counters since the host started.
+  uint64 invocations = 7;
+  uint64 turns = 8;
+  uint64 cpu_micros = 9;
+  // By `Stopped.reason`.
+  map<string, uint64> stopped = 10;
+  // By `Stopped.limit`.
+  map<string, uint64> limits = 11;
+  // RESOURCE_EXHAUSTED answers.
+  uint64 refusals = 12;
+  // Starts by kind: `fresh`, `warm`, `paged`, `hibernated`.
+  map<string, uint64> starts = 13;
+  uint64 instantiations = 14;
+  uint64 instantiate_micros = 15;
+  uint64 hibernations = 16;
+  // Linear memory mapped by this task's resident instances.
+  uint64 memory_bytes = 17;
+}
+
+message StatsReply {
+  repeated TaskStats tasks = 1;
+  uint64 rss_bytes = 2;
+  uint32 slots = 3;
+  uint32 slots_used = 4;
+  uint32 shards = 5;
+  int64 started_unix_ms = 6;
+}
+
+message DrainRequest {
+  // Hibernate every session isolate before answering.
+  bool hibernate = 1;
+  // How long in-flight invocations get to finish.
+  uint32 grace_millis = 2;
+}
+
+message DrainReply {
+  uint32 hibernated = 1;
+  // Invocations still running when the grace ran out (they are stopped
+  // with `reason = "ended"`).
+  uint32 cut = 2;
+}
+
+// ---------------------------------------------------------------------------
+// IsolateWorker: served by the worker
+// ---------------------------------------------------------------------------
+
+service IsolateWorker {
+  // One outbound HTTP request from an isolate. The worker applies the
+  // task's `connect` upstreams, egress policy, handlers, and credential
+  // injection, as it does for a gated allocation. A refusal is a reply with
+  // `error` set, not a gRPC error, so the guest sees a typed failure.
+  rpc Egress (EgressRequest) returns (EgressReply);
+
+  // One operation on a child VM (`legion:isolate/vm`).
+  rpc Vm (VmRequest) returns (VmReply);
+
+  // Store a hibernating session isolate's checkpoint. The first message
+  // carries `header`; the rest carry `data`. The checkpoint replaces any
+  // earlier one for the session only when the call completes.
+  rpc SaveCheckpoint (stream CheckpointChunk) returns (SaveCheckpointReply);
+
+  // Read a session isolate's checkpoint back. NOT_FOUND when the session
+  // does not exist or has never been hibernated.
+  rpc LoadCheckpoint (LoadCheckpointRequest) returns (stream CheckpointChunk);
+
+  // Guest stdout and stderr for the task's log stream.
+  rpc Log (stream LogBatch) returns (LogReply);
+}
+
+message EgressRequest {
+  Origin origin = 1;
+  string method = 2;
+  // Absolute URL. `http://<upstream name>/...` addresses a `connect`
+  // upstream of the task.
+  string url = 3;
+  repeated Header headers = 4;
+  bytes body = 5;
+  // The guest's own timeout, bounded by the invocation's wall limit.
+  uint32 timeout_millis = 6;
+}
+
+enum EgressErrorKind {
+  EGRESS_ERROR_UNSPECIFIED = 0;
+  EGRESS_DENIED = 1;       // refused by policy
+  EGRESS_DNS = 2;
+  EGRESS_CONNECT = 3;
+  EGRESS_TIMEOUT = 4;
+  EGRESS_TOO_LARGE = 5;    // a body over `max_body_bytes`
+  EGRESS_PROTOCOL = 6;
+  EGRESS_UNAVAILABLE = 7;  // this node has no datapath for the task
+}
+
+message EgressError {
+  EgressErrorKind kind = 1;
+  string message = 2;
+}
+
+message EgressReply {
+  uint32 status = 1;
+  repeated Header headers = 2;
+  bytes body = 3;
+  // Set when the request did not produce a response.
+  EgressError error = 4;
+}
+
+message VmAcquire {}
+
+message VmAttach {
+  string id = 1;
+}
+
+message VmExec {
+  string id = 1;
+  repeated string argv = 2;
+  bytes stdin = 3;
+  uint32 timeout_millis = 4;
+}
+
+message VmPut {
+  string id = 1;
+  string path = 2;
+  bytes content = 3;
+}
+
+message VmGet {
+  string id = 1;
+  string path = 2;
+}
+
+message VmFetch {
+  string id = 1;
+  uint32 port = 2;
+  HttpCall request = 3;
+}
+
+message VmResize {
+  string id = 1;
+  uint32 memory_mib = 2;
+  optional uint32 memory_max_mib = 3;
+  optional uint32 cpu_mhz = 4;
+}
+
+message VmRelease {
+  string id = 1;
+}
+
+message VmRequest {
+  Origin origin = 1;
+  oneof op {
+    VmAcquire acquire = 2;
+    VmAttach attach = 3;
+    VmExec exec = 4;
+    VmPut put = 5;
+    VmGet get = 6;
+    VmFetch fetch = 7;
+    VmResize resize = 8;
+    VmRelease release = 9;
+  }
+}
+
+enum VmErrorKind {
+  VM_ERROR_UNSPECIFIED = 0;
+  VM_NOT_CONFIGURED = 1;       // the task has no VM task
+  VM_RESOURCE_EXHAUSTED = 2;   // retryable: the VM task's envelope is full
+  VM_CHILD_GONE = 3;           // stopped, evicted, or its node was lost
+  VM_NEEDS_RESTART = 4;        // a resize past what the VM can do live
+  VM_FAILED = 5;
+}
+
+message VmError {
+  VmErrorKind kind = 1;
+  string message = 2;
+}
+
+message VmExecResult {
+  int32 exit = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  bool timed_out = 4;
+}
+
+message VmReply {
+  // Set when the operation failed; the other fields are then empty.
+  VmError error = 1;
+  // `acquire` and `attach`: the child's session id.
+  string id = 2;
+  // `exec`.
+  VmExecResult exec = 3;
+  // `get`.
+  bytes content = 4;
+  // `fetch`.
+  HttpOutcome response = 5;
+}
+
+// What a checkpoint is of. The body after it is opaque to the worker: the
+// host defines and versions it.
+message CheckpointHeader {
+  Origin origin = 1;
+  // `wasmtime-<version>`; a host with another engine wakes the session
+  // fresh rather than restoring this.
+  string engine_version = 2;
+  string module_id = 3;
+  // Size of the body that follows.
+  uint64 bytes = 4;
+  // Bytes of linear memory the checkpoint let the host release.
+  uint64 freed_bytes = 5;
+}
+
+message CheckpointChunk {
+  oneof part {
+    CheckpointHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message SaveCheckpointReply {
+  // The checkpoint's generation for this session, starting at 1.
+  uint64 generation = 1;
+}
+
+message LoadCheckpointRequest {
+  Origin origin = 1;
+}
+
+message LogLine {
+  // False = stdout, true = stderr.
+  bool stderr = 1;
+  bytes line = 2;
+  int64 unix_ms = 3;
+}
+
+message LogBatch {
+  Origin origin = 1;
+  repeated LogLine lines = 2;
+}
+
+message LogReply {}
