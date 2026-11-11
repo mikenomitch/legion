@@ -42,7 +42,6 @@ use std::sync::{Arc, Condvar};
 use std::time::Instant;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest as _, Sha256};
 
 use super::*;
 
