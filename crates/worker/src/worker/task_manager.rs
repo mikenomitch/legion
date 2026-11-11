@@ -13759,6 +13759,38 @@ mod tests {
                 Some(owner_ref(OWNER_SESSION, "agent-1")),
                 "manager",
             )?;
+            // A session is registered before its launch thread records the
+            // process, and the log skips a session with no pid. Under load
+            // (the full suite) the pid can still be missing here, so wait.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let guard = manager.lock().expect("task manager");
+                let has_pid = |local_key: i64| {
+                    guard
+                        .claims
+                        .by_local_key(local_key)
+                        .map(|claim| {
+                            guard
+                                .session_row(
+                                    claim,
+                                    crate::worker::session_log::SessionLogState::Running,
+                                )
+                                .process
+                                .and_then(|process| process.pid)
+                                .is_some()
+                        })
+                        .unwrap_or(false)
+                };
+                if has_pid(owner.local_key) && has_pid(child.local_key) {
+                    break;
+                }
+                drop(guard);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the sessions never recorded a process"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
             let mut guard = manager.lock().expect("task manager");
             // The launch thread logs a session after it registers it; log
             // both here so the sync below cannot run ahead of that.
