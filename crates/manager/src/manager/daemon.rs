@@ -4246,13 +4246,24 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 .validate()
                 .with_context(|| format!("invalid devices config in worker config {path_str}"))?;
         }
-        // The top-level `content`, `contentStore`, `sessions`, and `devices`
-        // blocks ride in the artifacts payload (see `WorkerArtifactsPayload`).
+        let isolate = wcp
+            .isolate
+            .as_ref()
+            .map(|isolate| {
+                let resolved = isolate.with_defaults();
+                resolved.validate().map(|()| resolved)
+            })
+            .transpose()
+            .with_context(|| format!("invalid isolate config in worker config {path_str}"))?;
+        // The top-level `content`, `contentStore`, `sessions`, `devices`,
+        // and `isolate` blocks ride in the artifacts payload (see
+        // `WorkerArtifactsPayload`).
         let artifacts = if wcp.artifacts.is_none()
             && wcp.content.is_none()
             && wcp.content_store.is_none()
             && wcp.sessions.is_none()
             && wcp.devices.is_none()
+            && isolate.is_none()
         {
             String::new()
         } else {
@@ -4262,6 +4273,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 content_store: wcp.content_store.clone(),
                 sessions: wcp.sessions.clone(),
                 devices: wcp.devices.clone(),
+                isolate,
             })?
         };
 

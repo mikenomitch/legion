@@ -1,5 +1,7 @@
 use crate::prelude::*;
-use crate::task_plugins::{ContainerTaskPlugin, ExecTaskPlugin, SandboxTaskPlugin, TaskPlugin};
+use crate::task_plugins::{
+    ContainerTaskPlugin, ExecTaskPlugin, IsolateTaskPlugin, SandboxTaskPlugin, TaskPlugin,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,10 @@ pub fn builtin_task_plugin_schemas() -> Vec<PluginSchemaDoc> {
         PluginSchemaDoc {
             name: "exec".to_string(),
             schema: ExecTaskPlugin.schema(),
+        },
+        PluginSchemaDoc {
+            name: "isolate".to_string(),
+            schema: IsolateTaskPlugin.schema(),
         },
         PluginSchemaDoc {
             name: "sandbox".to_string(),
@@ -138,6 +144,11 @@ fn expected_defaults(plugin_name: &str) -> BTreeMap<&'static str, Value> {
             ("landlock.read_write_paths", json!([])),
         ]),
         "container" | "sandbox" => BTreeMap::from([("env", json!({}))]),
+        "isolate" => BTreeMap::from([
+            ("env", json!({})),
+            ("lifetime", json!("request")),
+            ("cordon", json!("namespace")),
+        ]),
         _ => BTreeMap::new(),
     }
 }

@@ -192,9 +192,42 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    // Eight declared tasks, plus the envelope task Legion generates for the
-    // `scratch` session task at parse.
-    assert_eq!(config.tasks.len(), 9);
+    // Ten declared tasks, plus the envelope tasks Legion generates at parse
+    // for the `scratch`, `snippets`, and `snippets-vm` session tasks.
+    assert_eq!(config.tasks.len(), 13);
+    // The isolate task: a session task whose envelope needs the `isolates`
+    // capability and carries its datapath, gated.
+    let snippets = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "snippets")
+        .expect("maximal must declare the isolate task");
+    assert!(legion::structs::session::is_session_task(snippets));
+    let isolate = legion::structs::isolate::IsolateTaskConfig::of(snippets)
+        .expect("isolate config parses")
+        .expect("an isolate task");
+    assert_eq!(
+        legion::structs::isolate::vm_task_name(snippets, &isolate).as_deref(),
+        Some("snippets-vm")
+    );
+    let envelope = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "snippets-envelope")
+        .expect("the isolate task's envelope");
+    assert!(envelope
+        .constraints
+        .as_array()
+        .expect("constraints")
+        .iter()
+        .any(|rule| rule["value"] == legion::structs::isolate::ISOLATES_CAPABILITY));
+    assert_eq!(
+        envelope
+            .network
+            .as_ref()
+            .map(|network| network.mode.as_str()),
+        Some("gated")
+    );
     let trainer = config
         .tasks
         .iter()

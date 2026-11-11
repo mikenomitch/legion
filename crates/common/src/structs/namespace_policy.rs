@@ -60,6 +60,14 @@ pub struct NamespacePolicy {
     /// globs. Unset allows every runtime; an empty list allows none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtimes: Option<Vec<String>>,
+    /// The isolate cordon kinds (`config.cordon` of an `isolate` task) jobs
+    /// in the governed namespaces may use: `namespace`, `job`, `shared`.
+    /// Exact names, no globs. Unset allows `namespace` and `job`; `shared`
+    /// (one host process for several namespaces) is allowed only where a
+    /// governing policy lists it, and every governing policy that sets this
+    /// list must allow a kind for a job to use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolate_cordons: Option<Vec<String>>,
     /// Allowed host volumes (`driver = "host"`, by `params.name`), as names
     /// or globs. Unset allows every host volume; an empty list allows none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,6 +412,23 @@ impl NamespacePolicy {
                 validate_globs(&format!("{what}: {field}"), list)?;
             }
         }
+        if let Some(cordons) = self.isolate_cordons.as_mut() {
+            for kind in cordons.iter_mut() {
+                *kind = kind.trim().to_string();
+                if crate::structs::isolate::IsolateCordon::parse(kind).is_none() {
+                    return Err(format!(
+                        "{what}: isolateCordons entry {kind:?} is not a cordon kind; use \
+                         \"namespace\", \"job\", or \"shared\" (exact names, no globs)"
+                    ));
+                }
+            }
+            // Canonical order (namespace, job, shared), each once.
+            *cordons = crate::structs::isolate::IsolateCordon::ALL
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .filter(|kind| cordons.contains(kind))
+                .collect();
+        }
         if let Some(autoscale) = self.autoscale.as_ref() {
             autoscale.validate_inherited(&what)?;
         }
@@ -481,6 +506,7 @@ fn host_volume_names(task: &crate::structs::TaskConfig) -> Vec<(String, String)>
 pub fn admit_job(policies: &[NamespacePolicy], config: &mut JobConfig) -> Result<(), String> {
     let namespace = job_namespace(&config.name).to_string();
     let governing = governing(policies, &namespace);
+    admit_isolate_cordons(&governing, config, &namespace)?;
     if governing.is_empty() {
         return Ok(());
     }
@@ -602,6 +628,61 @@ pub fn admit_job(policies: &[NamespacePolicy], config: &mut JobConfig) -> Result
     Ok(())
 }
 
+/// `isolateCordons` against every isolate task of `config` (isolate-runtime
+/// plan §6.3). Runs with no governing policy too: `shared` mixes
+/// namespaces in one process, so it needs an operator's opt-in.
+fn admit_isolate_cordons(
+    governing: &[&NamespacePolicy],
+    config: &JobConfig,
+    namespace: &str,
+) -> Result<(), String> {
+    use crate::structs::isolate::{IsolateCordon, IsolateTaskConfig};
+    for task in &config.tasks {
+        if !crate::structs::isolate::is_isolate_task(task) {
+            continue;
+        }
+        // An unreadable config is `job validate`'s to report.
+        let Ok(parsed) = IsolateTaskConfig::from_value(&task.config) else {
+            continue;
+        };
+        let kind = parsed.cordon.as_str();
+        let prefix = format!("[isolate] {}/{}", config.name, task.name);
+        for policy in governing {
+            if let Some(allowed) = policy.isolate_cordons.as_ref() {
+                if !allowed.iter().any(|entry| entry == kind) {
+                    return Err(format!(
+                        "{prefix}: config.cordon = \"{kind}\" is refused by namespace policy \
+                         '{}' (isolateCordons = [{}])",
+                        policy.name,
+                        allowed
+                            .iter()
+                            .map(|entry| format!("\"{entry}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+        }
+        if parsed.cordon == IsolateCordon::Shared
+            && !governing.iter().any(|policy| {
+                policy
+                    .isolate_cordons
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.iter().any(|entry| entry == kind))
+            })
+        {
+            return Err(format!(
+                "{prefix}: config.cordon = \"shared\" is refused: no namespace policy governing \
+                 namespace {namespace} allows shared cordons, which run several namespaces' \
+                 isolates in one process\nHint: use cordon = \"namespace\" (the default), or \
+                 have an operator list \"shared\" in a namespace policy's isolateCordons \
+                 (isolateCordons = [\"namespace\", \"job\", \"shared\"])"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod namespace_policy_test {
     use super::*;
@@ -625,6 +706,107 @@ mod namespace_policy_test {
             pending_extensions: Default::default(),
             extensions: Default::default(),
         }
+    }
+
+    fn isolate_job(name: &str, cordon: &str) -> JobConfig {
+        let mut config = job(name, crate::structs::isolate::ISOLATE_RUNTIME, Value::Null);
+        config.tasks[0].name = "run".into();
+        config.tasks[0].config = json!({
+            "image": "python",
+            "limits": { "cpu": "100ms", "wall": "30s" },
+            "cordon": cordon,
+        });
+        config
+    }
+
+    /// Isolate-runtime plan §6.3: `isolateCordons` lists the cordon kinds a
+    /// namespace may use, and `shared` needs a policy's opt-in.
+    #[test]
+    fn isolate_cordons_gate_the_cordon_kinds_test() {
+        // No policy at all: namespace and job, never shared.
+        for cordon in ["namespace", "job"] {
+            admit_job(&[], &mut isolate_job("tenants/code-runner", cordon)).unwrap();
+        }
+        let err = admit_job(&[], &mut isolate_job("tenants/code-runner", "shared")).unwrap_err();
+        assert!(
+            err.starts_with(
+                "[isolate] tenants/code-runner/run: config.cordon = \"shared\" is refused: no \
+                 namespace policy governing namespace tenants allows shared cordons"
+            ),
+            "{err}"
+        );
+
+        let tenants = policy(json!({
+            "name": "tenants",
+            "namespaces": ["tenants"],
+            "isolateCordons": ["job", " namespace", "job"],
+        }));
+        assert_eq!(
+            tenants.isolate_cordons,
+            Some(vec!["namespace".to_string(), "job".to_string()])
+        );
+        let policies = vec![tenants];
+        admit_job(&policies, &mut isolate_job("tenants/code-runner", "job")).unwrap();
+        let err =
+            admit_job(&policies, &mut isolate_job("tenants/code-runner", "shared")).unwrap_err();
+        assert_eq!(
+            err,
+            "[isolate] tenants/code-runner/run: config.cordon = \"shared\" is refused by \
+             namespace policy 'tenants' (isolateCordons = [\"namespace\", \"job\"])"
+        );
+
+        // A policy that lists shared allows it; another that sets a list
+        // without it still refuses (allowlists intersect).
+        let open = policy(json!({
+            "name": "open",
+            "namespaces": ["anon-*"],
+            "isolateCordons": ["shared", "namespace"],
+        }));
+        admit_job(
+            std::slice::from_ref(&open),
+            &mut isolate_job("anon-1/code-runner", "shared"),
+        )
+        .unwrap();
+        let err = admit_job(
+            std::slice::from_ref(&open),
+            &mut isolate_job("anon-1/code-runner", "job"),
+        )
+        .unwrap_err();
+        assert!(err.contains("refused by namespace policy 'open'"), "{err}");
+        let narrow = policy(json!({
+            "name": "narrow",
+            "namespaces": ["*"],
+            "isolateCordons": ["namespace"],
+        }));
+        let err = admit_job(
+            &[open, narrow],
+            &mut isolate_job("anon-1/code-runner", "shared"),
+        )
+        .unwrap_err();
+        assert!(err.contains("namespace policy 'narrow'"), "{err}");
+
+        // Other runtimes are untouched by the list.
+        let only_ns = policy(json!({
+            "name": "only-ns",
+            "namespaces": ["*"],
+            "isolateCordons": ["namespace"],
+        }));
+        admit_job(&[only_ns], &mut job("web", "container", Value::Null)).unwrap();
+    }
+
+    #[test]
+    fn isolate_cordons_are_exact_kinds_test() {
+        for bad in ["*", "shar*", "vm", ""] {
+            let err = NamespacePolicy::from_json(
+                &json!({ "name": "p", "namespaces": ["*"], "isolateCordons": [bad] }).to_string(),
+            )
+            .unwrap_err();
+            assert!(err.contains("is not a cordon kind"), "{bad}: {err}");
+        }
+        let parsed = policy(json!({ "name": "p", "namespaces": ["*"], "isolateCordons": [] }));
+        assert_eq!(parsed.isolate_cordons, Some(Vec::new()));
+        let err = admit_job(&[parsed], &mut isolate_job("code-runner", "namespace")).unwrap_err();
+        assert!(err.contains("isolateCordons = []"), "{err}");
     }
 
     /// PLG4: operator CEL rules on jobs, refused with the policy and the

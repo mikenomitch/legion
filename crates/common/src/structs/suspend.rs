@@ -893,6 +893,22 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     let resolved = suspend
         .resolve()
         .map_err(|err| format!("task {:?}: {err}", task.name))?;
+    // An isolate hibernates to a checkpoint of its own format (the host's
+    // snapshot of its instance), never to a VM memory image or a volume.
+    // The rest of its `suspend` rules need the job and live in
+    // `isolate::validate_isolate_tasks`.
+    if task.runtime == crate::structs::isolate::ISOLATE_RUNTIME {
+        if let Some(kind) = resolved.checkpoint {
+            return Err(format!(
+                "task {:?} sets suspend.checkpoint = {:?}, but an isolate hibernates to its own \
+                 checkpoint format: \"memory\" is a sandbox guest's image and \"disk\" a \
+                 volume's\nHint: remove suspend.checkpoint; a session isolate (config.lifetime \
+                 = \"session\") hibernates when idle without it",
+                task.name,
+                kind.as_str()
+            ));
+        }
+    }
     validate_session_fields(task, suspend, &resolved)?;
     if let SuspendReserve::Amount {
         memory_mib,

@@ -108,6 +108,7 @@ pub const RESERVED_KIND_NOUNS: &[&str] = &[
     "guestresume",
     "identity",
     "instance",
+    "isolate",
     "job",
     "join",
     "jointoken",

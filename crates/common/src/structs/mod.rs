@@ -22,6 +22,7 @@ pub mod hops;
 pub mod host_guard;
 pub mod hostport;
 pub mod instance;
+pub mod isolate;
 pub mod job;
 pub mod ledger;
 pub mod namespace;
