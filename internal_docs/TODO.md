@@ -304,9 +304,11 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 
 - [ ] **The node's resource ledger is never configured in production.**
       `configure_ledger` has only test callers, so `LocalLedger` admits every
-      edge claim and doc verification step 7 checks against infinite room.
-      Configure it from declared resources and track allocations, or drop the
-      step ([edge-admission-control §5.3](plans/edge-admission-control-plan.md)).
+      edge claim (the docs now say so). Sizing it alone would leak room:
+      `LocalLedger::release` has no production caller and manager-placed
+      allocations are never committed. Size it from `ResourcePool::from_node`
+      and derive usage from live allocations (`crates/worker/src/worker/claims.rs`;
+      [edge-admission-control §5.3](plans/edge-admission-control-plan.md)).
 - [ ] **Speculative dispatch and late-binding apply don't compose**: when the
       apply falls back from `candidates[0]`, the claim goes unratified and holds
       staged work until its lease expires. Dispatch to top-n, or prefer
@@ -456,11 +458,12 @@ rig runs for everything below live in the verify list.
 - [ ] **The `sandbox` runtime cannot take on-demand signals**; only the stop
       signal reaches the guest. The guest agent would implement
       `TaskPlugin::signal` ([docs](../docs/task-runtime-sandbox.md#current-scope-and-limitations)).
-- [ ] **The container runtime's `#[ignore]`d OCI tests fail under runc
-      1.5.1.** `stop_lets_a_trapping_container_drain` and
-      `stop_force_kills_at_the_deadline` look stale (they call the hard
-      `stop()`); fix them. Three others are unexplained pending a cgroup v2
-      rerun (`crates/worker/src/task_plugins/container.rs`).
+- [ ] **Three of the container runtime's `#[ignore]`d OCI tests are
+      unexplained under runc** (`exec_runs_inside_the_container`,
+      `sees_task_dir_files_and_their_rewrites`,
+      `enforces_a_declared_memory_limit`), pending a cgroup v2 rerun
+      (`crates/worker/src/task_plugins/container.rs`). The two stop tests were
+      stale and are fixed.
 - [ ] **Two workers on one host can still collide on cgroup leaves and gated
       netns names.** OCI ids are node-scoped (2026-11-08), but the cgroup leaf
       stays `legion-<alloc>` and netns names carry no node id. The orphan-netns
@@ -510,8 +513,6 @@ rig runs for everything below live in the verify list.
         restored guest (calls 14).
   - [ ] After a restore that moved a port, the new allocation's
         `LEGION_PORT_<label>` differs from the guest's real port (calls 13).
-  - [ ] Gated `container`/`exec` tasks without upstreams get no resolver
-        (worker-plane-auth Phase 3).
   - [ ] The egress proxy records service-graph bytes only when a splice
         ends (`crates/worker/src/worker/netd/proxy.rs`).
   - [ ] A gated resolver forwards queries while policy is pending
@@ -902,7 +903,10 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 - [ ] **Autoconfigured, auto-rotated TLS for the CLI and UI.** Plan first (public cert
       vs self-signed CA). Includes the https CA default
       (`configs/tls/rootca.pem`), which is relative to the working directory.
-- [ ] **A join secret can claim a `lost` node's name** ([calls #3](calls/architecture-audit-2026-10-09_calls.md)).
+- [ ] **A join secret can claim a `lost` node's name** in the same pool
+      ([calls #3](calls/architecture-audit-2026-10-09_calls.md)); a token for
+      another pool is refused since 2026-11-11. Closing it needs per-node
+      bootstrap credentials, which overlaps the next item.
 - [ ] **A restarted worker still needs its join token string** ([calls #6](calls/join-token-file-and-cli-timeouts_calls.md)).
 - [ ] **Push direct exec revocations** instead of waiting a heartbeat ([calls #18](calls/security-gap-closure-plan_calls.md)).
 - [ ] **Run `exec` health checks inside the task's runtime** ([calls #4](calls/security-gap-closure-plan_calls.md)).
@@ -916,6 +920,9 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging.md), [event-stream.md](../docs/event-stream.md)
 
 - [ ] **A trace viewer in the UI** (dev-only first).
+- [ ] **The Nickel step budget is fixed** at 1,000,000 (`EVAL_STEP_BUDGET`);
+      a legitimately heavy config (sorting thousands of generated records)
+      fails. Make it configurable if users hit it ([calls](calls/nickel-eval-budget_calls.md)).
 - [ ] **Per-node metric families fold into `"other"` past 256 nodes**
       (`MAX_SERIES_PER_FAMILY`), so every `{node}` gauge is partial on a large
       fleet. Needs a different cap or a per-pool aggregate. There is also no
@@ -1068,11 +1075,6 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
 
 ## Cross-cutting
 
-- [ ] **Nickel evaluation has no memory or step bound.** A self-referencing field
-      (`host = { oneOf = [host] }`) evaluates forever and exhausts memory, in the
-      CLI or in a manager evaluating a bundled or installed manifest
-      (`config_lang::eval_sandboxed`). A step budget or depth limit would make it
-      an error.
 - [ ] **Spot-check papercuts** ([findings](launch-spot-check-findings.md#re-run-2026-10-12)):
   - [ ] **Stopping the macOS manager leaves its Apple containers running** — closed by
         [#39](https://github.com/mikenomitch/legion/pull/39).
@@ -1150,7 +1152,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Run a real gated container end to end on a Linux node (runc and crun, default mode): stock `nginx` reachable on its advertised port, `curl` through the proxy refused with `gated-default`, then allowed after `network.egress.allow` ([worker-plane-auth plan](plans/worker-plane-auth-plan.md) §6.12).
 - [ ] Run the kernel host guard on a cgroup v2 node as root: `sudo -E cargo test --lib kernel_guard_loads -- --ignored --nocapture` (a dial to `169.254.169.254` fails with `EPERM`, counter reports it) ([plan §6.13](plans/worker-plane-auth-plan.md)).
 - [ ] Run the container privilege floor on crun: `LEGION_OCI_RUNTIME=crun cargo test --lib oci_runtime_security -- --ignored` ([calls 40](calls/worker-plane-auth-plan_calls.md)).
-- [ ] Re-run the five ignored runc tests (`oci_runtime_exec_runs_inside_the_container`, `…_sees_task_dir_files_and_their_rewrites`, `…_enforces_a_declared_memory_limit`, `…_stop_force_kills_at_the_deadline`, `…_stop_lets_a_trapping_container_drain`) on a cgroup v2 host to tell environment from bug.
+- [ ] Re-run the three ignored runc tests (`oci_runtime_exec_runs_inside_the_container`, `…_sees_task_dir_files_and_their_rewrites`, `…_enforces_a_declared_memory_limit`) on a cgroup v2 host to tell environment from bug.
 - [ ] Re-run the AWS spot check without shims (`tests/spot-check/smoke.sh` + RUNBOOK human pass), including container/exec paths on the `0710` allocation-dir grant and edge-boot speculative dispatch ([launch-spot-check-fixes plan](plans/launch-spot-check-fixes-plan.md)).
 - [ ] Rerun `05-dag.ncl` on the 3-manager rig: a DAG advances past its first step ([launch-spot-check-findings.md](launch-spot-check-findings.md)).
 - [ ] Rerun `05-dag.ncl` twice with different `run` values: the resubmit's rollout progresses ([rollouts.md](../docs/rollouts.md#lifecycle-specific-behavior)).
@@ -1240,6 +1242,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - **Nickel replaces Jsonnet** — every config surface is `.ncl` through `crates/common/src/config_lang.rs`; `vars` + `--var`/`--var-code`/`--kv-var`/`--kv-var-code`; no `.jsonnet` compatibility ([plan](plans/nickel-config-language-plan.md) · [calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md))
 - **`.json` on four of five config surfaces** — extension-dispatched, for machine-emitted config; templates stay Nickel-only ([calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md#json-for-machine-emitted-config))
 - **Local jobspecs evaluated in place** — relative imports work from `job run/plan/validate`
+- **Nickel evaluation is bounded** — a 1,000,000-step budget enforced through Nickel's cache, on a dedicated large-stack thread; a self-referencing field is an error, not a hang ([calls](calls/nickel-eval-budget_calls.md) · [docs](../docs/configuration-language.md#evaluation-limits))
 
 ## Worker nodes
 
@@ -1343,6 +1346,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **Lazy memory restore, Phase 1** — on-demand restore on cloud-hypervisor v52+, `memory_restore = lazy|eager` ([plan](plans/lazy-memory-restore-plan.md) · [docs](../docs/task-runtime-sandbox.md#how-memory-comes-back))
 - **Sandbox `config.memory_mib` removed** — refused at submit; the guest boots at `resources.memoryMax`, else `memory`, else 512 MiB, read per unit at launch ([calls 26](calls/suspend-resume-and-oversubscription-plan_calls.md) · [docs](../docs/task-runtime-sandbox.md#guest-size))
 - **A smaller guest kernel, documented** — the options Legion needs and a build recipe ([docs](../docs/task-runtime-sandbox.md#a-smaller-guest-kernel) · [calls 18](calls/sandbox-boot-throughput-plan_calls.md))
+- **Container OCI stop tests drive `stop_with` then the hard stop**, and pass under runc 1.5.2
 
 ## Artifacts
 
@@ -1406,6 +1410,7 @@ Plans: [mesh control path](plans/mesh-control-path-plan.md) ([calls](calls/mesh-
 - **M10 `connect.templates` and `local_first`** ([plan](plans/network-handlers-plan.md))
 - **KV-held client CA for mutual ingress** — `network.ports[].tls.clients.ca = { kv }` ([plan](plans/mesh-interfaces-plan.md) · [docs](../docs/network-handlers.md#certificates-and-cas-from-kv))
 - **`connect.upstreams` from a gated `sandbox` guest** — credential injection keeps keys out of gated sandboxes via vsock relays ([calls](calls/egress-credential-injection-plan_calls.md))
+- **Every gated `container`/`exec` allocation gets the `127.0.0.53` resolver in its namespace** — already shipped with gated-by-default containers; a worker test now pins it (`specs.rs`)
 
 ## Stateful workloads & volumes
 
@@ -1500,6 +1505,7 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **Autoscaler Phases 2–4** — bundled task-autoscaling app, full policies (`prometheus`, `http`, `min = 0`, `scaling simulate`), external plugins and standalone policies ([plan](plans/autoscaler-v2-plan.md))
 - **Autoscaler Phase 5a: node-autoscaling substrate** — join-token `max_uses`/`attributes`, `ForgetNode` / `legion node forget`, `GetCapacityDemand` ([docs](../docs/autoscaling.md#capacity-demand))
 - **Autoscaler Phases 5b, 6, 7** — node groups run by the app, the UI as app views, sharded replicas with a 10,000-policy load test ([plan](plans/autoscaler-v2-plan.md))
+- **`app config get` prints Nickel** that `app config set -f` reads back; `-j` keeps the JSON envelope ([docs](../docs/apps.md))
 
 ## Auth & ACLs
 
@@ -1509,6 +1515,7 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **Audit 2026-10-09 security fixes** — scoped and pruned idempotency keys (S4), worker-plane identity binding (S1), browser origin allow-list (S2), private keys redacted from state queries (S3), cluster-wide `RotateMeshCa` (S5), stream re-auth (S7) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
 - **Keyring `provider test` / `root-key generate` in the capability catalog** ([calls](calls/cluster-ca-provider-plan_calls.md))
 - **Namespaces, Phases 1–4** — the namespace object and ACL resource, canonical `ns/job` ids, `-n`/`-A`, namespaced services/DNS/events, cross-namespace upstreams, UI switcher and pages, namespace policies with per-band quota and admission checks ([plan](plans/namespaces-plan.md) · [calls](calls/namespaces-plan_calls.md) · [docs](../docs/namespaces.md))
+- **A lost node rejoins only with a token for its own pool** ([docs](../docs/auth-and-acls.md#worker-nodes-join-tokens-and-node-tokens))
 
 ## Exec & actions
 

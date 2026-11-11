@@ -17,6 +17,10 @@
 //!   outright. Used by the manager for job templates, which must be
 //!   self-contained because the manager renders them on behalf of a caller.
 //!
+//! Every Nickel evaluation runs on a thread of its own under a step budget
+//! ([`EVAL_STEP_BUDGET`]), so a program that never finishes is an error
+//! rather than a hang that ends when the process runs out of memory.
+//!
 //! All three accept an optional `vars` record which is bound as the free
 //! identifier `vars` in the program's initial environment, next to `std`.
 //! That is Legion's parameterization hook: `legion job run web.ncl --var
@@ -58,12 +62,16 @@ use crate::prelude::*;
 
 use nickel_lang_core::error::report::{report_as_str, ColorOpt};
 use nickel_lang_core::error::{Error as NickelError, PointedExportErrorData};
-use nickel_lang_core::eval::cache::CacheImpl;
+use nickel_lang_core::eval::cache::{BlackholedError, Cache, CacheImpl, CacheIndex};
 use nickel_lang_core::eval::value::NickelValue;
+use nickel_lang_core::eval::Closure;
 use nickel_lang_core::identifier::Ident;
 use nickel_lang_core::parser::lexer::{Lexer, NormalToken, Token};
 use nickel_lang_core::program::{Program, ProgramBuilder};
 use nickel_lang_core::serialize::{self, ExportFormat};
+use nickel_lang_core::term::record::FieldDeps;
+use nickel_lang_core::term::BindingType;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 /// The file extension Legion's configuration files use.
@@ -148,7 +156,7 @@ fn vars_env(vars: Option<&Map<String, Value>>) -> R<Vec<(Ident, NickelValue)>> {
 ///
 /// Colors are off: these strings end up in gRPC statuses, JSON error
 /// envelopes, and log lines as often as they end up on a terminal.
-fn describe(program: &Program<CacheImpl>, error: NickelError) -> anyhow::Error {
+fn describe(program: &Program<BudgetedCache>, error: NickelError) -> anyhow::Error {
     let mut files = program.files();
     let rendered = report_as_str(&mut files, error, ColorOpt::Never);
     anyhow!("{}", rendered.trim_end())
@@ -159,7 +167,7 @@ fn describe(program: &Program<CacheImpl>, error: NickelError) -> anyhow::Error {
 /// Export errors carry a position that only means something against the
 /// program's position table, so they are resolved through it before being
 /// rendered.
-fn export_json(program: &Program<CacheImpl>, value: &NickelValue) -> R<String> {
+fn export_json(program: &Program<BudgetedCache>, value: &NickelValue) -> R<String> {
     let locate = |err: PointedExportErrorData| {
         describe(
             program,
@@ -175,11 +183,222 @@ fn export_json(program: &Program<CacheImpl>, value: &NickelValue) -> R<String> {
 /// `eval_full_for_export` is the `nickel export` evaluation mode: it forces
 /// the whole value and drops fields marked `| not_exported`, which is how a
 /// job template hides its `job` function from the manifest it publishes.
-fn run(mut program: Program<CacheImpl>) -> R<String> {
-    let value = program
-        .eval_full_for_export()
-        .map_err(|err| describe(&program, err))?;
-    export_json(&program, &value)
+///
+/// Runs inside [`on_eval_thread`], whose step budget it reports when the
+/// evaluation was cut short by it.
+fn evaluate(program: &mut Program<BudgetedCache>) -> R<String> {
+    match program.eval_full_for_export() {
+        Ok(value) => export_json(program, &value),
+        // Nickel reports the refused step as infinite recursion at whatever
+        // variable it was entering; the budget is the real story.
+        Err(_) if budget_spent() => Err(budget_error()),
+        Err(err) => Err(describe(program, err)),
+    }
+}
+
+/// The most steps one Nickel evaluation may take before it is stopped with
+/// an error.
+///
+/// A step is one entry into a suspended computation (every variable lookup
+/// and field access) or one allocation of a new one, so the budget bounds
+/// both the time an evaluation runs and the memory it can build up. Without
+/// it, a program that never finishes — a self-referencing value such as
+/// `host = { oneOf = [host] }`, or a recursive function with no base case —
+/// evaluates forever, growing until the process runs out of memory, in the
+/// CLI or in a manager evaluating a template or an app manifest.
+///
+/// Measured on nickel-lang-core 0.18 in a release build: the largest
+/// configuration Legion ships (`configs/jobs/maximal.ncl`) takes about
+/// 3,500 steps, and a jobspec generating 1,000 tasks with
+/// `std.array.generate` about 140,000. A runaway spends the budget in about
+/// half a second, holding at most a few hundred megabytes.
+pub const EVAL_STEP_BUDGET: u64 = 1_000_000;
+
+/// The stack the evaluation thread asks for. Nickel frees a long chain of
+/// suspended computations (what a runaway accumulator builds) recursively,
+/// so a budget-sized chain needs far more than a default thread stack:
+/// between 64 and 256 MiB for [`EVAL_STEP_BUDGET`] steps in a release build,
+/// more in a debug one. The reservation is virtual; only what is used is
+/// touched, and it is returned when the thread ends.
+const EVAL_STACK_BYTES: usize = 1 << 30;
+
+/// What the evaluation thread falls back to when the system will not
+/// reserve [`EVAL_STACK_BYTES`] (a small host with strict overcommit).
+const EVAL_FALLBACK_STACK_BYTES: usize = 64 << 20;
+
+/// The error for an evaluation that spent its budget.
+fn budget_error() -> anyhow::Error {
+    let budget = STEP_BUDGET.with(Cell::get);
+    anyhow!(
+        "evaluation did not finish within {budget} steps; the program most likely never ends, \
+         such as a field defined in terms of itself (`host = {{ oneOf = [host] }}`) or a \
+         recursive function with no base case"
+    )
+}
+
+/// The payload [`BudgetedCache::add`] unwinds with once the budget is spent.
+struct BudgetSpent;
+
+/// Runs one Nickel evaluation on a thread of its own, under
+/// [`EVAL_STEP_BUDGET`].
+///
+/// A thread of its own for its stack (see [`EVAL_STACK_BYTES`]) and so the
+/// budget, which lives in a thread-local, belongs to this evaluation alone.
+/// The caller blocks until it finishes, which the budget guarantees.
+fn on_eval_thread<T: Send>(eval: impl FnOnce() -> R<T> + Send) -> R<T> {
+    on_eval_thread_within(EVAL_STEP_BUDGET, eval)
+}
+
+/// [`on_eval_thread`] with the budget injected, for tests.
+fn on_eval_thread_within<T: Send>(steps: u64, eval: impl FnOnce() -> R<T> + Send) -> R<T> {
+    // Behind a lock so the closure can be offered to a second spawn when the
+    // first cannot reserve its stack (a refused spawn drops what it was
+    // given).
+    let eval = std::sync::Mutex::new(Some(eval));
+    let body = || {
+        let eval = eval
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("an evaluation runs once");
+        STEP_BUDGET.with(|budget| budget.set(steps));
+        STEPS_LEFT.with(|left| left.set(steps));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(eval)) {
+            Ok(result) => result,
+            Err(payload) if payload.is::<BudgetSpent>() => Err(budget_error()),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    };
+    std::thread::scope(|scope| {
+        let spawn = |stack: usize| {
+            std::thread::Builder::new()
+                .name("nickel-eval".to_string())
+                .stack_size(stack)
+        };
+        let handle = match spawn(EVAL_STACK_BYTES).spawn_scoped(scope, body) {
+            Ok(handle) => handle,
+            Err(_) => spawn(EVAL_FALLBACK_STACK_BYTES)
+                .spawn_scoped(scope, body)
+                .context("failed to start a thread to evaluate the configuration")?,
+        };
+        handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+thread_local! {
+    /// Steps the evaluation running on this thread may still take. Set by
+    /// [`on_eval_thread`], whose threads evaluate one program each, and
+    /// unlimited anywhere else.
+    static STEPS_LEFT: Cell<u64> = const { Cell::new(u64::MAX) };
+    /// The budget [`STEPS_LEFT`] started from, for the error message.
+    static STEP_BUDGET: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// Whether this thread's evaluation spent its budget.
+fn budget_spent() -> bool {
+    STEPS_LEFT.with(|left| left.get() == 0)
+}
+
+/// Charges one step; `false` once the budget is spent.
+fn charge_step() -> bool {
+    STEPS_LEFT.with(|left| match left.get() {
+        0 => false,
+        n => {
+            left.set(n - 1);
+            true
+        }
+    })
+}
+
+/// Nickel's evaluation cache with a step budget.
+///
+/// Nickel 0.18's virtual machine has no fuel, step limit, or cancellation
+/// hook of its own, but it is generic over its cache of suspended
+/// computations. Every variable lookup goes through
+/// [`Cache::get_update_index`], the one cache call the VM lets fail:
+/// refusing it once the budget is spent ends the evaluation with an
+/// ordinary error, on the evaluating thread, with nothing left running.
+/// Allocations ([`Cache::add`]) are charged too, and cannot fail, so an
+/// allocation past the budget unwinds instead ([`BudgetSpent`], caught by
+/// [`on_eval_thread`]): that is what stops a single built-in operation such
+/// as `std.array.generate f 100000000` from allocating without a lookup.
+#[derive(Clone, Debug, Default)]
+struct BudgetedCache(CacheImpl);
+
+impl Cache for BudgetedCache {
+    type UpdateIndex = <CacheImpl as Cache>::UpdateIndex;
+
+    fn get(&self, idx: CacheIndex) -> Closure {
+        self.0.get(idx)
+    }
+
+    fn get_update_index(
+        &mut self,
+        idx: &mut CacheIndex,
+    ) -> Result<Option<Self::UpdateIndex>, BlackholedError> {
+        if !charge_step() {
+            return Err(BlackholedError);
+        }
+        self.0.get_update_index(idx)
+    }
+
+    fn add(&mut self, clos: Closure, bty: BindingType) -> CacheIndex {
+        if !charge_step() {
+            // `resume_unwind`, not `panic!`: no panic hook, so nothing is
+            // printed for what is an ordinary configuration error.
+            std::panic::resume_unwind(Box::new(BudgetSpent));
+        }
+        self.0.add(clos, bty)
+    }
+
+    fn patch<F: Fn(&mut Closure)>(&mut self, idx: CacheIndex, f: F) {
+        self.0.patch(idx, f)
+    }
+
+    fn get_then<T, F: FnOnce(&Closure) -> T>(&self, idx: CacheIndex, f: F) -> T {
+        self.0.get_then(idx, f)
+    }
+
+    fn update(&mut self, clos: Closure, idx: Self::UpdateIndex) {
+        self.0.update(clos, idx)
+    }
+
+    fn new() -> Self {
+        BudgetedCache(CacheImpl::new())
+    }
+
+    fn reset_index_state(&mut self, idx: &mut Self::UpdateIndex) {
+        self.0.reset_index_state(idx)
+    }
+
+    fn build_cached(&mut self, idx: &mut CacheIndex, rec_env: &[(Ident, CacheIndex)]) {
+        self.0.build_cached(idx, rec_env)
+    }
+
+    fn saturate<I: DoubleEndedIterator<Item = Ident> + Clone>(
+        &mut self,
+        idx: CacheIndex,
+        fields: I,
+    ) -> NickelValue {
+        self.0.saturate(idx, fields)
+    }
+
+    fn revert(&mut self, idx: &CacheIndex) -> CacheIndex {
+        self.0.revert(idx)
+    }
+
+    fn deps(&self, idx: &CacheIndex) -> Option<FieldDeps> {
+        self.0.deps(idx)
+    }
+
+    fn make_update_index(
+        &mut self,
+        idx: &mut CacheIndex,
+    ) -> Result<Self::UpdateIndex, BlackholedError> {
+        self.0.make_update_index(idx)
+    }
 }
 
 /// Reads a `.json` configuration file.
@@ -226,12 +445,14 @@ pub fn eval_file_with_vars(path: impl AsRef<Path>, vars: Option<&Map<String, Val
     if format_for(path) == ConfigFormat::Json {
         return read_json(path, vars);
     }
-    let program = ProgramBuilder::new()
-        .add_path(path)
-        .extend_initial_env(vars_env(vars)?)
-        .build::<CacheImpl>()
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    run(program)
+    on_eval_thread(|| {
+        let mut program = ProgramBuilder::new()
+            .add_path(path)
+            .extend_initial_env(vars_env(vars)?)
+            .build::<BudgetedCache>()
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        evaluate(&mut program)
+    })
 }
 
 /// Evaluates a configuration file to JSON and reports every source it read.
@@ -259,18 +480,15 @@ pub fn eval_file_tracked(
         ));
     }
 
-    let mut program = ProgramBuilder::new()
-        .add_path(path)
-        .extend_initial_env(vars_env(vars)?)
-        .build::<CacheImpl>()
-        .with_context(|| format!("failed to read {}", path.display()))?;
-
-    let value = program
-        .eval_full_for_export()
-        .map_err(|err| describe(&program, err))?;
-    let json = export_json(&program, &value)?;
-
-    Ok((json, loaded_sources(&program, path)))
+    on_eval_thread(|| {
+        let mut program = ProgramBuilder::new()
+            .add_path(path)
+            .extend_initial_env(vars_env(vars)?)
+            .build::<BudgetedCache>()
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let json = evaluate(&mut program)?;
+        Ok((json, loaded_sources(&program, path)))
+    })
 }
 
 /// Collects the on-disk files an evaluation touched.
@@ -279,7 +497,7 @@ pub fn eval_file_tracked(
 /// sources, so entries are kept only when they name a real file. The primary
 /// path is emitted first and read from disk directly, so it is present even
 /// if the program is trivial.
-fn loaded_sources(program: &Program<CacheImpl>, primary: &Path) -> Vec<LoadedSource> {
+fn loaded_sources(program: &Program<BudgetedCache>, primary: &Path) -> Vec<LoadedSource> {
     let mut sources = Vec::new();
     let canonical_primary =
         std::fs::canonicalize(primary).unwrap_or_else(|_| primary.to_path_buf());
@@ -471,13 +689,25 @@ fn static_imports(source: &str) -> R<Vec<String>> {
 /// primitive. Imports are refused before evaluation starts rather than
 /// detected afterwards.
 pub fn eval_sandboxed(name: &str, source: &str, vars: Option<&Map<String, Value>>) -> R<String> {
+    eval_sandboxed_within(EVAL_STEP_BUDGET, name, source, vars)
+}
+
+/// [`eval_sandboxed`] with the step budget injected, for tests.
+fn eval_sandboxed_within(
+    steps: u64,
+    name: &str,
+    source: &str,
+    vars: Option<&Map<String, Value>>,
+) -> R<String> {
     reject_imports(source)?;
-    let program = ProgramBuilder::new()
-        .add_source_string(source.to_string(), name)
-        .extend_initial_env(vars_env(vars)?)
-        .build::<CacheImpl>()
-        .context("failed to prepare the Nickel program")?;
-    run(program)
+    on_eval_thread_within(steps, || {
+        let mut program = ProgramBuilder::new()
+            .add_source_string(source.to_string(), name)
+            .extend_initial_env(vars_env(vars)?)
+            .build::<BudgetedCache>()
+            .context("failed to prepare the Nickel program")?;
+        evaluate(&mut program)
+    })
 }
 
 /// Evaluates a Nickel expression given on the command line to a JSON value.
@@ -488,6 +718,90 @@ pub fn eval_sandboxed(name: &str, source: &str, vars: Option<&Map<String, Value>
 pub fn eval_expression(expr: &str) -> R<Value> {
     let json = eval_sandboxed("<--var-code>", expr, None)?;
     serde_json::from_str(&json).context("expression did not evaluate to a JSON-representable value")
+}
+
+/// Renders a JSON value as Nickel source that evaluates back to the same
+/// value: records as `key = value` (a key is quoted unless the Nickel lexer
+/// reads it as one plain identifier, so keywords and dashes-first keys are
+/// quoted), one field or element per line, indented by two spaces.
+///
+/// This is the readable form of stored configuration, for example
+/// `legion app config get`: what it prints is valid input for the matching
+/// `set` command.
+pub fn json_to_nickel(value: &Value) -> String {
+    let mut out = String::new();
+    write_nickel(&mut out, value, 0);
+    out
+}
+
+fn write_nickel(out: &mut String, value: &Value, depth: usize) {
+    let indent = |out: &mut String, depth: usize| out.push_str(&"  ".repeat(depth));
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => out.push_str(&number.to_string()),
+        Value::String(text) => out.push_str(&nickel_string(text)),
+        Value::Array(items) if items.is_empty() => out.push_str("[]"),
+        Value::Array(items) => {
+            out.push_str("[\n");
+            for item in items {
+                indent(out, depth + 1);
+                write_nickel(out, item, depth + 1);
+                out.push_str(",\n");
+            }
+            indent(out, depth);
+            out.push(']');
+        }
+        Value::Object(fields) if fields.is_empty() => out.push_str("{}"),
+        Value::Object(fields) => {
+            out.push_str("{\n");
+            for (key, field) in fields {
+                indent(out, depth + 1);
+                out.push_str(&nickel_field_name(key));
+                out.push_str(" = ");
+                write_nickel(out, field, depth + 1);
+                out.push_str(",\n");
+            }
+            indent(out, depth);
+            out.push('}');
+        }
+    }
+}
+
+/// A record field name: bare when the lexer reads it back as exactly one
+/// identifier with the same text, quoted otherwise.
+fn nickel_field_name(key: &str) -> String {
+    let mut tokens = Lexer::new(key);
+    let bare = matches!(
+        (tokens.next(), tokens.next()),
+        (Some(Ok((_, Token::Normal(NormalToken::Identifier(ident)), _))), None) if ident == key
+    );
+    if bare {
+        key.to_string()
+    } else {
+        nickel_string(key)
+    }
+}
+
+/// A Nickel string literal. Nickel's escapes are JSON's, plus `\%` (a `%{`
+/// starts interpolation), with `\u{…}` for other control characters.
+fn nickel_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '%' => out.push_str("\\%"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Rejects any use of the `import` keyword.
@@ -512,6 +826,88 @@ fn reject_imports(source: &str) -> R<()> {
 #[cfg(test)]
 mod config_lang_test {
     use super::*;
+
+    /// Runs `eval` on a thread of its own and fails the test, rather than
+    /// hanging it, when it has not answered within `limit`.
+    fn answers_within<T: Send + 'static>(
+        limit: std::time::Duration,
+        eval: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(eval());
+        });
+        rx.recv_timeout(limit)
+            .expect("the evaluation did not stop within its budget")
+    }
+
+    /// The TODO.md example: a field defined in terms of itself is an
+    /// infinite value, which used to evaluate until the process ran out of
+    /// memory. With the real budget, through the public entry point.
+    #[test]
+    fn a_self_referencing_field_is_an_error_not_a_hang_test() {
+        let err = answers_within(std::time::Duration::from_secs(300), || {
+            eval_sandboxed("t", "{ host = { oneOf = [host] } }", None)
+                .expect_err("an infinite value cannot be exported")
+                .to_string()
+        });
+        assert!(
+            err.contains(&format!("did not finish within {EVAL_STEP_BUDGET} steps")),
+            "{err}"
+        );
+        assert!(err.contains("host = { oneOf = [host] }"), "{err}");
+    }
+
+    /// A recursive function with no base case builds a chain of pending
+    /// `x + 1`s, which Nickel frees recursively once the budget stops it:
+    /// the evaluation thread's stack is what keeps that from overflowing.
+    #[test]
+    fn a_recursive_function_with_no_base_case_is_an_error_test() {
+        let err = answers_within(std::time::Duration::from_secs(300), || {
+            eval_sandboxed_within(200_000, "t", "let rec f = fun x => f (x + 1) in f 0", None)
+                .expect_err("it never returns")
+                .to_string()
+        });
+        assert!(err.contains("did not finish within 200000 steps"), "{err}");
+    }
+
+    /// A single built-in operation that allocates without looking anything
+    /// up is stopped mid-way too, by unwinding out of the allocation.
+    #[test]
+    fn a_huge_generated_array_is_stopped_mid_allocation_test() {
+        let err = answers_within(std::time::Duration::from_secs(300), || {
+            eval_sandboxed_within(
+                100_000,
+                "t",
+                "std.array.length (std.array.generate (fun i => i) 100000000)",
+                None,
+            )
+            .expect_err("a hundred million elements is over budget")
+            .to_string()
+        });
+        assert!(err.contains("did not finish within 100000 steps"), "{err}");
+        // A spent budget belongs to that evaluation's thread alone.
+        let json = eval_sandboxed_within(100_000, "t", "{ n = 1 + 1 }", None).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["n"], 2);
+    }
+
+    /// The budget leaves real configurations a wide margin: the largest one
+    /// Legion ships evaluates within a hundredth of it. If this fails, the
+    /// budget needs revisiting before users meet it.
+    #[test]
+    fn the_largest_shipped_config_is_far_inside_the_budget_test() {
+        let maximal =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/jobs/maximal.ncl");
+        on_eval_thread_within(EVAL_STEP_BUDGET / 100, || {
+            let mut program = ProgramBuilder::new()
+                .add_path(&maximal)
+                .extend_initial_env(vars_env(None)?)
+                .build::<BudgetedCache>()?;
+            evaluate(&mut program)
+        })
+        .expect("maximal.ncl evaluates within 1% of the step budget");
+    }
 
     #[test]
     fn evaluates_a_record_to_json_test() {
@@ -804,5 +1200,39 @@ mod config_lang_test {
         let err = format!("{:#}", eval_file_confined(&job, &repo).unwrap_err());
         assert!(err.contains("broken.ncl"), "{err}");
         assert!(!err.contains(&repo.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn json_to_nickel_round_trips_test() {
+        let value = serde_json::json!({
+            "interval": "30s",
+            "count": 3,
+            "ratio": -0.25,
+            "big": 1e100,
+            "enabled": true,
+            "nothing": null,
+            "empty": {},
+            "none": [],
+            "if": "a keyword key",
+            "dashed-key": "has %{no} interpolation \"quoted\" \\ \n\t\u{1}",
+            "2fast": 1,
+            "_private": 2,
+            "with space": [1, [2, {"x": "y"}]],
+            "policies": [{ "name": "web", "min": 1 }],
+        });
+        let source = json_to_nickel(&value);
+        assert!(source.contains("\n  interval = \"30s\",\n"), "{source}");
+        assert!(source.contains("\"if\" = "), "{source}");
+        assert!(source.contains("\n  dashed-key = "), "{source}");
+        assert!(source.contains("\"2fast\" = "), "{source}");
+        let back: Value = serde_json::from_str(&eval_sandboxed("t", &source, None).unwrap())
+            .unwrap_or_else(|err| panic!("{err}: {source}"));
+        assert_eq!(back, value, "{source}");
+        for scalar in [Value::Null, serde_json::json!("x"), serde_json::json!([])] {
+            let back: Value =
+                serde_json::from_str(&eval_sandboxed("t", &json_to_nickel(&scalar), None).unwrap())
+                    .unwrap();
+            assert_eq!(back, scalar);
+        }
     }
 }

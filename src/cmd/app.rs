@@ -121,7 +121,10 @@ pub fn config() -> Command {
                 .arg_required_else_help(true)
                 .subcommand(
                     Command::new("get")
-                        .about("Print an app's config, as JSON (valid input for `config set`)")
+                        .about(
+                            "Print an app's config as Nickel (valid input for `config set`); \
+                             -j for JSON",
+                        )
                         .arg(name_arg())
                         .arg(json_flag()),
                 )
@@ -709,12 +712,20 @@ async fn config_get(matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         output::print_success(&json!({ "app": app.name, "config": config }));
     } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&config).unwrap_or_default()
-        );
+        print!("{}", config_nickel(&app.name, &config));
     }
     Ok(())
+}
+
+/// `config get`'s human output: the config as Nickel, headed by a comment
+/// saying how to apply it, so the output saved to a `.ncl` file is valid
+/// input for `config set`.
+fn config_nickel(app: &str, config: &Value) -> String {
+    format!(
+        "# The config of app {app}. Save it as {app}.ncl, edit it, and apply it with\n\
+         # `legion app config set {app} -f {app}.ncl`.\n{}\n",
+        crate::config_lang::json_to_nickel(config)
+    )
 }
 
 async fn config_schema(matches: &ArgMatches) -> R<()> {
@@ -1402,5 +1413,25 @@ mod tests {
         assert_eq!(value["config"]["a"], 1);
         assert_eq!(value["grant"]["rules"][0]["resources"][0], "node");
         assert!(value.get("manifestJson").is_none());
+    }
+
+    #[test]
+    fn config_get_prints_nickel_that_config_set_reads_back() {
+        let config = serde_json::json!({
+            "interval": "30s",
+            "plugins": [{ "name": "prom", "source": "https://example.com/p.wasm" }],
+        });
+        let text = config_nickel("autoscaler", &config);
+        assert!(
+            text.starts_with("# The config of app autoscaler."),
+            "{text}"
+        );
+        assert!(text.contains("\n  interval = \"30s\",\n"), "{text}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autoscaler.ncl");
+        std::fs::write(&path, &text).unwrap();
+        let back: Value =
+            serde_json::from_str(&crate::config_lang::eval_file(&path).unwrap()).unwrap();
+        assert_eq!(back, config);
     }
 }

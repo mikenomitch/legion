@@ -3252,8 +3252,30 @@ mod tests {
         assert_eq!(container_stop_signal(&bare, &exotic), "SIGTERM");
     }
 
-    /// End-to-end Linux graceful stop: a container that traps its declared
-    /// signal exits inside the window, and `delete --force` finds it gone.
+    /// Waits up to `limit` for the container's foreground runtime process
+    /// (`runc run`) to exit, which it does when the container's init does.
+    /// Polled through the child handle rather than a pid probe, since an
+    /// exited-but-unreaped child is a zombie that a probe calls alive.
+    fn container_exits_within(instance: &mut TaskInstance, limit: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < until {
+            if !matches!(
+                instance.child.as_mut().expect("child handle").try_wait(),
+                Ok(None)
+            ) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// End-to-end Linux graceful stop, driven the way the worker's reaper
+    /// drives it: `stop_with` delivers the declared signal into the container
+    /// and returns at once, the container that traps it exits on its own
+    /// inside the window, and the hard `stop` afterwards only cleans up. Run
+    /// with `LEGION_OCI_RUNTIME=runc cargo test -p legion-worker
+    /// oci_runtime_stop -- --ignored`.
     #[test]
     #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_stop_lets_a_trapping_container_drain() -> R<()> {
@@ -3283,19 +3305,35 @@ mod tests {
             ..TaskInstance::default()
         };
         plugin.start(&allocation, &task, &mut instance)?;
+        // Let the shell reach its `trap` before signalling it, or the test
+        // measures a startup race instead of the stop path.
         std::thread::sleep(std::time::Duration::from_secs(3));
 
+        let ctx = crate::task_plugins::StopContext::with_ladder(
+            crate::structs::StopCause::Unknown,
+            "SIGINT",
+            std::time::Duration::from_secs(30),
+        );
         let started = std::time::Instant::now();
-        plugin.stop(&allocation, &task, &mut instance)?;
-        let elapsed = started.elapsed();
+        let signalled = plugin.stop_with(&allocation, &task, &mut instance, &ctx)?;
+        assert!(signalled, "the notice was handed to {binary} kill");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the notice must not wait out the window, took {:?}",
+            started.elapsed()
+        );
 
         assert!(
-            elapsed < std::time::Duration::from_secs(25),
-            "a trapping container must exit well inside its 30s window, took {elapsed:?}"
+            container_exits_within(&mut instance, std::time::Duration::from_secs(25)),
+            "a trapping container must exit well inside its 30s window"
         );
         let stdout =
             std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))?;
         assert!(stdout.contains("draining"), "trap ran: {stdout:?}");
+
+        // The reaper's cleanup: the container already exited, so this only
+        // removes what is left of it.
+        plugin.stop(&allocation, &task, &mut instance)?;
         assert!(
             !Command::new(&binary)
                 .args(["state", &name])
@@ -3307,8 +3345,9 @@ mod tests {
         Ok(())
     }
 
-    /// The other half: a container that ignores the signal is force-killed at
-    /// the deadline rather than hanging the stop forever.
+    /// The other half: a container that ignores its signal is still running
+    /// when the window closes, and the hard `stop` the reaper issues at the
+    /// deadline kills it promptly rather than hanging.
     #[test]
     #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_stop_force_kills_at_the_deadline() -> R<()> {
@@ -3335,17 +3374,29 @@ mod tests {
         plugin.start(&allocation, &task, &mut instance)?;
         std::thread::sleep(std::time::Duration::from_secs(3));
 
+        let ctx = crate::task_plugins::StopContext::with_ladder(
+            crate::structs::StopCause::Unknown,
+            "SIGTERM",
+            std::time::Duration::from_secs(3),
+        );
+        assert!(
+            plugin.stop_with(&allocation, &task, &mut instance, &ctx)?,
+            "the notice was handed to {binary} kill"
+        );
+        // The whole window passes and the container is still there: it
+        // trapped the notice.
+        assert!(
+            !container_exits_within(&mut instance, ctx.grace),
+            "a container ignoring SIGTERM outlives its window"
+        );
+        assert!(ctx.expired());
+
         let started = std::time::Instant::now();
         plugin.stop(&allocation, &task, &mut instance)?;
         let elapsed = started.elapsed();
-
         assert!(
-            elapsed >= std::time::Duration::from_secs(3),
-            "the full window must be honored before the kill, took {elapsed:?}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(20),
-            "and the kill must actually happen at the deadline, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(15),
+            "the hard stop at the deadline must not wait out another window, took {elapsed:?}"
         );
         assert!(
             !Command::new(&binary)

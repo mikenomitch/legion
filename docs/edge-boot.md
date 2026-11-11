@@ -338,7 +338,11 @@ ticket works once the runtime is enabled.
    lower wins)
 5. `jti` against a local single-use set
 6. the local claim table (one live claim per instance id per node)
-7. the local resource ledger (the node must have room)
+7. the local resource ledger (the node must have room). **Not enforced
+   yet:** the node does not size its ledger from its declared resources, so
+   this step admits every claim. Step 8 bounds how many unratified claims a
+   node holds, and the manager's apply re-validates capacity before it
+   ratifies one
 8. room in the node's claim window, which bounds its unratified edge claims
    and sheds starts when ratification falls behind (see
    [Overload](#overload))
@@ -898,10 +902,12 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 - **Gates above `stage` are unavailable to tasks with declared ports, connect
   upstreams, or non-node-local storage** (see [Automatic
   downgrades](#automatic-downgrades)).
-- **No edge-side capacity arbitration.** A node admits work against its own
-  local free resources and nothing else. It never negotiates, bids, or
-  preempts. The manager is still the only scheduler. The node's ledger is
-  advisory, and the apply's re-validation has the final say.
+- **No edge-side capacity arbitration.** A node never negotiates, bids, or
+  preempts. The manager is still the only scheduler: the apply's
+  re-validation has the final say on whether a claim fits. The node's own
+  resource check (verification step 7) is not sized from its resources yet,
+  so a node admits edge claims up to its claim window whatever room it has,
+  and a claim that does not fit is refused at ratification.
 - **Manager-side speculative dispatch does not name an instance.** The apply
   decides which keyed instance a placement binds, so a payload sent before
   the apply cannot know it. Keyed starts that need to name their sandbox up
