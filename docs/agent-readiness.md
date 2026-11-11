@@ -104,7 +104,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. With `scale:read`, `scalingInputs` adds request vs usage per task, cluster-wide: replicas (ready, placed, desired, unplaced), measured CPU and memory against the reservation, requests into a service the task backs (internal callers only), and `freshness.state`. Act on usage only when the state is `current`; `missing` and `resyncing` mean no data, not zero load ([Scaling inputs](autoscaling.md#scaling-inputs)). The reply carries the job's spec `version` and a `revision`; pass the revision back as `min_revision` (with `wait_seconds`, max 300) to block until the job changes ([watches-and-blocking-queries.md](watches-and-blocking-queries.md)). |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | This cluster's jobspec JSON Schema (`GetJobSchema`): the core fields and task runtimes, plus each key installed apps add at its point and in its qualified spelling `apps.<app>`. Without a reachable manager, the compiled-in schema, and `$comment` says installed keys are not included. |
-| `legion_job_validate` | no | Validate a rendered jobspec (JSON). An unknown key is an error naming its path and the closest known key (installed apps' keys included); values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`; offline, `unchecked`, and keys at extension points are reported as not checked); `allow_unknown_fields` shows what a submit with the flag would keep and drop (`warnings`, `unknownFields`). |
+| `legion_job_validate` | no | Validate a rendered jobspec (JSON). An unknown key is an error naming its path and the closest known key (installed apps' keys included); values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`; offline, `unchecked`, and keys at extension points are reported as not checked); `allow_unknown_fields` shows what a submit with the flag would keep and drop (`warnings`, `unknownFields`). Namespace policy `jobRules` are checked when the caller can read the governing policies (`namespace:read` on the job's namespace, or `acl:read`), failing with the policy and rule named; otherwise `warnings` says they were not checked. |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed), then its running [sessions](session-mode.md) (`mode: "session"`, `durable: false`) from the session index. The reply is `{ instances, nextIdlePageToken, complete, asOf }`: `complete: false` means some node that runs the job's sessions has not reported yet, so sessions may be missing. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
@@ -389,9 +389,11 @@ legion app extensions --json
 (`validate_job_config`), so an agent can fix mistakes before touching the
 cluster. It also checks the governing namespace policies' `jobRules` (CEL
 house rules such as "no `:latest` images") when the caller can read the
-policies, refusing with the policy and rule named (`namespace policy
+policies that govern the job's namespace (`namespace:read` there, or
+`acl:read`), refusing with the policy and rule named (`namespace policy
 'house-rules' jobRules[0]: ...`); otherwise it warns that they were not
-checked, and `job plan` checks them on the manager
+checked, and `job plan` checks them on the manager. The
+`legion_job_validate` MCP tool does the same
 ([namespaces.md](namespaces.md#job-rules)). The schema includes the built-in task-runtime config schemas (`exec`,
 `container`, …) under `taskRuntimes`, derived from the typed Rust structs.
 
@@ -700,9 +702,12 @@ caller is told it was first (`deduplicated: false`), and the other gets
 
 - **Writes that commit with their record** (`instance create`, `stop`,
   `start`, `destroy`, `fork`, `suspend` and `promote`, `snapshot create`,
-  `boot-ticket issue`): the loser's write is rolled back, so the key never
-  yields two instances, snapshots, or tickets, and the loser gets the
-  winner's reply, exactly as a later retry would.
+  `boot-ticket issue`, `app install` and `app uninstall`, `namespace policy
+  delete`): the loser's write is rolled back or never made, so the key never
+  yields two instances, snapshots, or tickets, a losing install is not
+  refused as a duplicate name, and a losing delete is not answered
+  `NOT_FOUND`. The loser gets the winner's reply, exactly as a later retry
+  would.
 - **Operations that converge** (`job run`, `job stop`, `job destroy`, `job
   scale`, `instance replace` and `restore`, deletes, `node` availability, app
   settings, object writes, and the like): the loser's repeat changed nothing

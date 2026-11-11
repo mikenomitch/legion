@@ -359,15 +359,25 @@ impl Store {
 
     /// Install an app and record the install's idempotency key in the same
     /// replicated entry: a retry after a crash finds the key (and is
-    /// `deduplicated`) exactly when it finds the record.
+    /// `deduplicated`) exactly when it finds the record. Returns `false`,
+    /// having inserted nothing, when a concurrent install with the same key
+    /// recorded first; the caller replays the winner's record. The key is
+    /// claimed before the insert, so that loser is not refused as a
+    /// duplicate name, and in a savepoint, so a refused insert takes the
+    /// key with it.
     #[instrument(err, skip_all, fields(app = %record.name))]
-    pub fn insert_app_recorded(&self, record: AppRecord, key: &str, reply: &str) -> R<()> {
+    pub fn insert_app_recorded(&self, record: AppRecord, key: &str, reply: &str) -> R<bool> {
         let key = key.to_owned();
         let reply = reply.to_owned();
         self.replicated(Lane::Control, "insert_app", move |s| {
-            s.insert_app_apply(&record, false)?;
-            s.idempotency_record(&key, "install_app", &reply)?;
-            Ok(())
+            let inserted = s.within_savepoint(|s| {
+                if !s.idempotency_record(&key, "install_app", &reply)? {
+                    return Ok(Err(()));
+                }
+                s.insert_app_apply(&record, false)?;
+                Ok(Ok(()))
+            })?;
+            Ok(inserted.is_ok())
         })
     }
 
@@ -570,7 +580,9 @@ impl Store {
     /// Delete an app record, and with `purge` every KV key under that
     /// prefix (and its locks), and record the uninstall's idempotency key
     /// with `reply`, all in one replicated entry. Returns the KV keys it
-    /// deleted.
+    /// deleted, or `None` when a concurrent uninstall with the same key
+    /// recorded first: then nothing is deleted, and the caller replays the
+    /// winner's record.
     #[instrument(err, skip_all, fields(app = name))]
     pub fn delete_app_recorded(
         &self,
@@ -578,16 +590,22 @@ impl Store {
         purge: Option<&str>,
         key: &str,
         reply: &str,
-    ) -> R<Vec<String>> {
+    ) -> R<Option<Vec<String>>> {
         let name = name.to_owned();
         let purge = purge.map(str::to_owned);
         let key = key.to_owned();
         let reply = reply.to_owned();
         self.replicated(Lane::Control, "delete_app", move |s| {
-            let purged = {
+            // The key first, so a losing uninstall changes nothing (and a
+            // purge never runs twice); in a savepoint, so a failed delete
+            // takes the key with it.
+            let deleted = s.within_savepoint(|s| {
+                if !s.idempotency_record(&key, "uninstall_app", &reply)? {
+                    return Ok(Err(()));
+                }
                 let conn = s.write_connection()?;
                 conn.execute("DELETE FROM app WHERE name = ?;", [&name])?;
-                match &purge {
+                let purged = match &purge {
                     Some(prefix) => {
                         let mut stmt = conn.prepare(
                             "SELECT key FROM kv_entry WHERE substr(key, 1, length(?1)) = ?1;",
@@ -607,10 +625,10 @@ impl Store {
                         keys
                     }
                     None => Vec::new(),
-                }
-            };
-            s.idempotency_record(&key, "uninstall_app", &reply)?;
-            Ok(purged)
+                };
+                Ok(Ok(purged))
+            })?;
+            Ok(deleted.ok())
         })
     }
 
@@ -928,6 +946,47 @@ mod app_store_tests {
         moved.updated_at = "t1".into();
         store.update_app(moved, "t0")?;
         assert_eq!(uid("one")?, APP_UID_BASE);
+        Ok(())
+    }
+
+    /// Two installs with one idempotency key: the second loses the key and
+    /// is told so (`false`), rather than refused as a duplicate name; an
+    /// install refused as a duplicate under another key leaves its key
+    /// unrecorded.
+    #[test]
+    fn a_concurrent_install_with_the_same_key_is_told_it_lost() -> R<()> {
+        let store = store()?;
+        assert!(store.insert_app_recorded(record("demo"), "install/k", "installed demo")?);
+        assert!(!store.insert_app_recorded(record("demo"), "install/k", "installed again")?);
+        assert_eq!(
+            store.idempotency_lookup("install/k")?.as_deref(),
+            Some("installed demo")
+        );
+        assert!(store
+            .insert_app_recorded(record("demo"), "install/other", "x")
+            .is_err());
+        assert_eq!(store.idempotency_lookup("install/other")?, None);
+        Ok(())
+    }
+
+    /// Two uninstalls with one idempotency key: the second loses the key,
+    /// deletes nothing, and is told so (`None`).
+    #[test]
+    fn a_concurrent_uninstall_with_the_same_key_is_told_it_lost() -> R<()> {
+        let store = store()?;
+        store.insert_app(record("demo"))?;
+        assert_eq!(
+            store.delete_app_recorded("demo", None, "uninstall/k", "{}")?,
+            Some(Vec::new())
+        );
+        assert!(store.get_app("demo")?.is_none());
+        // The name is free again; a loser must not delete a reinstall.
+        store.insert_app(record("demo"))?;
+        assert_eq!(
+            store.delete_app_recorded("demo", None, "uninstall/k", "{}")?,
+            None
+        );
+        assert!(store.get_app("demo")?.is_some());
         Ok(())
     }
 }
