@@ -878,14 +878,14 @@ async fn drive(
 
 /// What one exec into the session produced.
 #[derive(Debug, Default)]
-struct Captured {
-    exit: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
-    timed_out: bool,
-    session_gone: bool,
-    elapsed: Duration,
+pub(crate) struct Captured {
+    pub(crate) exit: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) timed_out: bool,
+    pub(crate) session_gone: bool,
+    pub(crate) elapsed: Duration,
 }
 
 #[derive(Default)]
@@ -899,7 +899,7 @@ struct Sink {
 /// Run one command in the session and capture its output, up to `budget`
 /// bytes of stdout plus stderr, killing it at `deadline` or when the
 /// session ends under it.
-fn exec_capture(
+pub(crate) fn exec_capture(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     session_id: &str,
     local_key: i64,
@@ -1008,12 +1008,12 @@ fn exec_capture(
 }
 
 /// The shell that writes one staged file: stdin to `$1`, mode `$2`.
-const STAGE_SCRIPT: &str = r#"set -e; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1""#;
+pub(crate) const STAGE_SCRIPT: &str = r#"set -e; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1""#;
 
 /// The shell that reads at most `$2` bytes of the file `$1`.
-const FETCH_SCRIPT: &str = r#"[ -f "$1" ] && head -c "$2" "$1""#;
+pub(crate) const FETCH_SCRIPT: &str = r#"[ -f "$1" ] && head -c "$2" "$1""#;
 
-fn shell(script: &str, args: &[&str]) -> ExecOptions {
+pub(crate) fn shell(script: &str, args: &[&str]) -> ExecOptions {
     let mut command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
     command.push("legion-run".to_string());
     command.extend(args.iter().map(|arg| arg.to_string()));

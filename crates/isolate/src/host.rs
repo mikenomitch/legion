@@ -1731,7 +1731,8 @@ impl Job {
         let c = &self.task.counters;
         c.invocations.fetch_add(1, Ordering::Relaxed);
         c.turns.fetch_add(self.inv.turns.load(Ordering::Relaxed), Ordering::Relaxed);
-        let cpu_us = self.inv.cpu_ns.load(Ordering::Relaxed) / 1000;
+        // Includes the turn running now, which the shard charges after it.
+        let cpu_us = self.inv.cpu_now_ns() / 1000;
         c.cpu_micros.fetch_add(cpu_us, Ordering::Relaxed);
         if let Some(s) = &stop {
             self.task.count(|m| &mut m.stopped, s.reason);

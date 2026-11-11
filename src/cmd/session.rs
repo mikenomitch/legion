@@ -224,9 +224,16 @@ pub fn config() -> Command {
              (docs/session-runs.md): start the session, stage --file and --input under \
              /legion/run/, execute the task's run.command, print its stdout and stderr, and end \
              the session. Exits with the command's status; 124 when the run was stopped by \
-             run.wall, 125 when it was stopped for another reason.\n\nGoes through a manager \
-             (job:write) by default. With --node and --ticket it talks to one worker directly, \
-             with no manager on the path.",
+             run.wall (or, in an isolate, by config.limits.wall), 125 when it was stopped for \
+             another reason.\n\nOn a task of the isolate runtime (docs/task-runtime-isolate.md) \
+             the run needs no run block: the node runs the file named main.<ext> (else the \
+             first --file) in an isolate under the task's config.limits, or in a VM of the \
+             task's VM task. --tier picks where (auto decides before anything runs); the reply \
+             says where it ran (tier, tierReason) and where this code should run next time \
+             (nextTier). A run stopped in an isolate stays stopped; --fallback vm runs your \
+             code a second time, in a VM.\n\nGoes through a manager (job:write) by default. \
+             With --node and --ticket it talks to one worker directly, with no manager on the \
+             path.",
         )
         .arg(Arg::new("job").value_name("JOB").required(true))
         .arg(
@@ -335,6 +342,51 @@ pub fn config() -> Command {
                     "Inside a task: ask this node's worker over the allocation's API socket \
                      (LEGION_ADDR = unix://...), with no token. The jobspec decides what the \
                      task may run; --task is required",
+                ),
+        )
+        .arg(
+            Arg::new("tier")
+                .long("tier")
+                .value_name("TIER")
+                .value_parser(["auto", "isolate", "vm"])
+                .help(
+                    "Isolate tasks only: where the run happens. auto (the default) decides \
+                     before anything runs, from the source's imports and the node's memo of \
+                     code that needed a VM; isolate runs it in an isolate; vm in a fresh VM of \
+                     the task's VM task (config.vm.task)",
+                ),
+        )
+        .arg(
+            Arg::new("tenant")
+                .long("tenant")
+                .value_name("KEY")
+                .help(
+                    "Isolate tasks only: who the run is for. Keys the warm instance of \
+                     config.lifetime = \"tenant\" and the node's per-tenant queue (up to 128 \
+                     printable ASCII bytes)",
+                ),
+        )
+        .arg(
+            Arg::new("session")
+                .long("session")
+                .value_name("ID")
+                .help(
+                    "Isolate tasks with config.lifetime = \"session\" only: run in this \
+                     existing session isolate, on the node its id names, instead of a fresh one",
+                ),
+        )
+        .arg(
+            Arg::new("fallback")
+                .long("fallback")
+                .value_name("TIER")
+                .value_parser(["vm"])
+                .conflicts_with_all(["session", "dry-run"])
+                .help(
+                    "Isolate tasks only: when the run is stopped in the isolate (an unsupported \
+                     call or a limit) and the reply says nextTier = vm, send it again with \
+                     --tier vm. This runs your code a second time, in a VM: use it only for \
+                     code that is safe to run twice. The reply then says ranTwice. Legion \
+                     itself never reruns a run",
                 ),
         )
         .arg(json_flag())
@@ -596,17 +648,32 @@ fn bytes_json(bytes: &[u8]) -> (Option<String>, Option<String>) {
 /// A run's reply in the envelope's `data` shape (docs/session-runs.md,
 /// "The reply"). Shared with the MCP tool.
 pub fn run_reply_json(reply: &RunSessionResponse) -> Value {
+    let text_or_null = |text: &str| {
+        if text.is_empty() {
+            Value::Null
+        } else {
+            json!(text)
+        }
+    };
     if let Some(dry) = reply.dry_run.as_ref() {
-        return json!({
+        let mut data = json!({
             "dryRun": true,
             "task": reply.task_name,
             "node": dry.node_id,
             "hasRoom": dry.has_room,
-            "reason": if dry.reason.is_empty() { Value::Null } else { json!(dry.reason) },
+            "reason": text_or_null(&dry.reason),
             "command": dry.command,
             "wall": dry.wall,
             "outputBytes": dry.output_bytes,
         });
+        // Isolate tasks: the pre-flight check's verdict.
+        if !dry.tier.is_empty() {
+            data["tier"] = json!(dry.tier);
+            data["tierReason"] = text_or_null(&dry.tier_reason);
+            data["imports"] = json!(dry.imports);
+            data["missingImports"] = json!(dry.missing_imports);
+        }
+        return data;
     }
     let stream = |bytes: &[u8]| match bytes_json(bytes) {
         (Some(text), _) => json!(text),
@@ -627,7 +694,7 @@ pub fn run_reply_json(reply: &RunSessionResponse) -> Value {
             })
         })
         .collect();
-    json!({
+    let mut data = json!({
         "task": reply.task_name,
         "node": reply.node_id,
         "sessionId": reply.session_id,
@@ -647,14 +714,36 @@ pub fn run_reply_json(reply: &RunSessionResponse) -> Value {
             "hint": stop.hint,
         })),
         "deduplicated": reply.deduplicated,
-    })
+    });
+    // Isolate tasks (docs/task-runtime-isolate.md): where the code ran, why,
+    // and where it should run next time. Absent for every other runtime.
+    if !reply.tier.is_empty() {
+        data["tier"] = json!(reply.tier);
+        data["tierReason"] = text_or_null(&reply.tier_reason);
+        data["nextTier"] = text_or_null(&reply.next_tier);
+        if reply.vm_ms > 0 {
+            data["vmMs"] = json!(reply.vm_ms);
+        }
+        if !reply.isolate_start.is_empty() {
+            data["isolateStart"] = json!(reply.isolate_start);
+        }
+        // An isolate measures in microseconds: milliseconds with a fraction.
+        if reply.tier == "isolate" && (reply.cpu_micros > 0 || reply.wall_micros > 0) {
+            data["cpuMs"] = json!(reply.cpu_micros as f64 / 1000.0);
+            data["wallMs"] = json!(reply.wall_micros as f64 / 1000.0);
+        }
+    }
+    data
 }
 
 /// The exit status `legion session run` ends with: the command's own, 124
-/// for a run stopped by `run.wall`, 125 for any other stop.
+/// for a run stopped by `run.wall` (or an isolate's `limits.wall`), 125 for
+/// any other stop.
 pub fn run_exit_code(reply: &RunSessionResponse) -> i32 {
     match reply.stopped.as_ref() {
         Some(stop) if stop.reason == "wall" => 124,
+        // An isolate's `config.limits.wall` is the same deadline.
+        Some(stop) if stop.reason == "limits" && stop.limit == "wall" => 124,
         Some(_) => 125,
         None => match reply.exit {
             Some(0) | None => 0,
@@ -714,7 +803,104 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .get_one::<String>("on-node")
             .cloned()
             .unwrap_or_default(),
+        tier: matches.get_one::<String>("tier").cloned().unwrap_or_default(),
+        tenant: matches
+            .get_one::<String>("tenant")
+            .cloned()
+            .unwrap_or_default(),
+        session_id: matches
+            .get_one::<String>("session")
+            .cloned()
+            .unwrap_or_default(),
     };
+    let fallback = matches.get_one::<String>("fallback").is_some();
+    let first = output::resolve(
+        format,
+        "Failed to run",
+        send_run(matches, request.clone(), &local).await?,
+    )?;
+    // `--fallback vm`: the caller's second request, never the server's.
+    let (reply, ran_twice) = match fallback
+        .then(|| fallback_vm_request(&first, &request))
+        .flatten()
+    {
+        Some(second) => {
+            let reason = fallback_reason(&first);
+            if !format.is_json() {
+                eprintln!("legion: {reason}; running it again with --tier vm (--fallback vm)");
+            }
+            let mut reply = output::resolve(
+                format,
+                "Failed to run the fallback in a VM",
+                send_run(matches, second, &local).await?,
+            )?;
+            reply.tier_reason = reason;
+            (reply, true)
+        }
+        None => (first, false),
+    };
+    print_run_reply(format, matches, &reply, ran_twice)?;
+    let code = run_exit_code(&reply);
+    if code != 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// The second request `--fallback vm` sends: the same run with `tier =
+/// "vm"`, when the first was stopped in the isolate and its reply says the
+/// code belongs in a VM. A caller's idempotency key becomes
+/// `<key>:fallback`, so a retry of the whole command finds both runs.
+pub fn fallback_vm_request(
+    first: &RunSessionResponse,
+    request: &RunSessionRequest,
+) -> Option<RunSessionRequest> {
+    let stop = first.stopped.as_ref()?;
+    if first.tier != "isolate"
+        || first.next_tier != "vm"
+        || !matches!(stop.reason.as_str(), "unsupported" | "limits")
+    {
+        return None;
+    }
+    Some(RunSessionRequest {
+        tier: "vm".into(),
+        idempotency_key: request
+            .idempotency_key
+            .as_ref()
+            .map(|key| format!("{key}:fallback")),
+        ..request.clone()
+    })
+}
+
+/// The `tierReason` a fallback reply carries: `fallback: stopped in the
+/// isolate, <reason> (<what stopped it>)`.
+pub fn fallback_reason(first: &RunSessionResponse) -> String {
+    let Some(stop) = first.stopped.as_ref() else {
+        return "fallback".into();
+    };
+    let head = if !stop.limit.is_empty() {
+        stop.limit.clone()
+    } else {
+        let detail = stop.detail.trim();
+        let head = detail.split(':').next().unwrap_or(detail).trim();
+        head.chars().take(80).collect()
+    };
+    if head.is_empty() {
+        format!("fallback: stopped in the isolate, {}", stop.reason)
+    } else {
+        format!("fallback: stopped in the isolate, {} ({head})", stop.reason)
+    }
+}
+
+/// Send one run where the flags say: the allocation's API socket
+/// (`--local`), one worker (`--node`), or a manager.
+async fn send_run(
+    matches: &ArgMatches,
+    request: RunSessionRequest,
+    local: &impl Fn(String) -> anyhow::Error,
+) -> R<Result<RunSessionResponse, tonic::Status>> {
     let result = if matches.get_flag("local") {
         let address = crate::cmd::helpers::manager_address();
         let path = crate::cmd::helpers::unix_socket_path(&address).ok_or_else(|| {
@@ -743,9 +929,23 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .await
             .map(tonic::Response::into_inner)
     };
-    let reply = output::resolve(format, "Failed to run", result)?;
+    Ok(result)
+}
+
+/// Print a run's reply: the JSON envelope, or the program's stdout on
+/// stdout and Legion's notes on stderr.
+fn print_run_reply(
+    format: OutputFormat,
+    matches: &ArgMatches,
+    reply: &RunSessionResponse,
+    ran_twice: bool,
+) -> R<()> {
     if format.is_json() {
-        output::print_success(&run_reply_json(&reply));
+        let mut data = run_reply_json(reply);
+        if ran_twice {
+            data["ranTwice"] = json!(true);
+        }
+        output::print_success(&data);
     } else if let Some(dry) = reply.dry_run.as_ref() {
         println!(
             "{} would run on {} ({})",
@@ -759,6 +959,13 @@ async fn run(matches: &ArgMatches) -> R<()> {
         );
         println!("command: {}", dry.command.join(" "));
         println!("wall: {}, output: {} bytes", dry.wall, dry.output_bytes);
+        if !dry.tier.is_empty() {
+            println!("tier: {} ({})", dry.tier, dry.tier_reason);
+            println!("imports: {}", dry.imports.join(", "));
+            if !dry.missing_imports.is_empty() {
+                println!("not in the image: {}", dry.missing_imports.join(", "));
+            }
+        }
     } else {
         use std::io::Write;
         let _ = std::io::stdout().write_all(&reply.stdout);
@@ -804,6 +1011,9 @@ async fn run(matches: &ArgMatches) -> R<()> {
                 ),
             }
         }
+        if let Some(note) = tier_note(reply, ran_twice) {
+            eprintln!("{note}");
+        }
         if let Some(stop) = reply.stopped.as_ref() {
             eprintln!(
                 "legion: run stopped ({}): {}\nHint: {}",
@@ -813,13 +1023,30 @@ async fn run(matches: &ArgMatches) -> R<()> {
             eprintln!("legion: answered from the kept reply of an earlier run (deduplicated)");
         }
     }
-    let code = run_exit_code(&reply);
-    if code != 0 {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::process::exit(code);
-    }
     Ok(())
+}
+
+/// The stderr note for a run of an isolate task: where it ran and why, and
+/// the tier to ask for next time when that is another. `None` for a run on
+/// any other runtime.
+pub fn tier_note(reply: &RunSessionResponse, ran_twice: bool) -> Option<String> {
+    if reply.tier.is_empty() {
+        return None;
+    }
+    let mut note = format!("legion: ran in the {} tier", reply.tier);
+    if !reply.tier_reason.is_empty() {
+        note.push_str(&format!(" ({})", reply.tier_reason));
+    }
+    if ran_twice {
+        note.push_str("; your code ran twice, the second time in a VM");
+    }
+    if !reply.next_tier.is_empty() && reply.stopped.is_none() {
+        note.push_str(&format!(
+            "; run this code with --tier {} next time",
+            reply.next_tier
+        ));
+    }
+    Some(note)
 }
 
 async fn edge_client(

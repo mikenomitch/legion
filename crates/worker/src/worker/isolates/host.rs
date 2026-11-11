@@ -28,6 +28,8 @@ pub struct Launched {
     pub exited: watch::Receiver<Option<String>>,
     /// Kills the process (idempotent).
     pub kill: Box<dyn Fn() + Send + Sync>,
+    /// The host's own cgroup, when it has one.
+    pub cgroup: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Launched {
@@ -50,9 +52,7 @@ pub struct HostSpawn {
 #[tonic::async_trait]
 pub trait HostLauncher: Send + Sync + 'static {
     /// Start one host and serve `worker` on its worker socket.
-    async fn launch<S: IsolateWorker>(&self, spawn: &HostSpawn, worker: S) -> R<Launched>
-    where
-        Self: Sized;
+    async fn launch(&self, spawn: &HostSpawn, worker: super::service::WorkerService) -> R<Launched>;
 }
 
 /// A connected `IsolateHost` client over an already-connected stream.
@@ -185,7 +185,11 @@ fn place_in_cgroup(dir: &Path, spawn: &HostSpawn, pid: u32) -> R<PathBuf> {
 #[cfg(target_os = "linux")]
 #[tonic::async_trait]
 impl HostLauncher for ProcessLauncher {
-    async fn launch<S: IsolateWorker>(&self, spawn: &HostSpawn, worker: S) -> R<Launched> {
+    async fn launch(
+        &self,
+        spawn: &HostSpawn,
+        worker: super::service::WorkerService,
+    ) -> R<Launched> {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         let (control_ours, control_theirs) = socket_pair()?;
@@ -237,9 +241,13 @@ impl HostLauncher for ProcessLauncher {
             .with_context(|| format!("start {} host", self.binary.display()))?;
         drop((control_theirs, worker_theirs, config));
         let pid = child.id().unwrap_or_default();
+        let mut cgroup = None;
         if let Some(dir) = self.cgroup_dir.as_ref() {
             match place_in_cgroup(dir, spawn, pid) {
-                Ok(leaf) => debug!(cordon = %spawn.cordon, cgroup = %leaf.display(), "Isolate host placed in its cgroup"),
+                Ok(leaf) => {
+                    debug!(cordon = %spawn.cordon, cgroup = %leaf.display(), "Isolate host placed in its cgroup");
+                    cgroup = Some(leaf);
+                }
                 Err(err) => warn!(cordon = %spawn.cordon, error = %format!("{err:#}"), "Could not place the isolate host in its own cgroup; it runs in the worker's"),
             }
         }
@@ -281,6 +289,7 @@ impl HostLauncher for ProcessLauncher {
             pid,
             exited,
             kill,
+            cgroup,
         })
     }
 }
@@ -288,7 +297,11 @@ impl HostLauncher for ProcessLauncher {
 #[cfg(not(target_os = "linux"))]
 #[tonic::async_trait]
 impl HostLauncher for ProcessLauncher {
-    async fn launch<S: IsolateWorker>(&self, _spawn: &HostSpawn, _worker: S) -> R<Launched> {
+    async fn launch(
+        &self,
+        _spawn: &HostSpawn,
+        _worker: super::service::WorkerService,
+    ) -> R<Launched> {
         bail!("isolate hosts run on Linux only")
     }
 }

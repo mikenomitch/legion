@@ -88,9 +88,11 @@ async fn returned_files_share_the_output_budget_test() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exit_codes_are_reported_test() {
     let h = cmd_task();
-    for code in [0, 3, 42] {
+    // WASI 0.2's `exit` carries only ok or error, and Rust's std uses it for
+    // every nonzero code, so 3 and 42 both arrive as 1.
+    for (code, seen) in [(0, 0), (3, 1), (42, 1)] {
         let r = h.run("j", "cmd", &["exit", &code.to_string()]).await;
-        assert_eq!(exit(&r), Some(code));
+        assert_eq!(exit(&r), Some(seen));
         assert_eq!(stdout(&r), "bye\n");
         assert!(r.stopped.is_none());
     }
