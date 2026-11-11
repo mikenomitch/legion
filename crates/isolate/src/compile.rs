@@ -182,18 +182,55 @@ pub fn write_atomic(out: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
-/// The whole `compile` subcommand.
+/// The largest component `compile` reads. Legion's own images are about
+/// 13 MB (`js`) and 30 MB (`python`); this bounds what a hostile input can
+/// make the compiler hold before it has parsed a byte.
+pub const MAX_INPUT_BYTES: u64 = 512 << 20;
+
+/// Read a component to compile, at most [`MAX_INPUT_BYTES`]. The
+/// `compile` subcommand calls this BEFORE it confines itself: confined, it
+/// keeps the caller's kernel uid without its capabilities, so a file the
+/// worker can read only as root (under a home directory, say) would be
+/// unreadable. Reading is not parsing: the untrusted bytes are still only
+/// interpreted inside the confinement.
+pub fn read_input(input: &Path) -> Result<Vec<u8>, CompileError> {
+    use std::io::Read;
+    let io = |e: std::io::Error| CompileError::Io(format!("reading {}: {e}", input.display()));
+    let file = std::fs::File::open(input).map_err(io)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(CompileError::Invalid(format!(
+            "{} is larger than the {} MiB a component may be",
+            input.display(),
+            MAX_INPUT_BYTES >> 20
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Validate and compile `bytes`, and write the artifact to `output`.
+pub fn compile_to(
+    params: &EngineParams,
+    bytes: &[u8],
+    output: &Path,
+) -> Result<CompileReport, CompileError> {
+    let (artifact, report) = compile_bytes(params, bytes)?;
+    write_atomic(output, &artifact)
+        .map_err(|e| CompileError::Io(format!("writing {}: {e}", output.display())))?;
+    Ok(report)
+}
+
+/// Read, validate, and compile `input` into `output`, unconfined (tests and
+/// benches; the `compile` subcommand reads first and confines between).
 pub fn compile_file(
     params: &EngineParams,
     input: &Path,
     output: &Path,
 ) -> Result<CompileReport, CompileError> {
-    let bytes = std::fs::read(input)
-        .map_err(|e| CompileError::Io(format!("reading {}: {e}", input.display())))?;
-    let (artifact, report) = compile_bytes(params, &bytes)?;
-    write_atomic(output, &artifact)
-        .map_err(|e| CompileError::Io(format!("writing {}: {e}", output.display())))?;
-    Ok(report)
+    compile_to(params, &read_input(input)?, output)
 }
 
 #[cfg(test)]

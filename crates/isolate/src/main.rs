@@ -161,8 +161,18 @@ fn main() -> ExitCode {
             // PID-namespace fork (the alarm then fires in the parent, whose
             // death takes the compiling child with it).
             confine::set_deadline(deadline_secs);
+            // Read the input now, before confinement takes the caller's
+            // capabilities away (see `compile::read_input`); it is parsed
+            // only after.
+            let bytes = match compile::read_input(&input) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("{}", e.to_json());
+                    return ExitCode::from(1);
+                }
+            };
             #[allow(unused_mut)]
-            let mut plan = match compiler_plan(&input, &output) {
+            let mut plan = match compiler_plan(&output) {
                 Ok(p) => p,
                 Err(e) => {
                     println!(
@@ -176,10 +186,7 @@ fn main() -> ExitCode {
             {
                 plan.skip = test_skip;
             }
-            let (input, output) = (
-                plan.read_files[0].clone(),
-                plan.write_dirs[0].join(output.file_name().unwrap_or_default()),
-            );
+            let output = plan.write_dirs[0].join(output.file_name().unwrap_or_default());
             let mut notes = Vec::new();
             if level != Confine::Off {
                 if let Err(e) = confine::limit_address_space(COMPILE_ADDRESS_SPACE) {
@@ -200,7 +207,7 @@ fn main() -> ExitCode {
             if let Some(what) = &test_attempt {
                 return legion_isolate::run_host::attempt(what, &plan);
             }
-            match compile::compile_file(&engine.params(), &input, &output) {
+            match compile::compile_to(&engine.params(), &bytes, &output) {
                 Ok(report) => {
                     let mut v = serde_json::to_value(&report).unwrap();
                     v["confinement"] = confinement_json(&c, notes);
@@ -222,14 +229,12 @@ fn main() -> ExitCode {
 /// before exec; this one never raises it).
 const COMPILE_ADDRESS_SPACE: u64 = 64 << 30;
 
-/// What the compiler may see: the input file (read-only) and the output's
-/// directory (read-write), both resolved before confinement, nothing else
-/// of the node's filesystem (a mount root, Landlock), with the compiler's
-/// seccomp allowlist, in its own user, network, PID, mount, IPC, and UTS
-/// namespaces.
-fn compiler_plan(input: &Path, output: &Path) -> Result<confine::Plan, String> {
-    let input =
-        std::fs::canonicalize(input).map_err(|e| format!("reading {}: {e}", input.display()))?;
+/// What the compiler may see: the output's directory (read-write),
+/// resolved before confinement, and nothing else of the node's filesystem
+/// (a mount root, Landlock); its input was read before confinement. With
+/// the compiler's seccomp allowlist, in its own user, network, PID, mount,
+/// IPC, and UTS namespaces.
+fn compiler_plan(output: &Path) -> Result<confine::Plan, String> {
     let dir = output
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -240,7 +245,6 @@ fn compiler_plan(input: &Path, output: &Path) -> Result<confine::Plan, String> {
         return Err(format!("writing {}: not a file name", output.display()));
     }
     Ok(confine::Plan {
-        read_files: vec![input],
         write_dirs: vec![dir],
         seccomp: Some(confine::Filter::Compiler),
         namespaces: true,

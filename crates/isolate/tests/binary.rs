@@ -552,6 +552,38 @@ fn compile_refuses_and_reports_as_json_test() {
     assert!(v["confinement"]["noNewPrivs"].as_bool().unwrap());
 }
 
+/// The compiler reads its input before confining itself, so an input the
+/// worker can reach only as root (a checkout under a 0750 home directory,
+/// as on CI runners) still compiles: confined, the process keeps root's
+/// kernel uid but none of its capabilities, and could not open it.
+#[test]
+fn the_compiler_reads_an_input_only_root_can_reach_test() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIP-REASON: needs root to make a directory only root can enter");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let input = locked.join("cmd.wasm");
+    std::fs::copy(fixture("cmd"), &input).unwrap();
+    // Owned by a uid nothing maps, mode 0700: only CAP_DAC_OVERRIDE gets in.
+    std::os::unix::fs::chown(&locked, Some(4242), Some(4242)).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = Command::new(BIN)
+        .args(["compile", "--confine", "best-effort", "--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(dir.path().join("cmd.cwasm"))
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(dir.path().join("cmd.cwasm").is_file());
+}
+
 #[test]
 fn compat_key_changes_with_layout_test() {
     let key = |layout: &str| {
@@ -1027,6 +1059,13 @@ async fn killing_the_pid_the_worker_knows_kills_the_host_test() {
 
 #[cfg(feature = "confinement-test")]
 fn compile_attempt(what: &str) -> (std::process::ExitStatus, String) {
+    compile_attempt_on(|_| what.to_string())
+}
+
+/// As [`compile_attempt`], with the attempt built from the input's path.
+fn compile_attempt_on(
+    make: impl Fn(&std::path::Path) -> String,
+) -> (std::process::ExitStatus, String) {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.wasm");
     std::fs::copy(fixture("cmd"), &input).unwrap();
@@ -1036,7 +1075,7 @@ fn compile_attempt(what: &str) -> (std::process::ExitStatus, String) {
         .arg(&input)
         .arg("--output")
         .arg(dir.path().join("out").join("x.cwasm"))
-        .args(["--test-attempt", what])
+        .args(["--test-attempt", &make(&input)])
         .output()
         .unwrap();
     (
@@ -1137,14 +1176,15 @@ fn the_compiler_is_refused_what_the_host_is_refused_test() {
                 assert!(out.contains(&enoent), "{what}: {out}");
             }
         }
-        let (_, out) = compile_attempt("read-inside");
-        assert!(out.contains("bytes"), "the input is readable: {out}");
-        let (_, out) = compile_attempt("write-inside");
-        assert!(
-            out.contains(&format!("Some({})", libc::EROFS))
-                || out.contains(&format!("Some({})", libc::EACCES)),
-            "the input is read-only: {out}"
-        );
+        // The compiler read its input before confining itself; inside, the
+        // input's path is gone (mount root) or refused (Landlock alone).
+        let (_, out) = compile_attempt_on(|input| format!("read-path:{}", input.display()));
+        if c.mount_root || c.landlock {
+            assert!(
+                out.contains(&enoent) || out.contains(&format!("Some({})", libc::EACCES)),
+                "the input is out of reach once confined: {out}"
+            );
+        }
         let (_, out) = compile_attempt("write-output");
         assert!(
             out.contains("wrote"),

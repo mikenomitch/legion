@@ -928,7 +928,7 @@ always kills.
 
 ---
 
-## 20. The compiler confines itself like the host, `enforce` by default, and sees one input file
+## 20. The compiler confines itself like the host, `enforce` by default, and reads its one input before it does
 
 *Added in the hardening round (2026-11-11). Replaces the "best effort, no
 seccomp" sentence of entry 13's first As built paragraph.*
@@ -959,6 +959,17 @@ Each compile reads a hard link (or a copy) of its one input in a fresh
 `<state>/isolates/compile-inputs/in-*` directory, removed afterwards, and
 at most two compiles run at once on a node. The hidden `--no-confine` flag
 is gone (`--confine off`).
+
+**As built (2026-11-11, after CI):** the compiler now reads its input
+(capped at 512 MiB) *before* confining itself, and its mount root and
+Landlock hold only the output directory, so the input is not in the
+sandbox at all; the bytes are parsed only after confinement. Confined, the
+process keeps the caller's kernel uid without its capabilities, so an
+input under a directory only root's `CAP_DAC_OVERRIDE` could enter (a CI
+runner's checkout under a 0750 home) could not be opened, and enforce
+failed the compile. This is alternative (b) in spirit: the input crosses
+into the sandbox as bytes in memory rather than as a path. Test:
+`the_compiler_reads_an_input_only_root_can_reach_test`.
 
 **Alternatives.** (a) The first build: always best effort, no seccomp,
 Landlock read on the input's parent directory (the content store's

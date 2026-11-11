@@ -903,10 +903,13 @@ loads an artifact from outside the directories the worker's compiler
 writes; a user-supplied `.cwasm` is never loaded.
 
 The compiler parses untrusted bytes, so it confines itself like a host
-([Confinement](#confinement)): the same namespaces and PID-namespace
-fork, a mount root holding only its one input file (read-only) and its
-output directory (writable, not executable), Landlock on those two paths,
-`no_new_privs`, and its own seccomp allowlist. It honours the worker's
+([Confinement](#confinement)): it reads its input (at most 512 MiB)
+first, then takes the same namespaces and PID-namespace fork, a mount root
+holding only its output directory (writable, not executable), Landlock on
+that directory, `no_new_privs`, and its own seccomp allowlist, and only
+then parses the bytes. Confined, it keeps the caller's kernel uid but none
+of its capabilities, which is why the input is read first: a file the
+worker reaches only as root would otherwise be out of reach. It honours the worker's
 `isolate.confine` (`legion-isolate compile --confine
 enforce|best-effort|off`, `enforce` by default); under `enforce` a layer
 that cannot apply fails the compile, and the task's `problem` reads `the

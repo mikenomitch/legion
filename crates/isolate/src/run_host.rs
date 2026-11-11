@@ -304,6 +304,12 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
                 Err(e) => report(format!("write-inside: {} ({:?})", e, e.raw_os_error())),
             }
         }
+        // Read the file at `<arg>` (a path the test names: the compiler's
+        // original input, which confinement must have left out of reach).
+        "read-path" => match std::fs::read(arg) {
+            Ok(b) => report(format!("read-path: {} bytes", b.len())),
+            Err(e) => report(format!("read-path: {} ({:?})", e, e.raw_os_error())),
+        },
         // Write `<first read dir>/<arg>/probe`: a path inside a submount of
         // a read directory (review N6).
         "write-in" => {
