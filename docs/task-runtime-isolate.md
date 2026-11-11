@@ -1159,7 +1159,8 @@ With `-j` the data is `{"task", "nodes"}` for one task, or `{"tasks":
 `legion isolate get <SESSION_ID> [--on-node NODE]` describes one session
 isolate by asking its node: `state`, `tenant`, invocations, memory and
 state bytes, checkpoint generation and size, and child VMs. A node that
-cannot be reached is `UNAVAILABLE`, not not-found. Both commands are in the
+cannot be reached is `UNAVAILABLE`, not not-found. A caller who cannot read
+the isolate's job gets the same `NOT_FOUND` as for an id no node holds. Both commands are in the
 capability catalog (`isolate.stats`, `isolate.get`) and the MCP server
 (`legion_isolate_stats`, `legion_isolate_get`).
 

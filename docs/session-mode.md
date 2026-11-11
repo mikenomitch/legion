@@ -336,8 +336,10 @@ dropped from the index, and its sessions disappear from listings.
 
 `legion instance get <ID>` works on a session id too. The manager gates it
 with a coarse `job:read` check before looking the id up, and enforces
-`job:read` on the session's own job after, so a caller without access to a
-job cannot learn which session ids exist.
+`job:read` on the session's own job after. A caller who cannot read that
+job gets the same `NOT_FOUND` as for an unknown id, so it cannot learn which
+session ids exist; the other session verbs (stop, suspend, start, resize,
+promote) answer such a caller the same way.
 
 ## Ending sessions
 
