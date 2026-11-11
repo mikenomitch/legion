@@ -1114,9 +1114,14 @@ fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotRepo
                     evicted = evicted.len(),
                     "Snapshot captured"
                 );
-                crate::manager::telemetry::metrics()
+                let metrics = crate::manager::telemetry::metrics();
+                metrics
                     .checkpoint_bytes
                     .observe(&[snapshot.kind.as_str()], snapshot.total_bytes as f64);
+                metrics.snapshot_capture_seconds.observe(
+                    &[snapshot.kind.as_str()],
+                    snapshot.duration_ms as f64 / 1000.0,
+                );
                 store.events().snapshot_created(&snapshot);
             }
             SnapshotReportOutcome::Suspended {
@@ -1340,6 +1345,18 @@ fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotRepo
                 error,
                 duration_ms,
             } => {
+                // The outcome does not carry the kind; one row read per
+                // restore, which is rare next to heartbeats.
+                if ok {
+                    if let Ok(Some(snapshot)) = store.get_snapshot(&snapshot_id) {
+                        crate::manager::telemetry::metrics()
+                            .snapshot_restore_seconds
+                            .observe(
+                                &[snapshot.kind.as_str()],
+                                report.duration_ms as f64 / 1000.0,
+                            );
+                    }
+                }
                 store.events().snapshot_restore(
                     &snapshot_id,
                     &job_id,

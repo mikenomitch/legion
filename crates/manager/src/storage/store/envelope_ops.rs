@@ -281,3 +281,25 @@ impl Store {
         Ok(EnvelopeResizeOutcome::with_size(outcome, &size, ""))
     }
 }
+
+impl Store {
+    /// Jobs with an envelope allocation row, for the
+    /// `legion_sessions_envelope_free` gauge (docs/metrics.md, "Sessions").
+    /// Scans task rows on the envelope runtime and probes each one's
+    /// allocations by index, so its cost follows the session tasks, not the
+    /// allocation table. A row of any status counts; the caller reads which
+    /// envelopes are live.
+    pub fn envelope_job_ids(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT tc.job_id FROM task_config tc \
+             WHERE tc.runtime = ?1 \
+               AND EXISTS (SELECT 1 FROM allocation a WHERE a.task_config_id = tc.id) \
+             ORDER BY 1;",
+        )?;
+        let rows = stmt.query_map([crate::structs::session::ENVELOPE_RUNTIME], |row| {
+            row.get(0)
+        })?;
+        Self::collect_rows(rows)
+    }
+}

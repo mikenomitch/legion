@@ -171,10 +171,10 @@ fn own_artifacts(messages: &str, manifest: &std::path::Path) -> Vec<std::path::P
             let file = std::path::PathBuf::from(file);
             // `.rlib`/`.rmeta` are a library's inputs to other crates;
             // only something a worker loads or runs is a plugin artifact.
-            let keep = match file.extension().and_then(|ext| ext.to_str()) {
-                Some("rlib") | Some("rmeta") | Some("d") => false,
-                _ => true,
-            };
+            let keep = !matches!(
+                file.extension().and_then(|ext| ext.to_str()),
+                Some("rlib") | Some("rmeta") | Some("d")
+            );
             if keep && file.is_file() {
                 out.push(file);
             }
