@@ -11,10 +11,13 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 
 | PR | What it lands |
 | --- | --- |
-| [#72](https://github.com/mikenomitch/legion/pull/72) | TODO close-out: 54 items done, or removed as done, duplicate or decided (the "TODO close-out (2026-11-10)" entries under Done describe it as landed) |
-| [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again (likely closes "Plugin lockfiles are stale") |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
 | [#37](https://github.com/mikenomitch/legion/pull/37) | UI appearance picker: built-in themes and custom colors |
+
+[#41](https://github.com/mikenomitch/legion/pull/41) (keep plugins out of the
+workspace) is superseded: the crate split ([#71](https://github.com/mikenomitch/legion/pull/71))
+landed the same `members` fix and the plugin build's exit-status check, so it
+can be closed.
 
 ---
 

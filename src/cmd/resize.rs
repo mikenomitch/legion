@@ -93,7 +93,7 @@ pub fn alloc_config() -> Command {
                     Arg::new("allocation")
                         .value_name("ALLOCATION")
                         .value_parser(clap::value_parser!(i64))
-                        .help("Allocation id (legion job status lists them)")
+                        .help("Allocation id (`legion ledger --job <JOB>` lists them)")
                         .required(true),
                 ),
         ))
