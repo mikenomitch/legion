@@ -333,14 +333,113 @@ impl Compiler {
                 })?,
             None => dir.join(entry.trim()),
         };
-        let content = std::fs::read(&path)
-            .map_err(|err| format!("reading config.entry {}: {err}", path.display()))?;
+        // The artifact is job-controlled (a git tree or an archive can carry
+        // symlinks): read it only beneath the staging directory, following
+        // no symlink, as a regular file of bounded size.
+        let relative = path.strip_prefix(&dir).map_err(|_| {
+            format!("config.entry {entry:?} is not inside the task's staged artifacts")
+        })?;
+        let content = read_beneath(&dir, relative, crate::structs::run::MAX_RUN_STAGED)
+            .map_err(|why| format!("config.entry {entry:?} cannot be used: {why}"))?;
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "main".into());
         Ok((name, content))
     }
+}
+
+/// Read `relative` beneath `root` without following any symlink (in any
+/// component, the last one included) and without leaving `root` (`..` and
+/// absolute components are refused). The file must be a regular file of at
+/// most `cap` bytes. Each component is opened with `openat(O_NOFOLLOW)`
+/// from the previous one's descriptor, so a symlink swapped in after a
+/// check cannot redirect the read (no time-of-check gap).
+pub fn read_beneath(root: &Path, relative: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => return Err("its path contains \"..\"".into()),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("its path is absolute".into())
+            }
+        }
+    }
+    let Some((last, dirs)) = parts.split_last() else {
+        return Err("it names a directory, not a file".into());
+    };
+    let open = |at: libc::c_int, name: &std::ffi::OsStr, flags: libc::c_int| {
+        let name = CString::new(name.as_bytes()).map_err(|_| "a NUL in its path".to_string())?;
+        // SAFETY: `name` is a valid C string; the result is checked.
+        let fd = unsafe {
+            libc::openat(at, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => format!(
+                    "{} is a symlink (or reached through one), which an entry may not be",
+                    name.to_string_lossy()
+                ),
+                _ => format!("{}: {err}", name.to_string_lossy()),
+            });
+        }
+        // SAFETY: a fresh descriptor this function owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let root_name = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| "a NUL in the staging path".to_string())?;
+    // SAFETY: a valid C string; the result is checked.
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(format!(
+            "the staging directory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a fresh descriptor this function owns.
+    let mut at = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for dir in dirs {
+        use std::os::fd::AsRawFd;
+        at = open(at.as_raw_fd(), dir, libc::O_PATH | libc::O_DIRECTORY)?;
+    }
+    let file = {
+        use std::os::fd::AsRawFd;
+        open(at.as_raw_fd(), last, libc::O_RDONLY | libc::O_NONBLOCK)?
+    };
+    let mut file = std::fs::File::from(file);
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    if !meta.file_type().is_file() {
+        return Err("it is not a regular file".into());
+    }
+    if meta.len() > cap {
+        return Err(format!(
+            "it is {} bytes, over the {cap}-byte limit for an entry",
+            meta.len()
+        ));
+    }
+    let mut content = Vec::with_capacity(meta.len() as usize);
+    file.by_ref()
+        .take(cap + 1)
+        .read_to_end(&mut content)
+        .map_err(|err| err.to_string())?;
+    if content.len() as u64 > cap {
+        return Err(format!("it is over the {cap}-byte limit for an entry"));
+    }
+    Ok(content)
 }
 
 /// The `cwasm` derived-content directory, which every host may read.
@@ -350,4 +449,53 @@ pub fn derived_dir(store: &ContentStore) -> PathBuf {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod read_beneath_test {
+    use super::read_beneath;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    #[test]
+    fn an_entry_is_read_only_beneath_its_root_without_symlinks_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("staged");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.py"), "print(1)").unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "node secret").unwrap();
+        // A normal entry.
+        assert_eq!(
+            read_beneath(&root, Path::new("src/main.py"), 1 << 20).unwrap(),
+            b"print(1)"
+        );
+        assert_eq!(
+            read_beneath(&root, Path::new("./src/main.py"), 1 << 20).unwrap(),
+            b"print(1)"
+        );
+        // A direct symlink entry.
+        symlink(&secret, root.join("src/link.py")).unwrap();
+        let err = read_beneath(&root, Path::new("src/link.py"), 1 << 20).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // A symlinked directory component.
+        symlink(dir.path(), root.join("up")).unwrap();
+        let err = read_beneath(&root, Path::new("up/secret"), 1 << 20).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // A chain to an absolute target.
+        symlink("/etc/passwd", root.join("abs")).unwrap();
+        symlink(root.join("abs"), root.join("chain.py")).unwrap();
+        let err = read_beneath(&root, Path::new("chain.py"), 1 << 20).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // `..` and absolute paths.
+        let err = read_beneath(&root, Path::new("../secret"), 1 << 20).unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        let err = read_beneath(&root, Path::new("/etc/passwd"), 1 << 20).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        // Not a regular file; over the cap.
+        let err = read_beneath(&root, Path::new("src"), 1 << 20).unwrap_err();
+        assert!(err.contains("regular file"), "{err}");
+        let err = read_beneath(&root, Path::new("src/main.py"), 3).unwrap_err();
+        assert!(err.contains("limit"), "{err}");
+    }
 }
