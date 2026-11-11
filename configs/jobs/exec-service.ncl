@@ -17,6 +17,6 @@
     service = { port = "http" },
     # Restart on any exit, waiting a few seconds between attempts.
     restart = { policy = "always", delay = "3s" },
-    resources = { cpus = 0.1, memory = 64 },
+    resources = { cpu = 100, memory = 64 },
   },
 }

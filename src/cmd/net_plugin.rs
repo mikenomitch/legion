@@ -558,6 +558,7 @@ fn plugin_json(plugin: &NetPlugin) -> Value {
         "createdAt": plugin.created_at,
         "updatedAt": plugin.updated_at,
         "referencedBy": plugin.referenced_by,
+        "referencedByJobs": plugin.referenced_by_jobs,
         "object": object,
     })
 }
@@ -706,6 +707,9 @@ async fn describe(matches: &ArgMatches) -> R<()> {
             "Used by policy object(s): {}",
             plugin.referenced_by.join(", ")
         );
+    }
+    if !plugin.referenced_by_jobs.is_empty() {
+        println!("Used by job(s): {}", plugin.referenced_by_jobs.join(", "));
     }
     let object: Value = serde_json::from_str(&plugin.object_json).unwrap_or(Value::Null);
     println!("{}", serde_json::to_string_pretty(&object)?);

@@ -159,7 +159,7 @@ in
         ],
       },
       checks = [http_check "/"],
-      resources = { cpus = 0.1, memory = 64 },
+      resources = { cpu = 100, memory = 64 },
     },
     {
       name = "api",
@@ -185,7 +185,7 @@ in
       # the replica that's already busy.
       connect = { upstreams = [{ to = "postgres", balance = "least_conn" }] },
       checks = [http_check "/healthz" & { bootGraceTime = "60s" }],
-      resources = { cpus = 0.25, memory = 128 },
+      resources = { cpu = 250, memory = 128 },
     },
     {
       name = "postgres",
@@ -215,7 +215,7 @@ in
       checks = [
         { type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", bootGraceTime = "60s" },
       ],
-      resources = { cpus = 0.5, memory = 512 },
+      resources = { cpu = 500, memory = 512 },
     },
     # A sidecar runs beside its group's primary task and shares its node and
     # lifecycle. This one exports Postgres metrics for Prometheus to scrape.
@@ -240,7 +240,7 @@ in
       network = { ports = [{ name = "metrics" }] },
       service = { name = "postgres-metrics", port = "metrics", meta = { protocol = "http", path = "/metrics" } },
       connect = { upstreams = [{ to = "postgres" }] },
-      resources = { cpus = 0.05, memory = 32 },
+      resources = { cpu = 50, memory = 32 },
     },
   ],
 }

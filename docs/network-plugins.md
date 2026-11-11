@@ -282,8 +282,17 @@ you cannot read" otherwise. A stopped job is not checked; its next `job run`
 is. The check reads every running job's config, which is fine for an
 operator action but makes a plugin write slower on a cluster with many jobs.
 
-Deleting a plugin checks policies only. A job that still references a
-deleted plugin keeps running, and its hops fail with `not on this node`.
+Deleting a plugin makes the same two checks. It is refused while a stored
+policy references the plugin, and while a job that is not stopped
+references it in its latest config:
+
+```
+net plugin 'llm-token-meter' is used by job(s) 'metered', 1 job(s) you cannot read; update or stop them first
+```
+
+A stopped job does not block the delete; its next `job run` is refused at
+submit. `legion net plugin get` and `legion net plugin status` list the
+policies and the jobs (the ones the caller may read) that use a plugin.
 
 ### How a plugin reaches a node
 

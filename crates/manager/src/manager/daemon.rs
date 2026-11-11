@@ -154,6 +154,9 @@ pub async fn run_manager_with(
     // rather than in an incident (docs/heartbeat-cadence-and-scale.md,
     // docs/node-liveness.md).
     full_config.heartbeat.validate()?;
+    if let Some(warning) = full_config.heartbeat.self_fence_warning() {
+        warn!("{warning}");
+    }
     // A system worker that cannot do what its block says (no namespaces, a
     // root app user, a zero lend) stops the start, rather than leaving the
     // manager without the worker Legion's own jobs need.

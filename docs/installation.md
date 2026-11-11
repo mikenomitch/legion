@@ -169,7 +169,7 @@ not untrusted code (see
 it is installed. It publishes a static binary with each release:
 
 ```bash
-CH_VERSION=v48.0       # see https://github.com/cloud-hypervisor/cloud-hypervisor/releases
+CH_VERSION=v51.2       # see https://github.com/cloud-hypervisor/cloud-hypervisor/releases
 # x86_64:
 curl -fsSL -o /tmp/cloud-hypervisor \
   "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
@@ -202,11 +202,11 @@ near-instant. See [the root disk cache](task-runtime-sandbox.md#the-root-disk-ca
 A microVM boots an uncompressed kernel image (`vmlinux`, not `bzImage`).
 cloud-hypervisor maintains a guest kernel and publishes builds on its
 [linux releases page](https://github.com/cloud-hypervisor/linux/releases).
-Each release carries a `vmlinux-x86_64` asset (and an arm64 image). Put it
-where the worker looks by default:
+Each release carries a `vmlinux-x86_64` asset (and `Image-arm64` for
+aarch64). Put it where the worker looks by default:
 
 ```bash
-KERNEL_TAG=ch-release-v6.12.8-20250114  # see the releases page for the latest tag
+KERNEL_TAG=ch-release-v6.16.9-20261001  # see the releases page for the latest tag
 sudo mkdir -p /var/lib/legion/kernels
 sudo curl -fsSL -o /var/lib/legion/kernels/vmlinux \
   "https://github.com/cloud-hypervisor/linux/releases/download/${KERNEL_TAG}/vmlinux-x86_64"

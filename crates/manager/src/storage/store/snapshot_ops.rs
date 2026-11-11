@@ -171,6 +171,8 @@ pub enum SnapshotReportOutcome {
         allocation_id: i64,
         ok: bool,
         error: String,
+        /// How long the node took to restore, as it reported.
+        duration_ms: u64,
     },
     /// A suspend capture landed: the instance is now `suspended` with this
     /// snapshot as its checkpoint. `reserved` when `suspend.reserve` kept the
@@ -820,6 +822,7 @@ impl Store {
                         allocation_id: report.allocation_id,
                         ok: report.ok,
                         error: report.error.clone(),
+                        duration_ms: report.duration_ms,
                     }
                 }
             }

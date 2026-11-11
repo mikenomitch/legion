@@ -25,6 +25,6 @@
         { name = "https", static = 443, tls = { cert = { kv = "certs/shop" } } },
       ],
     },
-    resources = { cpus = 0.1, memory = 64 },
+    resources = { cpu = 100, memory = 64 },
   },
 }

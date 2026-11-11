@@ -29,9 +29,11 @@ files are pruned at startup: Legion keeps 7 days of `./logs` and 3 days of
 `legion start worker`, console lines go to an in-memory buffer of up to
 128,000 lines, and one background thread writes them to stdout. When the
 reader falls behind (journald or a container runtime under load) and the
-buffer fills, new lines are dropped. Legion does not count or report the
-dropped lines. The JSON file log under `./logs` works the same way, with its
-own buffer.
+buffer fills, new lines are dropped. The JSON file log under `./logs` works
+the same way, with its own buffer. Dropped lines are counted per sink:
+`legion_log_dropped_lines_total{sink}` on a manager and
+`legion_worker_log_dropped_lines_total{sink}` on a worker
+([metrics.md](metrics.md#async-runtime)).
 
 The console used to be a blocking write. On a c5.metal worker starting a
 burst of 1,200 sandboxes, journald fell behind, and every thread that

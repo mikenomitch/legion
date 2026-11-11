@@ -350,16 +350,27 @@ async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<
         return Ok(());
     }
 
+    let locked = entries.iter().filter(|entry| entry.locked).count();
     let printable: Vec<KvEntryPrint> = entries
         .into_iter()
         .map(|entry| KvEntryPrint {
             key: entry.key.clone(),
-            value_type: value_type_label(entry.value_type).to_string(),
+            value_type: if entry.locked {
+                format!("{} (locked)", value_type_label(entry.value_type))
+            } else {
+                value_type_label(entry.value_type).to_string()
+            },
             version: entry.version,
             updated_at: entry.updated_at.clone(),
         })
         .collect();
     print_table(printable);
+    if locked > 0 {
+        eprintln!(
+            "{locked} value(s) are locked: this manager cannot decrypt them right now. \
+             `legion keyring status` names the data key."
+        );
+    }
 
     Ok(())
 }

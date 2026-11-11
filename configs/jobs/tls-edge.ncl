@@ -48,7 +48,7 @@
           { name = "https", static = 8443, tls = { cert = { kv = "certs/app.example.com" } } },
         ],
       },
-      resources = { cpus = 0.1, memory = 64 },
+      resources = { cpu = 100, memory = 64 },
     },
     {
       name = "nginx",
@@ -103,7 +103,7 @@
           },
         },
       ],
-      resources = { cpus = 0.2, memory = 128 },
+      resources = { cpu = 200, memory = 128 },
     },
   ],
 }

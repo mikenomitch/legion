@@ -343,6 +343,7 @@ by project impact. The full template and a worked example:
 - [test-build-footprint_calls.md](calls/test-build-footprint_calls.md)
 - [binary-size_calls.md](calls/binary-size_calls.md)
 - [todo-bug-sweep-2026-11-08_calls.md](calls/todo-bug-sweep-2026-11-08_calls.md)
+- [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-11-10_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)

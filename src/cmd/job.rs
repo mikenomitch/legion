@@ -1767,6 +1767,7 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             encrypted: false,
+            locked: false,
         }
     }
 

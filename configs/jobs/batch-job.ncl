@@ -17,7 +17,7 @@
       # Batch tasks default to `onFailure`. Exit code 3 means "nothing to do",
       # so count it as success too.
       restart = { policy = "onFailure", delay = "10s", successExitCodes = [0, 3] },
-      resources = { cpus = 0.1, memory = 64 },
+      resources = { cpu = 100, memory = 64 },
     },
   ],
 }

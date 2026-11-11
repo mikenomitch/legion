@@ -291,6 +291,9 @@ legion job logs web --include-removed
 legion job logs --allocation 31
 ```
 
+The UI's job Logs tab has the same switch: **Removed** adds the removed
+allocations after the live ones (`include_removed`).
+
 In `--json` output each allocation carries `removed`, `removalCause` (the stop
 cause: `stop`, `update`, `reschedule`, `node_lost`, `preempted`, `destroy`,
 `scale_in`, …), `removedAtUnix`, and `status` (`placed`, `complete`, or

@@ -218,7 +218,7 @@ fn logs_exec_and_ca_rotation_work_over_the_mtls_worker_plane_test() {
                 "runtime": "exec",
                 "lifecycle": "service",
                 "config": { "command": ["sh", "-c", "echo hello-from-task; exec sleep 600"] },
-                "resources": { "cpus": 0.1, "memory": 32 },
+                "resources": { "cpu": 100, "memory": 32 },
             },
         })
         .to_string(),
@@ -339,7 +339,7 @@ fn direct_exec_runs_on_the_worker_and_ends_when_its_token_is_revoked_test() {
                 "runtime": "exec",
                 "lifecycle": "service",
                 "config": { "command": ["sh", "-c", "exec sleep 600"] },
-                "resources": { "cpus": 0.1, "memory": 32 },
+                "resources": { "cpu": 100, "memory": 32 },
             },
         })
         .to_string(),
