@@ -285,12 +285,6 @@ value that manager holds.
 # configs/manager.ncl — every field optional; omitting the block
 # reproduces the defaults below.
 liveness = {
-  # Accumulation window for the heartbeat group commit. "0ms" (the default)
-  # is commit-while-you-can batching. A steady-state heartbeat does not
-  # commit at all, so this applies only to the checkpoint and to the
-  # mixed-version forwarding fallback.
-  batchWindow = "0ms",
-
   # After acquiring status-lane leadership (or starting the process), mark
   # nothing lost for this long.
   failoverGrace = "60s",

@@ -12255,19 +12255,20 @@ impl Manager for ManagerDaemonService {
             .await?;
         // Values only on request: browsing key names should not decrypt and
         // ship every secret in the prefix.
+        let readable =
+            |key: &str| identity.allows(AclResource::Kv, AclAction::Read, &AclScope::path(key));
+        // With values, the ACL filter runs before anything is decrypted, and
+        // a value this manager cannot decrypt is marked `locked` rather than
+        // failing the list.
         let entries = if req.include_values {
-            self.store.list_kv(&req.prefix)
+            self.store.list_kv_marking_locked(&req.prefix, readable)
         } else {
-            self.store.list_kv_keys(&req.prefix)
+            self.store.list_kv_keys(&req.prefix).map(|mut entries| {
+                entries.retain(|entry| readable(&entry.key));
+                entries
+            })
         };
-        let mut entries = entries.map_err(|e| map_store_error("Error listing kv entries", e))?;
-        entries.retain(|entry| {
-            identity.allows(
-                AclResource::Kv,
-                AclAction::Read,
-                &AclScope::path(&entry.key),
-            )
-        });
+        let entries = entries.map_err(|e| map_store_error("Error listing kv entries", e))?;
         // Locks on request, readable like entries; a lock id is its
         // holder's secret and never listed.
         let locks = if req.include_locks {
@@ -13747,7 +13748,7 @@ impl Manager for ManagerDaemonService {
         let verdict = run_blocking_admission(|| {
             crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
         })
-        .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
+        .map_err(|e| map_store_error("ratification failed", e))?;
 
         let job_id = self
             .store
@@ -13781,15 +13782,6 @@ impl Manager for ManagerDaemonService {
                     detail: String::new(),
                     allocation: payload,
                 }))
-            }
-            // Only the raft leader ratifies, and a follower does not forward
-            // it. Answered as an error rather than a verdict, so the node
-            // asks the leader instead of killing a claim no manager judged.
-            // Nothing was written: the ticket is still unspent.
-            crate::manager::edge_boot::Verdict::Refused { detail, .. }
-                if detail.contains("not the raft leader") =>
-            {
-                Err(Status::failed_precondition(detail))
             }
             crate::manager::edge_boot::Verdict::Refused { reason, detail } => {
                 tracing::Span::current().record("verdict", "refused");
@@ -15222,43 +15214,8 @@ impl ManagerDaemonService {
         callers: &HashMap<i64, (String, String)>,
     ) {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let minute = now / 60;
         let mut edges = self.net_edges.lock().unwrap_or_else(|p| p.into_inner());
-        for sample in samples {
-            let Some((job, task)) = callers.get(&sample.allocation_id) else {
-                continue;
-            };
-            let key = (
-                job.clone(),
-                task.clone(),
-                sample.service.clone(),
-                sample.tag.clone(),
-            );
-            let window = edges.entry(key).or_default();
-            if !sample.protocol.is_empty() {
-                window.protocol = sample.protocol.clone();
-            }
-            window.last_seen = now;
-            if window.buckets.back().is_none_or(|b| b.minute != minute) {
-                window.buckets.push_back(EdgeBucket {
-                    minute,
-                    ..Default::default()
-                });
-                while window.buckets.len() as i64 > EDGE_WINDOW_MINUTES {
-                    window.buckets.pop_front();
-                }
-            }
-            let bucket = window.buckets.back_mut().expect("bucket just pushed");
-            bucket.requests += sample.requests;
-            bucket.errors += sample.errors;
-            bucket.denied += sample.denied;
-            bucket.latency_ms_sum += sample.latency_ms_sum;
-            bucket.latency_ms_max = bucket.latency_ms_max.max(sample.latency_ms_max);
-            bucket.bytes_out += sample.bytes_out;
-            bucket.bytes_in += sample.bytes_in;
-        }
-        // Idle edges age out with their last bucket.
-        edges.retain(|_, window| now - window.last_seen <= EDGE_WINDOW_MINUTES * 60);
+        fold_edges(&mut edges, samples, callers, now);
     }
 
     /// The `egress-unenforced` note for each running allocation of `task`
@@ -15649,6 +15606,55 @@ struct EdgeWindow {
     protocol: String,
     last_seen: i64,
     buckets: std::collections::VecDeque<EdgeBucket>,
+}
+
+/// Fold one node's edge samples into the per-edge windows as of `now` (unix
+/// seconds): a sample lands in its edge's bucket for the current minute, a
+/// window keeps its newest [`EDGE_WINDOW_MINUTES`] buckets, a sample from an
+/// allocation not in `callers` is skipped, and an edge idle for the whole
+/// window is dropped.
+fn fold_edges(
+    edges: &mut HashMap<EdgeKey, EdgeWindow>,
+    samples: &[crate::structs::NetEdgeSample],
+    callers: &HashMap<i64, (String, String)>,
+    now: i64,
+) {
+    let minute = now / 60;
+    for sample in samples {
+        let Some((job, task)) = callers.get(&sample.allocation_id) else {
+            continue;
+        };
+        let key = (
+            job.clone(),
+            task.clone(),
+            sample.service.clone(),
+            sample.tag.clone(),
+        );
+        let window = edges.entry(key).or_default();
+        if !sample.protocol.is_empty() {
+            window.protocol = sample.protocol.clone();
+        }
+        window.last_seen = now;
+        if window.buckets.back().is_none_or(|b| b.minute != minute) {
+            window.buckets.push_back(EdgeBucket {
+                minute,
+                ..Default::default()
+            });
+            while window.buckets.len() as i64 > EDGE_WINDOW_MINUTES {
+                window.buckets.pop_front();
+            }
+        }
+        let bucket = window.buckets.back_mut().expect("bucket just pushed");
+        bucket.requests += sample.requests;
+        bucket.errors += sample.errors;
+        bucket.denied += sample.denied;
+        bucket.latency_ms_sum += sample.latency_ms_sum;
+        bucket.latency_ms_max = bucket.latency_ms_max.max(sample.latency_ms_max);
+        bucket.bytes_out += sample.bytes_out;
+        bucket.bytes_in += sample.bytes_in;
+    }
+    // Idle edges age out with their last bucket.
+    edges.retain(|_, window| now - window.last_seen <= EDGE_WINDOW_MINUTES * 60);
 }
 
 fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Value {
@@ -18756,6 +18762,75 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn edge_samples_fold_into_per_minute_windows_test() {
+        let sample =
+            |allocation_id: i64, requests: u64, latency_max: u64| crate::structs::NetEdgeSample {
+                allocation_id,
+                service: "db".into(),
+                tag: "primary".into(),
+                protocol: "tcp".into(),
+                requests,
+                errors: 1,
+                latency_ms_sum: 10,
+                latency_ms_max: latency_max,
+                ..Default::default()
+            };
+        let callers: HashMap<i64, (String, String)> =
+            HashMap::from([(7, ("web".to_string(), "api".to_string()))]);
+        let key: EdgeKey = ("web".into(), "api".into(), "db".into(), "primary".into());
+        let mut edges = HashMap::new();
+        let start = 60_000;
+
+        // Two reports in one minute share a bucket; an allocation the
+        // manager cannot attribute is skipped.
+        fold_edges(
+            &mut edges,
+            &[sample(7, 3, 20), sample(99, 50, 1)],
+            &callers,
+            start,
+        );
+        fold_edges(&mut edges, &[sample(7, 2, 40)], &callers, start + 30);
+        assert_eq!(edges.len(), 1, "allocation 99 has no caller");
+        let window = &edges[&key];
+        assert_eq!(window.protocol, "tcp");
+        assert_eq!(window.buckets.len(), 1);
+        let bucket = &window.buckets[0];
+        assert_eq!((bucket.requests, bucket.errors), (5, 2));
+        assert_eq!((bucket.latency_ms_sum, bucket.latency_ms_max), (20, 40));
+
+        // A new minute opens a new bucket, and the window keeps only the
+        // newest EDGE_WINDOW_MINUTES of them.
+        for minute in 1..=(EDGE_WINDOW_MINUTES + 3) {
+            fold_edges(
+                &mut edges,
+                &[sample(7, 1, 1)],
+                &callers,
+                start + minute * 60,
+            );
+        }
+        let window = &edges[&key];
+        assert_eq!(window.buckets.len() as i64, EDGE_WINDOW_MINUTES);
+        assert_eq!(
+            window.buckets.back().map(|b| b.minute),
+            Some(start / 60 + EDGE_WINDOW_MINUTES + 3)
+        );
+        assert_eq!(window.buckets.front().map(|b| b.requests), Some(1));
+
+        // An edge nothing reported for a whole window ages out on the next
+        // fold, whatever that fold carries.
+        let last = window.last_seen;
+        fold_edges(&mut edges, &[], &callers, last + EDGE_WINDOW_MINUTES * 60);
+        assert_eq!(edges.len(), 1, "still inside the window");
+        fold_edges(
+            &mut edges,
+            &[],
+            &callers,
+            last + EDGE_WINDOW_MINUTES * 60 + 1,
+        );
+        assert!(edges.is_empty());
+    }
+
     /// UpsertNetPlugin re-checks the jobs that use the plugin, as it does the
     /// policies: a change a running job could no longer be submitted with
     /// is refused and names the job; a compatible change and a stopped job
@@ -18820,9 +18895,30 @@ mod tests {
         }
         // A compatible change is applied.
         upsert(object(json!(["request", "response"]), "jobs"), false).await?;
+        // The running job is listed as a user, and blocks a delete.
+        let described = manager
+            .get_net_plugin(Request::new(GetNetPluginRequest {
+                name: "meter".into(),
+            }))
+            .await?
+            .into_inner()
+            .plugin
+            .context("plugin")?;
+        assert_eq!(described.referenced_by_jobs, vec!["metered".to_string()]);
+        let delete = || async {
+            manager
+                .delete_net_plugin(Request::new(DeleteNetPluginRequest {
+                    name: "meter".into(),
+                }))
+                .await
+        };
+        let err = delete().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert!(err.message().contains("job(s) 'metered'"), "{err:?}");
         // A stopped job is not held to it; its next run is.
         manager.store.stop_job("metered")?;
         upsert(object(json!(["request"]), "policies"), false).await?;
+        delete().await?;
         Ok(())
     }
 

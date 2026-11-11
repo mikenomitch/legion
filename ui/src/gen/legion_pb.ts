@@ -27373,6 +27373,16 @@ export class KvEntry extends Message<KvEntry> {
    */
   encrypted = false;
 
+  /**
+   * Set only by ListKv with `include_values`: this manager cannot decrypt
+   * the value right now (its data key is not unwrapped here, see
+   * docs/kv-encryption.md), so `value` is empty. The rest of the list is
+   * unaffected. GetKv fails with the keyring error instead.
+   *
+   * @generated from field: bool locked = 8;
+   */
+  locked = false;
+
   constructor(data?: PartialMessage<KvEntry>) {
     super();
     proto3.util.initPartial(data, this);
@@ -27388,6 +27398,7 @@ export class KvEntry extends Message<KvEntry> {
     { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "encrypted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "locked", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KvEntry {
@@ -46445,6 +46456,17 @@ export class NetPlugin extends Message<NetPlugin> {
    */
   referencedBy: string[] = [];
 
+  /**
+   * Ids of the jobs that reference this plugin in a chain or in an
+   * upstream's handlers: every job that is not stopped, judged by its latest
+   * config, sorted. Jobs the caller may not read (`job:read`) are left out,
+   * so the list can be shorter than what blocks a delete. Filled by
+   * GetNetPlugin and GetNetPluginStatus; empty in list replies.
+   *
+   * @generated from field: repeated string referenced_by_jobs = 10;
+   */
+  referencedByJobs: string[] = [];
+
   constructor(data?: PartialMessage<NetPlugin>) {
     super();
     proto3.util.initPartial(data, this);
@@ -46462,6 +46484,7 @@ export class NetPlugin extends Message<NetPlugin> {
     { no: 7, name: "usable_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "module_checksum", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "referenced_by", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 10, name: "referenced_by_jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetPlugin {

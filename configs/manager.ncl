@@ -178,8 +178,6 @@
     #
     # Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     # by default; the flags exist as escape hatches.
-    # lazy_version_sample: RETIRED (no effect, warns once). Plans now take
-    # their fence epochs from their own capacity snapshot.
     # plan_apply_coalescing = true, # false = one commit/raft propose per plan
     # plan_apply_batch_max = 16,    # max plans per group commit (1-128)
     # Job-intake group commit (docs/scheduler-and-eval-loop.md): concurrent
@@ -378,8 +376,10 @@
 
     # Floor and ceiling on a served interval. Past the ceiling the manager
     # stops backing off and warns instead: the answer is more control plane.
+    # The ceiling stays under the stateful self-fence (selfTerminateAfter,
+    # 90s by default); a ceiling at or past 90s starts with a warning.
     minInterval = "2s",
-    maxInterval = "120s",
+    maxInterval = "55s",
 
     # Headroom in the sizing formula `heartbeatSeconds >= H x N / R`.
     # 2 runs the control plane at half its measured ceiling.
@@ -409,12 +409,6 @@
     # ONLY — never read back as liveness. "0s" disables it entirely, and
     # non-leaders then show no time rather than an approximate one.
     checkpointInterval = "30s",
-
-    # Accumulation window for the heartbeat group commit. "0ms" (the
-    # default) is commit-while-you-can batching. A steady-state heartbeat
-    # does not commit at all, so this applies only to the checkpoint and to
-    # the mixed-version forwarding fallback.
-    # batchWindow = "0ms",
   },
   # Auth & ACLs (on by default; see docs/auth-and-acls.md). At first start
   # the manager mints the initial management token itself and writes it to

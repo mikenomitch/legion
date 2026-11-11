@@ -609,8 +609,6 @@ fn concurrent_scaling_cell(store: &Store, cell: &str) {
         .expect("task")[0]
         .0;
 
-    let metrics = legion::manager::telemetry::metrics();
-    let fallback_before = metrics.scheduler_lazy_sample_fallback_total.get();
     let stop = Arc::new(AtomicBool::new(false));
     let planned = Arc::new(AtomicUsize::new(0));
     let samples: Arc<Mutex<Vec<PlanTimings>>> = Arc::new(Mutex::new(Vec::new()));
@@ -664,17 +662,11 @@ fn concurrent_scaling_cell(store: &Store, cell: &str) {
     });
 
     let samples = samples.lock().unwrap();
-    let fallbacks = metrics.scheduler_lazy_sample_fallback_total.get() - fallback_before;
     let plans = planned.load(Ordering::Relaxed);
     eprintln!(
         "plan_fleet_scaling/concurrent/{cell}: {plans} plans in {SCALING_CONCURRENT_SECS}s \
-         ({:.1}/s), {fallbacks} lazy-sample fallbacks ({:.0}%)",
+         ({:.1}/s)",
         plans as f64 / SCALING_CONCURRENT_SECS as f64,
-        if plans > 0 {
-            100.0 * fallbacks as f64 / plans as f64
-        } else {
-            0.0
-        },
     );
     print_phase_means(&format!("plan_fleet_scaling/concurrent/{cell}"), &samples);
 }

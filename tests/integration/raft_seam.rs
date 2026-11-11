@@ -5,7 +5,8 @@
 //! and routed through `Store::replicated()`, with its body renamed to a
 //! private `<name>_apply` fn (or delegating into another replicated method's
 //! body). These tests make that classification *total*: they parse
-//! `crates/manager/src/storage/store.rs` + `crates/manager/src/storage/acl_store.rs` and assert that the
+//! `crates/manager/src/storage/store.rs`, its `store/*.rs` submodules and
+//! `crates/manager/src/storage/acl_store.rs`, and assert that the
 //! set of `fn <name>_apply` bodies and the set of `replicated(Lane::…, "…")`
 //! call sites exactly match the hardcoded classification below. Adding a
 //! mutating method without classifying it here fails these tests.
@@ -200,6 +201,65 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "update_node_heartbeats",
     "update_task_statuses_for_allocations",
     "upsert_allocation_health_snapshots",
+    // `storage/store/*.rs` submodules (apps, scaling, forks, snapshots,
+    // suspend, sessions, gangs, the keyring, forget). `partial` is the
+    // rollback test's op in `read_model_check.rs`.
+    "abandon_resume",
+    "apply_scale_write",
+    "apply_snapshot_report",
+    "begin_fork",
+    "begin_suspend",
+    "clear_gang_waits_for_job",
+    "clear_reschedule_holds_for_job",
+    "clear_scaling_pause",
+    "close_scaling_action",
+    "create_keyed_instances_from_snapshot",
+    "create_snapshot",
+    "delete_app_object",
+    "delete_snapshot",
+    "delete_snapshot_alias",
+    "expire_app_object_cleanups",
+    "expire_snapshots",
+    "forget_node",
+    "gang_member_lost",
+    "gc_retired_keys",
+    "group_commit",
+    "initialize_keyring",
+    "mark_node_snapshots_lost",
+    "mint_checkpoint_key",
+    "open_scaling_action",
+    "partial",
+    "promote_session",
+    "prune_app_object_status_orphans",
+    "prune_plan_submissions",
+    "put_app_object",
+    "put_scaling_defaults",
+    "record_scale_history",
+    "release_app_object",
+    "remove_failed_allocation",
+    "reset_keyring",
+    "restore_keyed_instance",
+    "resume_manifest_only_instance",
+    "resume_suspended_instance",
+    "rewrap_kv_batch",
+    "rewrap_root_key",
+    "rotate_data_key",
+    "run_data_migrations",
+    "set_scaling_pause",
+    "set_snapshot_alias",
+    "spend_unused_fork_snapshots",
+    "sweep_object_scaling_state",
+    "sync_object_kinds",
+    "unblock_evals",
+    "update_app_object_status",
+    "wake_timed_out_gangs",
+    // Child sessions and resize.
+    "create_keyed_child_instance",
+    "end_orphaned_keyed_children",
+    "set_task_resize",
+    "clear_task_resize",
+    "set_instance_size",
+    "replace_allocations_for_resize",
 ];
 
 /// Replicated public methods with no same-named `_apply` fn — either
@@ -245,6 +305,67 @@ const DELEGATED_BODIES: &[&str] = &[
     // update_node_heartbeats_apply with the batched form.
     "submit_and_apply_plans",
     "update_node_heartbeat",
+    // Submodule ops whose closure inlines its statements or composes other
+    // bodies (see SHARED_APPLY_BODIES for the bodies with no op of their
+    // own name).
+    "apply_scale_write",
+    "clear_gang_waits_for_job",
+    "clear_reschedule_holds_for_job",
+    "clear_scaling_pause",
+    "close_scaling_action",
+    "create_keyed_instances_from_snapshot",
+    "delete_app_object",
+    "delete_snapshot_alias",
+    "expire_app_object_cleanups",
+    "gang_member_lost",
+    "gc_retired_keys",
+    "group_commit",
+    "initialize_keyring",
+    "mark_node_snapshots_lost",
+    "mint_checkpoint_key",
+    "open_scaling_action",
+    "partial",
+    "prune_app_object_status_orphans",
+    "put_app_object",
+    "put_scaling_defaults",
+    "record_scale_history",
+    "release_app_object",
+    "reset_keyring",
+    "resume_manifest_only_instance",
+    "resume_suspended_instance",
+    "rewrap_root_key",
+    "rotate_data_key",
+    "run_data_migrations",
+    "set_scaling_pause",
+    "set_snapshot_alias",
+    "spend_unused_fork_snapshots",
+    "sweep_object_scaling_state",
+    "sync_object_kinds",
+    "update_app_object_status",
+    "wake_timed_out_gangs",
+    // Child sessions and resize: inlined statements or composed bodies.
+    "end_orphaned_keyed_children",
+    "set_task_resize",
+    "clear_task_resize",
+    "set_instance_size",
+    "replace_allocations_for_resize",
+];
+
+/// `_apply` bodies that no op is named after: each is called from the
+/// closure of a classified op with a different name, so it has no lane of
+/// its own (`resize_envelope_apply` runs inside the scheduler lane's
+/// `group_commit` op, the two gang bodies inside `gang_member_lost`,
+/// `insert_first_keyring_row_apply` inside `initialize_keyring`,
+/// `resize_allocation_apply` inside `group_commit`, and
+/// `cascade_keyed_children_apply` inside the job stop and destroy bodies and
+/// `end_orphaned_keyed_children`).
+const SHARED_APPLY_BODIES: &[&str] = &[
+    "decide_gang_loss",
+    "insert_first_keyring_row",
+    "resize_envelope",
+    "stop_failed_gang_job",
+    "cascade_keyed_children",
+    "resize_allocation",
 ];
 
 /// Public mutating methods that are deliberately NOT replicated — they route
@@ -321,7 +442,32 @@ fn lane_for(method: &str) -> Lane {
         | "upsert_acl_policy"
         | "upsert_acl_user"
         | "upsert_manager_config"
-        | "upsert_saved_state_query" => Lane::Control,
+        | "upsert_saved_state_query"
+        | "set_task_resize"
+        | "clear_task_resize"
+        | "apply_scale_write"
+        | "clear_scaling_pause"
+        | "close_scaling_action"
+        | "delete_app_object"
+        | "expire_app_object_cleanups"
+        | "forget_node"
+        | "gc_retired_keys"
+        | "initialize_keyring"
+        | "mint_checkpoint_key"
+        | "open_scaling_action"
+        | "partial"
+        | "put_app_object"
+        | "put_scaling_defaults"
+        | "record_scale_history"
+        | "release_app_object"
+        | "reset_keyring"
+        | "rewrap_kv_batch"
+        | "rewrap_root_key"
+        | "rotate_data_key"
+        | "run_data_migrations"
+        | "set_scaling_pause"
+        | "sweep_object_scaling_state"
+        | "sync_object_kinds" => Lane::Control,
         "append_rollout_event"
         | "apply_allocation_plan"
         | "complete_evals"
@@ -375,7 +521,35 @@ fn lane_for(method: &str) -> Lane {
         | "upsert_instance"
         | "delete_volume"
         | "mark_volume_destroyed"
-        | "sync_task_volume_claims" => Lane::Scheduler,
+        | "sync_task_volume_claims"
+        | "create_keyed_child_instance"
+        | "end_orphaned_keyed_children"
+        | "set_instance_size"
+        | "replace_allocations_for_resize"
+        | "abandon_resume"
+        | "apply_snapshot_report"
+        | "begin_fork"
+        | "begin_suspend"
+        | "clear_gang_waits_for_job"
+        | "clear_reschedule_holds_for_job"
+        | "create_keyed_instances_from_snapshot"
+        | "create_snapshot"
+        | "delete_snapshot"
+        | "delete_snapshot_alias"
+        | "expire_snapshots"
+        | "gang_member_lost"
+        | "group_commit"
+        | "mark_node_snapshots_lost"
+        | "promote_session"
+        | "prune_plan_submissions"
+        | "remove_failed_allocation"
+        | "restore_keyed_instance"
+        | "resume_manifest_only_instance"
+        | "resume_suspended_instance"
+        | "set_snapshot_alias"
+        | "spend_unused_fork_snapshots"
+        | "unblock_evals"
+        | "wake_timed_out_gangs" => Lane::Scheduler,
         "checkpoint_node_heartbeats"
         | "destroy_job_status_cleanup"
         | "emit_event"
@@ -396,7 +570,9 @@ fn lane_for(method: &str) -> Lane {
         | "update_node_heartbeat"
         | "update_node_heartbeats"
         | "update_task_statuses_for_allocations"
-        | "upsert_allocation_health_snapshots" => Lane::Status,
+        | "upsert_allocation_health_snapshots"
+        | "prune_app_object_status_orphans"
+        | "update_app_object_status" => Lane::Status,
         other => panic!(
             "mutating store method `{other}` is not classified into a raft lane; \
              add it to CLASSIFIED_MUTATIONS and lane_for in tests/integration/raft_seam.rs"
@@ -406,11 +582,25 @@ fn lane_for(method: &str) -> Lane {
 
 fn store_sources() -> String {
     let root = env!("CARGO_MANIFEST_DIR");
+    let mut paths = vec![
+        "crates/manager/src/storage/store.rs".to_string(),
+        "crates/manager/src/storage/acl_store.rs".to_string(),
+    ];
+    // `store.rs`'s submodules hold `impl Store` blocks too.
+    let submodules = "crates/manager/src/storage/store";
+    let mut entries: Vec<String> = std::fs::read_dir(format!("{root}/{submodules}"))
+        .unwrap_or_else(|e| panic!("failed listing {submodules}: {e}"))
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    entries.sort();
+    paths.extend(
+        entries
+            .into_iter()
+            .map(|name| format!("{submodules}/{name}")),
+    );
     let mut combined = String::new();
-    for path in [
-        "crates/manager/src/storage/store.rs",
-        "crates/manager/src/storage/acl_store.rs",
-    ] {
+    for path in paths {
         combined.push_str(
             &std::fs::read_to_string(format!("{root}/{path}"))
                 .unwrap_or_else(|e| panic!("failed reading {path}: {e}")),
@@ -428,7 +618,7 @@ fn diff(label_missing: &str, missing: &BTreeSet<&str>, label_extra: &str, extra:
 }
 
 /// The hardcoded classification exactly matches the set of `fn <name>_apply`
-/// bodies in store.rs + acl_store.rs: every classified or local-write method
+/// bodies in store.rs, its submodules and acl_store.rs: every classified or local-write method
 /// (except the documented delegating ones) has an `_apply` body, and every
 /// `_apply` body is classified or a documented local-write body.
 #[test]
@@ -439,7 +629,17 @@ fn apply_fn_set_matches_classification() {
         .captures_iter(&source)
         .map(|caps| caps[1].to_string())
         .collect();
-    let found: BTreeSet<&str> = found.iter().map(String::as_str).collect();
+    let found: BTreeSet<&str> = found
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !SHARED_APPLY_BODIES.contains(name))
+        .collect();
+    for name in SHARED_APPLY_BODIES {
+        assert!(
+            source.contains(&format!("fn {name}_apply")),
+            "SHARED_APPLY_BODIES entry `{name}` has no `_apply` body in the source"
+        );
+    }
 
     let delegated: BTreeSet<&str> = DELEGATED_BODIES.iter().copied().collect();
     let local: BTreeSet<&str> = LOCAL_WRITE_MUTATIONS.iter().copied().collect();

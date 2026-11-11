@@ -281,7 +281,7 @@ fn exec_session_benchmark() {
                 "runtime": "exec",
                 "lifecycle": "service",
                 "config": { "command": ["sleep", "3600"] },
-                "resources": { "cpus": 0.1, "memory": 32 },
+                "resources": { "cpu": 100, "memory": 32 },
             },
         })
         .to_string(),

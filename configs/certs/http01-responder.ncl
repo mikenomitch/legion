@@ -47,6 +47,6 @@
         timeout = "2s",
       },
     ],
-    resources = { cpus = 0.05, memory = 32 },
+    resources = { cpu = 50, memory = 32 },
   },
 }

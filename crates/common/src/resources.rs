@@ -35,13 +35,13 @@ pub struct ResourcePolicy {
 
 impl ResourcePolicy {
     pub fn from_manager_config(config: &ManagerConfigFull) -> R<Self> {
-        let mut defaults = match config.task_resource_defaults.as_ref() {
+        let defaults = match config.task_resource_defaults.as_ref() {
             Some(Value::Object(map)) => map.clone(),
             Some(_) => bail!("task_resource_defaults must be an object"),
             None => default_task_resource_defaults(),
         };
 
-        normalize_cpu_aliases(&mut defaults)?;
+        reject_cpus_key(&defaults, "taskResourceDefaults")?;
 
         if defaults.contains_key("cpu") && defaults.contains_key("cores") {
             bail!("task_resource_defaults cannot set both cpu and cores");
@@ -63,28 +63,17 @@ impl ResourcePolicy {
             _ => bail!("task resources must be an object"),
         };
 
-        let has_cpu = map.contains_key("cpu") || map.contains_key("cpus");
+        reject_cpus_key(&map, "task resources")?;
+        let has_cpu = map.contains_key("cpu");
         let has_cores = map.contains_key("cores");
-
-        if map.contains_key("cpu") && map.contains_key("cpus") {
-            bail!("task resources cannot define both cpu and cpus");
-        }
 
         if has_cpu && has_cores {
             bail!("task resources cannot define both cpu and cores");
         }
 
         let mut normalized = self.task_defaults.clone();
-        normalize_cpu_aliases(&mut normalized)?;
-
-        if map.contains_key("cpus") {
-            normalized.insert("cpu".to_string(), map["cpus"].clone());
-        }
 
         for (key, value) in map {
-            if key == "cpus" {
-                continue;
-            }
             normalized.insert(key, value);
         }
 
@@ -273,15 +262,15 @@ fn default_task_resource_defaults() -> Map<String, Value> {
     defaults
 }
 
-fn normalize_cpu_aliases(resources: &mut Map<String, Value>) -> R<()> {
-    if resources.contains_key("cpu") && resources.contains_key("cpus") {
-        bail!("resources cannot include both cpu and cpus");
+/// `cpus` was an alias for `cpu` (MHz) that read like a CPU count. It is
+/// refused by name rather than left to become a custom resource no node has.
+fn reject_cpus_key(resources: &Map<String, Value>, what: &str) -> R<()> {
+    if resources.contains_key("cpus") {
+        bail!(
+            "{what} set `cpus`, which is not a resource\nHint: use `cpu` for a CPU share in \
+             MHz (cpu = 500 is about half a 1 GHz core), or `cores` for whole exclusive CPUs"
+        );
     }
-
-    if let Some(cpus) = resources.remove("cpus") {
-        resources.insert("cpu".to_string(), cpus);
-    }
-
     Ok(())
 }
 
@@ -470,11 +459,27 @@ mod tests {
     }
 
     #[test]
-    fn resource_defaults_apply_with_aliases() -> R<()> {
+    fn resource_defaults_apply_and_cpus_is_refused() -> R<()> {
+        let aliased = ManagerConfigFull {
+            task_resource_defaults: Some(json!({ "memory": 512, "cpus": 200 })),
+            ..Default::default()
+        };
+        let err = ResourcePolicy::from_manager_config(&aliased)
+            .map(|_| ())
+            .expect_err("cpus is not a resource");
+        assert!(
+            err.to_string().contains("taskResourceDefaults set `cpus`"),
+            "{err}"
+        );
+        let err = ResourcePolicy::from_manager_config(&ManagerConfigFull::default())?
+            .normalize_task_resources(&json!({ "cpus": 1 }), true)
+            .expect_err("cpus is not a resource");
+        assert!(err.to_string().contains("use `cpu`"), "{err}");
+
         let config = ManagerConfigFull {
             task_resource_defaults: Some(json!({
                 "memory": 512,
-                "cpus": 200,
+                "cpu": 200,
             })),
             ..Default::default()
         };

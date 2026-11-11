@@ -359,7 +359,8 @@ the Access page reports it instead.
   is disabled while this manager is the only settled voter.
 - `components/LogViewer.tsx`: the live task log tail, with stream and
   allocation filters and **Find in logs** (case-insensitive, hits
-  highlighted, "N of M lines match").
+  highlighted, "N of M lines match"). On a whole job, **Removed** also
+  reads the allocations removed in the last 24 hours.
 - `TestingUtils.tsx`: unlisted (`/testing`), lazy-loaded. Renders the
   usage, pressure, instance (suspended, idle countdown, last stop, forks),
   snapshot (published, named, fork and suspend checkpoints), and content

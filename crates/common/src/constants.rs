@@ -148,7 +148,13 @@ pub const DEF_MISSED_BEATS_BEFORE_LOST: u32 = 5;
 pub const DEF_HEARTBEAT_MIN_INTERVAL_SEC: u64 = 2;
 /// Ceiling on a manager-served interval: past this the manager stops backing
 /// off and warns instead, because the answer is more control plane.
-pub const DEF_HEARTBEAT_MAX_INTERVAL_SEC: u64 = 120;
+///
+/// 55s, not the ladder's top rung, so the default stays under the stateful
+/// self-fence (`DEFAULT_SELF_TERMINATE_AFTER`, 90s): a worker beating every
+/// 55s still has about 30 seconds of retries before it would kill its
+/// stateful tasks. A higher `heartbeat.maxInterval` is accepted with a
+/// startup warning.
+pub const DEF_HEARTBEAT_MAX_INTERVAL_SEC: u64 = 55;
 /// Default aggregate heartbeat rate the manager sizes adaptive cadence for
 /// (`heartbeat.targetRatePerSecond`). With the default headroom of 2 the
 /// interval is `ceil(N / 1250)` seconds, so every fleet up to 2,500 nodes

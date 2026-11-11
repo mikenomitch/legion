@@ -1338,6 +1338,7 @@ fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotRepo
                 allocation_id,
                 ok,
                 error,
+                duration_ms,
             } => {
                 store.events().snapshot_restore(
                     &snapshot_id,
@@ -1347,6 +1348,7 @@ fn apply_one_snapshot_report(store: &Store, node_id: &str, report: &SnapshotRepo
                     allocation_id,
                     ok,
                     &error,
+                    duration_ms,
                 );
             }
             SnapshotReportOutcome::Forked {

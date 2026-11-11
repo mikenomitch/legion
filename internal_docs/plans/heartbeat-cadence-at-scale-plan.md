@@ -1119,7 +1119,9 @@ widening, and old managers neither serve nor relay one.
 
 - **The served interval is not checked against `selfTerminateAfter`.** At the
   default rate the 89s rung arrives past ~68,750 nodes, where a healthy
-  worker can fence between beats (calls entry 14, `internal_docs/TODO.md`).
+  worker can fence between beats (calls entry 14). *Closed 2026-11-10:* the
+  default `maxInterval` is 55s and a ceiling at or past 90s warns at startup
+  ([todo-closeout calls #1](../calls/todo-closeout-2026-11-10_calls.md)).
 - **The AWS adaptive-on reproduction**, now against the default rather than
   `R = 80`: served interval, freshness, and scheduler throughput at 10k and
   20k nodes, before and after.

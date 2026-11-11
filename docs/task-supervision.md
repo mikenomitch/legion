@@ -210,7 +210,7 @@ With this on, a Linux worker partitions the node into `legion/share` and
 | --- | --- |
 | `resources.memory` (MiB) | a hard `memory.max`, with swap pinned equal to it |
 | `resources.cores` (whole CPUs) | exclusive pinned CPUs (`cpuset.cpus`), removed from every other governed task's set |
-| `resources.cpu` (MHz, alias `cpus`) | proportional `cpu.weight` under contention |
+| `resources.cpu` (MHz) | proportional `cpu.weight` under contention |
 
 Enforcement is on by default, so declare `resources.memory` as what the task
 really needs: a task that uses more is OOM-killed. Set

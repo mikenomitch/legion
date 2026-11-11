@@ -7515,6 +7515,7 @@ impl Store {
             created_at: row.get(4)?,
             updated_at: row.get(5)?,
             encrypted: enc_key_id.is_some(),
+            locked: false,
         };
 
         Ok(KvRaw { entry, enc_key_id })
@@ -13751,7 +13752,6 @@ impl Store {
             let n = params.len() + 1;
             clauses.push(format!(
                 "(json_extract(metadata_json, '$.instanceId') = ?{n}
-                  OR json_extract(metadata_json, '$.instance_id') = ?{n}
                   OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.instances') WHERE value = ?{n})
                   OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.suspending') WHERE value = ?{n})
                   OR allocation_id IN (SELECT id FROM allocation WHERE instance_id = ?{n})
@@ -20620,6 +20620,7 @@ impl Store {
                 created_at: existing.created_at,
                 updated_at: now,
                 encrypted: enc_key_id.is_some(),
+                locked: false,
             }
         } else {
             if let Some(expected) = expected_version {
@@ -20651,6 +20652,7 @@ impl Store {
                 created_at: now.clone(),
                 updated_at: now,
                 encrypted: enc_key_id.is_some(),
+                locked: false,
             }
         };
 
@@ -20692,6 +20694,44 @@ impl Store {
             .into_iter()
             .map(|raw| self.kv_entry_from_raw(raw))
             .collect()
+    }
+
+    /// [`Store::list_kv`] for a caller who may read only the keys `allow`
+    /// accepts, tolerating values this manager cannot decrypt: such an entry
+    /// comes back with an empty `value` and `locked` set, and the rest of
+    /// the list is unaffected. Keys `allow` refuses are never decrypted, so
+    /// a locked value the caller could not read anyway costs nothing. Any
+    /// other decrypt failure (a corrupt row) still fails the call.
+    #[instrument(err, skip_all)]
+    pub fn list_kv_marking_locked(
+        &self,
+        prefix: &str,
+        allow: impl Fn(&str) -> bool,
+    ) -> R<Vec<KvEntry>> {
+        let mut entries = Vec::new();
+        for raw in self.list_kv_raw(prefix)? {
+            if !allow(&raw.entry.key) {
+                continue;
+            }
+            let sealed = raw.entry.clone();
+            match self.kv_entry_from_raw(raw) {
+                Ok(entry) => entries.push(entry),
+                Err(err)
+                    if matches!(
+                        StorageError::from_anyhow(&err),
+                        Some(StorageError::KeyringLocked { .. })
+                    ) =>
+                {
+                    entries.push(KvEntry {
+                        value: String::new(),
+                        locked: true,
+                        ..sealed
+                    });
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(entries)
     }
 
     /// [`Store::list_kv`] without the values: every entry comes back with an
@@ -21971,10 +22011,16 @@ impl Store {
     pub fn sync_missing_task_volume_claims(&self) -> R<u64> {
         let candidates: Vec<(String, String)> = {
             let conn = self.read_connection()?;
+            // Only jobs whose latest config declares a volume: `volumes` is
+            // NULL for a task that declares none, so the common case (no
+            // job mounts anything) is one query and no per-job config read.
             let mut stmt = conn.prepare(&format!(
                 "SELECT j.id, {LATEST_CONFIG_FOR_JOB}
                  FROM job j
-                 WHERE j.status NOT IN ('stopped', 'failed');"
+                 WHERE j.status NOT IN ('stopped', 'failed')
+                   AND EXISTS (SELECT 1 FROM task_config tc
+                               WHERE tc.job_config_id = {LATEST_CONFIG_FOR_JOB}
+                                 AND tc.volumes IS NOT NULL);"
             ))?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -29541,7 +29587,7 @@ mod tests {
             store.emit_event(draft);
         };
         emit("instance.suspended", json!({ "instanceId": "box-1" }), None);
-        emit("node.pressure", json!({ "instance_id": "box-1" }), None);
+        emit("node.pressure", json!({ "instanceId": "box-1" }), None);
         emit(
             "instance.forked",
             json!({ "instanceId": "box-0", "instances": ["box-1"] }),

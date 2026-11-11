@@ -45,6 +45,9 @@ export default function LogViewer(props: LogViewerProps) {
   const [follow, setFollow] = createSignal(true)
   const [wrap, setWrap] = createSignal(true)
   const [paused, setPaused] = createSignal(false)
+  // Also read the job's recently removed allocations. Off by default: the
+  // manager already returns them when the job has no live allocation.
+  const [showRemoved, setShowRemoved] = createSignal(false)
   const [lastUpdated, setLastUpdated] = createSignal<number | undefined>()
   const [error, setError] = createSignal<string>('')
   const [truncated, setTruncated] = createSignal(false)
@@ -90,6 +93,7 @@ export default function LogViewer(props: LogViewerProps) {
         tail: true,
         maxBytes: BigInt(WINDOW_BYTES),
         offset: BigInt(0),
+        includeRemoved: showRemoved(),
       })
       setError('')
       setLastUpdated(Date.now())
@@ -155,6 +159,7 @@ export default function LogViewer(props: LogViewerProps) {
   // Restart the incremental read when filters change so offsets are consistent.
   createEffect(() => {
     streamFilter()
+    showRemoved()
     offsets.clear()
     partials.clear()
     setLines([])
@@ -271,6 +276,20 @@ export default function LogViewer(props: LogViewerProps) {
             <option value="all">All allocations</option>
             <For each={allocOptions()}>{(id) => <option value={id}>alloc #{id}</option>}</For>
           </select>
+        </Show>
+
+        <Show when={singleAlloc() === undefined}>
+          <label
+            class="flex items-center gap-1.5 text-xs text-muted"
+            title="Also show allocations removed in the last 24 hours (the newest 10), after the live ones"
+          >
+            <input
+              type="checkbox"
+              checked={showRemoved()}
+              onChange={(e) => setShowRemoved(e.currentTarget.checked)}
+            />
+            Removed
+          </label>
         </Show>
 
         <div class="relative min-w-[12rem] flex-1">

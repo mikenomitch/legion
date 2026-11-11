@@ -14,6 +14,6 @@
     config = {
       command = ["sh", "-c", "while true; do echo \"heartbeat from $(hostname)\"; sleep 30; done"],
     },
-    resources = { cpus = 0.05, memory = 32 },
+    resources = { cpu = 50, memory = 32 },
   },
 }

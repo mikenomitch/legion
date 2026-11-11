@@ -331,6 +331,17 @@ export const INSTANCE_COLUMNS: InstanceColumn[] = [
             </div>
           )}
         </Show>
+        <Show when={row().instance.guestAddress}>
+          {(address) => (
+            <div
+              class="text-2xs text-faint"
+              title="This TAP-wired sandbox's guest address on its node's bridge. Reachable from that node and from whatever the bridge is routed to."
+            >
+              guest {address()}
+              <Show when={row().instance.guestBridge}>{(bridge) => <> on {bridge()}</>}</Show>
+            </div>
+          )}
+        </Show>
       </div>
     ),
   },

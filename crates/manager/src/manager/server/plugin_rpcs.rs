@@ -133,9 +133,10 @@ impl ManagerDaemonService {
         &self,
         request: Request<GetNetPluginRequest>,
     ) -> Result<Response<GetNetPluginReply>, Status> {
-        self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let identity =
+            self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
         let name = request.into_inner().name;
-        let plugin = self.described_plugin(&name)?;
+        let plugin = self.described_plugin(&identity, &name)?;
         Ok(Response::new(GetNetPluginReply {
             plugin: Some(plugin),
         }))
@@ -192,6 +193,20 @@ impl ManagerDaemonService {
                     .join(", ")
             )));
         }
+        let jobs = self.jobs_using_plugin(&name)?;
+        if !jobs.is_empty() {
+            let (readable, hidden): (Vec<&String>, Vec<&String>) = jobs.iter().partition(|job| {
+                identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job))
+            });
+            let mut named: Vec<String> = readable.iter().map(|job| format!("'{job}'")).collect();
+            if !hidden.is_empty() {
+                named.push(format!("{} job(s) you cannot read", hidden.len()));
+            }
+            return Err(Status::failed_precondition(format!(
+                "net plugin '{name}' is used by job(s) {}; update or stop them first",
+                named.join(", ")
+            )));
+        }
         self.store
             .delete_net_plugin(&name)
             .map_err(|e| map_store_error("Error deleting net plugin", e))?;
@@ -203,9 +218,10 @@ impl ManagerDaemonService {
         &self,
         request: Request<GetNetPluginStatusRequest>,
     ) -> Result<Response<GetNetPluginStatusReply>, Status> {
-        self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let identity =
+            self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
         let name = request.into_inner().name;
-        let plugin = self.described_plugin(&name)?;
+        let plugin = self.described_plugin(&identity, &name)?;
         let mut nodes: Vec<NetPluginNodeStatus> = self
             .net_plugin_status
             .lock()
@@ -229,8 +245,13 @@ impl ManagerDaemonService {
         }))
     }
 
-    /// One plugin with `referenced_by` filled, or NotFound.
-    fn described_plugin(&self, name: &str) -> Result<NetPlugin, Status> {
+    /// One plugin with `referenced_by` and `referenced_by_jobs` filled, or
+    /// NotFound. Jobs the caller cannot read are left out.
+    fn described_plugin(
+        &self,
+        identity: &crate::structs::AclIdentity,
+        name: &str,
+    ) -> Result<NetPlugin, Status> {
         let record = self
             .store
             .get_net_plugin(name)
@@ -242,7 +263,42 @@ impl ManagerDaemonService {
             .into_iter()
             .map(|p| p.name)
             .collect();
+        plugin.referenced_by_jobs = self
+            .jobs_using_plugin(name)?
+            .into_iter()
+            .filter(|job| identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job)))
+            .collect();
         Ok(plugin)
+    }
+
+    /// Ids of the jobs that are not stopped and whose latest config names
+    /// the plugin in a chain or an upstream's handlers, sorted. A stopped
+    /// job is checked when it is next run.
+    fn jobs_using_plugin(&self, name: &str) -> Result<Vec<String>, Status> {
+        let jobs = self
+            .store
+            .get_jobs()
+            .map_err(|e| map_store_error("Error listing jobs", e))?;
+        let mut using = Vec::new();
+        for job in jobs.iter().filter(|job| job.status != "stopped") {
+            let Some(config) = self
+                .store
+                .get_job_config_optional(&job.id)
+                .map_err(|e| map_store_error("Error loading job config", e))?
+            else {
+                continue;
+            };
+            if config
+                .tasks
+                .iter()
+                .flat_map(job_plugin_hops)
+                .any(|hop| hop.reference.name == name)
+            {
+                using.push(job.id.clone());
+            }
+        }
+        using.sort();
+        Ok(using)
     }
 
     /// Stored policy objects whose chains reference `name`.
@@ -555,6 +611,7 @@ fn net_plugin_to_proto(
         usable_by: object.usable_by.clone(),
         module_checksum: object.module.checksum.clone(),
         referenced_by: Vec::new(),
+        referenced_by_jobs: Vec::new(),
     }
 }
 

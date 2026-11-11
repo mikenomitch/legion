@@ -740,6 +740,8 @@ pub struct Metrics {
     pub evals_processed_total: Arc<CounterVec>,
     /// `legion_eval_queue_depth`
     pub eval_queue_depth: Arc<Gauge>,
+    /// `legion_log_dropped_lines_total{sink}`
+    pub log_dropped_lines_total: Arc<CounterVec>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
     /// `legion_eval_claim_total{outcome}`
@@ -886,6 +888,8 @@ pub struct Metrics {
     pub runtime_spawn_delay_seconds: Arc<Histogram>,
     /// `legion_runtime_worker_threads`
     pub runtime_worker_threads: Arc<Gauge>,
+    /// `process_resident_memory_bytes`
+    pub process_resident_memory_bytes: Arc<Gauge>,
     /// `legion_keyring_unlocked`
     pub keyring_unlocked: Arc<Gauge>,
     /// `legion_keyring_keys{state}`
@@ -944,8 +948,6 @@ pub struct Metrics {
     pub scheduler_index_maintenance_seconds: Arc<Histogram>,
     /// `legion_scheduler_plan_phase_seconds{phase}`
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
-    /// `legion_scheduler_lazy_sample_fallback_total`
-    pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
     /// `legion_scheduler_node_list_rebuilds_total`
     pub scheduler_node_list_rebuilds_total: Arc<Counter>,
     /// `legion_eval_phase_seconds{kind,phase}`
@@ -1045,6 +1047,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let log_dropped_lines_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_log_dropped_lines_total",
+                help: "Log lines this manager process dropped because a sink's buffer was full, by sink (console|file|traces). A server's log writers never block the thread that logs; a reader that falls behind (journald, a container runtime, a slow disk) costs lines instead.",
+                labels: &["sink"],
+            },
+            series: Series::new(),
         });
         let plan_apply_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1546,7 +1556,7 @@ impl Metrics {
         let runtime_spawn_delay_seconds = Arc::new(Histogram {
             meta: FamilyMeta {
                 name: "legion_runtime_spawn_delay_seconds",
-                help: "Probe: wall-clock from tokio::spawn to that task's first poll, sampled once a second. Microseconds on a healthy runtime; milliseconds mean every worker thread is busy or blocked, which shows up as latency on EVERY handler including trivial ones.",
+                help: "Probe: wall-clock from a once-a-second timer deadline to the first poll of a task the woken probe spawns. Microseconds on a healthy runtime; milliseconds mean every worker thread is busy or blocked, which shows up as latency on EVERY handler including trivial ones.",
                 labels: &[],
             },
             cell: HistogramCell::new(SCHEDULER_DELAY_BUCKETS),
@@ -1555,6 +1565,14 @@ impl Metrics {
             meta: FamilyMeta {
                 name: "legion_runtime_worker_threads",
                 help: "Tokio worker threads in this manager's runtime — the ceiling on concurrent blocking handlers, and the denominator for legion_grpc_in_flight.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let process_resident_memory_bytes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "process_resident_memory_bytes",
+                help: "Resident set size of this manager process in bytes, read from /proc/self/status at scrape time. Linux only; 0 elsewhere.",
                 labels: &[],
             },
             cell: GaugeCell::default(),
@@ -1800,14 +1818,6 @@ impl Metrics {
             series: Series::new(),
         });
 
-        let scheduler_lazy_sample_fallback_total = Arc::new(Counter {
-            meta: FamilyMeta {
-                name: "legion_scheduler_lazy_sample_fallback_total",
-                help: "Plans that re-ran with the eager epoch sample because the read model changed mid-plan.",
-                labels: &[],
-            },
-            cell: CounterCell::default(),
-        });
         let scheduler_node_list_rebuilds_total = Arc::new(Counter {
             meta: FamilyMeta {
                 name: "legion_scheduler_node_list_rebuilds_total",
@@ -2083,6 +2093,7 @@ impl Metrics {
             Arc::clone(&object_status_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&log_dropped_lines_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
@@ -2122,6 +2133,7 @@ impl Metrics {
             Arc::clone(&cluster_ca_provider_calls_total) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_spawn_delay_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_worker_threads) as Arc<dyn RenderMetric>,
+            Arc::clone(&process_resident_memory_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
@@ -2129,7 +2141,6 @@ impl Metrics {
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
-            Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_node_list_rebuilds_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_phase_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_round_seconds) as Arc<dyn RenderMetric>,
@@ -2149,6 +2160,7 @@ impl Metrics {
             grpc_in_flight,
             evals_processed_total,
             eval_queue_depth,
+            log_dropped_lines_total,
             plan_apply_total,
             eval_claim_total,
             eval_handle_seconds,
@@ -2212,6 +2224,7 @@ impl Metrics {
             store_coalesce_wait_rounds_total,
             runtime_spawn_delay_seconds,
             runtime_worker_threads,
+            process_resident_memory_bytes,
             keyring_unlocked,
             keyring_keys,
             keyring_active_key_age_seconds,
@@ -2241,7 +2254,6 @@ impl Metrics {
             scheduler_index_shadow_total,
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
-            scheduler_lazy_sample_fallback_total,
             scheduler_node_list_rebuilds_total,
             eval_phase_seconds,
             eval_queue_round_seconds,
@@ -2281,10 +2293,41 @@ pub fn metrics() -> &'static Metrics {
 /// Renders every registered family in the Prometheus text exposition format.
 pub fn render() -> String {
     let mut out = String::with_capacity(4096);
+    sync_dropped_log_lines(&metrics().log_dropped_lines_total);
+    if let Some(bytes) = resident_memory_bytes() {
+        metrics().process_resident_memory_bytes.set(bytes as i64);
+    }
     for family in &metrics().families {
         family.render_into(&mut out);
     }
     out
+}
+
+/// Bring a registry's dropped-log-lines counter up to the log writers' own
+/// counts. The writers count drops themselves (they cannot call back into a
+/// registry from the logging path), so the counter is advanced at scrape
+/// time by whatever it is behind.
+fn sync_dropped_log_lines(counter: &CounterVec) {
+    for (sink, dropped) in crate::tracing_util::dropped_log_lines() {
+        let seen = counter.get(&[sink]);
+        if dropped > seen {
+            counter.inc_by(&[sink], dropped - seen);
+        }
+    }
+}
+
+/// This process's resident set size in bytes, or `None` where it cannot be
+/// read (anything but Linux). It is `VmRSS` from `/proc/self/status`, which
+/// the kernel reports in kB, so no page size is needed.
+pub fn resident_memory_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_vm_rss_bytes(&status)
+}
+
+fn parse_vm_rss_bytes(status: &str) -> Option<u64> {
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// Structured snapshots of every family in every registry this process has
@@ -2320,6 +2363,8 @@ pub fn snapshot_initialized_families() -> Vec<FamilySnapshot> {
 /// series are deliberately not exported; at 1,250 nodes per host that is a
 /// cardinality bomb, and the manager already holds the per-node view.
 pub struct WorkerMetrics {
+    /// `legion_worker_log_dropped_lines_total{sink}`
+    pub log_dropped_lines_total: Arc<CounterVec>,
     /// `legion_worker_heartbeats_total{outcome}`
     pub heartbeats_total: Arc<CounterVec>,
     /// `legion_worker_heartbeat_duration_seconds`
@@ -2445,6 +2490,14 @@ pub struct WorkerMetrics {
 
 impl WorkerMetrics {
     fn new() -> Self {
+        let log_dropped_lines_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_log_dropped_lines_total",
+                help: "Log lines this worker process dropped because a sink's buffer was full, by sink (console|file|traces). A worker's log writers never block the thread that logs, so a console reader that falls behind costs lines, not heartbeats.",
+                labels: &["sink"],
+            },
+            series: Series::new(),
+        });
         let heartbeats_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_heartbeats_total",
@@ -2789,6 +2842,7 @@ impl WorkerMetrics {
             Arc::clone(&net_plugin_callback_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&net_plugin_metric) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&log_dropped_lines_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
@@ -2820,6 +2874,7 @@ impl WorkerMetrics {
         ];
 
         WorkerMetrics {
+            log_dropped_lines_total,
             heartbeats_total,
             heartbeat_duration_seconds,
             allocations_running,
@@ -2874,6 +2929,7 @@ pub fn worker_metrics() -> &'static WorkerMetrics {
 /// Renders the worker registry in the Prometheus text exposition format.
 pub fn render_worker() -> String {
     let mut out = String::with_capacity(1024);
+    sync_dropped_log_lines(&worker_metrics().log_dropped_lines_total);
     for family in &worker_metrics().families {
         family.render_into(&mut out);
     }
@@ -2891,8 +2947,9 @@ const RUNTIME_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 
 /// Start the runtime saturation probe on the current tokio runtime.
 ///
-/// Every second it spawns a task that does nothing but record how long it
-/// waited to be polled (`legion_runtime_spawn_delay_seconds`), and it
+/// Every second a timer readies it, and it records how long past that
+/// deadline a task it spawns is first polled
+/// (`legion_runtime_spawn_delay_seconds`), and it
 /// publishes the runtime's worker-thread count once
 /// (`legion_runtime_worker_threads`).
 ///
@@ -2912,12 +2969,17 @@ pub fn start_runtime_probe() {
         // not be handed a backlog of probe spawns to catch up on.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            let spawned_at = Instant::now();
+            // Measure from the tick's DEADLINE, not from the spawn. A task
+            // spawned from a worker thread lands in that worker's LIFO slot
+            // and is polled next whatever the other workers are doing, so
+            // spawn-to-poll reads microseconds on a starved runtime. What
+            // starvation delays is this loop being woken at all: the timer
+            // fires, and no worker is free to run the task it readied.
+            let deadline = ticker.tick().await;
             let probe = tokio::spawn(async move {
                 metrics()
                     .runtime_spawn_delay_seconds
-                    .observe(spawned_at.elapsed().as_secs_f64());
+                    .observe(deadline.elapsed().as_secs_f64());
             });
             if probe.await.is_err() {
                 debug!("runtime saturation probe task failed; stopping probe");
@@ -3226,6 +3288,25 @@ mod tests {
         gauge.render_into(&mut out);
         assert!(out.contains("test_nodes{status=\"active\"} 2\n"));
         assert!(out.contains("test_nodes{status=\"lost\"} 0\n"));
+    }
+
+    #[test]
+    fn vm_rss_is_parsed_from_proc_status() {
+        let status = "Name:\tlegion\nVmPeak:\t  204800 kB\nVmRSS:\t   51200 kB\nThreads:\t9\n";
+        assert_eq!(parse_vm_rss_bytes(status), Some(51200 * 1024));
+        assert_eq!(parse_vm_rss_bytes("Name:\tlegion\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_reports_this_process_resident_memory() {
+        let text = render();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("process_resident_memory_bytes "))
+            .expect("process_resident_memory_bytes is exported");
+        let bytes: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(bytes > 0, "a running process has a resident set");
     }
 
     #[test]

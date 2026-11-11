@@ -85,11 +85,12 @@ Two rules follow, checked at submit on every governed runtime:
 memory or CPU limit. Scheduler defaults aren't folded in. The task still
 lands in the hierarchy, which keeps it off other tasks' reserved cores.
 
-`resources.cpus` is an older alias for `cpu`, so it is in MHz too, not a CPU
-count: `cpus = 0.5` reserves half a megahertz, and `cpus = 1` reserves one.
-Declare `cpu = 500` for a share of about half a 1 GHz core, and `cores` for
-whole exclusive CPUs. Submit warns about any `cpu` or `cpus` under 10, since
-that is almost always a CPU count in the wrong unit.
+`resources.cpu` is in MHz, not a CPU count: `cpu = 0.5` reserves half a
+megahertz, and `cpu = 1` reserves one. Declare `cpu = 500` for a share of
+about half a 1 GHz core, and `cores` for whole exclusive CPUs. Submit warns
+about any `cpu` under 10, since that is almost always a CPU count in the
+wrong unit. `resources.cpus` is refused at submit: it was an alias for `cpu`
+that read like a count.
 
 ## Burstable memory: `memoryMax`
 
@@ -711,7 +712,7 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
   started before this release) falls back to `memory.reclaim`, which frees
   little from guest RAM.
 - **The balloon is a request.** The guest driver gives back what it can, and
-  `freed_bytes` reports the balloon's growth, not a measurement.
+  `freedBytes` reports the balloon's growth, not a measurement.
 - **`suspend` needs the instance's node to take a checkpoint**: the worker's
   content store for a memory checkpoint, or a retained volume for a disk one.
   A suspend that cannot capture leaves the task running and the next step
@@ -741,7 +742,8 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
 | Allocation fails: "cannot reserve N exclusive core(s) … this node has M free" | The scheduler's count said yes, but whole cores aren't actually free (fingerprint drift, offlined CPUs) | The message lists the free, reserved, and usable sets. The allocation goes through the normal `onUnhealthy` move handling instead of getting stuck |
 | Allocation fails: "reserving N core(s) … would leave the share slice empty" | The reservation would take every usable CPU | Leave at least one core unreserved, or lower the reservation |
 | Submit fails: "resources.cores … must be a whole number" | Fractional `cores` on a governed runtime | Round it, or declare `cpu` in MHz (for example `cpu = 500`) for a proportional share |
-| Submit warns: "sets resources.cpus = 1, which is 1 MHz, not 1 CPU(s)" | `cpu` and its alias `cpus` are in MHz, and the value reads like a CPU count | Declare `cpu` in MHz (`cpu = 1000`), or `cores` for whole CPUs |
+| Submit warns: "sets resources.cpu = 1, which is 1 MHz, not 1 CPU(s)" | `cpu` is in MHz, and the value reads like a CPU count | Declare `cpu` in MHz (`cpu = 1000`), or `cores` for whole CPUs |
+| Submit fails: "task resources set `cpus`, which is not a resource" | `cpus` was an alias for `cpu` and has been removed | Declare `cpu` in MHz, or `cores` for whole CPUs |
 | Submit fails: "declares both resources.cores and resources.cpu" | Two CPU contracts on one task | Pick one |
 | Submit fails: "resources.cores together with config.cgroup" | Legion can't fence an `exec` task that names its own cgroup | Drop `cores`, or drop `cgroup` and let the worker place the task |
 | `legion node usage` says "no usage reported" | Enforcement is off on that worker, the worker predates usage reporting, no report has reached this manager since it started, or the node reports to another manager | Turn on `resourceEnforcement.enabled`, upgrade the worker, wait 10 seconds, or ask the manager the node reports to. `legion job info` shows the job's per-task usage from any manager |

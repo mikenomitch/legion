@@ -223,6 +223,19 @@ pub fn ratify(
             Ok(Verdict::Confirmed { allocation_id })
         }
         Ok(Err((reason, detail))) => Ok(Verdict::refuse(reason, detail)),
+        // A follower judged nothing and wrote nothing (the ticket is still
+        // unspent). Returned as the typed error, not a verdict, so the RPC
+        // layer answers with the not-leader status and the leader-forward
+        // layer replays the request on the leader.
+        Err(err)
+            if err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::storage::raft::driver::NotRaftLeader>()
+                    .is_some()
+            }) =>
+        {
+            Err(err)
+        }
         Err(err) => {
             let detail = format!("{err:#}");
             Ok(Verdict::refuse(classify(&detail), detail))

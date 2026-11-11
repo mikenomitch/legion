@@ -105,11 +105,6 @@ snapshot raft_propose_apply_mean 'sum by (lane) (rate(legion_raft_propose_apply_
 snapshot store_write_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_write_lock_wait_seconds_bucket[1m])))'
 snapshot store_read_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_read_lock_wait_seconds_bucket[1m])))'
 snapshot evals_processed 'sum by (kind, outcome) (legion_evals_processed_total)'
-# Plans thrown away because the read model moved mid-plan, then re-run
-# with the eager O(fleet) sample. Measured after the fact at 27% of plans
-# at 5,000 nodes and 55% at 10,000 (plan-path-fleet-scaling-plan.md § 5.1);
-# archived per cell so that number never again has to be recovered by hand.
-snapshot lazy_sample_fallback 'sum(legion_scheduler_lazy_sample_fallback_total)'
 # Whole-eval time, not just planning. The plan-phase histogram covers
 # planning only, so before this the time an eval spent outside planning
 # (dispatch, follow-ups, settling the batch) could only be inferred from
@@ -183,19 +178,19 @@ snapshot disk_busy 'max by (instance_name, device) (rate(node_disk_io_time_secon
 # share of `used` that is reclaimable, not resident cost.
 snapshot memory_used 'sum by (instance_name, role) (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)'
 snapshot memory_anon 'sum by (instance_name, role) (node_memory_MemTotal_bytes - node_memory_MemFree_bytes - node_memory_Cached_bytes - node_memory_Buffers_bytes)'
+# The manager process's own resident set, from the gauge the manager exports
+# on :4749 (node_exporter exports the same family for itself, hence the job
+# filter).
+snapshot manager_rss 'process_resident_memory_bytes{job="legion-managers"}'
 
 # Reduced memory summary: peak and mean per role, so "memory at low /
 # medium / high load" is one small file per cell rather than a
 # re-derivation from the range export. The range data above stays
 # authoritative; this is the readable form.
 #
-# Known limitation, stated here because it changes how the number reads:
-# this is WHOLE-BOX memory from node_exporter, not the manager process's
-# RSS. Legion registers no process collector, so
-# `process_resident_memory_bytes` does not exist on :4749. The
-# control-plane boxes run nothing else of consequence, so box memory
-# tracks the manager closely — but it includes the OS and, in `used`,
-# the page cache. Treat these as an upper bound on the manager's cost.
+# These two are WHOLE-BOX memory from node_exporter: they include the OS
+# and, in `used`, the page cache, so they are an upper bound on the
+# manager's cost. The manager's own resident set is `manager_rss` below.
 # Same window as the range snapshots above, for the same reason: a peak
 # taken over a trailing 2h is the rig's peak, not the cell's.
 WINDOW_SECS=$((END - START))
