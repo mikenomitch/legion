@@ -18363,6 +18363,30 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   runtimeRefusals: RuntimeRefusals[] = [];
 
+  /**
+   * One aggregate per `isolate` task this node holds an envelope for
+   * (docs/task-runtime-isolate.md, "Observing"). Isolates are never
+   * reported one by one: a node can hold a hundred thousand of them, so
+   * the managers see counts, not units, and keep only the latest report
+   * per node in memory. Sent on every heartbeat by a node that runs the
+   * isolate runtime.
+   *
+   * Default: empty.
+   *
+   * @generated from field: repeated legion.IsolateTaskStats isolate_tasks = 24;
+   */
+  isolateTasks: IsolateTaskStats[] = [];
+
+  /**
+   * This node's isolate host processes, one per cordon replica, sent with
+   * `isolate_tasks`.
+   *
+   * Default: empty.
+   *
+   * @generated from field: repeated legion.IsolateHostStats isolate_hosts = 25;
+   */
+  isolateHosts: IsolateHostStats[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -18394,6 +18418,8 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 21, name: "net_plugins", kind: "message", T: NetPluginNodeStatus, repeated: true },
     { no: 22, name: "endpoint_feed", kind: "message", T: EndpointFeedState },
     { no: 23, name: "runtime_refusals", kind: "message", T: RuntimeRefusals, repeated: true },
+    { no: 24, name: "isolate_tasks", kind: "message", T: IsolateTaskStats, repeated: true },
+    { no: 25, name: "isolate_hosts", kind: "message", T: IsolateHostStats, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -18410,6 +18436,717 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
 
   static equals(a: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined, b: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined): boolean {
     return proto3.util.equals(HeartbeatRequest, a, b);
+  }
+}
+
+/**
+ * What one node holds for one `isolate` task: gauges of now, counters
+ * since the node's isolate host started, and rates over the node's last
+ * reporting interval. See `HeartbeatRequest.isolate_tasks`,
+ * `Manager.GetIsolateStats`, and `Worker.GetIsolateStats`.
+ *
+ * @generated from message legion.IsolateTaskStats
+ */
+export class IsolateTaskStats extends Message<IsolateTaskStats> {
+  /**
+   * The job and the isolate task.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * The cordon whose host process runs this task's isolates on the node
+   * (`config.cordon`): `ns:<namespace>`, `job:<job id>`, or `shared`.
+   *
+   * @generated from field: string cordon = 3;
+   */
+  cordon = "";
+
+  /**
+   * Isolates with an instance in memory on the node now: running, idle,
+   * or paged out. Each is charged `resources.memory` against the task's
+   * envelope.
+   *
+   * @generated from field: uint32 resident = 4;
+   */
+  resident = 0;
+
+  /**
+   * Invocations running now.
+   *
+   * @generated from field: uint32 active = 5;
+   */
+  active = 0;
+
+  /**
+   * Resident isolates whose private pages have been pushed to swap after
+   * `isolate.pageOutAfter` of idleness. Always 0 on a node with no swap,
+   * zswap, or zram, where paging out is not possible.
+   *
+   * @generated from field: uint32 paged_out = 6;
+   */
+  pagedOut = 0;
+
+  /**
+   * Session isolates held as a checkpoint in the node's content store
+   * with no instance in memory. They hold no envelope room.
+   *
+   * @generated from field: uint32 hibernated = 7;
+   */
+  hibernated = 0;
+
+  /**
+   * Invocations waiting for room in the envelope or for a memory slot.
+   *
+   * @generated from field: uint32 queued = 8;
+   */
+  queued = 0;
+
+  /**
+   * Invocations started, since the host started.
+   *
+   * @generated from field: uint64 invocations = 9;
+   */
+  invocations = protoInt64.zero;
+
+  /**
+   * CPU the task's isolates have used, in microseconds, since the host
+   * started.
+   *
+   * @generated from field: uint64 cpu_micros = 10;
+   */
+  cpuMicros = protoInt64.zero;
+
+  /**
+   * Invocations per second and CPU seconds per second over the node's
+   * last reporting interval.
+   *
+   * @generated from field: double invocations_per_second = 11;
+   */
+  invocationsPerSecond = 0;
+
+  /**
+   * @generated from field: double cpu_seconds_per_second = 12;
+   */
+  cpuSecondsPerSecond = 0;
+
+  /**
+   * Runs sent to a VM of the task's VM task (`tier = "vm"`, or `auto`
+   * deciding so), since the worker started, and per minute over the last
+   * reporting interval.
+   *
+   * @generated from field: uint64 vm_runs = 13;
+   */
+  vmRuns = protoInt64.zero;
+
+  /**
+   * @generated from field: double vm_runs_per_minute = 14;
+   */
+  vmRunsPerMinute = 0;
+
+  /**
+   * Child VMs this task's isolates own on the node now.
+   *
+   * @generated from field: uint32 child_vms = 15;
+   */
+  childVms = 0;
+
+  /**
+   * Invocations stopped before they finished, by reason: `limits`,
+   * `unsupported`, `trap`, `ended`.
+   *
+   * @generated from field: map<string, uint64> stopped = 16;
+   */
+  stopped: { [key: string]: bigint } = {};
+
+  /**
+   * Invocations stopped by a limit, by limit: `cpu`, `wall`, `memory`.
+   *
+   * @generated from field: map<string, uint64> limits = 17;
+   */
+  limits: { [key: string]: bigint } = {};
+
+  /**
+   * Invocations refused with ResourceExhausted because the envelope or
+   * the host had no room within the queue timeout.
+   *
+   * @generated from field: uint64 refusals = 18;
+   */
+  refusals = protoInt64.zero;
+
+  /**
+   * Linear memory mapped by the task's resident isolates, in bytes: an
+   * upper bound on what they hold, since untouched and paged-out pages
+   * are counted.
+   *
+   * @generated from field: uint64 memory_bytes = 19;
+   */
+  memoryBytes = protoInt64.zero;
+
+  /**
+   * The declared reservation of one isolate (`resources.memory`), in
+   * bytes, for comparing against `memory_bytes / resident`.
+   *
+   * @generated from field: uint64 reservation_bytes = 20;
+   */
+  reservationBytes = protoInt64.zero;
+
+  /**
+   * Session isolates hibernated since the host started.
+   *
+   * @generated from field: uint64 hibernations = 21;
+   */
+  hibernations = protoInt64.zero;
+
+  /**
+   * Why the node cannot run this task's isolates right now, when it
+   * cannot (the host process is restarting, the module failed to
+   * compile). Empty when it can.
+   *
+   * @generated from field: string problem = 22;
+   */
+  problem = "";
+
+  constructor(data?: PartialMessage<IsolateTaskStats>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IsolateTaskStats";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "cordon", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "resident", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "active", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "paged_out", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "hibernated", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "queued", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "invocations", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "cpu_micros", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "invocations_per_second", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 12, name: "cpu_seconds_per_second", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 13, name: "vm_runs", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 14, name: "vm_runs_per_minute", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 15, name: "child_vms", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 16, name: "stopped", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 4 /* ScalarType.UINT64 */} },
+    { no: 17, name: "limits", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 4 /* ScalarType.UINT64 */} },
+    { no: 18, name: "refusals", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 19, name: "memory_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 20, name: "reservation_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 21, name: "hibernations", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 22, name: "problem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IsolateTaskStats {
+    return new IsolateTaskStats().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IsolateTaskStats {
+    return new IsolateTaskStats().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IsolateTaskStats {
+    return new IsolateTaskStats().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IsolateTaskStats | PlainMessage<IsolateTaskStats> | undefined, b: IsolateTaskStats | PlainMessage<IsolateTaskStats> | undefined): boolean {
+    return proto3.util.equals(IsolateTaskStats, a, b);
+  }
+}
+
+/**
+ * One isolate host process on a node. See
+ * `HeartbeatRequest.isolate_hosts`.
+ *
+ * @generated from message legion.IsolateHostStats
+ */
+export class IsolateHostStats extends Message<IsolateHostStats> {
+  /**
+   * The cordon it serves, and which replica of it (0 for the first).
+   *
+   * @generated from field: string cordon = 1;
+   */
+  cordon = "";
+
+  /**
+   * @generated from field: uint32 replica = 2;
+   */
+  replica = 0;
+
+  /**
+   * The process's resident set size, in bytes.
+   *
+   * @generated from field: uint64 rss_bytes = 3;
+   */
+  rssBytes = protoInt64.zero;
+
+  /**
+   * Linear-memory slots the process has, and how many hold an instance.
+   *
+   * @generated from field: uint32 slots = 4;
+   */
+  slots = 0;
+
+  /**
+   * @generated from field: uint32 slots_used = 5;
+   */
+  slotsUsed = 0;
+
+  /**
+   * Shard threads.
+   *
+   * @generated from field: uint32 shards = 6;
+   */
+  shards = 0;
+
+  /**
+   * The engine it runs (`wasmtime-<version>`).
+   *
+   * @generated from field: string engine_version = 7;
+   */
+  engineVersion = "";
+
+  /**
+   * The process id the worker started for it. That process supervises the
+   * host: the host itself is its only child, PID 1 of its own PID
+   * namespace, and ends with it.
+   *
+   * @generated from field: uint32 pid = 8;
+   */
+  pid = 0;
+
+  /**
+   * When it started, in Unix milliseconds.
+   *
+   * @generated from field: int64 started_unix_ms = 9;
+   */
+  startedUnixMs = protoInt64.zero;
+
+  /**
+   * The slot layout: `guard-pages`, `mpk`, or `small`.
+   *
+   * @generated from field: string layout = 10;
+   */
+  layout = "";
+
+  /**
+   * The confinement in force, layer by layer: `userns`, `netns`,
+   * `mount-root`, `pid-ns`, `no-new-privs`, `landlock`,
+   * `landlock-scopes`, `seccomp`. A layer missing from the list did not
+   * apply.
+   *
+   * @generated from field: repeated string confinement = 11;
+   */
+  confinement: string[] = [];
+
+  /**
+   * Times the worker has restarted this host after it exited.
+   *
+   * @generated from field: uint32 restarts = 12;
+   */
+  restarts = 0;
+
+  constructor(data?: PartialMessage<IsolateHostStats>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IsolateHostStats";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cordon", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "replica", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "rss_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "slots", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "slots_used", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "shards", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "engine_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "pid", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "started_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 10, name: "layout", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "confinement", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 12, name: "restarts", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IsolateHostStats {
+    return new IsolateHostStats().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IsolateHostStats {
+    return new IsolateHostStats().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IsolateHostStats {
+    return new IsolateHostStats().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IsolateHostStats | PlainMessage<IsolateHostStats> | undefined, b: IsolateHostStats | PlainMessage<IsolateHostStats> | undefined): boolean {
+    return proto3.util.equals(IsolateHostStats, a, b);
+  }
+}
+
+/**
+ * Request payload for Manager.GetIsolateStats and Worker.GetIsolateStats.
+ *
+ * @generated from message legion.GetIsolateStatsRequest
+ */
+export class GetIsolateStatsRequest extends Message<GetIsolateStatsRequest> {
+  /**
+   * `Manager.GetIsolateStats`: the job. Required. `Worker.GetIsolateStats`:
+   * optional filter; empty returns every isolate task on the node.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * The isolate task. Empty returns every isolate task of the job.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  constructor(data?: PartialMessage<GetIsolateStatsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetIsolateStatsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIsolateStatsRequest {
+    return new GetIsolateStatsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIsolateStatsRequest {
+    return new GetIsolateStatsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIsolateStatsRequest {
+    return new GetIsolateStatsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetIsolateStatsRequest | PlainMessage<GetIsolateStatsRequest> | undefined, b: GetIsolateStatsRequest | PlainMessage<GetIsolateStatsRequest> | undefined): boolean {
+    return proto3.util.equals(GetIsolateStatsRequest, a, b);
+  }
+}
+
+/**
+ * One node's part of an isolate stats reply.
+ *
+ * @generated from message legion.IsolateNodeStats
+ */
+export class IsolateNodeStats extends Message<IsolateNodeStats> {
+  /**
+   * The node.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Its aggregates, one per isolate task asked for.
+   *
+   * @generated from field: repeated legion.IsolateTaskStats tasks = 2;
+   */
+  tasks: IsolateTaskStats[] = [];
+
+  /**
+   * Its isolate host processes that serve those tasks.
+   *
+   * @generated from field: repeated legion.IsolateHostStats hosts = 3;
+   */
+  hosts: IsolateHostStats[] = [];
+
+  /**
+   * How old the report is, in milliseconds, when it came from a heartbeat
+   * (`Manager.GetIsolateStats`). 0 from `Worker.GetIsolateStats`.
+   *
+   * @generated from field: uint64 age_ms = 4;
+   */
+  ageMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<IsolateNodeStats>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IsolateNodeStats";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "tasks", kind: "message", T: IsolateTaskStats, repeated: true },
+    { no: 3, name: "hosts", kind: "message", T: IsolateHostStats, repeated: true },
+    { no: 4, name: "age_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IsolateNodeStats {
+    return new IsolateNodeStats().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IsolateNodeStats {
+    return new IsolateNodeStats().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IsolateNodeStats {
+    return new IsolateNodeStats().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IsolateNodeStats | PlainMessage<IsolateNodeStats> | undefined, b: IsolateNodeStats | PlainMessage<IsolateNodeStats> | undefined): boolean {
+    return proto3.util.equals(IsolateNodeStats, a, b);
+  }
+}
+
+/**
+ * Reply payload for Manager.GetIsolateStats and Worker.GetIsolateStats.
+ *
+ * @generated from message legion.GetIsolateStatsReply
+ */
+export class GetIsolateStatsReply extends Message<GetIsolateStatsReply> {
+  /**
+   * One entry per node (exactly one from `Worker.GetIsolateStats`).
+   *
+   * @generated from field: repeated legion.IsolateNodeStats nodes = 1;
+   */
+  nodes: IsolateNodeStats[] = [];
+
+  constructor(data?: PartialMessage<GetIsolateStatsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetIsolateStatsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "nodes", kind: "message", T: IsolateNodeStats, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIsolateStatsReply {
+    return new GetIsolateStatsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIsolateStatsReply {
+    return new GetIsolateStatsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIsolateStatsReply {
+    return new GetIsolateStatsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetIsolateStatsReply | PlainMessage<GetIsolateStatsReply> | undefined, b: GetIsolateStatsReply | PlainMessage<GetIsolateStatsReply> | undefined): boolean {
+    return proto3.util.equals(GetIsolateStatsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Manager.GetIsolate and Worker.GetIsolate.
+ *
+ * @generated from message legion.GetIsolateRequest
+ */
+export class GetIsolateRequest extends Message<GetIsolateRequest> {
+  /**
+   * The session isolate's id.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * `Manager.GetIsolate` only: the node to ask, for an id that carries no
+   * node tag (one derived from an idempotency key).
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * `Worker.GetIsolate`, ticket class: the session ticket. Empty for a
+   * manager.
+   *
+   * @generated from field: string ticket = 3;
+   */
+  ticket = "";
+
+  constructor(data?: PartialMessage<GetIsolateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetIsolateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIsolateRequest {
+    return new GetIsolateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIsolateRequest {
+    return new GetIsolateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIsolateRequest {
+    return new GetIsolateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetIsolateRequest | PlainMessage<GetIsolateRequest> | undefined, b: GetIsolateRequest | PlainMessage<GetIsolateRequest> | undefined): boolean {
+    return proto3.util.equals(GetIsolateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Manager.GetIsolate and Worker.GetIsolate.
+ *
+ * @generated from message legion.GetIsolateReply
+ */
+export class GetIsolateReply extends Message<GetIsolateReply> {
+  /**
+   * The session isolate's id.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * The node that holds it.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * Its job and task.
+   *
+   * @generated from field: string job_id = 3;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 4;
+   */
+  taskName = "";
+
+  /**
+   * The tenant key it was started for. Empty when it had none.
+   *
+   * @generated from field: string tenant = 5;
+   */
+  tenant = "";
+
+  /**
+   * Where it is: `hot` (an instance in memory), `paged_out` (in memory,
+   * private pages pushed to swap), `hibernated` (a checkpoint only), or
+   * `empty` (started, not yet called).
+   *
+   * @generated from field: string state = 6;
+   */
+  state = "";
+
+  /**
+   * When it was started and last called, in Unix milliseconds.
+   *
+   * @generated from field: int64 started_unix_ms = 7;
+   */
+  startedUnixMs = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 last_active_unix_ms = 8;
+   */
+  lastActiveUnixMs = protoInt64.zero;
+
+  /**
+   * Invocations it has taken.
+   *
+   * @generated from field: uint64 invocations = 9;
+   */
+  invocations = protoInt64.zero;
+
+  /**
+   * Linear memory mapped for it, in bytes (0 while hibernated).
+   *
+   * @generated from field: uint64 memory_bytes = 10;
+   */
+  memoryBytes = protoInt64.zero;
+
+  /**
+   * Bytes it keeps in `legion:isolate/state`.
+   *
+   * @generated from field: uint64 state_bytes = 11;
+   */
+  stateBytes = protoInt64.zero;
+
+  /**
+   * Its checkpoint's generation and size, when it has been hibernated.
+   *
+   * @generated from field: uint64 checkpoint_generation = 12;
+   */
+  checkpointGeneration = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 checkpoint_bytes = 13;
+   */
+  checkpointBytes = protoInt64.zero;
+
+  /**
+   * The child sessions it owns (docs/child-sessions.md).
+   *
+   * @generated from field: repeated legion.ChildInfo children = 14;
+   */
+  children: ChildInfo[] = [];
+
+  constructor(data?: PartialMessage<GetIsolateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetIsolateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "tenant", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "started_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "last_active_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "invocations", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "memory_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "state_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 12, name: "checkpoint_generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 13, name: "checkpoint_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 14, name: "children", kind: "message", T: ChildInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIsolateReply {
+    return new GetIsolateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIsolateReply {
+    return new GetIsolateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIsolateReply {
+    return new GetIsolateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetIsolateReply | PlainMessage<GetIsolateReply> | undefined, b: GetIsolateReply | PlainMessage<GetIsolateReply> | undefined): boolean {
+    return proto3.util.equals(GetIsolateReply, a, b);
   }
 }
 
@@ -31847,6 +32584,56 @@ export class RunSessionRequest extends Message<RunSessionRequest> {
    */
   nodeId = "";
 
+  /**
+   * Tasks of the `isolate` runtime only (docs/task-runtime-isolate.md):
+   * where the run happens. `isolate` runs it in an isolate. `vm` runs it
+   * in a fresh, single-use VM of the task's VM task (`config.vm.task`),
+   * with the source staged as `/legion/run/main.<ext>`. `auto`, the
+   * default when empty, decides before anything runs: it scans the
+   * source's imports against the image's module list and consults the
+   * node's memo of code that needed a VM, and it sends the run to the VM
+   * while the isolate runtime is disabled. The reply's `tier` and
+   * `tier_reason` say what was chosen and why.
+   *
+   * @generated from field: string tier = 12;
+   */
+  tier = "";
+
+  /**
+   * Tasks of the `isolate` runtime only: the tenant key, saying who the
+   * run is for. It keys the warm instance for `config.lifetime =
+   * "tenant"`, and the per-tenant queue that keeps one tenant's runs from
+   * starving another's on a busy node. Up to 128 printable ASCII
+   * characters with no spaces; empty is the task's anonymous tenant.
+   *
+   * @generated from field: string tenant = 13;
+   */
+  tenant = "";
+
+  /**
+   * Tasks of the `isolate` runtime with `config.lifetime = "session"`
+   * only: run in this existing session isolate (started with
+   * `CreateInstance` or `Worker.StartSession`) instead of a fresh one.
+   * The run is routed to the node the id names, wakes the isolate if it
+   * is hibernated, and leaves it running afterwards.
+   *
+   * @generated from field: string session_id = 14;
+   */
+  sessionId = "";
+
+  /**
+   * Tasks of the `isolate` runtime only: arguments for the code being
+   * run. A command component reads them as its program arguments, and a
+   * language image passes them to the script (`sys.argv[1:]`,
+   * `process.argv.slice(2)`). When the run goes to a VM they are appended
+   * to the VM task's `run.command`. Unlike `command`, they do not replace
+   * what runs, so they need no more than `job:write`. At most 64
+   * arguments and 64 KiB together.
+   *
+   * @generated from field: repeated string args = 15;
+   */
+  args: string[] = [];
+
   constructor(data?: PartialMessage<RunSessionRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -31866,6 +32653,10 @@ export class RunSessionRequest extends Message<RunSessionRequest> {
     { no: 9, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 10, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "tier", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "tenant", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "args", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunSessionRequest {
@@ -32016,9 +32807,16 @@ export class RunOutputFile extends Message<RunOutputFile> {
  */
 export class RunStop extends Message<RunStop> {
   /**
-   * `wall` (the command outlived `run.wall`) or `session_ended` (the
-   * session was ended under the run: stopped by an operator, killed for
-   * memory, or its runtime exited).
+   * `wall` (the command outlived `run.wall`), `memory` (the session was
+   * killed for memory), or `session_ended` (the session was ended under
+   * the run: stopped by an operator, or its runtime exited).
+   *
+   * A run in an isolate uses `limits` (it exceeded one of the task's
+   * `config.limits` or its `resources.memoryMax`; `limit` names which),
+   * `unsupported` (the code called something an isolate does not offer,
+   * such as a subprocess; `detail` names it), `trap` (the guest crashed),
+   * or `ended` (its session isolate was stopped, its task was removed
+   * from the node, or the node's isolate host drained under it).
    *
    * @generated from field: string reason = 1;
    */
@@ -32026,7 +32824,9 @@ export class RunStop extends Message<RunStop> {
 
   /**
    * The limit that stopped it, as the jobspec wrote it (`"30s"`). Empty
-   * for `session_ended`.
+   * for `session_ended`. For an isolate's `limits` it is the limit's
+   * name: `cpu`, `wall`, or `memory`. (`config.limits.output` truncates
+   * the output and sets `truncated`; it never stops a run.)
    *
    * @generated from field: string limit = 2;
    */
@@ -32124,6 +32924,35 @@ export class RunDryRun extends Message<RunDryRun> {
    */
   outputBytes = protoInt64.zero;
 
+  /**
+   * Isolate tasks only: the tier the run would use and why, decided the
+   * way the run itself would decide it (the pre-flight import check and
+   * the node's memo).
+   *
+   * @generated from field: string tier = 7;
+   */
+  tier = "";
+
+  /**
+   * @generated from field: string tier_reason = 8;
+   */
+  tierReason = "";
+
+  /**
+   * Isolate tasks only: the modules the source imports, as the pre-flight
+   * check read them, and those among them the task's image does not
+   * have. A non-empty `missing_imports` is what sends an `auto` run to a
+   * VM.
+   *
+   * @generated from field: repeated string imports = 9;
+   */
+  imports: string[] = [];
+
+  /**
+   * @generated from field: repeated string missing_imports = 10;
+   */
+  missingImports: string[] = [];
+
   constructor(data?: PartialMessage<RunDryRun>) {
     super();
     proto3.util.initPartial(data, this);
@@ -32138,6 +32967,10 @@ export class RunDryRun extends Message<RunDryRun> {
     { no: 4, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 5, name: "wall", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "output_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "tier", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "tier_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "imports", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 10, name: "missing_imports", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunDryRun {
@@ -32193,7 +33026,8 @@ export class RunSessionResponse extends Message<RunSessionResponse> {
   exit?: number;
 
   /**
-   * The command's stdout and stderr, together at most `run.output` bytes.
+   * The command's stdout and stderr, together at most `run.output` bytes
+   * (`config.limits.output` for a run in an isolate).
    *
    * @generated from field: bytes stdout = 5;
    */
@@ -32214,6 +33048,9 @@ export class RunSessionResponse extends Message<RunSessionResponse> {
   /**
    * The contents of `result.json` in the run directory, when the command
    * wrote one that parses as JSON and fits `run.output`. Empty otherwise.
+   * A run in an isolate whose guest exports `legion:isolate/runner`
+   * (the language images do) reports the JSON result the runner returned,
+   * and falls back to `result.json` when it returned none.
    *
    * @generated from field: string result = 8;
    */
@@ -32275,6 +33112,70 @@ export class RunSessionResponse extends Message<RunSessionResponse> {
    */
   runId = "";
 
+  /**
+   * Isolate tasks only: where the code ran, `isolate` or `vm`. Empty for
+   * a run on any other runtime.
+   *
+   * @generated from field: string tier = 16;
+   */
+  tier = "";
+
+  /**
+   * Isolate tasks only: why that tier, in a phrase a person can read and
+   * an agent can log (`auto: no imports outside the image`, `auto: import
+   * torch is not in image python`, `requested`, `auto: this code needed a
+   * VM 12m ago`, `auto: the isolate runtime is disabled`).
+   *
+   * @generated from field: string tier_reason = 17;
+   */
+  tierReason = "";
+
+  /**
+   * Isolate tasks only: the tier to ask for the next time this code runs,
+   * when the outcome showed the other one is the right place for it.
+   * `vm` after an isolate run was stopped for `unsupported` or `limits`
+   * on a task with a VM task, and after any run that went to a VM. Empty
+   * when the tier that ran it was the right one. Callers that keep it per
+   * code hash never pay for the same wrong guess twice, on any node.
+   *
+   * @generated from field: string next_tier = 18;
+   */
+  nextTier = "";
+
+  /**
+   * Isolate tasks only: for a run that went to a VM, what the VM cost on
+   * top of the command, in milliseconds: the whole VM run (starting the
+   * session, staging files, collecting output, ending it) minus the
+   * command's own `wall_ms`. 0 otherwise.
+   *
+   * @generated from field: uint64 vm_ms = 19;
+   */
+  vmMs = protoInt64.zero;
+
+  /**
+   * CPU and wall-clock time in microseconds, where the runtime measures
+   * them that finely (isolates do; `cpu_ms` and `wall_ms` carry the same
+   * values rounded). 0 otherwise.
+   *
+   * @generated from field: uint64 cpu_micros = 20;
+   */
+  cpuMicros = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 wall_micros = 21;
+   */
+  wallMicros = protoInt64.zero;
+
+  /**
+   * Isolate tasks only: how the isolate that ran the code was obtained:
+   * `fresh` (a new instance), `warm` (an existing tenant or session
+   * instance), `paged` (resident, its pages faulted back in), or
+   * `hibernated` (restored from a checkpoint). Empty for a VM run.
+   *
+   * @generated from field: string isolate_start = 22;
+   */
+  isolateStart = "";
+
   constructor(data?: PartialMessage<RunSessionResponse>) {
     super();
     proto3.util.initPartial(data, this);
@@ -32298,6 +33199,13 @@ export class RunSessionResponse extends Message<RunSessionResponse> {
     { no: 13, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 14, name: "dry_run", kind: "message", T: RunDryRun },
     { no: 15, name: "run_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "tier", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "tier_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 18, name: "next_tier", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 19, name: "vm_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 20, name: "cpu_micros", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 21, name: "wall_micros", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 22, name: "isolate_start", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunSessionResponse {

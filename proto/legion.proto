@@ -10287,7 +10287,9 @@ message IsolateHostStats {
   // The engine it runs (`wasmtime-<version>`).
   string engine_version = 7;
 
-  // Its process id on the node.
+  // The process id the worker started for it. That process supervises the
+  // host: the host itself is its only child, PID 1 of its own PID
+  // namespace, and ends with it.
   uint32 pid = 8;
 
   // When it started, in Unix milliseconds.
