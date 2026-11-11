@@ -15,6 +15,10 @@
 // `tonic::Status` is 176 bytes; the host's API returns it as the gRPC
 // shell does (as `legion-proto` allows it crate-wide).
 #![allow(clippy::result_large_err)]
+// `#[async_trait]` and tonic's generated service traits mark methods
+// returning `Pin<Box<dyn Future>>` as `#[must_use]`, which clippy's
+// `double_must_use` flags on Rust 1.99+. The attribute comes from the macro.
+#![allow(clippy::double_must_use)]
 
 pub mod account;
 pub mod checkpoint;
