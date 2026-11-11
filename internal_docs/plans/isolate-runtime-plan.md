@@ -55,6 +55,16 @@ entry, and the affected section carries a dated **As built** note):
   (calls 27); prefixed cordon names (calls 36); NOT_FOUND for every
   session id the caller cannot read (calls 35); guest-log limits,
   targeted hibernation, and the host cgroup following its envelopes.
+  A verification re-review then found new issues in the fix code, and a
+  second round fixed them: injective cgroup leaf names (calls 31, 36),
+  a bounded and attributed guest-log path with escaped control
+  characters and per-task budgets (calls 70), one origin check on every
+  host call (calls 28), derived host-call limits (calls 46), read-only
+  nested mounts (calls 16), capabilities dropped even without a user
+  namespace (calls 18), a fixed VM entry name for `args` (calls 29), a
+  dedicated spawner thread and a compile deadline (calls 15), a compile
+  cgroup (calls 20), and the seccomp log switch only in test builds
+  (calls 19).
   Found on the way: a session task's generated envelope made every
   session job host-level, isolates included; it no longer does (calls
   37).
@@ -100,7 +110,7 @@ Deferred, deliberately not built in this round:
   builds (calls 75);
 - dropping the host's kernel uid (calls 18); denying anonymous executable
   memory, which needs an LSM; tracking in-flight invocations per replica
-  rather than per cordon (calls 28); a cgroup per compile (calls 20);
+  rather than per cordon (calls 28);
 - a release-build end-to-end measurement against the Phase 1 target of
   under 2 ms (the debug-build measurement missed it, §15).
 
@@ -1189,9 +1199,12 @@ invocation: at most 8 requests in flight (the rest wait), none outlives
 the invocation, a resource table of 4,096 entries and header sets of
 64 KiB per instance; request and response bodies are not charged to
 `memoryMax` (calls entry 45). The worker caps what a host can make it
-hold: checkpoints checked before buffering, 256 concurrent calls, stderr
-lines of 4 KiB, and guest logs of 4,096 lines per batch at 1 MiB/s per
-host (calls entry 46). An injected credential stays unseen by the guest
+hold: checkpoints checked before buffering, stderr lines of 4 KiB, and,
+after a second hardening round, a decode limit of `max(maxBodyBytes,
+16 MiB) + 1 MiB`, `shards × 8` concurrent calls (16 to 64), a per-host
+byte budget for bodies, one origin check on every call, and guest logs
+only for issued isolates, escaped, at 512 KiB/s per task under 2 MiB/s
+per host (calls entries 46, 28, 70). An injected credential stays unseen by the guest
 only while the upstream does not echo request headers back.
 
 ### 6.10 Security model and defense in depth
@@ -1301,7 +1314,12 @@ entry 20). Still short of the text above: the kernel uid is the worker's
 18); the artifact directories are mounted executable, because wasmtime
 maps compiled code from them; the cgroup has `memory.max` (now following
 its envelopes) and `pids.max` but no `cpu.weight`; anonymous executable
-memory is not denied (no LSM).
+memory is not denied (no LSM). *Second hardening round:* nested mounts
+inside an artifact directory are read-only too (`mount_setattr` with
+`AT_RECURSIVE`, else a remount per submount; `enforce` refuses a host
+where neither works), a `best-effort` host without a user namespace still
+drops every capability, and `LEGION_ISOLATE_SECCOMP=log` works only in a
+`confinement-test` build.
 
 ### 6.11 Limits and accounting
 

@@ -439,7 +439,8 @@ impl HostLauncher for FakeLauncher {
         let pid = 1000 + self.next_pid.fetch_add(1, Ordering::SeqCst);
         let (control_ours, control_theirs) = socket_pair()?;
         let (worker_ours, worker_theirs) = socket_pair()?;
-        serve_over(tokio_stream(worker_ours)?, worker);
+        let limits = worker.limits();
+        serve_over(tokio_stream(worker_ours)?, worker, limits);
         // The host's client of the worker's service.
         let worker_stream = tokio_stream(worker_theirs)?;
         let slot = Arc::new(Mutex::new(Some(worker_stream)));
@@ -1550,7 +1551,7 @@ async fn hosts_may_name_only_isolates_the_worker_issued() {
     let invocation = named("ns/app", "run", "inv-1", false);
     assert!(!h.supervisor.issued("ns", &invocation));
     {
-        let _open = h.supervisor.inflight("ns", &key, "inv-1");
+        let _open = h.supervisor.inflight("ns", &key, "inv-1", "");
         assert!(h.supervisor.issued("ns", &invocation));
         assert!(!h.supervisor.issued("shared", &invocation));
         assert!(!h
@@ -1669,4 +1670,402 @@ async fn checkpoints_are_bounded_and_checked_first() {
     let err = send("run-unknown.1", 4, vec![0; 4]).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
     send("run-c.1", 4, vec![0; 4]).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Second security review: what a host may send the worker (N2, N3, N5).
+// ---------------------------------------------------------------------------
+
+fn log_batch(origin: Origin, lines: Vec<Vec<u8>>) -> LogBatch {
+    LogBatch {
+        origin: Some(origin),
+        lines: lines
+            .into_iter()
+            .map(|line| LogLine {
+                stderr: false,
+                line,
+                unix_ms: 0,
+            })
+            .collect(),
+    }
+}
+
+async fn send_logs(
+    worker: &IsolateWorkerClient<tonic::transport::Channel>,
+    batches: Vec<LogBatch>,
+) -> Result<(), Status> {
+    let mut worker = worker.clone();
+    worker.log(futures::stream::iter(batches)).await.map(|_| ())
+}
+
+fn stdout_log(dir: &std::path::Path, allocation: i64) -> String {
+    std::fs::read_to_string(dir.join(allocation.to_string()).join("stdout.log")).unwrap_or_default()
+}
+
+fn stderr_log(dir: &std::path::Path, allocation: i64) -> String {
+    std::fs::read_to_string(dir.join(allocation.to_string()).join("stderr.log")).unwrap_or_default()
+}
+
+/// Every `IsolateWorker` method checks the origin first: an id outside the
+/// alphabet the worker mints, or too long, and a tenant that is not a
+/// tenant key, are refused before any lookup.
+#[tokio::test]
+async fn every_worker_call_refuses_an_unbounded_or_foreign_origin() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-o.1", "", "manager", "", "")
+        .await
+        .unwrap();
+    let worker = h.launcher.hosts()[0].1.worker.clone();
+    let bad = [
+        Origin {
+            isolate_id: "x".repeat(super::service::MAX_ISOLATE_ID_BYTES + 1),
+            ..origin("ns/app", "run", "")
+        },
+        Origin {
+            isolate_id: "run-o.1\n[isolate other]".into(),
+            ..origin("ns/app", "run", "")
+        },
+        Origin {
+            tenant: "t".repeat(1 << 20),
+            ..origin("ns/app", "run", "run-o.1")
+        },
+        Origin {
+            tenant: "has space".into(),
+            ..origin("ns/app", "run", "run-o.1")
+        },
+        Origin {
+            job_id: "j".repeat(super::service::MAX_ORIGIN_JOB_BYTES + 1),
+            ..origin("ns/app", "run", "run-o.1")
+        },
+    ];
+    for origin in bad {
+        let mut w = worker.clone();
+        let err = w
+            .egress(EgressRequest {
+                origin: Some(origin.clone()),
+                url: "http://example.com".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        // Never echoes what the host sent.
+        assert!(err.message().len() < 200, "{}", err.message().len());
+        let err = w
+            .vm(VmRequest {
+                origin: Some(origin.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        let err = w
+            .load_checkpoint(LoadCheckpointRequest {
+                origin: Some(origin.clone()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        let err = send_logs(
+            &worker,
+            vec![log_batch(origin.clone(), vec![b"x".to_vec()])],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        let chunks = vec![CheckpointChunk {
+            part: Some(checkpoint_chunk::Part::Header(CheckpointHeader {
+                origin: Some(origin),
+                bytes: 1,
+                ..Default::default()
+            })),
+        }];
+        let err = w
+            .save_checkpoint(futures::stream::iter(chunks))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    }
+    // A checkpoint header's own strings are bounded too (they are kept in
+    // the session book).
+    for (engine, module) in [
+        ("e".repeat(1 << 20), "m".to_string()),
+        ("e".into(), "m\n".into()),
+    ] {
+        let mut w = worker.clone();
+        let chunks = vec![CheckpointChunk {
+            part: Some(checkpoint_chunk::Part::Header(CheckpointHeader {
+                origin: Some(origin("ns/app", "run", "run-o.1")),
+                engine_version: engine,
+                module_id: module,
+                bytes: 1,
+                freed_bytes: 0,
+            })),
+        }];
+        let err = w
+            .save_checkpoint(futures::stream::iter(chunks))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    }
+    // A message over the host's limit is refused by the transport.
+    let limits = super::host::HostCallLimits::for_host(&h.launcher.hosts()[0].0.config);
+    let mut w = worker.clone();
+    let err = w
+        .egress(EgressRequest {
+            origin: Some(origin("ns/app", "run", "run-o.1")),
+            url: "http://example.com".into(),
+            body: vec![0; limits.max_message_bytes + 1],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.code(),
+            tonic::Code::OutOfRange | tonic::Code::ResourceExhausted
+        ),
+        "{err:?}"
+    );
+}
+
+/// `Log` writes lines only for isolates the worker gave the host, with the
+/// tenant the worker recorded; a newline bomb or a forged prefix is cut
+/// or rendered inert.
+#[tokio::test]
+async fn log_lines_are_attributed_only_to_issued_isolates() {
+    let h = harness();
+    let logs = h._dir.path().join("logs");
+    h.supervisor.set_log_root(logs.clone());
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-l.1", "acme", "manager", "", "")
+        .await
+        .unwrap();
+    let worker = h.launcher.hosts()[0].1.worker.clone();
+    // An id the worker never gave out: nothing is written.
+    send_logs(
+        &worker,
+        vec![log_batch(
+            origin("ns/app", "run", "run-never.1"),
+            vec![b"forged".to_vec()],
+        )],
+    )
+    .await
+    .unwrap();
+    // The session's own lines, under the tenant the host claims (bob):
+    // written as the session's (acme). A newline bomb, a forged prefix
+    // after a carriage return, and an escape sequence.
+    let mut bomb = vec![b'\n'; 4 << 20];
+    bomb.extend_from_slice(b"tail");
+    send_logs(
+        &worker,
+        vec![log_batch(
+            Origin {
+                tenant: "bob".into(),
+                ..origin("ns/app", "run", "run-l.1")
+            },
+            vec![
+                b"hello".to_vec(),
+                b"x\r[isolate other-id tenant=bob] payment ok\x1b[2K".to_vec(),
+                bomb,
+            ],
+        )],
+    )
+    .await
+    .unwrap();
+    let out = stdout_log(&logs, 7);
+    assert!(!out.contains("forged"), "{out}");
+    assert!(
+        out.starts_with("[isolate run-l.1 tenant=acme] hello\n"),
+        "{}",
+        &out[..200]
+    );
+    assert!(
+        out.contains(
+            "[isolate run-l.1 tenant=acme] x\\x0d[isolate other-id tenant=bob] payment ok\\x1b[2K\n"
+        ),
+        "{}",
+        &out[..300]
+    );
+    assert!(!out.contains('\r') && !out.contains('\x1b'));
+    // The bomb: at most MAX_LINES_PER_BATCH lines, and a marker.
+    assert_eq!(out.lines().count(), super::guest_logs::MAX_LINES_PER_BATCH);
+    assert!(out.len() < 2 << 20, "{}", out.len());
+    let err = stderr_log(&logs, 7);
+    assert!(err.contains("lines dropped"), "{err}");
+    // An invocation: while in flight and a little after, with the tenant it
+    // was invoked for.
+    let key = ("ns/app".to_string(), "run".to_string());
+    {
+        let _open = h.supervisor.inflight("ns:ns", &key, "run-inv.1", "zed");
+        let invocation = super::IsolateTaskRef {
+            job_id: "ns/app".into(),
+            task_name: "run".into(),
+            envelope_allocation_id: 7,
+            isolate_id: "run-inv.1".into(),
+            tenant: "bob".into(),
+            session: false,
+        };
+        assert_eq!(
+            h.supervisor.log_tenant("ns:ns", &invocation).as_deref(),
+            Some("zed")
+        );
+        assert_eq!(h.supervisor.log_tenant("shared", &invocation), None);
+        drop(_open);
+        assert!(!h.supervisor.issued("ns:ns", &invocation), "ended");
+        assert_eq!(
+            h.supervisor.log_tenant("ns:ns", &invocation).as_deref(),
+            Some("zed"),
+            "just ended: still attributable"
+        );
+    }
+    send_logs(
+        &worker,
+        vec![log_batch(
+            Origin {
+                session: false,
+                tenant: "bob".into(),
+                ..origin("ns/app", "run", "run-inv.1")
+            },
+            vec![b"after the reply".to_vec()],
+        )],
+    )
+    .await
+    .unwrap();
+    let out = stdout_log(&logs, 7);
+    assert!(
+        out.contains("[isolate run-inv.1 tenant=zed] after the reply\n"),
+        "an ended invocation's lines are kept for a grace period: {:?} {:?}",
+        &out[out.len().saturating_sub(300)..],
+        stderr_log(&logs, 7)
+    );
+}
+
+/// One task's flood does not drop another task's lines in the same host.
+#[tokio::test]
+async fn one_tasks_log_flood_leaves_other_tasks_lines_alone() {
+    let h = harness();
+    let logs = h._dir.path().join("logs");
+    h.supervisor.set_log_root(logs.clone());
+    let mut two = envelope(
+        "ns/two",
+        isolate_task("run", module_config("session")),
+        512.0,
+    );
+    two.allocation_id = 8;
+    h.supervisor.sync(vec![
+        envelope(
+            "ns/app",
+            isolate_task("run", module_config("session")),
+            1024.0,
+        ),
+        two,
+    ]);
+    for (job, id) in [("ns/app", "run-a.1"), ("ns/two", "run-b.1")] {
+        h.supervisor
+            .start_session(job, "run", id, "", "manager", "", "")
+            .await
+            .unwrap();
+    }
+    let worker = h.launcher.hosts()[0].1.worker.clone();
+    let line = vec![b'x'; 16 << 10];
+    let flood: Vec<LogBatch> = (0..8)
+        .map(|_| log_batch(origin("ns/app", "run", "run-a.1"), vec![line.clone(); 60]))
+        .collect();
+    send_logs(&worker, flood).await.unwrap();
+    assert!(
+        stderr_log(&logs, 7).contains("lines dropped"),
+        "the flooding task went over its own budget"
+    );
+    send_logs(
+        &worker,
+        vec![log_batch(
+            origin("ns/two", "run", "run-b.1"),
+            vec![b"still here".to_vec()],
+        )],
+    )
+    .await
+    .unwrap();
+    assert_eq!(stdout_log(&logs, 8), "[isolate run-b.1] still here\n");
+    assert!(!stderr_log(&logs, 8).contains("dropped"));
+}
+
+/// A VM-tier run stages its entry under the task's fixed name, so a caller
+/// cannot enable `args` by naming its file after a command's operand.
+#[test]
+fn the_vm_entry_path_is_fixed_per_task_not_chosen_by_the_caller() {
+    use crate::worker::task_manager::session_runs::vm_args_follow_command;
+    let file = |name: &str| (name.to_string(), b"x".to_vec(), false);
+    // A module task: the caller names its entry `app.js` to match a VM
+    // command ending with /legion/run/app.js.
+    let (files, entry_path) = super::supervisor::stage_for_vm(
+        None,
+        Some("app.js"),
+        None,
+        vec![file("app.js"), file("data.txt"), file("input.json")],
+    )
+    .unwrap();
+    assert_eq!(entry_path, "/legion/run/main");
+    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(names, ["main", "data.txt"]);
+    let command = |last: &str| vec!["node".to_string(), last.to_string()];
+    assert!(!vm_args_follow_command(
+        &command("/legion/run/app.js"),
+        &entry_path
+    ));
+    assert!(vm_args_follow_command(
+        &command("/legion/run/main"),
+        &entry_path
+    ));
+    // Exact match only.
+    for near in [
+        "/legion/run/./main",
+        "/legion/run/main/",
+        "/legion/run//main",
+        "/legion/run/main ",
+        "legion/run/main",
+    ] {
+        assert!(
+            !vm_args_follow_command(&command(near), &entry_path),
+            "{near}"
+        );
+    }
+    assert!(!vm_args_follow_command(&[], &entry_path));
+    // An image task: the image's VM entry.
+    let (files, entry_path) = super::supervisor::stage_for_vm(
+        Some("python"),
+        Some("solution.py"),
+        None,
+        vec![file("solution.py")],
+    )
+    .unwrap();
+    assert_eq!(entry_path, "/legion/run/main.py");
+    assert_eq!(files[0].path, "main.py");
+    // No entry in the run: config.entry is staged at the fixed name; no
+    // entry at all still yields the fixed path (nothing a caller names).
+    let configured = File {
+        path: "app.js".into(),
+        content: b"y".to_vec(),
+        ..Default::default()
+    };
+    let err =
+        super::supervisor::stage_for_vm(None, None, Some(configured.clone()), vec![file("main")])
+            .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    let (files, entry_path) =
+        super::supervisor::stage_for_vm(None, None, Some(configured), vec![file("data")]).unwrap();
+    assert_eq!(entry_path, "/legion/run/main");
+    assert_eq!(files.last().unwrap().path, "main");
+    assert_eq!(files.last().unwrap().content, b"y");
 }

@@ -27,8 +27,16 @@ use crate::worker::logs::LogConfig;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// The longest single guest line kept; the rest is replaced by a marker.
+/// The longest single guest line kept, after escaping; the rest is
+/// replaced by a marker.
 pub const MAX_LINE_BYTES: usize = 16 << 10;
+/// The most lines one batch keeps, counted after embedded newlines are
+/// split (one guest "line" holding a million `\n` is a million lines).
+pub const MAX_LINES_PER_BATCH: usize = 4096;
+/// The most escaped text one batch keeps; with the prefix (at most a few
+/// hundred bytes, from a checked isolate id and tenant) per line, a batch
+/// renders to at most `MAX_BATCH_BYTES + MAX_LINES_PER_BATCH * 420` bytes.
+pub const MAX_BATCH_BYTES: usize = 1 << 20;
 
 /// Appends guest lines to envelope allocations' task logs.
 #[derive(Debug, Clone)]
@@ -38,7 +46,16 @@ pub struct GuestLogs {
     config: LogConfig,
 }
 
-/// Who wrote a batch: the prefix every line gets.
+/// One guest line ready to write: split on newlines, escaped, cut; without
+/// its prefix and newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub stderr: bool,
+    pub text: Vec<u8>,
+}
+
+/// Who wrote a batch: the prefix every line gets. The worker's own record
+/// of the isolate id and tenant, both checked (`service::check_origin`).
 pub fn line_prefix(isolate_id: &str, tenant: &str) -> String {
     if tenant.is_empty() {
         format!("[isolate {isolate_id}] ")
@@ -47,8 +64,87 @@ pub fn line_prefix(isolate_id: &str, tenant: &str) -> String {
     }
 }
 
-/// Render one batch into the bytes for stdout and for stderr.
-pub fn render(prefix: &str, lines: &[LogLine]) -> (Vec<u8>, Vec<u8>) {
+/// The bytes `line` takes in the log file with `prefix`: what the rate
+/// budget is charged.
+pub fn rendered_len(prefix: &str, line: &Line) -> usize {
+    prefix.len() + line.text.len() + 1
+}
+
+/// Escape one line's body so it cannot pass for another line or drive a
+/// terminal (security review N5): every C0 control character but tab
+/// (`\r` included, so a guest cannot return to the start of the line and
+/// print another isolate's prefix over its own), DEL, and the UTF-8 C1
+/// controls (U+0080..U+009F, among them CSI) are written as visible `\xHH`
+/// escapes; everything else is kept as is. The result is cut at
+/// [`MAX_LINE_BYTES`] with a marker, without reading past what it keeps.
+pub fn escape_line(raw: &[u8]) -> Vec<u8> {
+    const CUT: &str = " [line cut at 16384 bytes]";
+    const _: () = assert!(MAX_LINE_BYTES == 16384, "the marker names the cut");
+    let mut out = Vec::with_capacity(raw.len().min(MAX_LINE_BYTES + CUT.len()));
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        let push = |token: &[u8], out: &mut Vec<u8>| -> bool {
+            if out.len() + token.len() > MAX_LINE_BYTES {
+                return false;
+            }
+            out.extend_from_slice(token);
+            true
+        };
+        let fits = if b == b'\t' || (b >= 0x20 && b != 0x7f && b != 0xc2) {
+            push(&[b], &mut out)
+        } else if b == 0xc2 && raw.get(i + 1).is_some_and(|n| (0x80..=0x9f).contains(n)) {
+            let token = format!("\\x{b:02x}\\x{:02x}", raw[i + 1]);
+            i += 1;
+            push(token.as_bytes(), &mut out)
+        } else if b == 0xc2 {
+            push(&[b], &mut out)
+        } else {
+            push(format!("\\x{b:02x}").as_bytes(), &mut out)
+        };
+        if !fits {
+            out.extend_from_slice(CUT.as_bytes());
+            break;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Split a batch into lines: each guest line on its embedded newlines (a
+/// trailing newline or CRLF ends a line, it does not start an empty one),
+/// each part escaped and cut ([`escape_line`]). Keeps at most `max_lines`
+/// lines and `max_bytes` of escaped text, in order; returns them and how
+/// many lines were dropped. Never allocates more than it keeps.
+pub fn split_lines(batch: &[LogLine], max_lines: usize, max_bytes: usize) -> (Vec<Line>, u64) {
+    let mut lines = Vec::new();
+    let mut bytes = 0usize;
+    let mut dropped = 0u64;
+    for line in batch {
+        let mut text: &[u8] = &line.line;
+        while let Some(rest) = text.strip_suffix(b"\n") {
+            text = rest;
+        }
+        for part in text.split(|b| *b == b'\n') {
+            if lines.len() >= max_lines || bytes >= max_bytes {
+                dropped += 1;
+                continue;
+            }
+            let part = part.strip_suffix(b"\r").unwrap_or(part);
+            let escaped = escape_line(part);
+            bytes += escaped.len();
+            lines.push(Line {
+                stderr: line.stderr,
+                text: escaped,
+            });
+        }
+    }
+    (lines, dropped)
+}
+
+/// Render lines into the bytes for stdout and for stderr: each line gets
+/// the prefix, so a reader can always tell whose a line is.
+pub fn render(prefix: &str, lines: &[Line]) -> (Vec<u8>, Vec<u8>) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     for line in lines {
@@ -57,25 +153,9 @@ pub fn render(prefix: &str, lines: &[LogLine]) -> (Vec<u8>, Vec<u8>) {
         } else {
             &mut stdout
         };
-        let mut text: &[u8] = &line.line;
-        while let Some(rest) = text.strip_suffix(b"\n") {
-            text = rest;
-        }
-        if let Some(rest) = text.strip_suffix(b"\r") {
-            text = rest;
-        }
-        // A guest's one "line" may itself hold newlines: each gets the
-        // prefix, so a reader can always tell whose a line is.
-        for part in text.split(|b| *b == b'\n') {
-            out.extend_from_slice(prefix.as_bytes());
-            if part.len() > MAX_LINE_BYTES {
-                out.extend_from_slice(&part[..MAX_LINE_BYTES]);
-                out.extend_from_slice(format!(" [line cut at {MAX_LINE_BYTES} bytes]").as_bytes());
-            } else {
-                out.extend_from_slice(part);
-            }
-            out.push(b'\n');
-        }
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(&line.text);
+        out.push(b'\n');
     }
     (stdout, stderr)
 }
@@ -97,8 +177,15 @@ impl GuestLogs {
         self.root.join(envelope_allocation_id.to_string())
     }
 
-    /// Append one batch (blocking file I/O: call from a blocking thread).
+    /// Append one batch of raw guest lines, split and escaped with the
+    /// batch limits (blocking file I/O: call from a blocking thread).
     pub fn append(&self, envelope_allocation_id: i64, prefix: &str, lines: &[LogLine]) -> R<()> {
+        let (lines, _) = split_lines(lines, MAX_LINES_PER_BATCH, MAX_BATCH_BYTES);
+        self.append_lines(envelope_allocation_id, prefix, &lines)
+    }
+
+    /// Append lines already split and escaped ([`split_lines`]). Blocking.
+    pub fn append_lines(&self, envelope_allocation_id: i64, prefix: &str, lines: &[Line]) -> R<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -171,6 +258,89 @@ mod guest_logs_test {
         );
         assert_eq!(read[1].stream, "stderr");
         assert_eq!(read[1].content, "[isolate run-a.1] oops\n");
+    }
+
+    #[test]
+    fn a_forged_prefix_or_terminal_escape_is_rendered_inert_test() {
+        let (lines, dropped) = split_lines(
+            &[line(
+                "x\r\x1b[2K[isolate other-id tenant=bob] payment ok\u{9b}31m\x07\x7f\tend\r\n",
+                false,
+            )],
+            MAX_LINES_PER_BATCH,
+            MAX_BATCH_BYTES,
+        );
+        assert_eq!(dropped, 0);
+        let (stdout, _) = render(&line_prefix("inv-1", "acme"), &lines);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "[isolate inv-1 tenant=acme] x\\x0d\\x1b[2K[isolate other-id tenant=bob] payment \
+             ok\\xc2\\x9b31m\\x07\\x7f\tend\n"
+        );
+        // A newline inside starts a line of its own, with the real prefix.
+        let (lines, _) = split_lines(
+            &[line("a\n[isolate other-id] forged", true)],
+            MAX_LINES_PER_BATCH,
+            MAX_BATCH_BYTES,
+        );
+        let (_, stderr) = render(&line_prefix("inv-1", ""), &lines);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "[isolate inv-1] a\n[isolate inv-1] [isolate other-id] forged\n"
+        );
+    }
+
+    #[test]
+    fn a_newline_bomb_is_cut_before_anything_is_built_test() {
+        // One "line" of 8 MiB of newlines: 8 M parts.
+        let bomb = LogLine {
+            stderr: false,
+            line: vec![b'\n'; 8 << 20].into_iter().chain(*b"a").collect(),
+            unix_ms: 0,
+        };
+        let many = LogLine {
+            stderr: false,
+            line: b"ab\n".repeat(1 << 20),
+            unix_ms: 0,
+        };
+        let (lines, dropped) = split_lines(&[bomb, many], MAX_LINES_PER_BATCH, MAX_BATCH_BYTES);
+        assert_eq!(lines.len(), MAX_LINES_PER_BATCH);
+        assert_eq!(
+            dropped as usize,
+            (8 << 20) + 1 + (1 << 20) - MAX_LINES_PER_BATCH
+        );
+        // Long lines: the batch keeps at most MAX_BATCH_BYTES of text.
+        let long = LogLine {
+            stderr: false,
+            line: [vec![b'x'; 100 << 10], b"\n".to_vec()].concat().repeat(200),
+            unix_ms: 0,
+        };
+        let (lines, dropped) = split_lines(&[long], MAX_LINES_PER_BATCH, MAX_BATCH_BYTES);
+        let text: usize = lines.iter().map(|l| l.text.len()).sum();
+        assert!(text < MAX_BATCH_BYTES + MAX_LINE_BYTES + 64, "{text}");
+        assert_eq!(lines.len() as u64 + dropped, 200);
+        // An escaped line stays within its cap: escaping expands 4x.
+        let controls = escape_line(&vec![0x01; 1 << 20]);
+        assert!(controls.len() <= MAX_LINE_BYTES + 32, "{}", controls.len());
+        assert!(controls.ends_with(b" [line cut at 16384 bytes]"));
+        // So the rendered batch is bounded by constants, whatever the host
+        // sent.
+        let prefix = line_prefix(&"i".repeat(256), &"t".repeat(128));
+        let (lines, _) = split_lines(
+            &[LogLine {
+                stderr: false,
+                line: b"\x01\n".repeat(1 << 20),
+                unix_ms: 0,
+            }],
+            MAX_LINES_PER_BATCH,
+            MAX_BATCH_BYTES,
+        );
+        let (stdout, _) = render(&prefix, &lines);
+        assert!(
+            stdout.len() <= MAX_BATCH_BYTES + MAX_LINES_PER_BATCH * (prefix.len() + 1),
+            "{}",
+            stdout.len()
+        );
     }
 
     #[test]

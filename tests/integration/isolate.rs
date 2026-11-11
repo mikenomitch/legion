@@ -136,6 +136,7 @@ fn a_component_compiles_once_into_derived_content() {
         store: Some(store.clone()),
         images: Some(catalog_with(&images, &fixture("cmd.wasm"))),
         fallback_dir: dir.path().join("cwasm"),
+        cgroup_dir: None,
     };
     let want = ModuleWant::Image("python".into());
     let first = compiler.compiled(&want).expect("compile cmd.wasm");
@@ -170,6 +171,7 @@ fn a_file_that_is_not_a_component_is_the_tasks_problem() {
         store: None,
         images: Some(catalog_with(&images, &junk)),
         fallback_dir: dir.path().join("cwasm"),
+        cgroup_dir: None,
     };
     let problem = compiler
         .compiled(&ModuleWant::Image("python".into()))
@@ -230,6 +232,7 @@ fn node_confined(image_fixture: &str, confine: ConfineMode) -> Node {
             store: Some(store.clone()),
             images: Some(catalog),
             fallback_dir: fallback.clone(),
+            cgroup_dir: None,
         }),
         binary: found,
         read_dirs: vec![fallback, derived],
@@ -378,6 +381,64 @@ async fn a_session_isolate_keeps_state_across_hibernation() {
     assert_eq!(reply.isolate_start, "hibernated");
     assert!(reply.result.contains('v'), "{reply:?}");
     assert!(node.supervisor.stop_session("run-s.1", "test").await);
+}
+
+/// The host's death signal follows the thread that forked it: a host
+/// started from a thread that then exits (as tokio's blocking-pool threads
+/// do) keeps running and serving, because every host is forked on the
+/// worker's one spawner thread (security review N8). The worker-gone
+/// guarantees still hold: killing the host ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_started_from_a_thread_that_exits_keeps_serving() {
+    use legion::worker::isolates::host::{HostCallLimits, HostLauncher, HostSpawn};
+    use legion::worker::isolates::service::WorkerService;
+    let dir = tempfile::tempdir().unwrap();
+    let config = legion::worker::isolates::plan::host_config(
+        &config_confined(ConfineMode::BestEffort),
+        "spawner",
+        8,
+        &[dir.path().to_path_buf()],
+    );
+    let spawn = HostSpawn {
+        cordon: "spawner".into(),
+        replica: 0,
+        memory_max_bytes: None,
+        config,
+    };
+    let launcher = ProcessLauncher {
+        binary: isolate_binary(),
+        cgroup_dir: None,
+    };
+    let handle = tokio::runtime::Handle::current();
+    let worker = WorkerService::new(
+        std::sync::Weak::new(),
+        "spawner",
+        HostCallLimits::for_host(&spawn.config),
+    );
+    let launched = std::thread::spawn(move || handle.block_on(launcher.launch(&spawn, worker)))
+        .join()
+        .unwrap()
+        .expect("launch");
+    // The asking thread is gone; give a death signal time to land.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        launched.exited.borrow().is_none(),
+        "the host died with the thread that asked for it: {:?}",
+        launched.exited.borrow()
+    );
+    let mut client = launched.client.clone();
+    let hello = client
+        .hello(legion::structs::isolate_host::HelloRequest {})
+        .await
+        .expect("the host still serves")
+        .into_inner();
+    assert_eq!(hello.pid, launched.pid);
+    (launched.kill)();
+    let mut exited = launched.exited.clone();
+    tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|e| e.is_some()))
+        .await
+        .expect("the killed host exits")
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -239,21 +239,73 @@ pub struct IsolateSupervisor {
     ingress: Mutex<HashMap<TaskKey, Vec<super::ingress::IngressServer>>>,
     /// Where guest output goes: the envelope allocations' task logs.
     guest_logs: RwLock<Option<super::guest_logs::GuestLogs>>,
-    /// Invocations in flight: (cordon, job, task, invocation id). A host
-    /// may act as a request or tenant isolate (child VMs) only while the
-    /// worker has such an invocation open with it.
-    inflight: Mutex<std::collections::HashSet<(String, String, String, String)>>,
+    /// Invocations in flight: (cordon, job, task, invocation id) and the
+    /// tenant the worker gave each. A host may act as a request or tenant
+    /// isolate (child VMs) only while the worker has such an invocation
+    /// open with it.
+    inflight: Mutex<HashMap<InflightKey, String>>,
+    /// Invocations that ended in the last [`RECENT_INVOCATION_GRACE`]: a
+    /// host forwards an invocation's log lines after its reply, so `Log`
+    /// accepts them a little after the call ended.
+    recent: Mutex<RecentInvocations>,
+}
+
+/// (cordon, job, task, invocation id).
+type InflightKey = (String, String, String, String);
+
+/// How long after an invocation ends its host may still log for it.
+const RECENT_INVOCATION_GRACE: Duration = Duration::from_secs(30);
+/// The most ended invocations remembered for that (oldest dropped first).
+const RECENT_INVOCATIONS_MAX: usize = 16_384;
+
+/// Ended invocations, oldest first, with the tenant each ran for.
+#[derive(Default)]
+struct RecentInvocations {
+    order: std::collections::VecDeque<(Instant, InflightKey)>,
+    tenants: HashMap<InflightKey, (Instant, String)>,
+}
+
+impl RecentInvocations {
+    fn prune(&mut self, now: Instant) {
+        while let Some((at, _)) = self.order.front() {
+            let expired = now.duration_since(*at) > RECENT_INVOCATION_GRACE;
+            if !expired && self.order.len() <= RECENT_INVOCATIONS_MAX {
+                break;
+            }
+            let (at, key) = self.order.pop_front().expect("a front entry");
+            // An id that ended twice (a repeated derived run id) keeps its
+            // newer entry.
+            if self.tenants.get(&key).is_some_and(|(when, _)| *when == at) {
+                self.tenants.remove(&key);
+            }
+        }
+    }
+
+    fn push(&mut self, key: InflightKey, tenant: String) {
+        let now = Instant::now();
+        self.tenants.insert(key.clone(), (now, tenant));
+        self.order.push_back((now, key));
+        self.prune(now);
+    }
+
+    fn tenant(&mut self, key: &InflightKey) -> Option<String> {
+        self.prune(Instant::now());
+        self.tenants.get(key).map(|(_, tenant)| tenant.clone())
+    }
 }
 
 /// Removes an in-flight invocation when the call ends, however it ends.
 pub(crate) struct Inflight<'a> {
     supervisor: &'a IsolateSupervisor,
-    key: (String, String, String, String),
+    key: InflightKey,
 }
 
 impl Drop for Inflight<'_> {
     fn drop(&mut self) {
-        lock(&self.supervisor.inflight).remove(&self.key);
+        let tenant = lock(&self.supervisor.inflight).remove(&self.key);
+        if let Some(tenant) = tenant {
+            lock(&self.supervisor.recent).push(self.key.clone(), tenant);
+        }
     }
 }
 
@@ -318,6 +370,7 @@ impl IsolateSupervisor {
             ingress: Mutex::new(HashMap::new()),
             guest_logs: RwLock::new(None),
             inflight: Mutex::new(Default::default()),
+            recent: Mutex::new(Default::default()),
         })
     }
 
@@ -853,7 +906,11 @@ impl IsolateSupervisor {
             ),
             memory_max_bytes: self.cordon_memory_bytes(&replica.cordon),
         };
-        let worker = super::service::WorkerService::new(self.me.clone(), &replica.cordon);
+        let worker = super::service::WorkerService::new(
+            self.me.clone(),
+            &replica.cordon,
+            super::host::HostCallLimits::for_host(&spawn.config),
+        );
         let launched = self.launcher.launch(&spawn, worker).await?;
         let mut client = launched.client.clone();
         let hello =
@@ -1077,11 +1134,14 @@ impl IsolateSupervisor {
                 .ok_or("the module is not compiled yet")?;
             (module, self.task_spec(task, replicas, replica.index))
         };
+        // Canonical: in the host's mount root only a directory's canonical
+        // path exists.
+        let artifact = std::fs::canonicalize(&module.path).unwrap_or(module.path.clone());
         let mut client = conn.client.clone();
         client
             .load_module(host::LoadModuleRequest {
                 module_id: module.module_id.clone(),
-                artifact_path: module.path.display().to_string(),
+                artifact_path: artifact.display().to_string(),
             })
             .await
             .map_err(|status| {
@@ -1203,14 +1263,20 @@ impl IsolateSupervisor {
         })
     }
 
-    pub(crate) fn inflight(&self, cordon: &str, key: &TaskKey, id: &str) -> Inflight<'_> {
+    pub(crate) fn inflight(
+        &self,
+        cordon: &str,
+        key: &TaskKey,
+        id: &str,
+        tenant: &str,
+    ) -> Inflight<'_> {
         let entry = (
             cordon.to_string(),
             key.0.clone(),
             key.1.clone(),
             id.to_string(),
         );
-        lock(&self.inflight).insert(entry.clone());
+        lock(&self.inflight).insert(entry.clone(), tenant.to_string());
         Inflight {
             supervisor: self,
             key: entry,
@@ -1222,12 +1288,45 @@ impl IsolateSupervisor {
     /// it holds, or an invocation of that task in flight on it. A host can
     /// otherwise claim any id (child VMs are owned by these ids).
     pub fn issued(&self, cordon: &str, task: &IsolateTaskRef) -> bool {
+        self.issued_tenant(cordon, task).is_some()
+    }
+
+    /// [`Self::issued`], with the tenant the worker gave that isolate (the
+    /// session's recorded tenant, or the tenant of the invocation in
+    /// flight): what a host's request is attributed to, whatever tenant its
+    /// `Origin` claims.
+    pub fn issued_tenant(&self, cordon: &str, task: &IsolateTaskRef) -> Option<String> {
         if task.session {
             return lock(&self.sessions)
                 .get(&task.isolate_id)
-                .is_some_and(|r| r.job_id == task.job_id && r.task_name == task.task_name);
+                .filter(|r| r.job_id == task.job_id && r.task_name == task.task_name)
+                .map(|r| r.tenant.clone());
         }
-        lock(&self.inflight).contains(&(
+        lock(&self.inflight)
+            .get(&(
+                cordon.to_string(),
+                task.job_id.clone(),
+                task.task_name.clone(),
+                task.isolate_id.clone(),
+            ))
+            .cloned()
+    }
+
+    /// The tenant to attribute a host's log lines to, when the isolate they
+    /// name is one this worker gave that host's cordon: a session isolate
+    /// of that job and task (its recorded tenant), or an invocation of that
+    /// task in flight or ended within [`RECENT_INVOCATION_GRACE`] (the
+    /// tenant the worker invoked it for). `None`: the host named an isolate
+    /// it was never given, and its lines are refused. The host's own word
+    /// for the tenant is never used.
+    pub fn log_tenant(&self, cordon: &str, task: &IsolateTaskRef) -> Option<String> {
+        if let Some(tenant) = self.issued_tenant(cordon, task) {
+            return Some(tenant);
+        }
+        if task.session {
+            return None;
+        }
+        lock(&self.recent).tenant(&(
             cordon.to_string(),
             task.job_id.clone(),
             task.task_name.clone(),
@@ -1750,7 +1849,7 @@ impl IsolateSupervisor {
                 get,
             })),
         };
-        let _inflight = self.inflight(&cordon, key, run_id);
+        let _inflight = self.inflight(&cordon, key, run_id, &tenant);
         let mut client = conn.client.clone();
         let reply = client
             .invoke(invoke)
@@ -1838,54 +1937,20 @@ impl IsolateSupervisor {
                 "this node cannot start a VM for the run",
             ));
         };
-        // The entry is staged as the image's VM entry name, the other files
-        // as sent.
-        let entry_name = decided.entry_name.clone();
-        let vm_entry = decided
-            .image
-            .as_deref()
-            .map(crate::structs::isolate::vm_entry_name);
-        let mut files = Vec::new();
-        for (path, content, executable) in staged.files {
-            if path == crate::structs::run::RUN_INPUT_FILE {
-                continue;
-            }
-            let path = match (&entry_name, vm_entry) {
-                (Some(entry), Some(vm_entry)) if *entry == path => vm_entry.to_string(),
-                _ => path,
-            };
-            files.push(crate::structs::RunFile {
-                path,
-                content,
-                executable,
-            });
-        }
-        // A task with `config.entry`: its entry is that file, staged for the
-        // VM as the image's VM entry (the run's files are data).
-        let mut entry_name = entry_name;
-        if entry_name.is_none() {
-            let configured = lock(&self.state)
+        let configured = if decided.entry_name.is_none() {
+            lock(&self.state)
                 .tasks
                 .get(key)
-                .and_then(|task| task.entry.clone());
-            if let Some(entry) = configured {
-                let path = vm_entry.map(str::to_string).unwrap_or(entry.path.clone());
-                files.push(crate::structs::RunFile {
-                    path: path.clone(),
-                    content: entry.content,
-                    executable: false,
-                });
-                entry_name = Some(path);
-            }
-        }
-        let entry_path = format!(
-            "{}/{}",
-            crate::structs::run::RUN_DIR,
-            vm_entry
-                .map(str::to_string)
-                .or_else(|| entry_name.clone())
-                .unwrap_or_default()
-        );
+                .and_then(|task| task.entry.clone())
+        } else {
+            None
+        };
+        let (files, entry_path) = stage_for_vm(
+            decided.image.as_deref(),
+            decided.entry_name.as_deref(),
+            configured,
+            staged.files,
+        )?;
         let vm_args = crate::worker::task_manager::session_runs::VmArgs {
             args: call.request.args.clone(),
             entry_path,
@@ -2580,7 +2645,7 @@ impl IsolateSupervisor {
         let tenant = tenant.as_str();
         let (_, conn) = self.pick_replica(&cordon, tenant, session_replica)?;
         let invocation_id = crate::structs::mint_session_id(task_name, &self.node_id);
-        let _inflight = self.inflight(&cordon, &key, &invocation_id);
+        let _inflight = self.inflight(&cordon, &key, &invocation_id, tenant);
         let mut client = conn.client.clone();
         let reply = client
             .invoke(host::InvokeRequest {
@@ -3046,6 +3111,59 @@ fn check_session_tenant(session_id: &str, own: &str, asked: &str) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+/// The run's files as a VM-tier run stages them, and the path of its
+/// entry there. The entry is always staged under a fixed name for the task,
+/// never one the caller chose (security review N4): the image's VM entry
+/// (`main.py`, `main.mjs`), or `main` for a module task. The run's `args`
+/// are appended to the VM task's `run.command` only when its last element
+/// is exactly that path, so a caller cannot name a file to match a
+/// command's operand. A task with `config.entry` and no run entry stages
+/// its configured entry there (the run's files are data).
+pub(crate) fn stage_for_vm(
+    image: Option<&str>,
+    entry_name: Option<&str>,
+    configured: Option<host::File>,
+    files: Vec<(String, Vec<u8>, bool)>,
+) -> Result<(Vec<crate::structs::RunFile>, String), Status> {
+    let vm_entry = image
+        .map(crate::structs::isolate::vm_entry_name)
+        .unwrap_or("main");
+    let has_entry = entry_name.is_some() || configured.is_some();
+    let mut staged = Vec::with_capacity(files.len() + 1);
+    for (path, content, executable) in files {
+        if path == crate::structs::run::RUN_INPUT_FILE {
+            continue;
+        }
+        let path = if entry_name == Some(path.as_str()) {
+            vm_entry.to_string()
+        } else if has_entry && path == vm_entry {
+            return Err(Status::invalid_argument(format!(
+                "file {path} has the name the VM tier stages the run's entry under; rename it"
+            )));
+        } else {
+            path
+        };
+        staged.push(crate::structs::RunFile {
+            path,
+            content,
+            executable,
+        });
+    }
+    if entry_name.is_none() {
+        if let Some(entry) = configured {
+            staged.push(crate::structs::RunFile {
+                path: vm_entry.to_string(),
+                content: entry.content,
+                executable: false,
+            });
+        }
+    }
+    Ok((
+        staged,
+        format!("{}/{vm_entry}", crate::structs::run::RUN_DIR),
+    ))
 }
 
 fn check_args(args: &[String]) -> Result<(), Status> {

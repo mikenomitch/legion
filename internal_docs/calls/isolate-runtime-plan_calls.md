@@ -737,6 +737,17 @@ review had reproduced the gap against the first build: a namespaced,
 capability-less process whose kernel uid is root could SIGKILL any process
 on the node through `F_SETOWN` and `O_ASYNC` on a Unix socketpair.
 
+**As built, second hardening round (2026-11-11).** Hosts are now forked from one
+process-wide `isolate-spawner` OS thread that never exits, because the
+worker's `PR_SET_PDEATHSIG` fires when the *thread* that forked dies, and
+tokio threads retire (a verification re-review found hosts could be
+killed spuriously). Alternative rejected: drop the worker-to-host death
+signal and rely on the control socket closing, which a compromised host
+that ignores its socket would survive. The compiler child gets the death
+signal too, and `legion-isolate compile --deadline-secs N` (`alarm(2)`
+set before the fork; the worker passes 310) so a compile never outlives
+its worker by more than its deadline.
+
 ---
 
 ## 16. The host's root is an empty read-only tmpfs; the artifact directories in it keep `exec`
@@ -781,6 +792,14 @@ closes two review findings for the host: on a kernel without Landlock the
 namespaces gave no filesystem protection at all, because the kernel uid
 stays the worker's (entry 18); and `stat`/`readlink` exposed path
 metadata Landlock does not govern.
+
+**As built, second hardening round (2026-11-11).** The bind was recursive, and a nested
+mount inside an artifact directory stayed writable (the re-review showed
+it). Each bind's whole subtree is now made read-only, `nosuid`, `nodev`
+with `mount_setattr(AT_RECURSIVE)`, falling back to remounting every
+mount `/proc/self/mountinfo` lists beneath it; if neither works, the note
+names the directory and `enforce` counts `read-only submounts` as a
+missing layer, so the host exits.
 
 ---
 
@@ -853,6 +872,13 @@ node, and Legion provisions none for any runtime yet. With the mount root
 on every enforced host, the filesystem the uid could reach is gone, which
 was the uid drop's purpose. It stays an open item.
 
+**As built, second hardening round (2026-11-11).** Under `best-effort`, a host that could
+not create its user namespace kept every capability as real root (the
+re-review's N7). It now clears the bounding, effective, permitted,
+inheritable, and ambient sets without a user namespace too; `userns`
+still reads as missing, so `enforce` still refuses. The kernel uid is
+still the worker's.
+
 ---
 
 ## 19. seccomp argument filters kill the process; they do not answer `EPERM`
@@ -868,7 +894,7 @@ none), and:
 fcntl   F_GETFD, F_SETFD, F_GETFL, F_DUPFD_CLOEXEC, and F_SETFL with O_ASYNC clear
 ioctl   FIONBIO, FIOCLEX
 prctl   PR_SET_NAME
-else    the process is killed (SIGSYS); LEGION_ISOLATE_SECCOMP=log logs instead
+else    the process is killed (SIGSYS); LEGION_ISOLATE_SECCOMP=log logs instead (test builds only, see below)
 ```
 
 Anything else, including `F_SETOWN`, `F_SETOWN_EX`, `F_SETSIG`,
@@ -894,6 +920,11 @@ list. These filters close the review's signal routes (`F_SETOWN`/`O_ASYNC`,
 `FIOSETOWN`/`FIOASYNC`) on their own, independently of the PID namespace
 (entry 15) and the Landlock scopes (entry 21):
 `seccomp_kills_every_signal_route_and_the_victim_survives_test`.
+
+**As built, second hardening round (2026-11-11).** `LEGION_ISOLATE_SECCOMP=log` is honoured
+only in a binary built with the `confinement-test` feature (a host built
+with it says so in its `Hello` notes); in a shipping build a refused call
+always kills.
 
 ---
 
@@ -945,6 +976,15 @@ review found it always best effort with no seccomp, which on a kernel
 without Landlock left an exploit in it reading and writing root-owned
 files and other cordons' `.cwasm` files, and with Landlock still able to
 read every job's artifacts. It now sees one file.
+
+**As built, second hardening round (2026-11-11).** With resource enforcement on and cgroup v2,
+each compile now runs in its own leaf cgroup (`compile.<pid>.<n>` under
+`isolate-hosts`, `memory.max` 4 GiB, `pids.max` 256, removed afterwards),
+joined between fork and `exec`, best effort like the hosts'; and it takes
+`--deadline-secs` (entry 15). Not exercised: the build container has
+cgroup v1. The entry's staging now happens in a private temporary
+directory removed as soon as the entry is read, and `entries/` is cleared
+at supervisor start.
 
 ---
 
@@ -1272,6 +1312,14 @@ already enforces; per-replica tracking would buy nothing between
 processes that share their jobs, and the job/task comparison is a smaller
 change to a registry other runtimes share.
 
+**As built, second hardening round (2026-11-11).** Every `IsolateWorker` method now passes one
+origin check first: job id at most 512 bytes, task name at most 256, isolate
+id at most 256 bytes of `[A-Za-z0-9._-]`, tenant empty or a valid tenant
+key; errors name lengths, never echo the host's strings. Checkpoint
+header strings are bounded the same way before they are persisted.
+`IsolateWorker.Log` is held to issued isolates too, with a 30 s grace after
+an invocation ends (entry 70).
+
 ---
 
 ## 29. VM-tier `args` are appended only to a `run.command` that ends with the staged entry, and always exported as `LEGION_RUN_ARGS`
@@ -1319,6 +1367,16 @@ which a direct run of the VM task forbids without `exec:write` and
 `allowCommand`. A command that ends with the entry makes the args the
 script's own arguments by construction, and the common VM task
 (`["python3", "/legion/run/main.py"]`) keeps working with no change.
+
+**As built, second hardening round (2026-11-11).** The hole the re-review found for module
+tasks is closed: the entry is always staged under the task's fixed VM
+entry name (`main.py`, `main.mjs`, or `main` for a module task, `config.entry`
+included), never a caller-chosen name, and the command's last element must
+equal `/legion/run/<that name>` byte for byte. A run file with that fixed
+name while an entry is staged there is refused (`file main has the name the
+VM tier stages the run's entry under; rename it`). Behavior change: a module
+task's VM run used to stage its entry under the caller's file name. The
+operand problem above is unchanged and stays documented.
 
 ---
 
@@ -1401,6 +1459,12 @@ membership is checked after spawn, and a failure is a warning that
 leaves the host in the worker's cgroup. Leaf names use the prefixed
 cordon (`ns_default-0`, entry 36). `cpu.weight` is still not set. None
 of this ran in the build container (cgroup v1).
+
+**As built, second hardening round (2026-11-11).** Leaf names are injective now (entry 36):
+a sanitized prefix of the cordon name plus the first 12 hex digits of its
+SHA-256 and the replica (`<prefix>-<digest>-r<replica>`), because the
+sanitized name alone let `job:acme/billing` and `job:acme_billing` share a
+cgroup and overwrite each other's `memory.max` (the re-review's N1).
 
 ---
 
@@ -1591,6 +1655,12 @@ its own prefix) rather than one name, and takes no namespace name away
 from users. The worker needed no change: it stores the recomputed name on
 each task at every sync and compares strings; nothing parses a cordon
 name.
+
+**As built, second hardening round (2026-11-11).** The cgroup leaf name built from the cordon
+was not injective (`:` and `/` both became `_`); path components built from
+a cordon now use `isolates::path_component`, a readable prefix plus a
+12-hex SHA-256 digest of the exact name (entry 31). Checkpoint file names
+keep `file_safe`, which is injective on the id alphabet sessions use.
 
 ---
 
@@ -1975,6 +2045,19 @@ three ways: `SaveCheckpoint` buffered up to 4 GiB before it checked the
 origin, the host's gRPC server had no concurrency limit, and stderr was
 read with an unbounded line reader; a raw `kill(pid)` after reaping could
 also hit a reused pid.
+
+**As built, second hardening round (2026-11-11).** The flat 256 calls and 64 MiB messages
+allowed 16 GiB of decoded messages per host (the re-review's N3). Limits
+now derive from the host's config: a decode limit of `max(maxBodyBytes,
+16 MiB) + 1 MiB` (17 MiB by default), concurrent calls `shards × 8`
+clamped to 16..=64, and a per-host byte budget of `max(64 MiB, 4 × the
+decode limit)` that egress and VM handlers take for the bodies they hold,
+answering `RESOURCE_EXHAUSTED` when it is full rather than waiting with the
+message already decoded. Worst case per host replica: 64 × 17 MiB decoded
+at once. A child-VM `put` or `exec` stdin larger than the decode limit now
+fails at the transport. Guest logs moved to per-task budgets (entry 70).
+Not done: bounding bytes during decode (tonic buffers each message
+whole).
 
 ---
 
@@ -2717,6 +2800,38 @@ id is the worker's, and a tenant key is printable ASCII without spaces.
 End to end, a session isolate's output was read back through
 `GetAllocationLogs`, and an HTTP handler's from the envelope's
 `stdout.log`.
+
+**As built, second hardening round (2026-11-11).** The re-review found the log path
+unsafe for the worker: `Origin.isolate_id` and `tenant` were host-chosen
+and unbounded, and rendering repeated the prefix per embedded newline, so
+one forged batch could make the worker attempt an impossible allocation
+(N2); and mid-line `\r` or terminal escapes let a guest forge another
+isolate's prefix on screen, while one per-host budget let one tenant drop
+everyone's lines (N5). Now:
+
+- a batch is written only for an isolate the worker gave that cordon (a
+  session in the book, or an invocation in flight or ended within the last
+  30 s, at most 16,384 remembered), and the prefix's tenant is the worker's
+  record, never the host's; the 30 s grace exists because the host sends an
+  invocation's output after its reply, and making it wait would add
+  log-file latency to every request; for those 30 s a compromised host can
+  still write under that invocation's real id and tenant;
+- lines are split on embedded newlines first, then capped at 4,096 per
+  batch and 1 MiB of text, each cut at 16 KiB;
+- C0 controls except tab (`\r` included), DEL, and UTF-8 C1 are written as
+  visible `\xHH`, so coloured output appears as `\x1b[31m`;
+- the rate budget is charged for the rendered line: 512 KiB/s per (job,
+  task) with a 4 MiB burst, under 2 MiB/s per host with a 16 MiB burst, at
+  most 1,024 task buckets per host; tenants of one task share its bucket
+  (tenant keys are caller-chosen and unbounded in number).
+
+```text
+[isolate 7c1e... tenant=acme] x\x0d\x1b[2K[isolate other] ok
+[isolate 7c1e... tenant=acme] 1200 lines dropped: over the task's log rate or the batch limit
+```
+
+The "cannot be forged" sentence in the paragraph above held only for the
+prefix's own fields, not for what a line displays; it holds for both now.
 
 ---
 

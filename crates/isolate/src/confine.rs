@@ -640,7 +640,12 @@ struct MountAttr {
 /// `noexec`) to every mount at or beneath `at`: `mount_setattr` with
 /// `AT_RECURSIVE` (Linux 5.12+), else (or when `walk_only`, a test hook)
 /// a remount of each mount the mount table lists beneath `at`.
-fn restrict_submounts(at: &Path, rdonly: bool, noexec: bool, walk_only: bool) -> Result<(), String> {
+fn restrict_submounts(
+    at: &Path,
+    rdonly: bool,
+    noexec: bool,
+    walk_only: bool,
+) -> Result<(), String> {
     let mut set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
     if rdonly {
         set |= MOUNT_ATTR_RDONLY;
@@ -717,7 +722,9 @@ fn submounts_beneath(mountinfo: &str, at: &Path) -> Vec<PathBuf> {
             if b[i] == b'\\' && i + 4 <= b.len() {
                 let oct = &b[i + 1..i + 4];
                 if oct.iter().all(|d| (b'0'..=b'7').contains(d)) {
-                    let v = oct.iter().fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+                    let v = oct
+                        .iter()
+                        .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
                     if let Ok(v) = u8::try_from(v) {
                         out.push(v);
                         i += 4;

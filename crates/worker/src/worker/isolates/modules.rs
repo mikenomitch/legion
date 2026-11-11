@@ -19,6 +19,11 @@ pub const COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
 /// large interpreter image needs a few GiB of virtual memory.
 pub const COMPILE_ADDRESS_SPACE: u64 = 16 << 30;
 
+/// The compile process's cgroup `memory.max` (its resident memory), when
+/// the node gives isolate hosts cgroups. Cranelift on the Python image
+/// stays well under 2 GiB resident; twice that leaves room.
+pub const COMPILE_MEMORY_MAX: u64 = 4 << 30;
+
 /// The artifact file inside a derived entry.
 pub const ARTIFACT_FILE: &str = "module.cwasm";
 
@@ -66,6 +71,46 @@ pub struct Compiler {
     pub images: Option<ImageCatalog>,
     /// Where artifacts go when the content store cannot keep them.
     pub fallback_dir: PathBuf,
+    /// The isolate hosts' cgroup directory, when the node governs resources
+    /// with cgroup v2: each compile runs in its own leaf there, with
+    /// [`COMPILE_MEMORY_MAX`].
+    pub cgroup_dir: Option<PathBuf>,
+}
+
+/// A compile's own cgroup leaf, removed when the compile is done.
+struct CompileCgroup {
+    leaf: PathBuf,
+    procs: std::os::fd::OwnedFd,
+}
+
+impl CompileCgroup {
+    /// A fresh leaf `compile.<n>` under `dir` (host leaves always end in
+    /// `-r<replica>`, so the names never meet).
+    fn prepare(dir: &Path) -> R<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (leaf, procs) = super::host::prepare_leaf(
+            dir,
+            &format!("compile.{}.{n}", std::process::id()),
+            Some(COMPILE_MEMORY_MAX),
+            256,
+        )?;
+        Ok(Self { leaf, procs })
+    }
+}
+
+impl Drop for CompileCgroup {
+    fn drop(&mut self) {
+        // Empty once the compiler and its PID-namespace child are gone (the
+        // child dies with its parent, a moment after it).
+        for _ in 0..50 {
+            if std::fs::remove_dir(&self.leaf).is_ok() || !self.leaf.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        debug!(cgroup = %self.leaf.display(), "Compile cgroup not removed (still busy)");
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -171,6 +216,11 @@ impl Compiler {
             .arg(input)
             .arg("--output")
             .arg(output)
+            // The compiler ends itself shortly after the timeout even if
+            // this worker is gone by then (the worker's own kill at the
+            // timeout comes first while it lives).
+            .arg("--deadline-secs")
+            .arg((COMPILE_TIMEOUT.as_secs() + 10).to_string())
             .arg("--confine")
             .arg(match self.config.confine {
                 crate::structs::isolate::ConfineMode::Enforce => "enforce",
@@ -182,15 +232,37 @@ impl Compiler {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .env_clear();
-        // SAFETY: setrlimit is async-signal-safe.
+        // Its own cgroup leaf with a memory ceiling, when the node gives
+        // hosts cgroups (best effort, like the hosts').
+        let cgroup = self.cgroup_dir.as_deref().and_then(|dir| {
+            CompileCgroup::prepare(dir)
+                .map_err(|err| {
+                    warn!(error = %format!("{err:#}"), "Could not create a cgroup for the isolate compiler; it runs in the worker's")
+                })
+                .ok()
+        });
+        let procs_fd = {
+            use std::os::fd::AsRawFd;
+            cgroup.as_ref().map(|c| c.procs.as_raw_fd())
+        };
+        // SAFETY: setrlimit, prctl, and write are async-signal-safe.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 let limit = libc::rlimit {
                     rlim_cur: COMPILE_ADDRESS_SPACE as libc::rlim_t,
                     rlim_max: COMPILE_ADDRESS_SPACE as libc::rlim_t,
                 };
                 if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // Dies with the thread that forked it, which waits for it
+                // below (a blocking-pool thread that cannot retire while it
+                // waits): a worker that dies takes the compile with it.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(fd) = procs_fd {
+                    let _ = libc::write(fd, b"0".as_ptr().cast(), 1);
                 }
                 Ok(())
             });
@@ -226,6 +298,7 @@ impl Compiler {
                 Err(err) => return Err(format!("waiting for the compiler: {err}")),
             }
         };
+        drop(cgroup);
         let stdout = out.join().unwrap_or_default();
         let stderr = err.join().unwrap_or_default();
         let seconds = started.elapsed().as_secs_f64();
@@ -269,6 +342,29 @@ impl Compiler {
             module_id: key.to_string(),
             path,
         })
+    }
+}
+
+/// Where `config.entry` artifacts are staged (one private directory per
+/// staging, removed once the entry is read).
+fn entries_dir(fallback_dir: &Path) -> PathBuf {
+    fallback_dir
+        .parent()
+        .unwrap_or(fallback_dir)
+        .join("entries")
+}
+
+/// Remove every staging directory a previous worker left (it crashed
+/// between staging and reading). Called once at start, before any task is
+/// prepared.
+pub fn remove_stale_entries(fallback_dir: &Path) {
+    let dir = entries_dir(fallback_dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => debug!(dir = %dir.display(), "Removed stale config.entry staging"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(dir = %dir.display(), error = %err, "Could not remove stale config.entry staging")
+        }
     }
 }
 
@@ -338,18 +434,22 @@ impl Compiler {
             .stager
             .as_ref()
             .ok_or("this node has no artifact stager to fetch config.entry with")?;
-        let dir = self
-            .fallback_dir
-            .parent()
-            .unwrap_or(&self.fallback_dir)
-            .join("entries")
-            .join(format!(
-                "{}-{}",
+        // A private directory for this staging only, removed when the entry
+        // has been read (its artifacts may have been fetched with the job's
+        // credentials, and nothing reads them again; a re-preparation stages
+        // afresh). `remove_stale_entries` clears what a crash left behind.
+        let entries = entries_dir(&self.fallback_dir);
+        std::fs::create_dir_all(&entries)
+            .map_err(|err| format!("creating {}: {err}", entries.display()))?;
+        let staging = tempfile::Builder::new()
+            .prefix(&format!(
+                "{}-{}-",
                 crate::structs::session::derived_session_id(&task.name, job_id, "entry"),
                 allocation_id
-            ));
-        std::fs::create_dir_all(&dir)
-            .map_err(|err| format!("creating {}: {err}", dir.display()))?;
+            ))
+            .tempdir_in(&entries)
+            .map_err(|err| format!("creating a directory to stage config.entry in: {err}"))?;
+        let dir = staging.path().to_path_buf();
         let board = crate::artifacts::status::ArtifactStatusBoard::new();
         let staged = stager
             .stage_task_artifacts(allocation_id, &dir, &task.artifacts, &board)
@@ -560,5 +660,47 @@ mod read_beneath_test {
         assert!(err.contains("regular file"), "{err}");
         let err = read_beneath(&root, Path::new("src/main.py"), 3).unwrap_err();
         assert!(err.contains("limit"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod compile_hygiene_test {
+    use super::*;
+
+    #[test]
+    fn each_compile_gets_its_own_cgroup_leaf_with_a_ceiling_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = CompileCgroup::prepare(dir.path()).unwrap();
+        let b = CompileCgroup::prepare(dir.path()).unwrap();
+        assert_ne!(a.leaf, b.leaf);
+        let name = a.leaf.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("compile."), "{name}");
+        assert!(!name.contains("-r"), "never a host leaf's shape: {name}");
+        assert_eq!(
+            std::fs::read_to_string(a.leaf.join("memory.max")).unwrap(),
+            COMPILE_MEMORY_MAX.to_string()
+        );
+        // (A plain directory stands in for cgroupfs here: its files keep
+        // the leaf from being removed, which a real, empty cgroup does
+        // not.)
+        let leaf = a.leaf.clone();
+        for file in ["memory.max", "pids.max", "cgroup.procs"] {
+            std::fs::remove_file(leaf.join(file)).unwrap();
+        }
+        drop(a);
+        assert!(!leaf.exists(), "an empty leaf is removed with the compile");
+    }
+
+    #[test]
+    fn stale_entry_staging_is_removed_at_start_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("cwasm");
+        let stale = entries_dir(&fallback).join("run-abc-7-x1y2");
+        std::fs::create_dir_all(stale.join("src")).unwrap();
+        std::fs::write(stale.join("src/secret.py"), "token").unwrap();
+        remove_stale_entries(&fallback);
+        assert!(!entries_dir(&fallback).exists());
+        // Nothing there: a no-op.
+        remove_stale_entries(&fallback);
     }
 }

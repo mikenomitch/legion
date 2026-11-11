@@ -271,8 +271,12 @@ pub fn prepare_leaf(
     }
     std::fs::write(leaf.join("pids.max"), pids_max.to_string())?;
     use std::os::unix::fs::OpenOptionsExt;
+    // `create`: a no-op on cgroupfs, where the file exists (and cannot be
+    // created where it does not); lets a plain directory stand in in tests.
     let procs = std::fs::OpenOptions::new()
         .write(true)
+        .create(true)
+        .truncate(false)
         .custom_flags(libc::O_CLOEXEC)
         .open(leaf.join("cgroup.procs"))?;
     Ok((leaf, procs.into()))
@@ -608,7 +612,10 @@ mod host_process_test {
         let a = cgroup_leaf_name("job:acme/billing", 0);
         let b = cgroup_leaf_name("job:acme_billing", 0);
         assert_ne!(a, b);
-        assert_ne!(cgroup_leaf_name("job:t/a.b", 0), cgroup_leaf_name("job:t/a_b", 0));
+        assert_ne!(
+            cgroup_leaf_name("job:t/a.b", 0),
+            cgroup_leaf_name("job:t/a_b", 0)
+        );
         assert_ne!(a, cgroup_leaf_name("job:acme/billing", 1));
         // Each gets its own leaf with its own memory.max.
         let dir = tempfile::tempdir().unwrap();
@@ -624,7 +631,12 @@ mod host_process_test {
         let max = |leaf: &Path| std::fs::read_to_string(leaf.join("memory.max")).unwrap();
         assert_eq!(max(&leaf_a), (1u64 << 30).to_string());
         assert_eq!(max(&leaf_b), (1u64 << 20).to_string());
-        assert!(leaf_a.file_name().unwrap().to_str().unwrap().starts_with("job_acme_billing-"));
+        assert!(leaf_a
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("job_acme_billing-"));
     }
 
     #[test]
@@ -634,9 +646,15 @@ mod host_process_test {
             max_body_bytes: 16 << 20,
             ..Default::default()
         });
-        assert_eq!(limits.max_message_bytes, (16 << 20) + MESSAGE_OVERHEAD_BYTES);
+        assert_eq!(
+            limits.max_message_bytes,
+            (16 << 20) + MESSAGE_OVERHEAD_BYTES
+        );
         assert_eq!(limits.max_calls, 32);
-        assert_eq!(limits.body_budget_bytes, 4 * ((16 << 20) + MESSAGE_OVERHEAD_BYTES));
+        assert_eq!(
+            limits.body_budget_bytes,
+            4 * ((16 << 20) + MESSAGE_OVERHEAD_BYTES)
+        );
         // Bounded both ways, and never below what a log batch needs.
         let small = HostCallLimits::for_host(&HostConfig {
             shards: 1,
@@ -644,7 +662,10 @@ mod host_process_test {
             ..Default::default()
         });
         assert_eq!(small.max_calls, MIN_HOST_CALLS);
-        assert_eq!(small.max_message_bytes, MAX_LOG_BATCH_BYTES + MESSAGE_OVERHEAD_BYTES);
+        assert_eq!(
+            small.max_message_bytes,
+            MAX_LOG_BATCH_BYTES + MESSAGE_OVERHEAD_BYTES
+        );
         assert_eq!(small.body_budget_bytes, 4 * small.max_message_bytes);
         let big = HostCallLimits::for_host(&HostConfig {
             shards: 1000,
@@ -654,7 +675,9 @@ mod host_process_test {
     }
 
     /// `sleep 30` with the death signal the launcher sets, forked by `fork`.
-    fn sleeper(fork: impl FnOnce(std::process::Command) -> std::process::Child) -> std::process::Child {
+    fn sleeper(
+        fork: impl FnOnce(std::process::Command) -> std::process::Child,
+    ) -> std::process::Child {
         use std::os::unix::process::CommandExt;
         let mut command = std::process::Command::new("sleep");
         command.arg("30");
@@ -685,17 +708,26 @@ mod host_process_test {
         let mut direct = std::thread::spawn(|| sleeper(|mut c| c.spawn().unwrap()))
             .join()
             .unwrap();
-        assert!(!alive_after_a_moment(&mut direct), "the death signal follows the thread");
+        assert!(
+            !alive_after_a_moment(&mut direct),
+            "the death signal follows the thread"
+        );
         // With it: the asking thread exits, the child lives on.
         let mut spawned = std::thread::spawn(|| {
             sleeper(|c| {
                 let mut c = c;
-                on_spawner(move || c.spawn()).blocking_recv().unwrap().unwrap()
+                on_spawner(move || c.spawn())
+                    .blocking_recv()
+                    .unwrap()
+                    .unwrap()
             })
         })
         .join()
         .unwrap();
-        assert!(alive_after_a_moment(&mut spawned), "forked on the spawner thread");
+        assert!(
+            alive_after_a_moment(&mut spawned),
+            "forked on the spawner thread"
+        );
     }
 }
 

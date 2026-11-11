@@ -1227,14 +1227,11 @@ impl SubMount {
     fn new(dir: &std::path::Path) -> Option<Self> {
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        let c = |p: &std::path::Path| {
-            std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap()
-        };
+        let c =
+            |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
         let (src, fs, at) = (c("tmpfs".as_ref()), c("tmpfs".as_ref()), c(&sub));
         // SAFETY: NUL-terminated strings, no data.
-        let r = unsafe {
-            libc::mount(src.as_ptr(), at.as_ptr(), fs.as_ptr(), 0, std::ptr::null())
-        };
+        let r = unsafe { libc::mount(src.as_ptr(), at.as_ptr(), fs.as_ptr(), 0, std::ptr::null()) };
         (r == 0).then(|| SubMount(sub))
     }
 }
@@ -1376,7 +1373,13 @@ fn a_compile_ends_at_its_deadline_test() {
         let started = Instant::now();
         // The compiler's allowlist has no sleep; seccomp is left out.
         let out = Command::new(BIN)
-            .args(["compile", "--confine", "best-effort", "--deadline-secs", "1"])
+            .args([
+                "compile",
+                "--confine",
+                "best-effort",
+                "--deadline-secs",
+                "1",
+            ])
             .arg("--input")
             .arg(&input)
             .arg("--output")
@@ -1392,14 +1395,16 @@ fn a_compile_ends_at_its_deadline_test() {
 
 /// A shipping build (no `confinement-test` feature) has no test hooks: the
 /// flags are unknown arguments.
+/// Compiled only without the feature (with it, the flags are accepted and
+/// the host would serve).
+#[cfg(not(feature = "confinement-test"))]
 #[test]
-#[cfg_attr(
-    feature = "confinement-test",
-    ignore = "checks a build without --features confinement-test"
-)]
 fn a_shipping_build_rejects_the_test_hooks_test() {
     let cfg = bin_config(Confine::BestEffort);
-    for extra in [&["--test-skip", "seccomp"][..], &["--test-attempt", "socket"][..]] {
+    for extra in [
+        &["--test-skip", "seccomp"][..],
+        &["--test-attempt", "socket"][..],
+    ] {
         let (mut cmd, _c, _w, _ends) = command(&cfg, extra);
         let out = cmd.output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{extra:?}: {out:?}");
@@ -1409,7 +1414,15 @@ fn a_shipping_build_rejects_the_test_hooks_test() {
         );
     }
     let out = Command::new(BIN)
-        .args(["compile", "--input", "x", "--output", "y", "--test-attempt", "socket"])
+        .args([
+            "compile",
+            "--input",
+            "x",
+            "--output",
+            "y",
+            "--test-attempt",
+            "socket",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{out:?}");

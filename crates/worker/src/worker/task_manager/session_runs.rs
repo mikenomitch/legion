@@ -515,6 +515,15 @@ pub struct VmArgs {
     pub entry_path: String,
 }
 
+/// Whether a VM-tier run's `args` may follow `command`: only when its last
+/// element is exactly the staged entry's path (no normalization: a command
+/// ending with `/legion/run/./main` or `/legion/run/main/` does not count).
+/// The entry path is fixed per task, never a name the caller chose
+/// (`isolates::supervisor::stage_for_vm`).
+pub fn vm_args_follow_command(command: &[String], entry_path: &str) -> bool {
+    command.last().map(String::as_str) == Some(entry_path)
+}
+
 fn prepare(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     call: &RunCall,
@@ -579,7 +588,7 @@ fn prepare(
     let mut run_args = None;
     if let Some(vm) = vm_args {
         if !vm.args.is_empty() {
-            if command.last().map(String::as_str) != Some(vm.entry_path.as_str()) {
+            if !vm_args_follow_command(&command, &vm.entry_path) {
                 return Err(Status::failed_precondition(format!(
                     "task {}'s run.command does not end with {}, so arguments cannot be passed \
                      to it safely; the run carries {} args\nHint: end the VM task's \

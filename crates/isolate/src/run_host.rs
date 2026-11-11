@@ -334,7 +334,8 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
             };
             let mut d = [Data::default(); 2];
             // SAFETY: capget v3 with a header and two data structs.
-            let r = unsafe { libc::syscall(libc::SYS_capget, &mut h as *mut Header, d.as_mut_ptr()) };
+            let r =
+                unsafe { libc::syscall(libc::SYS_capget, &mut h as *mut Header, d.as_mut_ptr()) };
             let (mut bounding, mut ambient) = (0, 0);
             for cap in 0..64 {
                 // SAFETY: prctl with integer arguments.

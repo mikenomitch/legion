@@ -111,6 +111,17 @@ pub async fn start(
             warn!(dir = %dir.display(), error = %err, "Could not create an isolate artifact directory");
         }
     }
+    // Hosts get canonical paths: inside a host's mount root only the
+    // canonical path of a directory exists (a symlinked state directory
+    // would otherwise make every artifact unreadable).
+    let read_dirs: Vec<PathBuf> = read_dirs
+        .into_iter()
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
+        .collect();
+    let fallback_dir = std::fs::canonicalize(&fallback_dir).unwrap_or(fallback_dir);
+    // Nothing is being prepared yet: config.entry staging a crashed worker
+    // left behind can go.
+    super::modules::remove_stale_entries(&fallback_dir);
     let cgroup_dir = (enforcement.enabled && crate::worker::resources::enforcement_available())
         .then(|| {
             PathBuf::from("/sys/fs/cgroup")
@@ -133,6 +144,7 @@ pub async fn start(
             store: store.clone(),
             images: images.clone(),
             fallback_dir,
+            cgroup_dir: cgroup_dir.clone(),
         }),
         launcher: Arc::new(ProcessLauncher {
             binary: found.path.clone(),
