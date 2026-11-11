@@ -11,9 +11,7 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 
 | PR | What it lands |
 | --- | --- |
-| [#70](https://github.com/mikenomitch/legion/pull/70) | Smaller shipping binary (97.3 → 89.1 MB): packed relocations, size-optimized config crates, trimmed dependency features |
-| [#73](https://github.com/mikenomitch/legion/pull/73) | Runtime disable, derived content, session runs, child sessions, and resize, built from #63's plans (carries those plan documents; merge after #70) |
-| [#63](https://github.com/mikenomitch/legion/pull/63) | The isolate-runtime plan |
+| [#72](https://github.com/mikenomitch/legion/pull/72) | TODO close-out: 54 items done, or removed as done, duplicate or decided (the "TODO close-out (2026-11-10)" entries under Done describe it as landed) |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again (likely closes "Plugin lockfiles are stale") |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
 | [#37](https://github.com/mikenomitch/legion/pull/37) | UI appearance picker: built-in themes and custom colors |
