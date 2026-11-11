@@ -45,12 +45,7 @@ pub struct Scan {
 
 /// Scan `source` and compare against `available` (the image manifest's
 /// module list) and the run's own file names (`helper.py`, `pkg/mod.py`).
-pub fn scan(
-    language: Language,
-    source: &[u8],
-    available: &[String],
-    run_files: &[String],
-) -> Scan {
+pub fn scan(language: Language, source: &[u8], available: &[String], run_files: &[String]) -> Scan {
     let imports = imports(language, source);
     let available: BTreeSet<&str> = available.iter().map(String::as_str).collect();
     let local = local_modules(language, run_files);
@@ -232,7 +227,11 @@ fn python_string(src: &[u8], start: usize) -> (String, usize) {
 }
 
 fn top_python(name: &str) -> String {
-    name.split('.').next().unwrap_or_default().trim().to_string()
+    name.split('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn python_imports(tokens: &[Tok], push: &mut impl FnMut(String)) {
@@ -353,7 +352,9 @@ fn lex_js(src: &[u8]) -> Vec<Tok> {
                     i += 1;
                 }
                 let end = i.min(src.len());
-                out.push(Tok::Str(String::from_utf8_lossy(&src[start..end]).into_owned()));
+                out.push(Tok::Str(
+                    String::from_utf8_lossy(&src[start..end]).into_owned(),
+                ));
                 i = end + 1;
             }
             b'`' => {
@@ -409,8 +410,19 @@ fn regex_allowed(previous: Option<&Tok>) -> bool {
         Some(Tok::Punct(c)) => !matches!(c, b')' | b']' | b'}'),
         Some(Tok::Ident(word)) => matches!(
             word.as_str(),
-            "return" | "typeof" | "case" | "do" | "else" | "in" | "of" | "new" | "delete"
-                | "void" | "throw" | "yield" | "await"
+            "return"
+                | "typeof"
+                | "case"
+                | "do"
+                | "else"
+                | "in"
+                | "of"
+                | "new"
+                | "delete"
+                | "void"
+                | "throw"
+                | "yield"
+                | "await"
         ),
         Some(Tok::Str(_)) | Some(Tok::Newline) => false,
     }
@@ -452,8 +464,7 @@ fn js_imports(tokens: &[Tok], push: &mut impl FnMut(String)) {
             Tok::Punct(b';') => in_module_statement = false,
             Tok::Ident(word) if word == "import" && !is_member(i) => {
                 if punct(i + 1, b'(') {
-                    if let (Some(Tok::Str(spec)), true) = (tokens.get(i + 2), punct(i + 3, b')'))
-                    {
+                    if let (Some(Tok::Str(spec)), true) = (tokens.get(i + 2), punct(i + 3, b')')) {
                         push_spec(spec);
                     }
                 } else if punct(i + 1, b'.') {
@@ -502,7 +513,10 @@ mod preflight_test {
             py("import numpy as np, pandas as pd\n"),
             vec!["numpy", "pandas"]
         );
-        assert_eq!(py("from collections.abc import Mapping"), vec!["collections"]);
+        assert_eq!(
+            py("from collections.abc import Mapping"),
+            vec!["collections"]
+        );
         assert_eq!(py("from torch import nn\n"), vec!["torch"]);
         assert_eq!(py("x = 1; import re"), vec!["re"]);
         assert_eq!(py("if True: import csv"), vec!["csv"]);
@@ -524,18 +538,27 @@ mod preflight_test {
             vec!["importlib", "scipy"]
         );
         assert_eq!(py("m = __import__(name)"), Vec::<String>::new());
-        assert_eq!(py("importlib.import_module('.sibling')"), Vec::<String>::new());
+        assert_eq!(
+            py("importlib.import_module('.sibling')"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn python_relative_imports_are_local() {
-        assert_eq!(py("from . import helper\nfrom .util import x"), Vec::<String>::new());
+        assert_eq!(
+            py("from . import helper\nfrom .util import x"),
+            Vec::<String>::new()
+        );
         assert_eq!(py("from ..pkg import y"), Vec::<String>::new());
     }
 
     #[test]
     fn python_comments_and_strings_are_not_imports() {
-        assert_eq!(py("# import torch\nx = 'import torch'"), Vec::<String>::new());
+        assert_eq!(
+            py("# import torch\nx = 'import torch'"),
+            Vec::<String>::new()
+        );
         assert_eq!(
             py("doc = \"\"\"\nimport torch\nfrom x import y\n\"\"\"\nimport json"),
             vec!["json"]
@@ -558,32 +581,44 @@ mod preflight_test {
     fn javascript_import_forms() {
         assert_eq!(js("import fs from 'node:fs';"), vec!["fs"]);
         assert_eq!(js("import { a, b } from \"lodash/fp\""), vec!["lodash"]);
-        assert_eq!(js("import * as z from '@scope/pkg/sub'"), vec!["@scope/pkg"]);
+        assert_eq!(
+            js("import * as z from '@scope/pkg/sub'"),
+            vec!["@scope/pkg"]
+        );
         assert_eq!(js("import 'side-effect'"), vec!["side-effect"]);
         assert_eq!(js("const m = await import('sharp')"), vec!["sharp"]);
         assert_eq!(js("const x = require(\"crypto\")"), vec!["crypto"]);
         assert_eq!(js("export { y } from 'zod'"), vec!["zod"]);
-        assert_eq!(
-            js("import a from 'a'\nimport b from 'b'\n"),
-            vec!["a", "b"]
-        );
+        assert_eq!(js("import a from 'a'\nimport b from 'b'\n"), vec!["a", "b"]);
     }
 
     #[test]
     fn javascript_local_and_dynamic_specifiers() {
         assert_eq!(js("import h from './helper.mjs'"), Vec::<String>::new());
-        assert_eq!(js("import x from '../x.js'; import y from '/abs.js'"), Vec::<String>::new());
+        assert_eq!(
+            js("import x from '../x.js'; import y from '/abs.js'"),
+            Vec::<String>::new()
+        );
         assert_eq!(js("import(name); require(variable)"), Vec::<String>::new());
         assert_eq!(js("import('https://esm.sh/x')"), Vec::<String>::new());
         assert_eq!(js("console.log(import.meta.url)"), Vec::<String>::new());
-        assert_eq!(js("obj.require('x'); obj.import('y')"), Vec::<String>::new());
+        assert_eq!(
+            js("obj.require('x'); obj.import('y')"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn javascript_comments_strings_and_regexes_are_not_imports() {
-        assert_eq!(js("// import x from 'x'\n/* require('y') */"), Vec::<String>::new());
+        assert_eq!(
+            js("// import x from 'x'\n/* require('y') */"),
+            Vec::<String>::new()
+        );
         assert_eq!(js("const s = \"require('x')\""), Vec::<String>::new());
-        assert_eq!(js("const t = `import x from 'x' ${\"require('y')\"}`"), Vec::<String>::new());
+        assert_eq!(
+            js("const t = `import x from 'x' ${\"require('y')\"}`"),
+            Vec::<String>::new()
+        );
         assert_eq!(
             js("const re = /require\\('x'\\)/g; const q = a / b; require('ok')"),
             vec!["ok"]
@@ -594,7 +629,11 @@ mod preflight_test {
     #[test]
     fn scan_reports_missing_against_the_image_and_the_runs_files() {
         let available = vec!["json".to_string(), "re".to_string()];
-        let files = vec!["main.py".to_string(), "helper.py".to_string(), "pkg/__init__.py".to_string()];
+        let files = vec![
+            "main.py".to_string(),
+            "helper.py".to_string(),
+            "pkg/__init__.py".to_string(),
+        ];
         let source = "import json\nimport helper\nfrom pkg import x\nimport torch\nimport re";
         let scan = scan(Language::Python, source.as_bytes(), &available, &files);
         assert_eq!(scan.imports, vec!["json", "helper", "pkg", "torch", "re"]);
@@ -607,7 +646,9 @@ mod preflight_test {
         source.push_str(&"x".repeat(MAX_SCAN_BYTES));
         source.push_str("\nimport torch\n");
         assert_eq!(py(&source), vec!["json"]);
-        let garbage: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let garbage: Vec<u8> = (0..20_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         let _ = imports(Language::Python, &garbage);
         let _ = imports(Language::JavaScript, &garbage);
         let _ = imports(Language::JavaScript, b"/");

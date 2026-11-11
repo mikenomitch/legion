@@ -202,7 +202,9 @@ impl CheckpointStore {
             });
         }
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{}.{generation}", file_safe(session_id)));
+        let path = self
+            .dir
+            .join(format!("{}.{generation}", file_safe(session_id)));
         std::fs::write(&path, body)?;
         Ok(StoredCheckpoint {
             path: path.display().to_string(),
@@ -250,7 +252,13 @@ impl CheckpointStore {
 
 fn file_safe(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

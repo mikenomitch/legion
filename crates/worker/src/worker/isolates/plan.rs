@@ -195,11 +195,20 @@ mod plan_test {
     fn slots_are_clamped_by_max_map_count() {
         // The kernel default allows about 7,900 live instances.
         let plan = plan_slots(10_000, SlotLayout::GuardPages, DEFAULT_MAX_MAP_COUNT);
-        assert_eq!(plan.slots, ((DEFAULT_MAX_MAP_COUNT - HOST_MAPPINGS) / 8) as u32);
+        assert_eq!(
+            plan.slots,
+            ((DEFAULT_MAX_MAP_COUNT - HOST_MAPPINGS) / 8) as u32
+        );
         assert!(plan.clamped.unwrap().contains("vm.max_map_count is 65530"));
         // A raised sysctl leaves the configured value alone.
         let plan = plan_slots(10_000, SlotLayout::GuardPages, 1 << 20);
-        assert_eq!(plan, SlotPlan { slots: 10_000, clamped: None });
+        assert_eq!(
+            plan,
+            SlotPlan {
+                slots: 10_000,
+                clamped: None
+            }
+        );
         // The layout's own maximum.
         let plan = plan_slots(50_000, SlotLayout::GuardPages, 1 << 22);
         assert_eq!(plan.slots, 16_000);
@@ -226,14 +235,26 @@ mod plan_test {
     fn task_room_from_the_envelope() {
         let mut task = TaskConfig::new("run", "isolate");
         task.resources = serde_json::json!({ "cpu": 10, "memory": 16, "memoryMax": 128 });
-        let envelope = BTreeMap::from([("memory".to_string(), 32768.0), ("cpu".to_string(), 16000.0)]);
+        let envelope = BTreeMap::from([
+            ("memory".to_string(), 32768.0),
+            ("cpu".to_string(), 16000.0),
+        ]);
         assert_eq!(
             task_room(&envelope, &task),
-            TaskRoom { max_resident: 2048, max_active: 1600 }
+            TaskRoom {
+                max_resident: 2048,
+                max_active: 1600
+            }
         );
         // A tiny envelope still lets one invocation run.
         let tiny = BTreeMap::from([("memory".to_string(), 8.0), ("cpu".to_string(), 1.0)]);
-        assert_eq!(task_room(&tiny, &task), TaskRoom { max_resident: 0, max_active: 1 });
+        assert_eq!(
+            task_room(&tiny, &task),
+            TaskRoom {
+                max_resident: 0,
+                max_active: 1
+            }
+        );
     }
 
     #[test]

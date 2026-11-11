@@ -55,7 +55,9 @@ pub async fn start(
     enforcement: &crate::structs::WorkerResourceEnforcementConfig,
 ) -> Option<Arc<IsolateSupervisor>> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        info!("The isolate runtime runs on x86-64 Linux only; this node does not advertise isolates");
+        info!(
+            "The isolate runtime runs on x86-64 Linux only; this node does not advertise isolates"
+        );
         return None;
     }
     let Some(path) = binary::locate_binary(&config) else {

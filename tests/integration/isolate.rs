@@ -137,7 +137,9 @@ fn a_component_compiles_once_into_derived_content() {
     let first = compiler.compiled(&want).expect("compile cmd.wasm");
     assert!(first.path.is_file(), "{first:?}");
     assert!(
-        first.path.starts_with(legion::worker::isolates::modules::derived_dir(&store)),
+        first
+            .path
+            .starts_with(legion::worker::isolates::modules::derived_dir(&store)),
         "kept as derived content: {first:?}"
     );
     let modified = std::fs::metadata(&first.path).unwrap().modified().unwrap();
@@ -295,14 +297,28 @@ async fn a_run_executes_in_a_real_host_and_hosts_follow_cordons() {
         envelope("ns/b", task("run", "request", "namespace")),
         envelope("ns/c", alone),
     ]);
-    let reply = node.supervisor.run(run("ns/a", &[]), None).await.expect("run");
+    let reply = node
+        .supervisor
+        .run(run("ns/a", &[]), None)
+        .await
+        .expect("run");
     assert_eq!(reply.exit, Some(0));
     assert!(String::from_utf8_lossy(&reply.stdout).contains("args="));
     assert_eq!(reply.tier, "isolate");
-    node.supervisor.run(run("ns/b", &[]), None).await.expect("run b");
-    node.supervisor.run(run("ns/c", &[]), None).await.expect("run c");
+    node.supervisor
+        .run(run("ns/b", &[]), None)
+        .await
+        .expect("run b");
+    node.supervisor
+        .run(run("ns/c", &[]), None)
+        .await
+        .expect("run c");
     let (_, hosts) = node.supervisor.stats("", "").await;
-    assert_eq!(hosts.len(), 2, "one host for namespace ns, one for job ns/c");
+    assert_eq!(
+        hosts.len(),
+        2,
+        "one host for namespace ns, one for job ns/c"
+    );
     let (tasks, _) = node.supervisor.stats("", "").await;
     assert!(tasks.iter().all(|t| t.problem.is_empty()), "{tasks:?}");
 }
@@ -313,9 +329,17 @@ async fn limits_stop_runs_and_output_truncates() {
     let node = node("cmd.wasm");
     node.supervisor
         .sync(vec![envelope("ns/a", task("run", "request", "namespace"))]);
-    let spin = node.supervisor.run(run("ns/a", &["spin"]), None).await.unwrap();
+    let spin = node
+        .supervisor
+        .run(run("ns/a", &["spin"]), None)
+        .await
+        .unwrap();
     assert_eq!(spin.stopped.unwrap().limit, "cpu");
-    let alloc = node.supervisor.run(run("ns/a", &["alloc"]), None).await.unwrap();
+    let alloc = node
+        .supervisor
+        .run(run("ns/a", &["alloc"]), None)
+        .await
+        .unwrap();
     assert_eq!(alloc.stopped.unwrap().limit, "memory");
     let print = node
         .supervisor

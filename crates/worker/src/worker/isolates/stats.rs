@@ -164,7 +164,11 @@ mod stats_test {
             },
         ];
         let folded = fold(&facts, &replies);
-        assert_eq!(folded.len(), 2, "tasks the supervisor does not know are dropped");
+        assert_eq!(
+            folded.len(),
+            2,
+            "tasks the supervisor does not know are dropped"
+        );
         let a = &folded[0];
         assert_eq!((a.resident, a.invocations, a.cpu_micros), (5, 15, 150));
         assert_eq!((a.hibernated, a.vm_runs, a.child_vms), (4, 7, 1));
@@ -187,7 +191,10 @@ mod stats_test {
             ..Default::default()
         }];
         rates.apply(&mut stats, start);
-        assert_eq!(stats[0].invocations_per_second, 0.0, "no rate on the first report");
+        assert_eq!(
+            stats[0].invocations_per_second, 0.0,
+            "no rate on the first report"
+        );
         stats[0].invocations = 300;
         stats[0].cpu_micros = 3_000_000;
         stats[0].vm_runs = 3;
@@ -206,6 +213,10 @@ mod stats_test {
         let mut deltas = Deltas::default();
         assert_eq!(deltas.delta("k".into(), 10), 10);
         assert_eq!(deltas.delta("k".into(), 15), 5);
-        assert_eq!(deltas.delta("k".into(), 3), 3, "a restarted host counts from zero");
+        assert_eq!(
+            deltas.delta("k".into(), 3),
+            3,
+            "a restarted host counts from zero"
+        );
     }
 }

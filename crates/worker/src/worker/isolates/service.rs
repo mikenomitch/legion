@@ -43,23 +43,24 @@ impl WorkerService {
     }
 
     /// The task an origin names, when it belongs to this host's cordon.
-    fn task(&self, origin: Option<&Origin>) -> Result<(Arc<IsolateSupervisor>, IsolateTaskRef), Status> {
+    fn task(
+        &self,
+        origin: Option<&Origin>,
+    ) -> Result<(Arc<IsolateSupervisor>, IsolateTaskRef), Status> {
         let supervisor = self.supervisor()?;
         let origin = origin.ok_or_else(|| Status::invalid_argument("missing origin"))?;
-        let task = supervisor
-            .task_ref(&self.cordon, origin)
-            .ok_or_else(|| {
-                warn!(
-                    cordon = %self.cordon,
-                    job_id = %origin.job_id,
-                    task = %origin.task_name,
-                    "An isolate host asked for a task outside its cordon; refused"
-                );
-                Status::permission_denied(format!(
-                    "task {}/{} is not served by cordon {}",
-                    origin.job_id, origin.task_name, self.cordon
-                ))
-            })?;
+        let task = supervisor.task_ref(&self.cordon, origin).ok_or_else(|| {
+            warn!(
+                cordon = %self.cordon,
+                job_id = %origin.job_id,
+                task = %origin.task_name,
+                "An isolate host asked for a task outside its cordon; refused"
+            );
+            Status::permission_denied(format!(
+                "task {}/{} is not served by cordon {}",
+                origin.job_id, origin.task_name, self.cordon
+            ))
+        })?;
         Ok((supervisor, task))
     }
 }
@@ -77,7 +78,9 @@ impl IsolateWorker for WorkerService {
         // checked against the cordon.
         let request = request.into_inner();
         let (supervisor, task) = self.task(request.origin.as_ref())?;
-        Ok(Response::new(supervisor.egress_backend().fetch(&task, request).await))
+        Ok(Response::new(
+            supervisor.egress_backend().fetch(&task, request).await,
+        ))
     }
 
     async fn vm(&self, request: Request<VmRequest>) -> Result<Response<VmReply>, Status> {
@@ -119,7 +122,9 @@ impl IsolateWorker for WorkerService {
                 }
                 Some(checkpoint_chunk::Part::Data(data)) => {
                     if header.is_none() {
-                        return Err(Status::invalid_argument("checkpoint data before its header"));
+                        return Err(Status::invalid_argument(
+                            "checkpoint data before its header",
+                        ));
                     }
                     if body.len() as u64 + data.len() as u64 > MAX_CHECKPOINT_BYTES {
                         return Err(Status::resource_exhausted("the checkpoint is too large"));
@@ -161,7 +166,10 @@ impl IsolateWorker for WorkerService {
         Ok(Response::new(Box::pin(futures::stream::iter(chunks))))
     }
 
-    async fn log(&self, request: Request<Streaming<LogBatch>>) -> Result<Response<LogReply>, Status> {
+    async fn log(
+        &self,
+        request: Request<Streaming<LogBatch>>,
+    ) -> Result<Response<LogReply>, Status> {
         // ACL: node-local, as `egress`.
         let mut stream = request.into_inner();
         while let Some(batch) = stream.message().await? {

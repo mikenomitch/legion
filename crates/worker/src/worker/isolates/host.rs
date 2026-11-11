@@ -52,7 +52,8 @@ pub struct HostSpawn {
 #[tonic::async_trait]
 pub trait HostLauncher: Send + Sync + 'static {
     /// Start one host and serve `worker` on its worker socket.
-    async fn launch(&self, spawn: &HostSpawn, worker: super::service::WorkerService) -> R<Launched>;
+    async fn launch(&self, spawn: &HostSpawn, worker: super::service::WorkerService)
+        -> R<Launched>;
 }
 
 /// A connected `IsolateHost` client over an already-connected stream.
@@ -159,7 +160,13 @@ fn config_memfd(config: &HostConfig) -> R<std::os::fd::OwnedFd> {
 fn sanitize(cordon: &str) -> String {
     cordon
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -248,7 +255,9 @@ impl HostLauncher for ProcessLauncher {
                     debug!(cordon = %spawn.cordon, cgroup = %leaf.display(), "Isolate host placed in its cgroup");
                     cgroup = Some(leaf);
                 }
-                Err(err) => warn!(cordon = %spawn.cordon, error = %format!("{err:#}"), "Could not place the isolate host in its own cgroup; it runs in the worker's"),
+                Err(err) => {
+                    warn!(cordon = %spawn.cordon, error = %format!("{err:#}"), "Could not place the isolate host in its own cgroup; it runs in the worker's")
+                }
             }
         }
         if let Some(stderr) = child.stderr.take() {
@@ -258,7 +267,8 @@ impl HostLauncher for ProcessLauncher {
                 use tokio::io::AsyncBufReadExt;
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if line.contains("ERROR") || line.contains("WARN") || line.contains("panicked") {
+                    if line.contains("ERROR") || line.contains("WARN") || line.contains("panicked")
+                    {
                         info!(cordon = %cordon, replica, "isolate host: {line}");
                     } else {
                         debug!(cordon = %cordon, replica, "isolate host: {line}");

@@ -1257,7 +1257,10 @@ mod tests {
         let actions = responder.tick(start, 1_000, &mut node);
         assert!(actions.is_empty(), "the isolates covered the shortfall");
         assert_eq!(node.isolate_asks.len(), 1);
-        assert!(!node.isolate_asks[0].0, "paging out first, at the reclaim step");
+        assert!(
+            !node.isolate_asks[0].0,
+            "paging out first, at the reclaim step"
+        );
         assert!(node.reclaimed.is_empty() && node.evicted.is_empty());
         // Still short after settle: the next step runs, the isolates are not
         // asked to page out again this episode.

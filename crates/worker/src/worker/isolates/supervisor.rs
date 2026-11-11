@@ -13,7 +13,9 @@ use super::binary::{ImageCatalog, IsolateBinary};
 use super::host::{HostLauncher, HostSpawn};
 use super::modules::{ModuleArtifact, ModuleSource, ModuleWant};
 use super::plan::{self, SlotPlan, TaskRoom};
-use super::sessions::{CheckpointStore, SessionBook, SessionRecord, SessionState, StoredCheckpoint};
+use super::sessions::{
+    CheckpointStore, SessionBook, SessionRecord, SessionState, StoredCheckpoint,
+};
 use super::stats::{Deltas, Rates, TaskFacts};
 use super::tier::{self, Tier, TierInputs, TierRefusal, VmMemo};
 use super::{EgressBackend, IsolateEnvelope, IsolateTaskRef, NoEgress, NoVm, VmBackend};
@@ -288,7 +290,9 @@ impl IsolateSupervisor {
     }
 
     fn arc(&self) -> Arc<Self> {
-        self.me.upgrade().expect("the supervisor is alive while it runs")
+        self.me
+            .upgrade()
+            .expect("the supervisor is alive while it runs")
     }
 
     /// The task manager this supervisor serves (for VM runs and task
@@ -318,7 +322,10 @@ impl IsolateSupervisor {
     }
 
     pub fn egress_backend(&self) -> Arc<dyn EgressBackend> {
-        self.egress.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.egress
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn vm_backend(&self) -> Arc<dyn VmBackend> {
@@ -415,7 +422,10 @@ impl IsolateSupervisor {
                     Err(problem) => {
                         warn!(job_id = %envelope.job_id, task = %task.name, %problem, "Isolate task cannot run on this node");
                         readiness.send_replace(Readiness::Failed(problem));
-                        let config = IsolateTaskConfig::of(&task).ok().flatten().unwrap_or_default();
+                        let config = IsolateTaskConfig::of(&task)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
                         TaskEntry {
                             job_id: envelope.job_id.clone(),
                             task_name: task.name.clone(),
@@ -584,7 +594,13 @@ impl IsolateSupervisor {
                 task.task
                     .network
                     .as_ref()
-                    .map(|network| network.ports.iter().map(|port| port.name.clone()).collect::<Vec<_>>())
+                    .map(|network| {
+                        network
+                            .ports
+                            .iter()
+                            .map(|port| port.name.clone())
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default(),
             )
         }) else {
@@ -594,11 +610,23 @@ impl IsolateSupervisor {
             return;
         }
         let max_body = self.config.max_body_bytes().unwrap_or(16 << 20);
-        match super::ingress::serve_ports(&alloc_root, allocation, &labels, &key.0, &key.1, max_body, self.arc()).await {
+        match super::ingress::serve_ports(
+            &alloc_root,
+            allocation,
+            &labels,
+            &key.0,
+            &key.1,
+            max_body,
+            self.arc(),
+        )
+        .await
+        {
             Ok(servers) => {
                 lock(&self.ingress).insert(key.clone(), servers);
             }
-            Err(err) => warn!(job_id = %key.0, task = %key.1, error = %format!("{err:#}"), "Isolate ingress not served"),
+            Err(err) => {
+                warn!(job_id = %key.0, task = %key.1, error = %format!("{err:#}"), "Isolate ingress not served")
+            }
         }
     }
 
@@ -657,7 +685,8 @@ impl IsolateSupervisor {
                 .replicas
                 .push(replica.clone());
             if let Err(err) = self.start_replica(&replica).await {
-                let problem = format!("the isolate host for cordon {cordon} did not start: {err:#}");
+                let problem =
+                    format!("the isolate host for cordon {cordon} did not start: {err:#}");
                 replica.set_problem(problem.clone());
                 self.spawn_restart(replica.clone());
                 if index == 0 {
@@ -672,7 +701,9 @@ impl IsolateSupervisor {
             let others: Vec<TaskKey> = lock(&self.state)
                 .tasks
                 .iter()
-                .filter(|(other, task)| *other != key && task.cordon == cordon && task.module.is_some())
+                .filter(|(other, task)| {
+                    *other != key && task.cordon == cordon && task.module.is_some()
+                })
                 .map(|(other, _)| other.clone())
                 .collect();
             drop(_held);
@@ -722,23 +753,32 @@ impl IsolateSupervisor {
         let spawn = HostSpawn {
             cordon: replica.cordon.clone(),
             replica: replica.index,
-            config: plan::host_config(&self.config, &replica.cordon, self.slots.slots, &self.read_dirs),
+            config: plan::host_config(
+                &self.config,
+                &replica.cordon,
+                self.slots.slots,
+                &self.read_dirs,
+            ),
             memory_max_bytes: self.cordon_memory_bytes(&replica.cordon),
         };
         let worker = super::service::WorkerService::new(self.me.clone(), &replica.cordon);
         let launched = self.launcher.launch(&spawn, worker).await?;
         let mut client = launched.client.clone();
-        let hello = match tokio::time::timeout(HELLO_TIMEOUT, client.hello(host::HelloRequest {})).await {
-            Ok(Ok(hello)) => hello.into_inner(),
-            Ok(Err(status)) => {
-                (launched.kill)();
-                bail!("its Hello failed: {}", status.message());
-            }
-            Err(_) => {
-                (launched.kill)();
-                bail!("it did not answer Hello within {}s", HELLO_TIMEOUT.as_secs());
-            }
-        };
+        let hello =
+            match tokio::time::timeout(HELLO_TIMEOUT, client.hello(host::HelloRequest {})).await {
+                Ok(Ok(hello)) => hello.into_inner(),
+                Ok(Err(status)) => {
+                    (launched.kill)();
+                    bail!("its Hello failed: {}", status.message());
+                }
+                Err(_) => {
+                    (launched.kill)();
+                    bail!(
+                        "it did not answer Hello within {}s",
+                        HELLO_TIMEOUT.as_secs()
+                    );
+                }
+            };
         if hello.protocol_version != host::PROTOCOL_VERSION {
             (launched.kill)();
             bail!(
@@ -748,7 +788,8 @@ impl IsolateSupervisor {
             );
         }
         let (applied, missing) = plan::confinement_layers(hello.confinement.as_ref());
-        if self.config.confine == crate::structs::isolate::ConfineMode::Enforce && !missing.is_empty()
+        if self.config.confine == crate::structs::isolate::ConfineMode::Enforce
+            && !missing.is_empty()
         {
             (launched.kill)();
             bail!(
@@ -839,7 +880,9 @@ impl IsolateSupervisor {
                         let tasks: Vec<TaskKey> = lock(&me.state)
                             .tasks
                             .iter()
-                            .filter(|(_, task)| task.cordon == replica.cordon && task.module.is_some())
+                            .filter(|(_, task)| {
+                                task.cordon == replica.cordon && task.module.is_some()
+                            })
                             .map(|(key, _)| key.clone())
                             .collect();
                         let replicas = me.replica_count(&replica.cordon);
@@ -919,14 +962,25 @@ impl IsolateSupervisor {
     }
 
     /// Load the task's module into one replica and configure the task.
-    async fn configure_on(&self, replica: &Replica, key: &TaskKey, replicas: u32) -> Result<(), String> {
-        let conn = replica
-            .conn()
-            .ok_or_else(|| format!("the isolate host for cordon {} is not running", replica.cordon))?;
+    async fn configure_on(
+        &self,
+        replica: &Replica,
+        key: &TaskKey,
+        replicas: u32,
+    ) -> Result<(), String> {
+        let conn = replica.conn().ok_or_else(|| {
+            format!(
+                "the isolate host for cordon {} is not running",
+                replica.cordon
+            )
+        })?;
         let (module, spec) = {
             let state = lock(&self.state);
             let task = state.tasks.get(key).ok_or("the task left this node")?;
-            let module = task.module.clone().ok_or("the module is not compiled yet")?;
+            let module = task
+                .module
+                .clone()
+                .ok_or("the module is not compiled yet")?;
             (module, self.task_spec(task, replicas, replica.index))
         };
         let mut client = conn.client.clone();
@@ -936,7 +990,9 @@ impl IsolateSupervisor {
                 artifact_path: module.path.display().to_string(),
             })
             .await
-            .map_err(|status| format!("the isolate host refused the module: {}", status.message()))?;
+            .map_err(|status| {
+                format!("the isolate host refused the module: {}", status.message())
+            })?;
         client
             .configure_task(spec)
             .await
@@ -992,7 +1048,10 @@ impl IsolateSupervisor {
         for id in ids {
             self.stop_session(&id, "its task left the node").await;
         }
-        let empty = !lock(&self.state).tasks.values().any(|task| task.cordon == cordon);
+        let empty = !lock(&self.state)
+            .tasks
+            .values()
+            .any(|task| task.cordon == cordon);
         if empty {
             let cordon_entry = lock(&self.state).cordons.remove(cordon);
             for replica in cordon_entry.map(|c| c.replicas).unwrap_or_default() {
@@ -1057,7 +1116,14 @@ impl IsolateSupervisor {
             .and_then(|task| task.vm_task.clone())
     }
 
-    fn task_ref_for(&self, job_id: &str, task_name: &str, isolate_id: &str, tenant: &str, session: bool) -> IsolateTaskRef {
+    fn task_ref_for(
+        &self,
+        job_id: &str,
+        task_name: &str,
+        isolate_id: &str,
+        tenant: &str,
+        session: bool,
+    ) -> IsolateTaskRef {
         let allocation = lock(&self.state)
             .tasks
             .get(&(job_id.to_string(), task_name.to_string()))
@@ -1136,7 +1202,12 @@ impl IsolateSupervisor {
 
     /// The replica a call goes to: a session's own, a tenant's by hash (so
     /// its warm instance is found again), or the next live one.
-    fn pick_replica(&self, cordon: &str, tenant: &str, session_replica: Option<u32>) -> Result<(Arc<Replica>, Arc<HostConn>), Status> {
+    fn pick_replica(
+        &self,
+        cordon: &str,
+        tenant: &str,
+        session_replica: Option<u32>,
+    ) -> Result<(Arc<Replica>, Arc<HostConn>), Status> {
         let replicas = self.replicas(cordon);
         if replicas.is_empty() {
             return Err(Status::unavailable(format!(
@@ -1180,11 +1251,13 @@ impl IsolateSupervisor {
 
     /// A host call failed: when its process is gone, say so as retryable.
     fn host_error(&self, conn: &HostConn, cordon: &str, status: Status) -> Status {
-        let transport = matches!(status.code(), Code::Unavailable | Code::Unknown | Code::Internal | Code::Cancelled)
-            && (status.message().contains("transport")
-                || status.message().contains("connection")
-                || status.message().contains("broken pipe")
-                || status.message().contains("h2 protocol"));
+        let transport = matches!(
+            status.code(),
+            Code::Unavailable | Code::Unknown | Code::Internal | Code::Cancelled
+        ) && (status.message().contains("transport")
+            || status.message().contains("connection")
+            || status.message().contains("broken pipe")
+            || status.message().contains("h2 protocol"));
         if !conn.alive() || transport {
             return Status::unavailable(format!(
                 "the isolate host for cordon {cordon} exited during the call; the worker is \
@@ -1212,7 +1285,10 @@ impl IsolateSupervisor {
                 call.task_name
             )));
         }
-        if !matches!(request.tier.trim(), "" | tier::TIER_AUTO | tier::TIER_ISOLATE | tier::TIER_VM) {
+        if !matches!(
+            request.tier.trim(),
+            "" | tier::TIER_AUTO | tier::TIER_ISOLATE | tier::TIER_VM
+        ) {
             return Err(Status::invalid_argument(format!(
                 "tier {:?} is not one of \"auto\", \"isolate\", \"vm\"",
                 request.tier
@@ -1254,17 +1330,21 @@ impl IsolateSupervisor {
             move |run_id| async move {
                 let result = match decided.tier.clone() {
                     Tier::Isolate { reason } => {
-                        me.run_isolate(&key, &call, staged, &decided, &reason, &run_id).await
+                        me.run_isolate(&key, &call, staged, &decided, &reason, &run_id)
+                            .await
                     }
                     Tier::Vm { reason } => {
-                        me.run_vm(&key, call, staged, &decided, &reason, launch_pool).await
+                        me.run_vm(&key, call, staged, &decided, &reason, launch_pool)
+                            .await
                     }
                 };
-                crate::telemetry::worker_metrics().session_runs_total.inc(&[match &result {
-                    Ok(reply) if reply.stopped.is_some() => "stopped",
-                    Ok(_) => "ran",
-                    Err(_) => "failed",
-                }]);
+                crate::telemetry::worker_metrics()
+                    .session_runs_total
+                    .inc(&[match &result {
+                        Ok(reply) if reply.stopped.is_some() => "stopped",
+                        Ok(_) => "ran",
+                        Err(_) => "failed",
+                    }]);
                 result
             },
         )
@@ -1272,17 +1352,26 @@ impl IsolateSupervisor {
     }
 
     /// The tier decision and what went into it.
-    fn decide(&self, key: &TaskKey, request: &RunSessionRequest, staged: &crate::worker::task_manager::session_runs::StagedFiles) -> Result<Decided, Status> {
+    fn decide(
+        &self,
+        key: &TaskKey,
+        request: &RunSessionRequest,
+        staged: &crate::worker::task_manager::session_runs::StagedFiles,
+    ) -> Result<Decided, Status> {
         let (has_vm, image, modules, entry_source, memo_for, entry_name) = {
             let state = lock(&self.state);
-            let task = state.tasks.get(key).ok_or_else(|| Status::unavailable("the task left this node; retry"))?;
+            let task = state
+                .tasks
+                .get(key)
+                .ok_or_else(|| Status::unavailable("the task left this node; retry"))?;
             let names: Vec<&str> = staged
                 .files
                 .iter()
                 .filter(|(path, _, _)| path != crate::structs::run::RUN_INPUT_FILE)
                 .map(|(path, _, _)| path.as_str())
                 .collect();
-            let entry_name = crate::structs::isolate::run_entry(task.image(), &names).map(str::to_string);
+            let entry_name =
+                crate::structs::isolate::run_entry(task.image(), &names).map(str::to_string);
             let source = match entry_name.as_deref() {
                 Some(name) => staged
                     .files
@@ -1290,7 +1379,11 @@ impl IsolateSupervisor {
                     .find(|(path, _, _)| path == name)
                     .map(|(_, content, _)| content.clone())
                     .unwrap_or_default(),
-                None => task.entry.as_ref().map(|f| f.content.clone()).unwrap_or_default(),
+                None => task
+                    .entry
+                    .as_ref()
+                    .map(|f| f.content.clone())
+                    .unwrap_or_default(),
             };
             (
                 task.vm_task.is_some(),
@@ -1301,7 +1394,11 @@ impl IsolateSupervisor {
                 entry_name,
             )
         };
-        let run_files: Vec<String> = staged.files.iter().map(|(path, _, _)| path.clone()).collect();
+        let run_files: Vec<String> = staged
+            .files
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect();
         let scan = image
             .as_deref()
             .and_then(super::preflight::Language::of_image)
@@ -1309,7 +1406,11 @@ impl IsolateSupervisor {
             .unwrap_or_default();
         let memo_key = VmMemo::key(&key.0, &key.1, &entry_source);
         let memo_age = lock(&self.memo).lookup(&memo_key, memo_for, Instant::now());
-        let runtime_disabled = self.gate.current().refusing(ISOLATE_RUNTIME, &key.0).is_some();
+        let runtime_disabled = self
+            .gate
+            .current()
+            .refusing(ISOLATE_RUNTIME, &key.0)
+            .is_some();
         let decision = tier::decide(&TierInputs {
             requested: &request.tier,
             has_vm,
@@ -1467,7 +1568,11 @@ impl IsolateSupervisor {
             Some(record.replica)
         };
         let (_, conn) = self.pick_replica(&cordon, &request.tenant, session_replica)?;
-        let get: Vec<String> = staged.get.iter().map(|(_, relative)| relative.clone()).collect();
+        let get: Vec<String> = staged
+            .get
+            .iter()
+            .map(|(_, relative)| relative.clone())
+            .collect();
         let asked: Vec<String> = staged.get.iter().map(|(asked, _)| asked.clone()).collect();
         let files = staged
             .files
@@ -1540,7 +1645,9 @@ impl IsolateSupervisor {
         }
         if request.session_id.is_empty() {
             let task = self.task_ref_for(&key.0, &key.1, run_id, &request.tenant, false);
-            self.vm_backend().owner_ended(&task, "its run finished").await;
+            self.vm_backend()
+                .owner_ended(&task, "its run finished")
+                .await;
         }
         Ok(mapped)
     }
@@ -1548,9 +1655,10 @@ impl IsolateSupervisor {
     fn observe_invocation(&self, reply: &host::InvokeReply, image: Option<&str>) {
         let metrics = crate::telemetry::worker_metrics();
         if reply.instantiate_micros > 0 {
-            metrics
-                .isolate_instantiate_seconds
-                .observe(&[image.unwrap_or("module")], reply.instantiate_micros as f64 / 1e6);
+            metrics.isolate_instantiate_seconds.observe(
+                &[image.unwrap_or("module")],
+                reply.instantiate_micros as f64 / 1e6,
+            );
         }
         if let Some(stop) = reply.stopped.as_ref() {
             metrics.isolate_stopped_total.inc(&[stop.reason.as_str()]);
@@ -1646,6 +1754,18 @@ impl IsolateSupervisor {
     // -----------------------------------------------------------------
     // Session isolates
     // -----------------------------------------------------------------
+
+    /// The session isolates this node holds (restored from the book after
+    /// a worker restart), as child owners: register each with the child VM
+    /// backend before its first child reconcile, or their children are
+    /// reaped as orphans.
+    pub fn session_owner_refs(&self) -> Vec<IsolateTaskRef> {
+        let records: Vec<SessionRecord> = lock(&self.sessions).records().cloned().collect();
+        records
+            .into_iter()
+            .map(|r| self.task_ref_for(&r.job_id, &r.task_name, &r.session_id, &r.tenant, true))
+            .collect()
+    }
 
     /// Whether `session_id` names a session isolate on this node.
     pub fn knows_session(&self, session_id: &str) -> bool {
@@ -1754,7 +1874,12 @@ impl IsolateSupervisor {
             origin: origin.to_string(),
             ..Default::default()
         });
-        info!(job_id, task = task_name, session_id, "Session isolate started");
+        info!(
+            job_id,
+            task = task_name,
+            session_id,
+            "Session isolate started"
+        );
         Ok(StartedIsolate {
             session_id: session_id.to_string(),
             deduplicated: false,
@@ -1782,12 +1907,19 @@ impl IsolateSupervisor {
                     .await;
             }
         }
-        let task = self.task_ref_for(&record.job_id, &record.task_name, session_id, &record.tenant, true);
+        let task = self.task_ref_for(
+            &record.job_id,
+            &record.task_name,
+            session_id,
+            &record.tenant,
+            true,
+        );
         self.vm_backend().owner_ended(&task, reason).await;
         if let Some(checkpoint) = record.checkpoint.clone() {
             let store = self.checkpoints.clone();
             let id = session_id.to_string();
-            let _ = tokio::task::spawn_blocking(move || store.drop_checkpoint(&id, &checkpoint)).await;
+            let _ =
+                tokio::task::spawn_blocking(move || store.drop_checkpoint(&id, &checkpoint)).await;
         }
         info!(job_id = %record.job_id, task = %record.task_name, session_id, reason, "Session isolate stopped");
         true
@@ -1831,7 +1963,11 @@ impl IsolateSupervisor {
             started_unix_ms: record.started_unix_ms,
             last_active_unix_ms: record.last_active_unix_ms,
             checkpoint_generation: record.generation,
-            checkpoint_bytes: record.checkpoint.as_ref().map(|c| c.bytes).unwrap_or_default(),
+            checkpoint_bytes: record
+                .checkpoint
+                .as_ref()
+                .map(|c| c.bytes)
+                .unwrap_or_default(),
             ..Default::default()
         };
         if record.state == SessionState::Resident {
@@ -1840,7 +1976,9 @@ impl IsolateSupervisor {
                 .tasks
                 .get(&(record.job_id.clone(), record.task_name.clone()))
                 .map(|task| task.cordon.clone());
-            if let Some(Ok((_, conn))) = cordon.map(|c| self.pick_replica(&c, "", Some(record.replica))) {
+            if let Some(Ok((_, conn))) =
+                cordon.map(|c| self.pick_replica(&c, "", Some(record.replica)))
+            {
                 let mut client = conn.client.clone();
                 match client
                     .get_session(host::GetSessionRequest {
@@ -1851,12 +1989,15 @@ impl IsolateSupervisor {
                     Ok(info) => {
                         let info = info.into_inner();
                         reply.state = info.tier;
-                        reply.last_active_unix_ms = info.last_active_unix_ms.max(reply.last_active_unix_ms);
+                        reply.last_active_unix_ms =
+                            info.last_active_unix_ms.max(reply.last_active_unix_ms);
                         reply.invocations = info.invocations;
                         reply.memory_bytes = info.memory_bytes;
                         reply.state_bytes = info.state_bytes;
                     }
-                    Err(status) if status.code() == Code::NotFound && record.checkpoint.is_some() => {
+                    Err(status)
+                        if status.code() == Code::NotFound && record.checkpoint.is_some() =>
+                    {
                         reply.state = "hibernated".into();
                     }
                     Err(_) => {}
@@ -1873,10 +2014,16 @@ impl IsolateSupervisor {
         let record = lock(&self.sessions)
             .get(session_id)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("session isolate {session_id} is not on this node")))?;
+            .ok_or_else(|| {
+                Status::not_found(format!("session isolate {session_id} is not on this node"))
+            })?;
         if record.state == SessionState::Hibernated {
             return Ok((
-                record.checkpoint.as_ref().map(|c| c.bytes).unwrap_or_default(),
+                record
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| c.bytes)
+                    .unwrap_or_default(),
                 record.generation,
                 true,
             ));
@@ -1899,7 +2046,11 @@ impl IsolateSupervisor {
         let after = lock(&self.sessions).get(session_id).cloned();
         match after {
             Some(after) if after.state == SessionState::Hibernated => Ok((
-                after.checkpoint.as_ref().map(|c| c.bytes).unwrap_or_default(),
+                after
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| c.bytes)
+                    .unwrap_or_default(),
                 after.generation,
                 false,
             )),
@@ -1907,28 +2058,40 @@ impl IsolateSupervisor {
                 "session isolate {session_id} is busy (a call is running in it); suspend it \
                  again once it is idle"
             ))),
-            None => Err(Status::not_found(format!("session isolate {session_id} ended"))),
+            None => Err(Status::not_found(format!(
+                "session isolate {session_id} ended"
+            ))),
         }
     }
 
     /// Store a hibernating session's checkpoint (`IsolateWorker.SaveCheckpoint`).
-    pub async fn save_checkpoint(&self, task: &IsolateTaskRef, header: &host::CheckpointHeader, body: Vec<u8>) -> Result<u64, Status> {
+    pub async fn save_checkpoint(
+        &self,
+        task: &IsolateTaskRef,
+        header: &host::CheckpointHeader,
+        body: Vec<u8>,
+    ) -> Result<u64, Status> {
         let session_id = task.isolate_id.clone();
         let (previous, generation) = {
             let book = lock(&self.sessions);
             let record = book
                 .get(&session_id)
                 .filter(|r| r.job_id == task.job_id && r.task_name == task.task_name)
-                .ok_or_else(|| Status::not_found(format!("session isolate {session_id} is not on this node")))?;
+                .ok_or_else(|| {
+                    Status::not_found(format!("session isolate {session_id} is not on this node"))
+                })?;
             (record.checkpoint.clone(), record.generation + 1)
         };
         let store = self.checkpoints.clone();
         let id = session_id.clone();
         let now = crate::util::now_unix_ms();
-        let mut stored = tokio::task::spawn_blocking(move || store.put(&id, generation, &body, now))
-            .await
-            .map_err(|err| Status::internal(format!("storing the checkpoint panicked: {err}")))?
-            .map_err(|err| Status::resource_exhausted(format!("could not keep the checkpoint: {err:#}")))?;
+        let mut stored =
+            tokio::task::spawn_blocking(move || store.put(&id, generation, &body, now))
+                .await
+                .map_err(|err| Status::internal(format!("storing the checkpoint panicked: {err}")))?
+                .map_err(|err| {
+                    Status::resource_exhausted(format!("could not keep the checkpoint: {err:#}"))
+                })?;
         stored.engine_version = header.engine_version.clone();
         stored.module_id = header.module_id.clone();
         let replaced = {
@@ -1945,24 +2108,42 @@ impl IsolateSupervisor {
                 None => Some(stored),
             }
         };
-        if let Some(old) = replaced.filter(|old| !same_checkpoint(old, lock(&self.sessions).get(&session_id).and_then(|r| r.checkpoint.as_ref()))) {
+        if let Some(old) = replaced.filter(|old| {
+            !same_checkpoint(
+                old,
+                lock(&self.sessions)
+                    .get(&session_id)
+                    .and_then(|r| r.checkpoint.as_ref()),
+            )
+        }) {
             let store = self.checkpoints.clone();
-            let _ = tokio::task::spawn_blocking(move || store.drop_checkpoint(&session_id, &old)).await;
+            let _ =
+                tokio::task::spawn_blocking(move || store.drop_checkpoint(&session_id, &old)).await;
         }
         Ok(generation)
     }
 
     /// Read a session's checkpoint back (`IsolateWorker.LoadCheckpoint`).
-    pub async fn load_checkpoint(&self, task: &IsolateTaskRef) -> Result<(host::CheckpointHeader, Vec<u8>), Status> {
+    pub async fn load_checkpoint(
+        &self,
+        task: &IsolateTaskRef,
+    ) -> Result<(host::CheckpointHeader, Vec<u8>), Status> {
         let record = lock(&self.sessions)
             .get(&task.isolate_id)
             .filter(|r| r.job_id == task.job_id && r.task_name == task.task_name)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("session isolate {} is not on this node", task.isolate_id)))?;
-        let checkpoint = record
-            .checkpoint
-            .clone()
-            .ok_or_else(|| Status::not_found(format!("session isolate {} has never hibernated", task.isolate_id)))?;
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "session isolate {} is not on this node",
+                    task.isolate_id
+                ))
+            })?;
+        let checkpoint = record.checkpoint.clone().ok_or_else(|| {
+            Status::not_found(format!(
+                "session isolate {} has never hibernated",
+                task.isolate_id
+            ))
+        })?;
         let store = self.checkpoints.clone();
         let read = checkpoint.clone();
         let body = tokio::task::spawn_blocking(move || store.get(&read))
@@ -2048,15 +2229,27 @@ impl IsolateSupervisor {
     /// Resize a session isolate (docs/resize.md): re-admit its reservation
     /// against the envelope, then change it in place (resident) or in its
     /// record (hibernated). Returns (outcome, message, from, to).
-    pub async fn resize_session(&self, session_id: &str, memory_mib: Option<f64>, memory_max_mib: Option<f64>, cpu: Option<f64>, dry_run: bool) -> Result<(&'static str, String, Value, Value, String, String), Status> {
+    pub async fn resize_session(
+        &self,
+        session_id: &str,
+        memory_mib: Option<f64>,
+        memory_max_mib: Option<f64>,
+        cpu: Option<f64>,
+        dry_run: bool,
+    ) -> Result<(&'static str, String, Value, Value, String, String), Status> {
         let record = lock(&self.sessions)
             .get(session_id)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("session isolate {session_id} is not on this node")))?;
+            .ok_or_else(|| {
+                Status::not_found(format!("session isolate {session_id} is not on this node"))
+            })?;
         let key = (record.job_id.clone(), record.task_name.clone());
         let (task_reservation, task_max, envelope_mib, cordon) = {
             let state = lock(&self.state);
-            let task = state.tasks.get(&key).ok_or_else(|| Status::unavailable("its task left this node"))?;
+            let task = state
+                .tasks
+                .get(&key)
+                .ok_or_else(|| Status::unavailable("its task left this node"))?;
             (
                 crate::structs::isolate::reservation_mib(&task.task),
                 crate::structs::isolate::memory_max_mib(&task.task),
@@ -2064,8 +2257,16 @@ impl IsolateSupervisor {
                 task.cordon.clone(),
             )
         };
-        let current_res = if record.memory_reservation_bytes > 0 { record.memory_reservation_bytes >> 20 } else { task_reservation };
-        let current_max = if record.memory_max_bytes > 0 { record.memory_max_bytes >> 20 } else { task_max };
+        let current_res = if record.memory_reservation_bytes > 0 {
+            record.memory_reservation_bytes >> 20
+        } else {
+            task_reservation
+        };
+        let current_max = if record.memory_max_bytes > 0 {
+            record.memory_max_bytes >> 20
+        } else {
+            task_max
+        };
         let from = json!({ "memory": current_res, "memoryMax": current_max });
         let (job, task) = key.clone();
         if cpu.is_some() {
@@ -2080,8 +2281,12 @@ impl IsolateSupervisor {
                 task,
             ));
         }
-        let new_res = memory_mib.map(|m| m.ceil().max(0.0) as u64).unwrap_or(current_res);
-        let new_max = memory_max_mib.map(|m| m.ceil().max(0.0) as u64).unwrap_or(current_max);
+        let new_res = memory_mib
+            .map(|m| m.ceil().max(0.0) as u64)
+            .unwrap_or(current_res);
+        let new_max = memory_max_mib
+            .map(|m| m.ceil().max(0.0) as u64)
+            .unwrap_or(current_max);
         let to = json!({ "memory": new_res, "memoryMax": new_max });
         let worker_max = self.config.max_memory_bytes().unwrap_or(4 << 30) >> 20;
         if new_max > worker_max {
@@ -2156,14 +2361,19 @@ impl IsolateSupervisor {
         request: host::HttpCall,
     ) -> Result<host::HttpOutcome, Status> {
         if !tenant.is_empty() {
-            crate::structs::isolate::validate_tenant_key(tenant).map_err(Status::invalid_argument)?;
+            crate::structs::isolate::validate_tenant_key(tenant)
+                .map_err(Status::invalid_argument)?;
         }
         let key = self.known_task(job_id, task_name)?;
         if let Some(refusal) = self.gate.check(ISOLATE_RUNTIME, job_id).err() {
             return Err(refusal.to_status());
         }
         self.ready(&key, DEFAULT_READY_WAIT).await?;
-        let cordon = lock(&self.state).tasks.get(&key).map(|t| t.cordon.clone()).unwrap_or_default();
+        let cordon = lock(&self.state)
+            .tasks
+            .get(&key)
+            .map(|t| t.cordon.clone())
+            .unwrap_or_default();
         let session_replica = if session_id.is_empty() {
             None
         } else {
@@ -2172,7 +2382,12 @@ impl IsolateSupervisor {
                     .get(session_id)
                     .filter(|r| r.job_id == job_id && r.task_name == task_name)
                     .map(|r| r.replica)
-                    .ok_or_else(|| Status::not_found(format!("session isolate {session_id} is not on node {}", self.node_id)))?,
+                    .ok_or_else(|| {
+                        Status::not_found(format!(
+                            "session isolate {session_id} is not on node {}",
+                            self.node_id
+                        ))
+                    })?,
             )
         };
         let (_, conn) = self.pick_replica(&cordon, tenant, session_replica)?;
@@ -2190,11 +2405,16 @@ impl IsolateSupervisor {
             .await
             .map_err(|status| self.host_error(&conn, &cordon, status))?
             .into_inner();
-        let image = lock(&self.state).tasks.get(&key).and_then(|t| t.image().map(str::to_string));
+        let image = lock(&self.state)
+            .tasks
+            .get(&key)
+            .and_then(|t| t.image().map(str::to_string));
         self.observe_invocation(&reply, image.as_deref());
         if session_id.is_empty() {
             let task = self.task_ref_for(job_id, task_name, &invocation_id, tenant, false);
-            self.vm_backend().owner_ended(&task, "its request finished").await;
+            self.vm_backend()
+                .owner_ended(&task, "its request finished")
+                .await;
         }
         match (reply.outcome, reply.stopped) {
             (Some(host::invoke_reply::Outcome::Http(outcome)), None) => Ok(outcome),
@@ -2204,9 +2424,15 @@ impl IsolateSupervisor {
                     name: "content-type".into(),
                     value: b"text/plain; charset=utf-8".to_vec(),
                 }],
-                body: format!("isolate stopped: {} {} {}\n", stop.reason, stop.limit, stop.detail).into_bytes(),
+                body: format!(
+                    "isolate stopped: {} {} {}\n",
+                    stop.reason, stop.limit, stop.detail
+                )
+                .into_bytes(),
             }),
-            _ => Err(Status::internal("the isolate host answered an HTTP call without a response")),
+            _ => Err(Status::internal(
+                "the isolate host answered an HTTP call without a response",
+            )),
         }
     }
 
@@ -2217,7 +2443,11 @@ impl IsolateSupervisor {
     /// Poll every host and build the node's aggregates. With a filter, only
     /// those tasks (and the hosts serving them); without, also updates the
     /// rates and the metrics (the heartbeat's call).
-    pub async fn stats(&self, job_id: &str, task_name: &str) -> (Vec<IsolateTaskStats>, Vec<IsolateHostStats>) {
+    pub async fn stats(
+        &self,
+        job_id: &str,
+        task_name: &str,
+    ) -> (Vec<IsolateTaskStats>, Vec<IsolateHostStats>) {
         let replicas: Vec<Arc<Replica>> = lock(&self.state)
             .cordons
             .values()
@@ -2230,7 +2460,9 @@ impl IsolateSupervisor {
             let reply = match conn.as_ref() {
                 Some(conn) => {
                     let mut client = conn.client.clone();
-                    match tokio::time::timeout(STATS_TIMEOUT, client.stats(host::StatsRequest {})).await {
+                    match tokio::time::timeout(STATS_TIMEOUT, client.stats(host::StatsRequest {}))
+                        .await
+                    {
                         Ok(Ok(reply)) => Some(reply.into_inner()),
                         _ => None,
                     }
@@ -2252,11 +2484,17 @@ impl IsolateSupervisor {
                     .map(|r| r.shards)
                     .or(conn.as_ref().map(|c| c.hello.shards))
                     .unwrap_or_default(),
-                engine_version: conn.as_ref().map(|c| c.hello.engine_version.clone()).unwrap_or_default(),
+                engine_version: conn
+                    .as_ref()
+                    .map(|c| c.hello.engine_version.clone())
+                    .unwrap_or_default(),
                 pid: conn.as_ref().map(|c| c.pid).unwrap_or_default(),
                 started_unix_ms: conn.as_ref().map(|c| c.started_unix_ms).unwrap_or_default(),
                 layout: plan::layout_name(self.config.layout).to_string(),
-                confinement: conn.as_ref().map(|c| c.confinement.clone()).unwrap_or_default(),
+                confinement: conn
+                    .as_ref()
+                    .map(|c| c.confinement.clone())
+                    .unwrap_or_default(),
                 restarts: replica.restarts.load(Ordering::Acquire),
             });
         }
@@ -2265,8 +2503,11 @@ impl IsolateSupervisor {
         let mut tasks = super::stats::fold(&facts, &all_replies);
         let filtered = !job_id.is_empty();
         if filtered {
-            tasks.retain(|t| t.job_id == job_id && (task_name.is_empty() || t.task_name == task_name));
-            let cordons: std::collections::HashSet<String> = tasks.iter().map(|t| t.cordon.clone()).collect();
+            tasks.retain(|t| {
+                t.job_id == job_id && (task_name.is_empty() || t.task_name == task_name)
+            });
+            let cordons: std::collections::HashSet<String> =
+                tasks.iter().map(|t| t.cordon.clone()).collect();
             hosts.retain(|h| cordons.contains(&h.cordon));
         } else {
             lock(&self.rates).apply(&mut tasks, Instant::now());
@@ -2285,7 +2526,11 @@ impl IsolateSupervisor {
             .map(|task| {
                 let hibernated = book
                     .records()
-                    .filter(|r| r.job_id == task.job_id && r.task_name == task.task_name && r.state == SessionState::Hibernated)
+                    .filter(|r| {
+                        r.job_id == task.job_id
+                            && r.task_name == task.task_name
+                            && r.state == SessionState::Hibernated
+                    })
                     .count() as u32;
                 let mut problem = task.problem();
                 if problem.is_empty() {
@@ -2317,20 +2562,29 @@ impl IsolateSupervisor {
             .collect()
     }
 
-    fn update_metrics(&self, tasks: &[IsolateTaskStats], replies: &[(String, StatsReply)], hosts: &[IsolateHostStats]) {
+    fn update_metrics(
+        &self,
+        tasks: &[IsolateTaskStats],
+        replies: &[(String, StatsReply)],
+        hosts: &[IsolateHostStats],
+    ) {
         let metrics = crate::telemetry::worker_metrics();
         let sum = |f: fn(&IsolateTaskStats) -> u32| tasks.iter().map(f).sum::<u32>() as i64;
         let resident = sum(|t| t.resident);
         let paged = sum(|t| t.paged_out);
         metrics.isolate_resident.set(&["hot"], resident - paged);
         metrics.isolate_resident.set(&["paged_out"], paged);
-        metrics.isolate_resident.set(&["hibernated"], sum(|t| t.hibernated));
+        metrics
+            .isolate_resident
+            .set(&["hibernated"], sum(|t| t.hibernated));
         metrics.isolate_child_vms.set(sum(|t| t.child_vms));
         let mut deltas = lock(&self.deltas);
         for (index, (cordon, reply)) in replies.iter().enumerate() {
             for task in &reply.tasks {
                 let base = format!("{cordon}/{index}/{}/{}", task.job_id, task.task_name);
-                metrics.isolate_turns_total.add(deltas.delta(format!("{base}/turns"), task.turns));
+                metrics
+                    .isolate_turns_total
+                    .add(deltas.delta(format!("{base}/turns"), task.turns));
                 metrics
                     .isolate_cpu_microseconds_total
                     .add(deltas.delta(format!("{base}/cpu"), task.cpu_micros));
@@ -2351,8 +2605,12 @@ impl IsolateSupervisor {
         }
         for (cordon, (rss, used, free)) in by_cordon {
             metrics.isolate_host_rss_bytes.set(&[cordon], rss as i64);
-            metrics.isolate_slots.set(&[cordon, "used"], i64::from(used));
-            metrics.isolate_slots.set(&[cordon, "free"], i64::from(free));
+            metrics
+                .isolate_slots
+                .set(&[cordon, "used"], i64::from(used));
+            metrics
+                .isolate_slots
+                .set(&[cordon, "free"], i64::from(free));
         }
     }
 
@@ -2364,7 +2622,13 @@ impl IsolateSupervisor {
     /// to its cgroup's `memory.reclaim` (only where the node can page out);
     /// `Hibernate` hibernates idle sessions and drops idle tenants. Returns
     /// the bytes given back (an estimate).
-    pub async fn reclaim(&self, level: host::ReclaimLevel, target_bytes: u64, min_idle: Duration, cordons: Option<&[String]>) -> u64 {
+    pub async fn reclaim(
+        &self,
+        level: host::ReclaimLevel,
+        target_bytes: u64,
+        min_idle: Duration,
+        cordons: Option<&[String]>,
+    ) -> u64 {
         if level == host::ReclaimLevel::ReclaimPageOut && self.paging_unavailable.is_some() {
             return 0;
         }
@@ -2396,7 +2660,10 @@ impl IsolateSupervisor {
                 if let Some(cgroup) = conn.cgroup.as_ref() {
                     let path = cgroup.join("memory.reclaim");
                     let bytes = reply.bytes;
-                    let _ = tokio::task::spawn_blocking(move || std::fs::write(path, bytes.to_string())).await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        std::fs::write(path, bytes.to_string())
+                    })
+                    .await;
                 }
             }
             freed = freed.saturating_add(reply.bytes);
@@ -2438,9 +2705,17 @@ impl IsolateSupervisor {
             cordons
         };
         if !drained.is_empty() {
-            let resident = lock(&self.sessions).records().any(|r| r.state == SessionState::Resident);
+            let resident = lock(&self.sessions)
+                .records()
+                .any(|r| r.state == SessionState::Resident);
             if resident {
-                self.reclaim(host::ReclaimLevel::ReclaimHibernate, 0, Duration::ZERO, Some(&drained)).await;
+                self.reclaim(
+                    host::ReclaimLevel::ReclaimHibernate,
+                    0,
+                    Duration::ZERO,
+                    Some(&drained),
+                )
+                .await;
             }
         }
         // keepFor: a hibernated session whose checkpoint is older ends.
@@ -2457,7 +2732,9 @@ impl IsolateSupervisor {
                         .map(|t| t.keep_for)
                         .unwrap_or(Duration::ZERO);
                     !keep_for.is_zero()
-                        && r.checkpoint.as_ref().is_some_and(|c| now - c.taken_unix_ms > keep_for.as_millis() as i64)
+                        && r.checkpoint
+                            .as_ref()
+                            .is_some_and(|c| now - c.taken_unix_ms > keep_for.as_millis() as i64)
                 })
                 .map(|r| r.session_id.clone())
                 .collect()
@@ -2486,7 +2763,8 @@ impl IsolateSupervisor {
                 me.maintain().await;
                 if !page_out_after.is_zero() && last_page_out.elapsed() >= page_out_after {
                     last_page_out = Instant::now();
-                    me.reclaim(host::ReclaimLevel::ReclaimPageOut, 0, page_out_after, None).await;
+                    me.reclaim(host::ReclaimLevel::ReclaimPageOut, 0, page_out_after, None)
+                        .await;
                 }
             }
         });
@@ -2589,7 +2867,12 @@ fn placeholder_resolved() -> ResolvedIsolate {
 }
 
 /// A task entry from its spec, or why the node cannot run it.
-fn build_entry(job_id: &str, task: TaskConfig, room: TaskRoom, images: &Option<ImageCatalog>) -> Result<TaskEntry, String> {
+fn build_entry(
+    job_id: &str,
+    task: TaskConfig,
+    room: TaskRoom,
+    images: &Option<ImageCatalog>,
+) -> Result<TaskEntry, String> {
     let config = IsolateTaskConfig::of(&task)
         .map_err(|err| format!("{err:#}"))?
         .ok_or("not an isolate task")?;
@@ -2603,10 +2886,12 @@ fn build_entry(job_id: &str, task: TaskConfig, room: TaskRoom, images: &Option<I
     if suspend.durability == crate::structs::snapshot::SnapshotDurability::Store
         && resolved.lifetime == IsolateLifetime::Session
     {
-        return Err("suspend.durability = \"store\" is not available for isolate sessions yet: \
+        return Err(
+            "suspend.durability = \"store\" is not available for isolate sessions yet: \
                     their checkpoints stay on the node that took them; use durability = \
                     \"local\""
-            .into());
+                .into(),
+        );
     }
     let image_modules = resolved
         .image
@@ -2632,7 +2917,11 @@ fn build_entry(job_id: &str, task: TaskConfig, room: TaskRoom, images: &Option<I
         attempted: Instant::now(),
         module: None,
         entry: None,
-        hibernate_after: suspend.idle.as_ref().map(|idle| idle.after).unwrap_or_default(),
+        hibernate_after: suspend
+            .idle
+            .as_ref()
+            .map(|idle| idle.after)
+            .unwrap_or_default(),
         keep_for: suspend.keep_for,
         image_modules,
         resolved,
@@ -2650,6 +2939,7 @@ impl super::IngressTarget for IsolateSupervisor {
         session_id: &str,
         request: host::HttpCall,
     ) -> Result<host::HttpOutcome, Status> {
-        self.http(job_id, task_name, tenant, session_id, request).await
+        self.http(job_id, task_name, tenant, session_id, request)
+            .await
     }
 }

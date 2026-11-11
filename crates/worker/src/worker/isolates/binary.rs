@@ -226,8 +226,14 @@ mod binary_test {
         let wrong = catalog
             .resolve(&format!("python@sha256:{}", "0".repeat(64)))
             .unwrap_err();
-        assert!(wrong.contains("but this node has python@sha256:"), "{wrong}");
-        assert!(catalog.resolve("js").unwrap_err().contains("no build of image \"js\""));
+        assert!(
+            wrong.contains("but this node has python@sha256:"),
+            "{wrong}"
+        );
+        assert!(catalog
+            .resolve("js")
+            .unwrap_err()
+            .contains("no build of image \"js\""));
         Ok(())
     }
 

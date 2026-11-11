@@ -307,14 +307,18 @@ impl Compiler {
             .stager
             .as_ref()
             .ok_or("this node has no artifact stager to fetch config.entry with")?;
-        let dir = self.fallback_dir.parent().unwrap_or(&self.fallback_dir).join("entries").join(
-            format!(
+        let dir = self
+            .fallback_dir
+            .parent()
+            .unwrap_or(&self.fallback_dir)
+            .join("entries")
+            .join(format!(
                 "{}-{}",
                 crate::structs::session::derived_session_id(&task.name, job_id, "entry"),
                 allocation_id
-            ),
-        );
-        std::fs::create_dir_all(&dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
+            ));
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("creating {}: {err}", dir.display()))?;
         let board = crate::artifacts::status::ArtifactStatusBoard::new();
         let staged = stager
             .stage_task_artifacts(allocation_id, &dir, &task.artifacts, &board)
@@ -324,7 +328,9 @@ impl Compiler {
                 .iter()
                 .find(|artifact| artifact.name.as_deref() == Some(name))
                 .map(|artifact| artifact.reference_path().to_path_buf())
-                .ok_or_else(|| format!("config.entry names artifact {name:?}, which the task does not declare"))?,
+                .ok_or_else(|| {
+                    format!("config.entry names artifact {name:?}, which the task does not declare")
+                })?,
             None => dir.join(entry.trim()),
         };
         let content = std::fs::read(&path)

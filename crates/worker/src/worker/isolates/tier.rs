@@ -175,7 +175,11 @@ impl VmMemo {
 
 /// The hint a stopped isolate run carries (plan §7.2).
 pub fn stop_hint(reason: &str, limit: &str, has_vm: bool) -> String {
-    let vm = if has_vm { ", or rerun with --tier vm" } else { "" };
+    let vm = if has_vm {
+        ", or rerun with --tier vm"
+    } else {
+        ""
+    };
     match (reason, limit) {
         ("limits", "cpu") => format!("raise config.limits.cpu{vm}"),
         ("limits", "wall") => format!("raise config.limits.wall{vm}"),
@@ -285,11 +289,25 @@ mod tier_test {
     fn decision_table() {
         let none: Vec<String> = Vec::new();
         let torch = vec!["torch".to_string()];
-        let isolate = |reason: &str| Ok(Tier::Isolate { reason: reason.into() });
-        let vm = |reason: &str| Ok(Tier::Vm { reason: reason.into() });
+        let isolate = |reason: &str| {
+            Ok(Tier::Isolate {
+                reason: reason.into(),
+            })
+        };
+        let vm = |reason: &str| {
+            Ok(Tier::Vm {
+                reason: reason.into(),
+            })
+        };
 
-        assert_eq!(decide(&inputs("", &none)), isolate("auto: no imports outside the image"));
-        assert_eq!(decide(&inputs("auto", &none)), isolate("auto: no imports outside the image"));
+        assert_eq!(
+            decide(&inputs("", &none)),
+            isolate("auto: no imports outside the image")
+        );
+        assert_eq!(
+            decide(&inputs("auto", &none)),
+            isolate("auto: no imports outside the image")
+        );
         assert_eq!(decide(&inputs("isolate", &torch)), isolate("requested"));
         assert_eq!(decide(&inputs("vm", &none)), vm("requested"));
         assert_eq!(
@@ -299,7 +317,10 @@ mod tier_test {
         // No VM task: a missing import goes to the isolate and fails there.
         let mut no_vm = inputs("auto", &torch);
         no_vm.has_vm = false;
-        assert_eq!(decide(&no_vm), isolate("auto: no imports outside the image"));
+        assert_eq!(
+            decide(&no_vm),
+            isolate("auto: no imports outside the image")
+        );
         no_vm.requested = "vm";
         assert_eq!(decide(&no_vm), Err(TierRefusal::NoVm));
         // The memo.
@@ -311,7 +332,10 @@ mod tier_test {
         // A disabled runtime.
         let mut disabled = inputs("auto", &none);
         disabled.runtime_disabled = true;
-        assert_eq!(decide(&disabled), vm("auto: the isolate runtime is disabled"));
+        assert_eq!(
+            decide(&disabled),
+            vm("auto: the isolate runtime is disabled")
+        );
         disabled.has_vm = false;
         assert_eq!(decide(&disabled), Err(TierRefusal::RuntimeDisabled));
         disabled.requested = "isolate";
@@ -331,7 +355,11 @@ mod tier_test {
         assert_eq!(memo.lookup(&key, Duration::from_secs(3600), now), None);
         memo.record(key, now);
         assert_eq!(
-            memo.lookup(&key, Duration::from_secs(3600), now + Duration::from_secs(60)),
+            memo.lookup(
+                &key,
+                Duration::from_secs(3600),
+                now + Duration::from_secs(60)
+            ),
             Some(Duration::from_secs(60))
         );
         assert_eq!(memo.lookup(&key, Duration::ZERO, now), None);

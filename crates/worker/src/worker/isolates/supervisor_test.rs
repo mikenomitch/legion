@@ -4,7 +4,9 @@
 //! launcher runs as it does on a node.
 
 use super::binary::{ImageCatalog, ImageEntry, IsolateBinary};
-use super::host::{client_over, serve_over, socket_pair, tokio_stream, HostLauncher, HostSpawn, Launched};
+use super::host::{
+    client_over, serve_over, socket_pair, tokio_stream, HostLauncher, HostSpawn, Launched,
+};
 use super::modules::{ModuleArtifact, ModuleSource, ModuleWant};
 use super::sessions::CheckpointStore;
 use super::{IsolateEnvelope, IsolateSupervisor, SupervisorParts};
@@ -75,16 +77,29 @@ impl IsolateHost for FakeHost {
         }))
     }
 
-    async fn load_module(&self, request: Request<LoadModuleRequest>) -> Result<Response<LoadModuleReply>, Status> {
-        self.state.lock().unwrap().modules.push(request.into_inner().module_id);
+    async fn load_module(
+        &self,
+        request: Request<LoadModuleRequest>,
+    ) -> Result<Response<LoadModuleReply>, Status> {
+        self.state
+            .lock()
+            .unwrap()
+            .modules
+            .push(request.into_inner().module_id);
         Ok(Response::new(LoadModuleReply::default()))
     }
 
-    async fn unload_module(&self, _: Request<UnloadModuleRequest>) -> Result<Response<UnloadModuleReply>, Status> {
+    async fn unload_module(
+        &self,
+        _: Request<UnloadModuleRequest>,
+    ) -> Result<Response<UnloadModuleReply>, Status> {
         Ok(Response::new(UnloadModuleReply { unloaded: true }))
     }
 
-    async fn configure_task(&self, request: Request<TaskSpec>) -> Result<Response<ConfigureTaskReply>, Status> {
+    async fn configure_task(
+        &self,
+        request: Request<TaskSpec>,
+    ) -> Result<Response<ConfigureTaskReply>, Status> {
         let spec = request.into_inner();
         self.state
             .lock()
@@ -94,7 +109,10 @@ impl IsolateHost for FakeHost {
         Ok(Response::new(ConfigureTaskReply {}))
     }
 
-    async fn remove_task(&self, request: Request<RemoveTaskRequest>) -> Result<Response<RemoveTaskReply>, Status> {
+    async fn remove_task(
+        &self,
+        request: Request<RemoveTaskRequest>,
+    ) -> Result<Response<RemoveTaskReply>, Status> {
         let request = request.into_inner();
         self.state
             .lock()
@@ -104,7 +122,10 @@ impl IsolateHost for FakeHost {
         Ok(Response::new(RemoveTaskReply { dropped: 0 }))
     }
 
-    async fn invoke(&self, request: Request<InvokeRequest>) -> Result<Response<InvokeReply>, Status> {
+    async fn invoke(
+        &self,
+        request: Request<InvokeRequest>,
+    ) -> Result<Response<InvokeReply>, Status> {
         let request = request.into_inner();
         if !self
             .state
@@ -141,7 +162,13 @@ impl IsolateHost for FakeHost {
         let mut start = "fresh".to_string();
         let mut stdout = entry.clone();
         if !request.session_id.is_empty() {
-            let known = self.state.lock().unwrap().sessions.get(&request.session_id).copied();
+            let known = self
+                .state
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&request.session_id)
+                .copied();
             let Some((mut counter, resident)) = known else {
                 return Err(Status::not_found("unknown session"));
             };
@@ -151,7 +178,11 @@ impl IsolateHost for FakeHost {
                     .worker
                     .clone()
                     .load_checkpoint(LoadCheckpointRequest {
-                        origin: Some(origin(&request.job_id, &request.task_name, &request.session_id)),
+                        origin: Some(origin(
+                            &request.job_id,
+                            &request.task_name,
+                            &request.session_id,
+                        )),
                     })
                     .await
                 {
@@ -216,15 +247,24 @@ impl IsolateHost for FakeHost {
         }))
     }
 
-    async fn open_session(&self, request: Request<OpenSessionRequest>) -> Result<Response<OpenSessionReply>, Status> {
+    async fn open_session(
+        &self,
+        request: Request<OpenSessionRequest>,
+    ) -> Result<Response<OpenSessionReply>, Status> {
         let request = request.into_inner();
         let mut state = self.state.lock().unwrap();
         let existed = state.sessions.contains_key(&request.session_id);
-        state.sessions.entry(request.session_id).or_insert((0, false));
+        state
+            .sessions
+            .entry(request.session_id)
+            .or_insert((0, false));
         Ok(Response::new(OpenSessionReply { existed }))
     }
 
-    async fn close_session(&self, request: Request<CloseSessionRequest>) -> Result<Response<CloseSessionReply>, Status> {
+    async fn close_session(
+        &self,
+        request: Request<CloseSessionRequest>,
+    ) -> Result<Response<CloseSessionReply>, Status> {
         let closed = self
             .state
             .lock()
@@ -235,7 +275,10 @@ impl IsolateHost for FakeHost {
         Ok(Response::new(CloseSessionReply { closed }))
     }
 
-    async fn get_session(&self, request: Request<GetSessionRequest>) -> Result<Response<SessionInfo>, Status> {
+    async fn get_session(
+        &self,
+        request: Request<GetSessionRequest>,
+    ) -> Result<Response<SessionInfo>, Status> {
         let id = request.into_inner().session_id;
         let state = self.state.lock().unwrap();
         match state.sessions.get(&id) {
@@ -249,7 +292,10 @@ impl IsolateHost for FakeHost {
         }
     }
 
-    async fn resize_session(&self, request: Request<ResizeSessionRequest>) -> Result<Response<ResizeSessionReply>, Status> {
+    async fn resize_session(
+        &self,
+        request: Request<ResizeSessionRequest>,
+    ) -> Result<Response<ResizeSessionReply>, Status> {
         let request = request.into_inner();
         Ok(Response::new(ResizeSessionReply {
             memory_max_bytes: request.memory_max_bytes,
@@ -257,7 +303,10 @@ impl IsolateHost for FakeHost {
         }))
     }
 
-    async fn reclaim(&self, request: Request<ReclaimRequest>) -> Result<Response<ReclaimReply>, Status> {
+    async fn reclaim(
+        &self,
+        request: Request<ReclaimRequest>,
+    ) -> Result<Response<ReclaimReply>, Status> {
         let request = request.into_inner();
         if request.level != ReclaimLevel::ReclaimHibernate as i32 {
             return Ok(Response::new(ReclaimReply::default()));
@@ -358,7 +407,11 @@ impl FakeLauncher {
 
 #[tonic::async_trait]
 impl HostLauncher for FakeLauncher {
-    async fn launch(&self, spawn: &HostSpawn, worker: super::service::WorkerService) -> R<Launched> {
+    async fn launch(
+        &self,
+        spawn: &HostSpawn,
+        worker: super::service::WorkerService,
+    ) -> R<Launched> {
         let pid = 1000 + self.next_pid.fetch_add(1, Ordering::SeqCst);
         let (control_ours, control_theirs) = socket_pair()?;
         let (worker_ours, worker_theirs) = socket_pair()?;
@@ -430,7 +483,13 @@ impl ModuleSource for FakeModules {
         }
     }
 
-    fn entry_file(&self, _: &str, _: &TaskConfig, _: i64, entry: &str) -> Result<(String, Vec<u8>), String> {
+    fn entry_file(
+        &self,
+        _: &str,
+        _: &TaskConfig,
+        _: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String> {
         Ok((entry.to_string(), b"print(1)".to_vec()))
     }
 }
@@ -524,7 +583,10 @@ fn envelope(job: &str, task: TaskConfig, memory_mib: f64) -> IsolateEnvelope {
             task_config_id: 1,
             task,
         },
-        room: BTreeMap::from([("memory".to_string(), memory_mib), ("cpu".to_string(), 1000.0)]),
+        room: BTreeMap::from([
+            ("memory".to_string(), memory_mib),
+            ("cpu".to_string(), 1000.0),
+        ]),
     }
 }
 
@@ -563,8 +625,11 @@ async fn eventually<F: Fn() -> bool>(what: &str, check: F) {
 #[tokio::test]
 async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     let reply = h
         .supervisor
         .run(run_call("ns/app", "run", &[("main.wasm", "hi")]), None)
@@ -579,8 +644,12 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
     let hosts = h.launcher.hosts();
     assert_eq!(hosts.len(), 1);
     assert_eq!(hosts[0].0.cordon, "ns", "the namespace cordon by default");
-    let spec = hosts[0].1.state.lock().unwrap().tasks[&("ns/app".to_string(), "run".to_string())].clone();
-    assert_eq!(spec.max_resident, 64, "1024 MiB envelope over a 16 MiB reservation");
+    let spec =
+        hosts[0].1.state.lock().unwrap().tasks[&("ns/app".to_string(), "run".to_string())].clone();
+    assert_eq!(
+        spec.max_resident, 64,
+        "1024 MiB envelope over a 16 MiB reservation"
+    );
     assert_eq!(spec.max_active, 100, "1000 MHz over a 10 MHz weight");
     assert_eq!(spec.limits.unwrap().cpu_micros, 100_000);
     assert_eq!(spec.memory_max_bytes, 128 << 20);
@@ -589,8 +658,16 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
     let mut job_cordon = module_config("request");
     job_cordon["cordon"] = json!("job");
     h.supervisor.sync(vec![
-        envelope("ns/app", isolate_task("run", module_config("request")), 1024.0),
-        envelope("ns/other", isolate_task("run", module_config("request")), 1024.0),
+        envelope(
+            "ns/app",
+            isolate_task("run", module_config("request")),
+            1024.0,
+        ),
+        envelope(
+            "ns/other",
+            isolate_task("run", module_config("request")),
+            1024.0,
+        ),
         envelope("ns/alone", isolate_task("run", job_cordon), 1024.0),
     ]);
     h.supervisor
@@ -601,13 +678,21 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
         .run(run_call("ns/alone", "run", &[("main.wasm", "x")]), None)
         .await
         .unwrap();
-    let cordons: Vec<String> = h.launcher.hosts().iter().map(|(s, _)| s.cordon.clone()).collect();
+    let cordons: Vec<String> = h
+        .launcher
+        .hosts()
+        .iter()
+        .map(|(s, _)| s.cordon.clone())
+        .collect();
     assert_eq!(cordons, vec!["ns", "job:ns/alone"]);
     let (_, hosts) = h.supervisor.stats("", "").await;
     assert_eq!(hosts.len(), 2);
     // The last task of a cordon leaving stops its host.
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     let mut hosts = 2;
     for _ in 0..200 {
         hosts = h.supervisor.stats("", "").await.1.len();
@@ -622,26 +707,42 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
 #[tokio::test]
 async fn isolate_only_fields_are_checked() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.command = vec!["python3".into()];
     let err = h.supervisor.run(call, None).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.tier = "gpu".into();
-    assert_eq!(h.supervisor.run(call, None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        h.supervisor.run(call, None).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.tenant = "has space".into();
-    assert_eq!(h.supervisor.run(call, None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        h.supervisor.run(call, None).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.session_id = "s".into();
     let err = h.supervisor.run(call, None).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("lifetime = \"session\""), "{}", err.message());
+    assert!(
+        err.message().contains("lifetime = \"session\""),
+        "{}",
+        err.message()
+    );
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.input = Some("{not json".into());
-    assert_eq!(h.supervisor.run(call, None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        h.supervisor.run(call, None).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.tier = "vm".into();
     let err = h.supervisor.run(call, None).await.unwrap_err();
@@ -660,16 +761,28 @@ async fn a_module_that_does_not_compile_is_the_tasks_problem() {
     let h = harness();
     let mut config = module_config("request");
     config["module"]["source"] = json!("file:///guests/broken.wasm");
-    h.supervisor.sync(vec![envelope("ns/app", isolate_task("run", config), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", config),
+        1024.0,
+    )]);
     let err = h
         .supervisor
         .run(run_call("ns/app", "run", &[("main.wasm", "hi")]), None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("not a component"), "{}", err.message());
+    assert!(
+        err.message().contains("not a component"),
+        "{}",
+        err.message()
+    );
     let (tasks, _) = h.supervisor.stats("ns/app", "").await;
-    assert!(tasks[0].problem.contains("failed to compile"), "{:?}", tasks[0]);
+    assert!(
+        tasks[0].problem.contains("failed to compile"),
+        "{:?}",
+        tasks[0]
+    );
 }
 
 #[tokio::test]
@@ -679,7 +792,11 @@ async fn stopped_runs_set_next_tier_and_teach_the_memo() {
     config["image"] = json!("python");
     config.as_object_mut().unwrap().remove("module");
     config["vm"] = json!({ "task": "machine" });
-    h.supervisor.sync(vec![envelope("ns/app", isolate_task("run", config), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", config),
+        1024.0,
+    )]);
     let reply = h
         .supervisor
         .run(run_call("ns/app", "run", &[("main.py", "spin")]), None)
@@ -687,7 +804,10 @@ async fn stopped_runs_set_next_tier_and_teach_the_memo() {
         .unwrap();
     assert_eq!(reply.exit, None);
     let stop = reply.stopped.clone().unwrap();
-    assert_eq!((stop.reason.as_str(), stop.limit.as_str()), ("limits", "cpu"));
+    assert_eq!(
+        (stop.reason.as_str(), stop.limit.as_str()),
+        ("limits", "cpu")
+    );
     assert_eq!(reply.next_tier, "vm");
     // The same code now goes to a VM on its own: a dry run says so.
     let mut dry = run_call("ns/app", "run", &[("main.py", "spin")]);
@@ -695,9 +815,20 @@ async fn stopped_runs_set_next_tier_and_teach_the_memo() {
     let reply = h.supervisor.run(dry, None).await.unwrap();
     let dry = reply.dry_run.unwrap();
     assert_eq!(dry.tier, "vm");
-    assert!(dry.tier_reason.starts_with("auto: this code needed a VM"), "{}", dry.tier_reason);
+    assert!(
+        dry.tier_reason.starts_with("auto: this code needed a VM"),
+        "{}",
+        dry.tier_reason
+    );
     // An import the image lacks goes to the VM too, and the dry run lists it.
-    let mut dry = run_call("ns/app", "run", &[("main.py", "import json\nimport torch\n"), ("helper.py", "")]);
+    let mut dry = run_call(
+        "ns/app",
+        "run",
+        &[
+            ("main.py", "import json\nimport torch\n"),
+            ("helper.py", ""),
+        ],
+    );
     dry.request.dry_run = true;
     let dry = h.supervisor.run(dry, None).await.unwrap().dry_run.unwrap();
     assert_eq!(dry.tier, "vm");
@@ -712,15 +843,21 @@ async fn stopped_runs_set_next_tier_and_teach_the_memo() {
     // A VM run on a node without the task manager is refused, not faked.
     let mut vm = run_call("ns/app", "run", &[("main.py", "import torch")]);
     vm.request.tier = "vm".into();
-    assert_eq!(h.supervisor.run(vm, None).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        h.supervisor.run(vm, None).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
 }
 
 #[tokio::test]
 async fn a_disabled_runtime_refuses_or_diverts() {
     use crate::structs::runtime_state::{RuntimeDisable, RuntimeDisableSet};
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     h.gate.replace(RuntimeDisableSet::new(vec![RuntimeDisable {
         runtime: "isolate".into(),
         namespaces: vec![],
@@ -746,8 +883,11 @@ async fn a_disabled_runtime_refuses_or_diverts() {
 #[tokio::test]
 async fn idempotent_retries_are_deduplicated() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.idempotency_key = Some("k1".into());
     let first = h.supervisor.run(call.clone(), None).await.unwrap();
@@ -766,8 +906,11 @@ async fn idempotent_retries_are_deduplicated() {
 #[tokio::test]
 async fn a_killed_host_fails_in_flight_runs_and_is_restarted() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     h.supervisor
         .run(run_call("ns/app", "run", &[("main.wasm", "warm up")]), None)
         .await
@@ -811,8 +954,11 @@ async fn replicas_split_a_task_when_one_host_has_too_few_slots() {
     );
     assert_eq!(h.supervisor.slots_per_host(), 2);
     // 80 MiB over 16 MiB: five residents, so three replicas of two slots.
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("tenant")), 80.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("tenant")),
+        80.0,
+    )]);
     h.supervisor
         .run(run_call("ns/app", "run", &[("main.wasm", "x")]), None)
         .await
@@ -821,7 +967,16 @@ async fn replicas_split_a_task_when_one_host_has_too_few_slots() {
     assert_eq!(hosts.len(), 3);
     let split: Vec<u32> = hosts
         .iter()
-        .map(|(_, host)| host.state.lock().unwrap().tasks.values().next().unwrap().max_resident)
+        .map(|(_, host)| {
+            host.state
+                .lock()
+                .unwrap()
+                .tasks
+                .values()
+                .next()
+                .unwrap()
+                .max_resident
+        })
         .collect();
     assert_eq!(split, vec![2, 2, 1]);
     // A tenant's runs keep going to the same replica.
@@ -850,8 +1005,11 @@ fn the_slot_clamp_is_applied_to_hosts() {
             },
             65_530,
         );
-        h.supervisor
-            .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 64.0)]);
+        h.supervisor.sync(vec![envelope(
+            "ns/app",
+            isolate_task("run", module_config("request")),
+            64.0,
+        )]);
         h.supervisor
             .run(run_call("ns/app", "run", &[("main.wasm", "x")]), None)
             .await
@@ -863,8 +1021,11 @@ fn the_slot_clamp_is_applied_to_hosts() {
 #[tokio::test]
 async fn session_isolates_start_run_hibernate_wake_and_stop() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("session")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
     // Request lifetime tasks have nothing to start.
     let started = h
         .supervisor
@@ -885,7 +1046,10 @@ async fn session_isolates_start_run_hibernate_wake_and_stop() {
     };
     let first = h.supervisor.run(session_run(), None).await.unwrap();
     let second = h.supervisor.run(session_run(), None).await.unwrap();
-    assert_eq!((first.stdout.as_slice(), second.stdout.as_slice()), (&b"1"[..], &b"2"[..]));
+    assert_eq!(
+        (first.stdout.as_slice(), second.stdout.as_slice()),
+        (&b"1"[..], &b"2"[..])
+    );
     assert_eq!(second.session_id, "run-abc.1");
     assert_eq!(
         h.supervisor.session_status("run-abc.1").unwrap().state,
@@ -894,9 +1058,15 @@ async fn session_isolates_start_run_hibernate_wake_and_stop() {
     // Hibernate: the host writes its checkpoint through the worker.
     let (bytes, generation, already) = h.supervisor.hibernate("run-abc.1").await.unwrap();
     assert_eq!((bytes, generation, already), (1, 1, false));
-    assert_eq!(h.supervisor.session_status("run-abc.1").unwrap().state, "suspended");
+    assert_eq!(
+        h.supervisor.session_status("run-abc.1").unwrap().state,
+        "suspended"
+    );
     let isolate = h.supervisor.get_isolate("run-abc.1").await.unwrap();
-    assert_eq!((isolate.state.as_str(), isolate.checkpoint_generation), ("hibernated", 1));
+    assert_eq!(
+        (isolate.state.as_str(), isolate.checkpoint_generation),
+        ("hibernated", 1)
+    );
     let (tasks, _) = h.supervisor.stats("ns/app", "run").await;
     assert_eq!(tasks[0].hibernated, 1);
     // The next call wakes it with its state.
@@ -905,7 +1075,8 @@ async fn session_isolates_start_run_hibernate_wake_and_stop() {
     assert_eq!(woke.isolate_start, "hibernated");
     // A worker restart keeps the record of a hibernated session.
     h.supervisor.hibernate("run-abc.1").await.unwrap();
-    let book = super::sessions::SessionBook::open(Some(h._dir.path().join("isolates/sessions.json")));
+    let book =
+        super::sessions::SessionBook::open(Some(h._dir.path().join("isolates/sessions.json")));
     assert_eq!(book.get("run-abc.1").unwrap().generation, 2);
     // Resize: above the worker's maxMemory needs a restart; cpu is not
     // per session.
@@ -935,29 +1106,45 @@ async fn session_isolates_start_run_hibernate_wake_and_stop() {
     assert!(!h.supervisor.stop_session("run-abc.1", "requested").await);
     let mut call = session_run();
     call.request.session_id = "run-abc.1".into();
-    assert_eq!(h.supervisor.run(call, None).await.unwrap_err().code(), tonic::Code::NotFound);
-    assert!(std::fs::read_dir(h._dir.path().join("checkpoints")).unwrap().next().is_none());
+    assert_eq!(
+        h.supervisor.run(call, None).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    assert!(std::fs::read_dir(h._dir.path().join("checkpoints"))
+        .unwrap()
+        .next()
+        .is_none());
 }
 
 #[tokio::test]
 async fn request_lifetime_tasks_have_nothing_to_start() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     let err = h
         .supervisor
         .start_session("ns/app", "run", "run-x.1", "", "manager", "", "")
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("there is nothing to start"), "{}", err.message());
+    assert!(
+        err.message().contains("there is nothing to start"),
+        "{}",
+        err.message()
+    );
 }
 
 #[tokio::test]
 async fn a_host_only_acts_as_its_own_cordons_jobs() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     h.supervisor
         .run(run_call("ns/app", "run", &[("main.wasm", "x")]), None)
         .await
@@ -1000,8 +1187,11 @@ async fn a_host_only_acts_as_its_own_cordons_jobs() {
 #[tokio::test]
 async fn stats_fold_and_count() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     for _ in 0..3 {
         h.supervisor
             .run(run_call("ns/app", "run", &[("main.wasm", "x")]), None)
@@ -1027,8 +1217,11 @@ async fn stats_fold_and_count() {
 #[tokio::test]
 async fn args_reach_the_host_and_are_bounded() {
     let h = harness();
-    h.supervisor
-        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("request")),
+        1024.0,
+    )]);
     let mut call = run_call("ns/app", "run", &[("main.wasm", "x")]);
     call.request.args = vec!["spin".into(), "1".into()];
     h.supervisor.run(call.clone(), None).await.unwrap();
@@ -1044,9 +1237,19 @@ async fn args_reach_the_host_and_are_bounded() {
     assert!(!other.deduplicated);
     assert_ne!(first.run_id, other.run_id);
     call.request.args = vec!["a".into(); 65];
-    assert_eq!(h.supervisor.run(call.clone(), None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        h.supervisor
+            .run(call.clone(), None)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
     call.request.args = vec!["a".repeat(70 << 10)];
-    assert_eq!(h.supervisor.run(call, None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        h.supervisor.run(call, None).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     // Elsewhere args are an isolate-only field.
     let generic = RunSessionRequest {
         args: vec!["x".into()],
@@ -1056,4 +1259,75 @@ async fn args_reach_the_host_and_are_bounded() {
         crate::worker::task_manager::session_runs::isolate_only_field(&generic),
         Some("args")
     );
+}
+
+#[tokio::test]
+async fn restored_session_isolates_are_registered_as_child_owners() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-own.1", "", "manager", "", "")
+        .await
+        .unwrap();
+    h.supervisor.hibernate("run-own.1").await.unwrap();
+    // A worker restart: a new supervisor over the same book.
+    let restored =
+        super::sessions::SessionBook::open(Some(h._dir.path().join("isolates/sessions.json")));
+    assert!(restored.get("run-own.1").is_some());
+    let again = harness_with_book(h._dir.path());
+    let owners = again.session_owner_refs();
+    assert_eq!(owners.len(), 1);
+    assert!(owners[0].session);
+    let dir = tempfile::tempdir().unwrap();
+    let task_manager = Arc::new(Mutex::new(
+        crate::worker::task_manager::WorkerTaskManager::with_state_store(
+            crate::worker::state::WorkerStateStore::new(dir.path().join("state.json")),
+        ),
+    ));
+    let vms = super::vm::ChildVms::new(
+        task_manager.clone(),
+        "node-1",
+        Arc::new(crate::worker::launch_pool::LaunchPool::new(
+            1,
+            Duration::from_secs(1),
+        )),
+        1 << 20,
+    );
+    for owner in &owners {
+        vms.register_owner(owner);
+    }
+    let owner = super::vm::ChildVms::owner_of(&owners[0]);
+    assert!(task_manager.lock().unwrap().isolate_owner(&owner).is_some());
+}
+
+fn harness_with_book(dir: &std::path::Path) -> Arc<IsolateSupervisor> {
+    IsolateSupervisor::new(SupervisorParts {
+        node_id: "node-1".into(),
+        config: WorkerIsolateConfigFull::default(),
+        binary: IsolateBinary {
+            path: "/nonexistent".into(),
+            engine_version: "wasmtime-fake".into(),
+            compat_key: "fake".into(),
+        },
+        images: None,
+        launcher: Arc::new(FakeLauncher::default()),
+        modules: Arc::new(FakeModules),
+        read_dirs: vec![],
+        book_path: Some(dir.join("isolates/sessions.json")),
+        checkpoints: CheckpointStore {
+            store: None,
+            dir: dir.join("checkpoints"),
+        },
+        run_registry: RunRegistry::new(dir.join("no-sessions.db")),
+        gate: Arc::new(crate::worker::runtime_state::RuntimeGate::beside(
+            &dir.join("worker_state.json"),
+        )),
+        queue_timeout: Duration::from_secs(1),
+        max_map_count: 1 << 24,
+        paging_unavailable: None,
+    })
 }

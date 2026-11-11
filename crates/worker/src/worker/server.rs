@@ -181,7 +181,10 @@ pub struct WorkerDaemonService {
 impl WorkerDaemonService {
     /// The isolate supervisor, on a node that runs isolates.
     fn isolates(&self) -> Option<Arc<crate::worker::isolates::IsolateSupervisor>> {
-        self.task_manager.lock().ok().and_then(|manager| manager.isolates())
+        self.task_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.isolates())
     }
 
     /// Take a launch slot, or refuse the start as retryable on another node.
@@ -847,7 +850,13 @@ impl Worker for WorkerDaemonService {
             if isolates.knows_session(session_id) {
                 let to = request.to.clone().unwrap_or_default();
                 let (outcome, message, from, to, job_id, task_name) = isolates
-                    .resize_session(session_id, to.memory, to.memory_max, to.cpu, request.dry_run)
+                    .resize_session(
+                        session_id,
+                        to.memory,
+                        to.memory_max,
+                        to.cpu,
+                        request.dry_run,
+                    )
                     .await?;
                 let reply = crate::structs::ResizeSessionReply {
                     outcome: outcome.to_string(),

@@ -303,10 +303,14 @@ struct Setup {
     disabled: Vec<&'static str>,
     /// Enforce ACLs.
     acl: bool,
+    /// Give the isolate task a `connect` upstream with a KV-held
+    /// credential.
+    connect: bool,
 }
 
 struct Cluster {
     svc: ManagerDaemonService,
+    connect: bool,
     nodes: BTreeMap<String, FakeNode>,
     _dir: tempfile::TempDir,
 }
@@ -338,6 +342,7 @@ impl Cluster {
         };
         let mut cluster = Cluster {
             svc,
+            connect: false,
             nodes: BTreeMap::new(),
             _dir: dir,
         };
@@ -409,6 +414,7 @@ impl Cluster {
                 }))
                 .await?;
         }
+        cluster.connect = setup.connect;
         cluster.submit(if setup.lifetime.is_empty() {
             "request"
         } else {
@@ -465,6 +471,20 @@ impl Cluster {
                 },
             ],
         });
+        let mut spec = spec;
+        if self.connect {
+            spec["tasks"][0]["connect"] = json!({
+                "upstreams": [{
+                    "name": "openai",
+                    "to": "https://api.openai.com",
+                    "credentials": [{
+                        "header": "authorization",
+                        "prefix": "Bearer ",
+                        "from": { "kv": "secrets/openai" },
+                    }],
+                }],
+            });
+        }
         let config: JobConfig = serde_json::from_value(spec.clone())?;
         tokio::task::block_in_place(|| -> R<()> {
             self.store().handle_job_submit(
@@ -1085,5 +1105,176 @@ async fn a_disabled_isolate_runtime_keeps_the_envelope_and_auto_runs_test() -> R
         "{err:?}"
     );
     assert_eq!(cluster.runs().len(), 1);
+    Ok(())
+}
+
+/// Child VMs of isolates (docs/task-runtime-isolate.md, "Child VMs"): a
+/// request or tenant isolate's children carry an `isolate` owner no
+/// manager judges; a session isolate's children carry its session id, which
+/// the manager finds by asking the node its tag names. Only a node that
+/// answers "not here" ends them; one that does not answer is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn children_of_isolates_are_judged_by_their_node_test() -> R<()> {
+    use legion::structs::children::{owner_ref, OWNER_ISOLATE, OWNER_SESSION};
+    let cluster = Cluster::new(
+        &["w-1", "w-2"],
+        Setup {
+            lifetime: "session",
+            ..Default::default()
+        },
+    )
+    .await?;
+    // A node whose worker address answers nothing.
+    cluster.store().insert_node(NodeMsg::from(Node {
+        id: "w-3".into(),
+        pool: "default".into(),
+        status: "ready".into(),
+        availability: "available".into(),
+        last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
+        config_attrs: json!({
+            "node_id": "w-3",
+            "resources": {},
+            "workerAddress": "https://127.0.0.1:1",
+        }),
+        fingerprint_attrs: json!({}),
+        dynamic_attrs: json!({ "capabilities": ["sessions"] }),
+        health_checks: json!({}),
+    }))?;
+    let alive = legion::structs::mint_session_id(TASK, "w-1");
+    cluster.node("w-1").lock().sessions.insert(
+        alive.clone(),
+        SessionStatus {
+            session_id: alive.clone(),
+            job_id: JOB.into(),
+            task_name: TASK.into(),
+            state: "running".into(),
+            ..Default::default()
+        },
+    );
+    let gone = legion::structs::mint_session_id(TASK, "w-1");
+    let silent = legion::structs::mint_session_id(TASK, "w-3");
+
+    // `locate` finds a session isolate the index never lists.
+    match legion::manager::sessions::locate(cluster.store(), &alive).await {
+        legion::manager::sessions::Located::Found(found) => assert_eq!(found.node_id, "w-1"),
+        other => panic!("{alive}: {other:?}"),
+    }
+    assert!(matches!(
+        legion::manager::sessions::locate(cluster.store(), &gone).await,
+        legion::manager::sessions::Located::NotFound
+    ));
+    assert!(matches!(
+        legion::manager::sessions::locate(cluster.store(), &silent).await,
+        legion::manager::sessions::Located::Unreachable(_)
+    ));
+
+    // w-2 runs one child VM per owner.
+    let child = |id: &str, owner: legion::structs::OwnerRef| SessionStatus {
+        session_id: legion::structs::mint_session_id(VM_TASK, id),
+        job_id: JOB.into(),
+        task_name: VM_TASK.into(),
+        state: "running".into(),
+        lease_issued_at_unix_ms: 1_000,
+        owner: Some(owner),
+        ..Default::default()
+    };
+    let upserts = vec![
+        child("w-2", owner_ref(OWNER_ISOLATE, "run:acme")),
+        child("w-2", owner_ref(OWNER_SESSION, &alive)),
+        child("w-2", owner_ref(OWNER_SESSION, &gone)),
+        child("w-2", owner_ref(OWNER_SESSION, &silent)),
+    ];
+    legion::manager::children::NOT_FOUND_GRACE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut ended = std::collections::BTreeSet::new();
+    for epoch in 1..=40u64 {
+        let reply = cluster
+            .svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                id: "w-2".into(),
+                session_report: Some(legion::structs::SessionReport {
+                    epoch,
+                    base_epoch: 0,
+                    full: true,
+                    upserts: upserts.clone(),
+                    removed: Vec::new(),
+                }),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        for notice in reply.owner_notices {
+            let owner = notice.owner.context("owner")?;
+            ended.insert((owner.kind, owner.id));
+        }
+        if ended.contains(&(OWNER_SESSION.to_string(), gone.clone())) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        ended,
+        std::collections::BTreeSet::from([(OWNER_SESSION.to_string(), gone.clone())]),
+        "only the owner its node says is gone has ended"
+    );
+    Ok(())
+}
+
+/// A KV-held `connect` credential of an isolate task is declared on its
+/// envelope, which is the allocation the node's datapath serves: the node
+/// fetches it for the envelope allocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_isolate_tasks_credential_is_fetched_for_its_envelope_test() -> R<()> {
+    let cluster = Cluster::new(
+        &["w-1"],
+        Setup {
+            connect: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    cluster.store().put_kv(
+        "secrets/openai",
+        "sk-test",
+        legion::structs::KvValueType::String,
+        None,
+        None,
+    )?;
+    let config_id = cluster.store().get_job_config(JOB)?.id();
+    let tasks = cluster
+        .store()
+        .shared_task_configs_for_job_config(&config_id)?;
+    let envelope_task = tasks
+        .iter()
+        .find(|(_, task)| task.name == format!("{TASK}-envelope"))
+        .map(|(id, task)| (*id, task.clone()))
+        .context("the envelope task")?;
+    assert!(
+        envelope_task.1.connect.is_some(),
+        "the envelope carries the isolate task's connect"
+    );
+    let allocation = cluster
+        .store()
+        .allocs_for_job(JOB)?
+        .into_iter()
+        .find(|allocation| allocation.task_config_id == envelope_task.0)
+        .context("the envelope allocation")?;
+    let reply = cluster
+        .svc
+        .fetch_datapath_material(Request::new(legion::structs::FetchDatapathMaterialRequest {
+            node_id: "w-1".into(),
+            refs: vec![legion::structs::MaterialRef {
+                kind: legion::structs::source::MATERIAL_CREDENTIAL.into(),
+                allocation_id: allocation.id,
+                key: "openai".into(),
+                part: "authorization".into(),
+                version: 0,
+            }],
+        }))
+        .await?
+        .into_inner();
+    let material = &reply.materials[0];
+    assert_eq!(material.error, "", "{material:?}");
+    assert_eq!(material.value, "sk-test");
     Ok(())
 }

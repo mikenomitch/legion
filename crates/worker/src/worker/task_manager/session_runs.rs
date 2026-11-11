@@ -1028,7 +1028,8 @@ pub(crate) fn exec_capture(
 }
 
 /// The shell that writes one staged file: stdin to `$1`, mode `$2`.
-pub(crate) const STAGE_SCRIPT: &str = r#"set -e; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1""#;
+pub(crate) const STAGE_SCRIPT: &str =
+    r#"set -e; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1""#;
 
 /// The shell that reads at most `$2` bytes of the file `$1`.
 pub(crate) const FETCH_SCRIPT: &str = r#"[ -f "$1" ] && head -c "$2" "$1""#;

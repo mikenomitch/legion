@@ -793,12 +793,18 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     )
     .await;
     if let Some(isolates) = isolate_supervisor.as_ref() {
-        isolates.set_vm_backend(Arc::new(crate::worker::isolates::vm::ChildVms::new(
+        let child_vms = Arc::new(crate::worker::isolates::vm::ChildVms::new(
             task_manager.clone(),
             name.clone(),
             launch_pool.clone(),
             isolate_config.max_body_bytes().unwrap_or(16 << 20),
-        )));
+        ));
+        // Session isolates restored from before a restart still own their
+        // children: register them before the first child reconcile.
+        for owner in isolates.session_owner_refs() {
+            child_vms.register_owner(&owner);
+        }
+        isolates.set_vm_backend(child_vms);
     }
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
