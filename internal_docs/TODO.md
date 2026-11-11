@@ -12,6 +12,7 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 | PR | What it lands |
 | --- | --- |
 | [#71](https://github.com/mikenomitch/legion/pull/71) | Legion as five crates (`legion-proto` → `-common` → `-worker` → `-manager` → the binary), so builds and tests fit in memory; moves most of `src/` under `crates/` (the entries under "Developer workflow & CI" at the bottom describe it as landed) |
+| [#70](https://github.com/mikenomitch/legion/pull/70) | Smaller shipping binary (97.3 → 89.1 MB): packed relocations, size-optimized config crates, trimmed dependency features |
 | [#63](https://github.com/mikenomitch/legion/pull/63) | The isolate-runtime plan |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again (likely closes "Plugin lockfiles are stale") |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
@@ -1205,10 +1206,12 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
         for a trait and a few types. The ABI fingerprint moves with it.
   - [ ] **A datapath crate** (`worker/netd`, 25.7k lines), if the worker's
         2.2 GB becomes the constraint.
-- [ ] **Find what makes the linux/amd64 binary 97 MB.** `.text` alone is
-      76 MB; the 26 MB the docs used to quote was a macOS arm64 build of a
-      smaller tree. Two questions for `cargo bloat --profile dist --crates`
-      on an unstripped build:
+- [ ] **Shrink the linux/amd64 binary further.** It is 89 MB, `.text` alone
+      72 MB; the 26 MB the docs used to quote was a macOS arm64 build of a
+      smaller tree. Most of it is Legion's own code and the generics
+      instantiated for its types, not a dependency
+      ([dev notes](development.md#finding-what-grew),
+      [calls](calls/binary-size_calls.md)). What is left:
   - [ ] **The crate split added 5.8 MB** (91.5 → 97.3 MB,
         [plan § 5.4](plans/workspace-crate-split-plan.md#54-measured-before-and-after),
         [calls 3](calls/workspace-crate-split-plan_calls.md)). Likely generics
@@ -1216,9 +1219,21 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
         parsed in four crates). Confirm with a symbol-level diff against a
         `main` build, then put non-generic wrappers at the crate boundary for
         the heavy ones.
-  - [ ] **Which dependencies own the rest** (candidates: `nickel-lang-core`,
-        `wasmi`, `object_store` with `aws`, `oci-client`,
-        `opentelemetry-otlp`, `cel`).
+  - [ ] **`panic = "abort"`** is worth about 9 MB of unwind tables, but ~20
+        `catch_unwind` sites contain plugin and rule panics (calls 6).
+  - [ ] **Types decoded both from text and from `serde_json::Value` carry two
+        decoders** (about 1 MB); routing both through one needs call-site
+        changes.
+  - [ ] **Each RPC costs 40-100 KB** of generated tonic, prost, and serde
+        code; nothing bounds it.
+  - [ ] **Nickel is about 8 MB by symbol owner**, the only dependency over
+        5 MB besides `serde_json`.
+  - [ ] **Re-measure macOS arm64**; the last figure (26.0 MB) is from
+        2026-07-28.
+- [ ] **Log writers queue up to 128,000 lines each.**
+      `tracing_appender::non_blocking` in `crates/common/src/tracing_util.rs` uses its default
+      buffer, about 4 MB of heap per writer when full;
+      `NonBlockingBuilder::buffered_lines_limit` would cap it.
 - [ ] **Share one target dir across plugin builds** (each rebuilds ~470 crates).
 - [ ] **Decide whether the UI ships inside the binary.**
 - [ ] **Create the `proto-breaking-ok` label** (audit M5).
@@ -1730,6 +1745,7 @@ Fixes for the open bug and security items; judgement calls in
 ## Developer workflow & CI
 
 - **Legion is five crates in a chain** — `legion-proto` → `legion-common` → `legion-worker` → `legion-manager` → the binary; a clean build peaks at 5.0 GB where it took 9.0, `cargo test --all` builds on a 16 GB machine (it was OOM-killed at 13.5 GB), and `cargo check` after an edit takes 3–19 s where it took 30 ([plan](plans/workspace-crate-split-plan.md) · [calls](calls/workspace-crate-split-plan_calls.md) · [docs](../docs/codebase-conventions.md#crates))
+- **Smaller shipping binary** — `dist` on linux/amd64 from 97.3 MB to 89.1 MB: packed relocations, Nickel and CEL built for size, `jsonschema` without its HTTP resolver (a remote `$ref` is no longer fetched), WAT parsing out of the binary; and which crates own the bytes, which answers "which dependencies own the rest" ([calls](calls/binary-size_calls.md) · [dev notes](development.md#what-else-keeps-the-binary-small))
 - **Shipping binary measured on linux/amd64** — 97 MB with `--profile dist` (91.5 MB before the crate split); README, AGENTS.md, `Cargo.toml` and development.md corrected from the 26 MB macOS figure ([development.md](development.md#building-a-shipping-binary---profile-dist))
 - **Smaller, faster test builds** — one integration binary (12.9 GB → 1.1 GB), scratch-root temp dirs, line-table debuginfo, faster migrations ([calls](calls/test-build-footprint_calls.md) · [docs](../docs/testing-and-benchmarks.md#test-layout) · [dev notes](development.md#keeping-builds-and-test-runs-small))
 - **Raft-entry-count tests read the applied marker** — `Store::raft_applied_entries` instead of lagging openraft metrics

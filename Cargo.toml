@@ -129,7 +129,11 @@ bytes = "1"
 json-patch = "3.0.1"
 rusqlite_migration = "1.0.2"
 humantime = "2.1.0"
-jsonschema = "0.17.1"
+# No default features: they are a CLI and resolvers that fetch a remote or
+# on-disk `$ref`. Legion only allows local refs (`"#/..."`), and the HTTP
+# resolver alone linked a second, older HTTP stack (reqwest 0.11, hyper 0.14,
+# h2 0.3) into the binary.
+jsonschema = { version = "0.17.1", default-features = false }
 # CEL validation `rules` on app object kinds (src/structs/object_rules.rs,
 # docs/app-objects.md "Validation rules"). No default features: no regex,
 # chrono, or encoders; `parser_pratt` is the recursion-limited parser.
@@ -157,7 +161,9 @@ sha2 = "0.10.8"
 ring = "0.17"
 # Network plugins (docs/network-plugins.md): an interpreter keeps the
 # shipping binary small; fuel bounds every callback.
-wasmi = { version = "=2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch", "wat"] }
+# No `wat` here: plugins ship as binary `.wasm`, and the text-format parser
+# is only for tests (legion-worker turns it on in its dev-dependencies).
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"] }
 # Only to name `LimiterError` in the plugin memory cap; wasmi does not
 # re-export it.
 wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] }
@@ -360,15 +366,21 @@ opt-level = 3
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP
 # server, so binary size is a feature. The stock `--release` profile leaves
-# ~74 MB on the table (linux/amd64, ~490 crates, 2026-11-10):
+# ~70 MB on the table (linux/amd64, ~470 crates, 2026-11-10):
 #
-#   --release           171.2 MB
-#   --profile dist       97.3 MB   (-43%)
+#   --release           159.6 MB
+#   --profile dist       89.1 MB   (-44%)
 #
 # A little over half of that is `strip` dropping the symbol tables (41 MB);
 # the rest is fat LTO with one codegen unit collapsing dead code and
-# cross-crate duplication (loaded sections 129.7 MB -> 97.3 MB, `.text`
-# 95.4 -> 76.3 MB).
+# cross-crate duplication (loaded sections 118.7 MB -> 89.1 MB, `.text`
+# 89.7 -> 71.6 MB).
+#
+# Two more things keep the binary small in every optimized profile: the
+# size-optimized crates under `[profile.release.package.*]` below, and the
+# packed relocations `build.rs` asks the linker for. Without them the `dist`
+# binary was 97.3 MB (internal_docs/development.md, "What else keeps the
+# binary small").
 #
 # The cost is build time. A clean `dist` build takes ~24 minutes on 4 vCPU
 # against ~11 for `--release`: one codegen unit cannot parallelize LLVM
@@ -400,6 +412,28 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 strip = "symbols"
+
+# Crates that only run when a config file or a validation rule is read are
+# built for size, in every optimized profile (`dist` and `distfast` inherit
+# these from `release`). They are large and cold: the Nickel evaluator and
+# its bignum library parse a jobspec once per submission, and CEL runs an app
+# object's rules once per write. Nothing here is on the scheduler, storage, or
+# network path. Measured on the `dist` binary: 3.3 MB smaller, and
+# `legion job validate configs/jobs/maximal.ncl` goes from 25 ms to 26 ms.
+[profile.release.package.nickel-lang-core]
+opt-level = "s"
+[profile.release.package.nickel-lang-parser]
+opt-level = "s"
+[profile.release.package.malachite-base]
+opt-level = "s"
+[profile.release.package.malachite-nz]
+opt-level = "s"
+[profile.release.package.malachite-q]
+opt-level = "s"
+[profile.release.package.cel]
+opt-level = "s"
+[profile.release.package.antlr4rust]
+opt-level = "s"
 
 # [[bin]] # Bin to run the HelloWorld gRPC server
 # name = "legion"
