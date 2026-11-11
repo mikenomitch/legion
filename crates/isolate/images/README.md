@@ -78,11 +78,11 @@ the host library (`cargo test -p legion-isolate --test images -- --ignored
 { "images": {
     "python": { "file": "python.wasm", "sha256": "<hex>", "extensions": [".py"], "vmEntry": "main.py",
                 "modules": ["__future__", "_abc", "...", "zoneinfo"],
-                "initialMemoryBytes": 24313856, "idlePrivateBytes": 1484390,
+                "initialMemoryBytes": 24313856, "idlePrivateBytes": 1397063,
                 "runtime": "CPython 3.14.0 (componentize-py 0.25.1)" },
     "js":     { "file": "js.wasm", "sha256": "<hex>", "extensions": [".js", ".mjs"], "vmEntry": "main.mjs",
                 "modules": [],
-                "initialMemoryBytes": 9502720, "idlePrivateBytes": 734064,
+                "initialMemoryBytes": 9502720, "idlePrivateBytes": 734494,
                 "runtime": "StarlingMonkey (componentize-js 0.23.0)" } } }
 ```
 
@@ -93,7 +93,7 @@ the host library (`cargo test -p legion-isolate --test images -- --ignored
   library, read inside the image; each is kept when `import <name>`
   succeeds in a fresh instance of the built image; `legion` is added;
   `ctypes` (a stub, below) and componentize-py's own runtime module are
-  left out. The current image lists 247 names. For JS it is empty: the
+  left out. The current image lists 246 names. For JS it is empty: the
   image resolves no module specifier by itself (no packages, no Node
   builtins, no ES modules from source).
 - `initialMemoryBytes` is the component's largest initial linear memory.

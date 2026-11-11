@@ -110,6 +110,16 @@ pub fn compile_bytes(
         engine::plain_engine(params).map_err(|e| CompileError::Internal(format!("{e:#}")))?;
     let component = wasmtime::component::Component::new(&engine, bytes)
         .map_err(|e| CompileError::Invalid(format!("the engine refused the component: {e:#}")))?;
+    // By name first: wasmtime accepts an import of an empty instance it
+    // has no definition for, so the linker alone would let one through.
+    let imports = module::imports_of(&engine, &component);
+    if let Some(name) = imports.iter().find(|n| !module::provided(n)) {
+        return Err(CompileError::UnsupportedImport(format!(
+            "the component imports `{name}`, which the isolate host does not provide \
+             (it offers WASI 0.2 up to 0.2.12 without wasi:http/incoming-handler as an \
+             import, and legion:isolate@0.1.0 control, state, and vm)"
+        )));
+    }
     let linker = module::linker(&engine).map_err(|e| CompileError::Internal(format!("{e:#}")))?;
     if let Err(e) = linker.instantiate_pre(&component) {
         let msg = format!("{e:#}");
@@ -139,7 +149,7 @@ pub fn compile_bytes(
         ok: true,
         exports,
         initial_memory_bytes: module::initial_memory_bytes(&component),
-        imports: module::imports_of(&engine, &component),
+        imports,
         bytes: artifact.len() as u64,
         compile_millis: started.elapsed().as_millis() as u64,
     };
@@ -225,5 +235,18 @@ mod compile_test {
         let e = compile_bytes(&EngineParams::default(), &c).unwrap_err();
         assert_eq!(e.kind(), "unsupported-import", "{e:?}");
         assert!(e.message().contains("wasi:nope/thing@0.2.0"), "{e:?}");
+        // A provided interface at a version newer than the host's.
+        let c = wat::parse_str(
+            r#"(component
+                (import "wasi:cli/environment@0.2.99" (instance))
+                (core module $m (func (export "run") (result i32) i32.const 0))
+                (core instance $i (instantiate $m))
+                (func $run (result (result)) (canon lift (core func $i "run")))
+                (instance $r (export "run" (func $run)))
+                (export "wasi:cli/run@0.2.0" (instance $r)))"#,
+        )
+        .unwrap();
+        let e = compile_bytes(&EngineParams::default(), &c).unwrap_err();
+        assert!(e.message().contains("wasi:cli/environment@0.2.99"), "{e:?}");
     }
 }

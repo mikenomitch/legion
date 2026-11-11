@@ -848,7 +848,7 @@ impl Worker for WorkerDaemonService {
         }
         if let (ResizeTarget::Session(session_id), Some(isolates)) = (&target, self.isolates()) {
             if isolates.knows_session(session_id) {
-                let to = request.to.clone().unwrap_or_default();
+                let to = request.to.unwrap_or_default();
                 let (outcome, message, from, to, job_id, task_name) = isolates
                     .resize_session(
                         session_id,

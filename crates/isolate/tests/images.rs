@@ -258,7 +258,6 @@ impl WorkerApi for FakeWorker {
                             value: b"yes".to_vec(),
                         }],
                         body: b"vm body".to_vec(),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 }
@@ -503,7 +502,7 @@ fn p50(mut v: Vec<u128>) -> (u128, u128) {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_hello_and_exit_codes_test() {
-    let _g = shared();
+    let _g = shared().await;
     let mut i = instance(python(), Opts::default()).await;
     let ran = i.src("main.py", "print('hello from python')\n").await;
     ran.ok();
@@ -574,7 +573,7 @@ async fn python_hello_and_exit_codes_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_input_result_and_files_test() {
-    let _g = shared();
+    let _g = shared().await;
     let mut i = instance(python(), Opts::default()).await;
     let src = r#"
 import json, os, sys, legion
@@ -656,7 +655,7 @@ with open("result.json", "w") as f:
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_globals_persist_per_instance_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "try:\n    count += 1\nexcept NameError:\n    count = 1\nresult = count\n";
     let mut a = instance(
         python(),
@@ -686,7 +685,7 @@ async fn python_globals_persist_per_instance_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_unsupported_stops_the_run_test() {
-    let _g = shared();
+    let _g = shared().await;
     let cases = [
         ("import subprocess\nsubprocess.run(['ls'])\n", "subprocess.run: processes are not available in an isolate"),
         ("import subprocess\nsubprocess.check_output(['ls'])\n", "subprocess.check_output: processes are not available in an isolate"),
@@ -735,7 +734,7 @@ async fn python_unsupported_stops_the_run_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_state_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = r#"
 import legion
 before = legion.state.get("count")
@@ -786,7 +785,7 @@ except legion.StateError as e:
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_fetch_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = r#"
 import legion, json, urllib.request, urllib.error, http.client
 r = legion.fetch("http://payments/v1/charge?x=1", method="POST", headers={"X-Test": "1"}, body='{"a":1}')
@@ -835,7 +834,7 @@ result = out
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_vm_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = r#"
 import legion
 m = legion.vm.acquire()
@@ -905,7 +904,7 @@ result = {"id": m.id, "exit": r.exit, "stdout": r.stdout.decode(), "stderr": r.s
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_restore_hygiene_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "import random, os, uuid, secrets\n\
                result = [random.random(), os.urandom(8).hex(), str(uuid.uuid4()), secrets.token_hex(8), random.getrandbits(64)]\n";
     let mut seen = Vec::new();
@@ -931,7 +930,7 @@ async fn python_restore_hygiene_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn python_stdlib_test() {
-    let _g = shared();
+    let _g = shared().await;
     let mut i = instance(python(), Opts::default()).await;
     // Modules the standard library imports lazily inside functions must be
     // in the image too (time.strptime imports _strptime on first use).
@@ -973,7 +972,7 @@ result = {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_hello_and_exit_codes_test() {
-    let _g = shared();
+    let _g = shared().await;
     let mut i = instance(js(), Opts::default()).await;
     let ran = i.src("main.js", "console.log('hello from js');\n").await;
     ran.ok();
@@ -1041,7 +1040,7 @@ async fn js_hello_and_exit_codes_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_input_result_and_files_test() {
-    let _g = shared();
+    let _g = shared().await;
     let mut i = instance(js(), Opts::default()).await;
     // `return` from the entry is the result; top-level await works.
     let src = "await new Promise((r) => setTimeout(r, 0));\n\
@@ -1099,7 +1098,7 @@ async fn js_input_result_and_files_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_globals_persist_per_instance_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "globalThis.count = (globalThis.count ?? 0) + 1;\nreturn count;\n";
     let mut a = instance(
         js(),
@@ -1128,7 +1127,7 @@ async fn js_globals_persist_per_instance_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_unsupported_stops_the_run_test() {
-    let _g = shared();
+    let _g = shared().await;
     let cases = [
         ("require('child_process').execSync('ls');", "require('child_process'): Node builtins are not available in an isolate"),
         ("require('node:fs').readFileSync('x');", "require('fs'): Node builtins are not available in an isolate"),
@@ -1172,7 +1171,7 @@ async fn js_unsupported_stops_the_run_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_state_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "const before = legion.state.get('count');\n\
                const n = Number(before ? new TextDecoder().decode(before) : '0') + 1;\n\
                legion.state.set('count', String(n));\n\
@@ -1217,7 +1216,7 @@ async fn js_state_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_fetch_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "const r = await fetch('http://payments/v1/charge?x=1', { method: 'POST', headers: { 'X-Test': '1' }, body: '{\"a\":1}' });\n\
                const echo = await r.json();\n\
                const out = { status: r.status, upstream: r.headers.get('x-upstream'), method: echo.method, url: echo.url,\n\
@@ -1243,7 +1242,7 @@ async fn js_fetch_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_vm_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "const m = legion.vm.acquire();\n\
                const r = m.exec(['echo', 'hi'], { stdin: 'in' });\n\
                m.put('/work/a.txt', 'data');\n\
@@ -1305,7 +1304,7 @@ async fn js_vm_test() {
 #[tokio::test]
 #[ignore = "needs built images: crates/isolate/images/build.sh"]
 async fn js_restore_hygiene_test() {
-    let _g = shared();
+    let _g = shared().await;
     let src = "return [Math.random(), Math.random(), [...crypto.getRandomValues(new Uint8Array(8))].join(','), crypto.randomUUID()];\n";
     let mut seen = Vec::new();
     for _ in 0..2 {
@@ -1328,11 +1327,11 @@ async fn js_restore_hygiene_test() {
 // ---------------------------------------------------------------------------
 
 /// Tests share the process; the memory measurement must not.
-fn shared() -> std::sync::RwLockReadGuard<'static, ()> {
-    LOCK.read().unwrap_or_else(|e| e.into_inner())
+async fn shared() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    LOCK.read().await
 }
 
-static LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 fn private_dirty_kib() -> u64 {
     let s = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
@@ -1433,7 +1432,7 @@ const PY_IMPORTS: &str = "import json, re, datetime, collections, math, random, 
                           print(json.dumps({'n': len(re.findall('a', 'banana'))}))\n";
 
 async fn measure(image: &Image) -> Measured {
-    let _g = LOCK.write().unwrap_or_else(|e| e.into_inner());
+    let _g = LOCK.write().await;
     let js = image.name == "js";
     let (name, hello) = if js {
         ("main.js", "console.log('hello');\n")

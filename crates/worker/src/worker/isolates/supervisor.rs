@@ -745,7 +745,7 @@ impl IsolateSupervisor {
         // Each replica may hold the whole of it: the split moves as load
         // does, and memory.max is a ceiling, not a reservation.
         let _ = replicas;
-        (mib > 0.0).then(|| (mib * 1024.0 * 1024.0) as u64)
+        (mib > 0.0).then_some((mib * 1024.0 * 1024.0) as u64)
     }
 
     /// Start one replica's host process and handshake with it.
@@ -2635,7 +2635,7 @@ impl IsolateSupervisor {
         let replicas: Vec<Arc<Replica>> = lock(&self.state)
             .cordons
             .iter()
-            .filter(|(name, _)| cordons.map_or(true, |only| only.contains(name)))
+            .filter(|(name, _)| cordons.is_none_or(|only| only.contains(name)))
             .flat_map(|(_, c)| c.replicas.clone())
             .collect();
         let mut freed = 0u64;

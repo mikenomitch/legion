@@ -382,11 +382,13 @@ impl IsolateHost for FakeHost {
     }
 }
 
+type Killer = Arc<dyn Fn() + Send + Sync>;
+
 /// Starts [`FakeHost`]s and remembers them.
 #[derive(Default)]
 struct FakeLauncher {
     next_pid: AtomicU32,
-    hosts: Mutex<Vec<(HostSpawn, FakeHost, Arc<dyn Fn() + Send + Sync>)>>,
+    hosts: Mutex<Vec<(HostSpawn, FakeHost, Killer)>>,
 }
 
 impl FakeLauncher {

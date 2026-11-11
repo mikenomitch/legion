@@ -171,6 +171,10 @@ impl VmMemo {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// The hint a stopped isolate run carries (plan §7.2).

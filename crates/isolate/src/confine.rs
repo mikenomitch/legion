@@ -187,8 +187,13 @@ fn landlock(_plan: &Plan) -> Result<(), String> {
     Err("Landlock is Linux-only".into())
 }
 
-/// The syscalls the host makes after confinement, found by running the
-/// host's tests under strace (x86-64). Grouped by who needs them.
+/// The syscalls the host makes after confinement (x86-64), found by running
+/// the spawn tests (`tests/binary.rs`: runs, limits, egress, sessions,
+/// hibernation over the real sockets) under `strace -ff` and keeping what
+/// the host's threads called after the filter went on, plus the few a
+/// path the tests do not reach needs (MPK's `pkey_*`, `mremap` for a large
+/// reallocation, `sched_setaffinity` for pinned shards). Grouped by who
+/// needs them.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const ALLOWED: &[(&str, i64)] = &[
     // Memory: the allocator, wasmtime's pooling allocator and fiber stacks,
@@ -236,10 +241,6 @@ pub const ALLOWED: &[(&str, i64)] = &[
     ("recvmsg", libc::SYS_recvmsg),
     ("sendmsg", libc::SYS_sendmsg),
     ("shutdown", libc::SYS_shutdown),
-    // tonic asks the inherited sockets for their peer address and options.
-    ("getpeername", libc::SYS_getpeername),
-    ("getsockname", libc::SYS_getsockname),
-    ("getsockopt", libc::SYS_getsockopt),
     ("close", libc::SYS_close),
     ("fcntl", libc::SYS_fcntl),
     ("ioctl", libc::SYS_ioctl),
@@ -249,8 +250,6 @@ pub const ALLOWED: &[(&str, i64)] = &[
     ("epoll_pwait", libc::SYS_epoll_pwait),
     ("epoll_pwait2", libc::SYS_epoll_pwait2),
     ("eventfd2", libc::SYS_eventfd2),
-    ("poll", libc::SYS_poll),
-    ("ppoll", libc::SYS_ppoll),
     // Reading artifacts (Landlock decides which) and /proc/self/statm.
     ("openat", libc::SYS_openat),
     ("fstat", libc::SYS_fstat),
@@ -258,9 +257,6 @@ pub const ALLOWED: &[(&str, i64)] = &[
     ("statx", libc::SYS_statx),
     ("lseek", libc::SYS_lseek),
     ("readlink", libc::SYS_readlink),
-    ("getcwd", libc::SYS_getcwd),
-    ("sysinfo", libc::SYS_sysinfo),
-    ("uname", libc::SYS_uname),
     // clone3 is answered ENOSYS by a second filter (glibc then uses clone).
     ("clone3", libc::SYS_clone3),
 ];

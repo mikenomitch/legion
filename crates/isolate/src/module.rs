@@ -63,6 +63,75 @@ fn link(l: &mut Linker<Ctx>) -> wasmtime::Result<()> {
     Ok(())
 }
 
+/// The interfaces [`linker`] provides, by package and interface, with the
+/// newest version of each package it implements. A guest may import an
+/// older patch release of the same minor version (wasmtime matches
+/// semver-compatibly); anything else is refused at compile time.
+pub const PROVIDED: &[(&str, &[&str], (u32, u32, u32))] = &[
+    ("wasi:io", &["error", "poll", "streams"], (0, 2, 12)),
+    ("wasi:clocks", &["wall-clock", "monotonic-clock"], (0, 2, 12)),
+    ("wasi:random", &["random", "insecure", "insecure-seed"], (0, 2, 12)),
+    (
+        "wasi:cli",
+        &[
+            "exit",
+            "environment",
+            "stdin",
+            "stdout",
+            "stderr",
+            "terminal-input",
+            "terminal-output",
+            "terminal-stdin",
+            "terminal-stdout",
+            "terminal-stderr",
+        ],
+        (0, 2, 12),
+    ),
+    (
+        "wasi:sockets",
+        &[
+            "network",
+            "instance-network",
+            "tcp",
+            "tcp-create-socket",
+            "udp",
+            "udp-create-socket",
+            "ip-name-lookup",
+        ],
+        (0, 2, 12),
+    ),
+    ("wasi:filesystem", &["types", "preopens"], (0, 2, 12)),
+    ("wasi:http", &["types", "outgoing-handler"], (0, 2, 12)),
+    ("legion:isolate", &["control", "state", "vm"], (0, 1, 0)),
+];
+
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let core = v.split(['-', '+']).next()?;
+    let mut it = core.split('.').map(|p| p.parse::<u32>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+/// Whether the host provides import `name` (`pkg:ns/iface@x.y.z`).
+pub fn provided(name: &str) -> bool {
+    let (path, version) = match name.split_once('@') {
+        Some((p, v)) => (p, Some(v)),
+        None => (name, None),
+    };
+    let Some((pkg, iface)) = path.rsplit_once('/') else {
+        return false;
+    };
+    PROVIDED.iter().any(|(p, ifaces, newest)| {
+        *p == pkg
+            && ifaces.contains(&iface)
+            && match version.and_then(parse_version) {
+                Some((maj, min, patch)) => {
+                    (maj, min) == (newest.0, newest.1) && patch <= newest.2
+                }
+                None => version.is_none(),
+            }
+    })
+}
+
 /// What a component exports, which decides the calls it takes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,6 +256,18 @@ impl LoadedModule {
 #[cfg(test)]
 mod module_test {
     use super::*;
+
+    #[test]
+    fn provided_interfaces_match_by_semver_test() {
+        assert!(provided("wasi:cli/environment@0.2.0"));
+        assert!(provided("wasi:http/types@0.2.12"));
+        assert!(provided("legion:isolate/state@0.1.0"));
+        assert!(!provided("wasi:cli/environment@0.2.13"), "newer than the host");
+        assert!(!provided("wasi:cli/environment@0.3.0"));
+        assert!(!provided("wasi:http/incoming-handler@0.2.0"), "an export, not an import");
+        assert!(!provided("wasi:nope/thing@0.2.0"));
+        assert!(!provided("legion:isolate/runner@0.1.0"));
+    }
 
     #[test]
     fn names_the_missing_import_test() {

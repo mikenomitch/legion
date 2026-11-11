@@ -274,6 +274,63 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
     assert!(h.child.try_wait().unwrap().is_none(), "{}", stderr_of(&mut h.child));
 }
 
+/// Confinement on, as a worker runs it: Hello and one Invoke over the
+/// inherited sockets, under best effort and under enforce (every layer
+/// applies in this container; on a kernel without one, enforce exits
+/// before serving and this test says so).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_and_invoke_work_with_confinement_on_test() {
+    for level in [Confine::BestEffort, Confine::Enforce] {
+        let (mut cmd, control, _worker, ends) = command(&bin_config(level), &[]);
+        let mut child = cmd.spawn().unwrap();
+        drop(ends);
+        // SAFETY: we own the socket.
+        let cs = unsafe { inherited(OwnedFd::from(control).into_raw_fd_for_test()) }.unwrap();
+        let mut client = IsolateHostClient::new(channel_over(cs).await.unwrap());
+        let hello = match client.hello(HelloRequest {}).await {
+            Ok(h) => h.into_inner(),
+            Err(e) => {
+                let status = child.wait().unwrap();
+                let err = stderr_of(&mut child);
+                assert!(
+                    level == Confine::Enforce && status.code() == Some(3),
+                    "{level:?}: Hello failed: {e}; host {status:?}: {err}"
+                );
+                eprintln!("LAYER UNAVAILABLE HERE: enforce refused to start: {err}");
+                continue;
+            }
+        };
+        let c = hello.confinement.unwrap();
+        eprintln!("{level:?}: {c:?}");
+        client
+            .load_module(LoadModuleRequest {
+                module_id: "cmd".into(),
+                artifact_path: artifact("cmd").display().to_string(),
+            })
+            .await
+            .unwrap();
+        client.configure_task(spec("j", "cmd", "cmd")).await.unwrap();
+        let r = client
+            .invoke(InvokeRequest {
+                job_id: "j".into(),
+                task_name: "cmd".into(),
+                invocation_id: next_id(),
+                call: Some(invoke_request::Call::Run(run(&["echo", "x"]))),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{level:?}: {e}: {}", stderr_of(&mut child)))
+            .into_inner();
+        assert_eq!(exit(&r), Some(0), "{level:?}");
+        if level == Confine::Enforce {
+            assert!(c.user_namespace && c.network_namespace && c.no_new_privs && c.landlock && c.seccomp);
+        }
+        drop(client);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_host_exits_when_the_control_socket_closes_test() {
     let (mut cmd, control, _worker, ends) = command(&bin_config(Confine::BestEffort), &[]);

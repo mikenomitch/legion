@@ -252,8 +252,7 @@ fn python_imports(tokens: &[Tok], push: &mut impl FnMut(String)) {
             Tok::Ident(word) if at_start && word == "import" => {
                 // import a.b as c, d
                 i += 1;
-                loop {
-                    let Some(name) = ident(i) else { break };
+                while let Some(name) = ident(i) {
                     push(top_python(name));
                     i += 1;
                     while punct(i, b'.') && ident(i + 1).is_some() {
@@ -284,12 +283,12 @@ fn python_imports(tokens: &[Tok], push: &mut impl FnMut(String)) {
                 i += 1;
                 continue;
             }
-            Tok::Ident(word) if word == "__import__" || word == "import_module" => {
-                if punct(i + 1, b'(') {
-                    if let Some(Tok::Str(name)) = tokens.get(i + 2) {
-                        if !name.starts_with('.') {
-                            push(top_python(name));
-                        }
+            Tok::Ident(word)
+                if (word == "__import__" || word == "import_module") && punct(i + 1, b'(') =>
+            {
+                if let Some(Tok::Str(name)) = tokens.get(i + 2) {
+                    if !name.starts_with('.') {
+                        push(top_python(name));
                     }
                 }
             }
