@@ -1,0 +1,52 @@
+[package]
+name = "legion-isolate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Legion's isolate host: the confined, multi-tenant process that runs WebAssembly isolates for a worker, and the compiler that prepares their modules"
+repository = "https://github.com/mikenomitch/legion"
+
+# The one crate that links the WebAssembly engine. A worker starts this
+# binary as a host process per cordon and as a short-lived compiler per
+# module, and speaks `legion_proto::isolate_host` to it over inherited
+# sockets (docs/task-runtime-isolate.md, "The host process"). It depends on
+# `legion-proto` for that protocol and on nothing else of Legion's, so an
+# engine upgrade ships without rebuilding the worker.
+[lib]
+doctest = false
+
+[[bin]]
+name = "legion-isolate"
+path = "src/main.rs"
+
+[dependencies]
+legion-proto.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+libc.workspace = true
+prost.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wasmtime-wasi-io.workspace = true
+wasmtime-wasi-http.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
