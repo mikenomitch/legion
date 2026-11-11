@@ -1467,3 +1467,13 @@ async fn python_version() -> String {
         .await;
     serde_json::from_str(ran.ok().result.as_deref().unwrap()).unwrap()
 }
+
+#[tokio::test]
+#[ignore = "debug"]
+async fn zz_debug_test() {
+    let (img, name) = if std::env::var("DBG_JS").is_ok() { (js(), "main.js") } else { (python(), "main.py") };
+    let src = std::env::var("DBG_SRC").unwrap();
+    let mut i = instance(img, Opts::default()).await;
+    let ran = i.src(name, &src).await;
+    println!("{ran:#?}");
+}

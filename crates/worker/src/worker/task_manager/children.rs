@@ -141,10 +141,7 @@ fn same_owner(a: &OwnerRef, b: &OwnerRef) -> bool {
     a.kind == b.kind && a.id == b.id
 }
 
-/// The owner kind of a child VM owned by a request or tenant isolate: the
-/// invocation (`isolates::vm`). A session isolate owns its children as a
-/// `session`. Only the node that runs the isolate judges an `isolate` owner.
-pub const OWNER_ISOLATE: &str = "isolate";
+pub use crate::structs::children::OWNER_ISOLATE;
 
 /// An isolate that owns child VMs on this node, registered by the isolate
 /// supervisor's VM backend while the isolate lives (`isolates::vm`).

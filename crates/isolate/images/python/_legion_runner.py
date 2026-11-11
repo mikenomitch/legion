@@ -56,34 +56,49 @@ def _compile_library():
     import marshal
     import zlib
 
-    root = os.path.dirname(os.__file__)
-    index, chunks, offset = {}, [], 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel = dirpath[len(root):].strip("/")
-        parts = rel.split("/") if rel else []
-        if parts and (parts[0] in SKIP or "__init__.py" not in filenames or "__pycache__" in parts):
-            dirnames[:] = []
-            continue
-        dirnames.sort()
-        for fn in sorted(filenames):
-            if not fn.endswith(".py"):
-                continue
-            stem = fn[:-3]
-            is_pkg = stem == "__init__"
-            name = ".".join(parts if is_pkg else parts + [stem])
-            if not name or name.split(".")[0] in SKIP or _imp.is_frozen(name):
-                continue
-            path = os.path.join(dirpath, fn)
-            with open(path, "rb") as f:
-                source = f.read()
-            try:
-                code = compile(source, path, "exec", dont_inherit=True)
-            except SyntaxError:
-                continue
-            data = zlib.compress(marshal.dumps(code), 6)
-            index[name] = (offset, len(data), is_pkg, path)
-            chunks.append(data)
-            offset += len(data)
+    # Where componentize-py mounts the library during the build (`os` is
+    # frozen, so its __file__ does not say).
+    root = next(p for p in sys.path if os.path.isfile(p + "/json/__init__.py"))
+    index, chunks = {}, []
+    offset = 0
+
+    def add(name, path, is_pkg):
+        nonlocal offset
+        with open(path, "rb") as f:
+            source = f.read()
+        try:
+            code = compile(source, path, "exec", dont_inherit=True)
+        except SyntaxError:
+            return
+        data = zlib.compress(marshal.dumps(code), 6)
+        index[name] = (offset, len(data), is_pkg, path)
+        chunks.append(data)
+        offset += len(data)
+
+    def walk(directory, prefix):
+        # os.listdir, not os.walk: scandir's entry types are not reliable on
+        # the build's WASI filesystem.
+        for fn in sorted(os.listdir(directory)):
+            path = directory + "/" + fn
+            if fn.endswith(".py"):
+                stem = fn[:-3]
+                if stem == "__init__":
+                    continue
+                name = prefix + stem
+                if name.split(".")[0] in SKIP or _imp.is_frozen(name):
+                    continue
+                add(name, path, False)
+            elif "." not in fn and fn != "__pycache__" and not (not prefix and fn in SKIP):
+                init = path + "/__init__.py"
+                if os.path.isfile(init):
+                    name = prefix + fn
+                    if not _imp.is_frozen(name):
+                        add(name, init, True)
+                    walk(path, name + ".")
+
+    walk(root, "")
+    if len(index) < 100:
+        raise RuntimeError("the standard library was not found under %s (%d modules)" % (root, len(index)))
     return b"".join(chunks), index
 
 
