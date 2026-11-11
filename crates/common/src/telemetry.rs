@@ -2407,7 +2407,7 @@ pub struct WorkerMetrics {
     /// `fresh`, `warm`, `paged`, `hibernated`.
     pub isolate_wakes_total: Arc<CounterVec>,
     /// `legion_isolate_limit_total{limit}` — invocations stopped by a
-    /// limit: `cpu`, `wall`, `memory`, `output`.
+    /// limit: `cpu`, `wall`, `memory` (`limits.output` truncates, never stops).
     pub isolate_limit_total: Arc<CounterVec>,
     /// `legion_isolate_vm_runs_total{reason}` — runs of isolate tasks sent
     /// to a VM: `requested`, `disabled`, `import`, `memo`.
@@ -2612,7 +2612,7 @@ impl WorkerMetrics {
         let isolate_limit_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_isolate_limit_total",
-                help: "Isolate invocations stopped by a limit (cpu|wall|memory|output).",
+                help: "Isolate invocations stopped by a limit (cpu|wall|memory).",
                 labels: &["limit"],
             },
             series: Series::new(),

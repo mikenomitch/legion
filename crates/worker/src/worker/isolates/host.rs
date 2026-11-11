@@ -98,7 +98,7 @@ pub fn serve_over<S: IsolateWorker>(stream: tokio::net::UnixStream, service: S) 
         // A host is not trusted with the worker's memory: bound how many
         // calls it may have open at once on its one connection.
         if let Err(err) = tonic::transport::Server::builder()
-            .http2_max_concurrent_streams(Some(MAX_HOST_CALLS))
+            .max_concurrent_streams(Some(MAX_HOST_CALLS))
             .concurrency_limit_per_connection(MAX_HOST_CALLS as usize)
             .add_service(server)
             .serve_with_incoming(incoming)
@@ -184,9 +184,13 @@ fn sanitize(cordon: &str) -> String {
         .collect()
 }
 
-/// Create the host's cgroup and move `pid` into it. Best effort: a node
-/// that cannot (no delegation, cgroup v1) runs the host in the worker's.
-fn place_in_cgroup(dir: &Path, spawn: &HostSpawn, pid: u32) -> R<PathBuf> {
+/// Create the host's cgroup with its limits, before the host starts, and
+/// open its `cgroup.procs` for the child to join itself between fork and
+/// exec (the host forks again at startup into a PID namespace, so moving
+/// the spawned pid afterwards would leave the real host behind). Best
+/// effort: a node that cannot (no delegation, cgroup v1) runs the host in
+/// the worker's.
+fn prepare_cgroup(dir: &Path, spawn: &HostSpawn) -> R<(PathBuf, std::os::fd::OwnedFd)> {
     std::fs::create_dir_all(dir)?;
     if let Some(parent) = dir.parent() {
         let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids");
@@ -199,8 +203,19 @@ fn place_in_cgroup(dir: &Path, spawn: &HostSpawn, pid: u32) -> R<PathBuf> {
     }
     // Shards plus the epoch ticker and the I/O runtime; generous.
     std::fs::write(leaf.join("pids.max"), "1024")?;
-    std::fs::write(leaf.join("cgroup.procs"), pid.to_string())?;
-    Ok(leaf)
+    use std::os::unix::fs::OpenOptionsExt;
+    let procs = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(leaf.join("cgroup.procs"))?;
+    Ok((leaf, procs.into()))
+}
+
+/// Whether `pid` is a member of the cgroup `leaf`.
+fn in_cgroup(leaf: &Path, pid: u32) -> bool {
+    std::fs::read_to_string(leaf.join("cgroup.procs"))
+        .map(|procs| procs.lines().any(|line| line.trim() == pid.to_string()))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -221,6 +236,15 @@ impl HostLauncher for ProcessLauncher {
             worker_theirs.as_raw_fd(),
             config.as_raw_fd(),
         ];
+        // The cgroup exists, with its limits, before the host does.
+        let prepared = self.cgroup_dir.as_ref().and_then(|dir| {
+            prepare_cgroup(dir, spawn)
+                .map_err(|err| {
+                    warn!(cordon = %spawn.cordon, error = %format!("{err:#}"), "Could not create the isolate host's cgroup; it runs in the worker's")
+                })
+                .ok()
+        });
+        let procs_fd = prepared.as_ref().map(|(_, fd)| fd.as_raw_fd());
         let mut command = std::process::Command::new(&self.binary);
         command
             .arg("host")
@@ -250,6 +274,12 @@ impl HostLauncher for ProcessLauncher {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Join the host's cgroup ("0" = the writing process) before
+                // exec, so everything the host forks is in it too. A failed
+                // write is detected after spawn.
+                if let Some(fd) = procs_fd {
+                    let _ = libc::write(fd, b"0".as_ptr().cast(), 1);
+                }
                 Ok(())
             });
         }
@@ -267,15 +297,13 @@ impl HostLauncher for ProcessLauncher {
         // exited and was reaped.
         let pidfd = pidfd_open(pid);
         let mut cgroup = None;
-        if let Some(dir) = self.cgroup_dir.as_ref() {
-            match place_in_cgroup(dir, spawn, pid) {
-                Ok(leaf) => {
-                    debug!(cordon = %spawn.cordon, cgroup = %leaf.display(), "Isolate host placed in its cgroup");
-                    cgroup = Some(leaf);
-                }
-                Err(err) => {
-                    warn!(cordon = %spawn.cordon, error = %format!("{err:#}"), "Could not place the isolate host in its own cgroup; it runs in the worker's")
-                }
+        if let Some((leaf, fd)) = prepared {
+            drop(fd);
+            if in_cgroup(&leaf, pid) {
+                debug!(cordon = %spawn.cordon, cgroup = %leaf.display(), "Isolate host started in its cgroup");
+                cgroup = Some(leaf);
+            } else {
+                warn!(cordon = %spawn.cordon, cgroup = %leaf.display(), "The isolate host did not join its own cgroup; it runs in the worker's");
             }
         }
         if let Some(stderr) = child.stderr.take() {

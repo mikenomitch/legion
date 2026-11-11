@@ -464,7 +464,7 @@ fn carry_isolate_datapath(task: &TaskConfig, envelope: &mut TaskConfig) -> R<()>
 }
 
 /// Whether a session of `task` may be promoted to a keyed instance. An
-/// isolate session may not (isolate-runtime calls entry 10): the error is
+/// isolate session may not (isolate-runtime calls entry 24): the error is
 /// the `FAILED_PRECONDITION` text `instance promote` answers.
 pub fn promotable(task: &TaskConfig) -> Result<(), String> {
     match crate::structs::isolate::promote_refusal(task) {
@@ -1096,9 +1096,10 @@ mod session_test {
         let config = isolate_job(json!({ "service": { "name": "runner", "port": 8080 } }));
         let err = validate_session_task(&config.tasks[0]).expect_err("service");
         assert!(err.to_string().contains("declares a service"), "{err}");
-        assert!(promotable(&config.tasks[0])
-            .unwrap_err()
-            .starts_with("isolate sessions cannot be promoted"));
+        assert_eq!(
+            promotable(&config.tasks[0]).unwrap_err(),
+            crate::structs::isolate::PROMOTE_REFUSAL
+        );
 
         // Every other session task keeps today's refusal.
         let mut task = session_task();

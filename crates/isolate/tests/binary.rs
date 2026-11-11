@@ -385,6 +385,9 @@ async fn hello_and_invoke_work_with_confinement_on_test() {
                     && c.no_new_privs
                     && c.landlock
                     && c.seccomp
+                    && c.pid_namespace
+                    && c.mount_root,
+                "{c:?}"
             );
         }
         drop(client);
@@ -478,11 +481,23 @@ fn compat_key_changes_with_layout_test() {
 // ---------------------------------------------------------------------------
 
 /// Run `host --test-attempt <what>` under full confinement and return
-/// (exit status, stdout).
+/// (exit status, stdout, stderr).
 #[cfg(feature = "confinement-test")]
 fn attempt(what: &str) -> (std::process::ExitStatus, String, String) {
+    attempt_skipping(what, &[])
+}
+
+/// The same with some confinement layers left out (`--test-skip`), to show
+/// that each remaining layer stops an attack on its own.
+#[cfg(feature = "confinement-test")]
+fn attempt_skipping(what: &str, skip: &[&str]) -> (std::process::ExitStatus, String, String) {
     let cfg = bin_config(Confine::BestEffort);
-    let (mut cmd, _c, _w, _ends) = command(&cfg, &["--test-attempt", what]);
+    let mut extra = vec!["--test-attempt", what];
+    let skip = skip.join(",");
+    if !skip.is_empty() {
+        extra.extend(["--test-skip", &skip]);
+    }
+    let (mut cmd, _c, _w, _ends) = command(&cfg, &extra);
     let out = cmd.output().unwrap();
     (
         out.status,
@@ -524,6 +539,9 @@ fn confinement_layers_report_what_the_kernel_offers_test() {
             (c.no_new_privs, "no_new_privs"),
             (c.landlock, "landlock"),
             (c.seccomp, "seccomp"),
+            (c.pid_namespace, "pid namespace"),
+            (c.mount_root, "mount root"),
+            (c.landlock_scopes, "landlock scopes"),
         ] {
             if !on {
                 eprintln!("LAYER UNAVAILABLE HERE: {name}");
@@ -591,22 +609,45 @@ fn seccomp_kills_ptrace_test() {
     not(feature = "confinement-test"),
     ignore = "needs --features confinement-test"
 )]
-fn landlock_denies_files_outside_read_dirs_test() {
+fn the_filesystem_outside_read_dirs_does_not_exist_for_the_host_test() {
     #[cfg(feature = "confinement-test")]
     {
         let c = hello_confinement();
-        let (status, out, _) = attempt("open-outside");
-        assert!(status.success());
-        if !c.landlock {
-            eprintln!("LAYER UNAVAILABLE HERE: landlock ({out})");
-            return;
-        }
-        assert!(out.contains(&format!("Some({})", libc::EACCES)), "{out}");
         artifact("cmd");
         let (_, out, _) = attempt("read-inside");
         assert!(out.contains("bytes"), "{out}");
         let (_, out, _) = attempt("write-inside");
-        assert!(out.contains(&format!("Some({})", libc::EACCES)), "{out}");
+        assert!(
+            out.contains(&format!("Some({})", libc::EROFS))
+                || out.contains(&format!("Some({})", libc::EACCES)),
+            "{out}"
+        );
+        if !c.mount_root {
+            eprintln!("LAYER UNAVAILABLE HERE: mount root ({:?})", c.notes);
+        } else {
+            // Not "permission denied": the node's files are not there.
+            let enoent = format!("Some({})", libc::ENOENT);
+            for what in [
+                "open-outside",
+                "open-proc",
+                "stat-outside",
+                "readlink-outside",
+            ] {
+                let (status, out, err) = attempt(what);
+                assert!(status.success(), "{what}: {status:?} {err}");
+                assert!(out.contains(&enoent), "{what}: {out}");
+            }
+            // The mount root alone (no Landlock) hides them too.
+            let (_, out, _) = attempt_skipping("open-outside", &["landlock"]);
+            assert!(out.contains(&enoent), "{out}");
+        }
+        if !c.landlock {
+            eprintln!("LAYER UNAVAILABLE HERE: landlock ({:?})", c.notes);
+        } else {
+            // Landlock alone (no mount root) refuses them.
+            let (_, out, _) = attempt_skipping("open-outside", &["mount"]);
+            assert!(out.contains(&format!("Some({})", libc::EACCES)), "{out}");
+        }
     }
 }
 
@@ -649,4 +690,327 @@ async fn the_host_network_namespace_has_no_interface_test() {
         ["65534", &uid.to_string(), "1"],
         "{map}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Signals, descriptors, the PID namespace (review findings 2 and 10).
+// ---------------------------------------------------------------------------
+
+/// A process outside the host that a compromised host would like to kill.
+#[cfg(feature = "confinement-test")]
+struct Victim(Child);
+
+#[cfg(feature = "confinement-test")]
+impl Victim {
+    fn new() -> Self {
+        Victim(Command::new("sleep").arg("60").spawn().unwrap())
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    fn alive(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
+}
+
+#[cfg(feature = "confinement-test")]
+impl Drop for Victim {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Every route by which a process can make the kernel signal another one
+/// through its own descriptors.
+#[cfg(feature = "confinement-test")]
+const SIGNAL_ROUTES: &[&str] = &[
+    "sigio-fcntl",
+    "sigio-setown-ex",
+    "sigio-ioctl",
+    "sigio-pgrp",
+    "kill",
+];
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn seccomp_kills_every_signal_route_and_the_victim_survives_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let c = hello_confinement();
+        if !c.seccomp {
+            eprintln!("LAYER UNAVAILABLE HERE: seccomp");
+            return;
+        }
+        for route in SIGNAL_ROUTES.iter().chain(&["fsetfl-async"]) {
+            let mut v = Victim::new();
+            let (status, out, err) = attempt(&format!("{route}:{}", v.pid()));
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGSYS),
+                "{route}: {status:?} {out} {err}"
+            );
+            assert!(v.alive(), "{route} killed the victim");
+        }
+        // The flags the runtime does use stay allowed.
+        let (status, out, err) = attempt("fsetfl-nonblock");
+        assert!(status.success(), "{status:?} {err}");
+        assert!(out.contains("returned 0"), "{out}");
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn the_pid_namespace_alone_hides_every_outside_process_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let c = hello_confinement();
+        if !c.pid_namespace {
+            eprintln!("LAYER UNAVAILABLE HERE: pid namespace ({:?})", c.notes);
+            return;
+        }
+        let (_, out, _) = attempt("pid");
+        assert_eq!(out.trim(), "pid 1", "the host is PID 1 of its namespace");
+        for route in SIGNAL_ROUTES {
+            let mut v = Victim::new();
+            let (status, out, err) =
+                attempt_skipping(&format!("{route}:{}", v.pid()), &["seccomp", "scopes"]);
+            assert!(status.success(), "{route}: {status:?} {err}");
+            // The pid does not exist in the host's namespace.
+            assert!(
+                out.contains(&format!("/{}", libc::ESRCH))
+                    || out.contains(&format!("errno {}", libc::ESRCH)),
+                "{route}: {out}"
+            );
+            assert!(v.alive(), "{route} killed the victim: {out}");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn landlock_scopes_alone_stop_signals_to_outside_processes_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let c = hello_confinement();
+        if !c.landlock_scopes {
+            eprintln!("LAYER UNAVAILABLE HERE: landlock scopes ({:?})", c.notes);
+            return;
+        }
+        for route in SIGNAL_ROUTES {
+            let mut v = Victim::new();
+            let (status, out, err) =
+                attempt_skipping(&format!("{route}:{}", v.pid()), &["seccomp", "pidns"]);
+            assert!(status.success(), "{route}: {status:?} {err}");
+            assert!(v.alive(), "{route} killed the victim: {out}");
+        }
+        // Without any of the three layers the attack is real here: the
+        // test above is not passing by accident.
+        let mut v = Victim::new();
+        let (_, out, _) = attempt_skipping(
+            &format!("sigio-fcntl:{}", v.pid()),
+            &["seccomp", "pidns", "scopes"],
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!v.alive(), "the unconfined route should kill: {out}");
+    }
+}
+
+/// Start the binary with one more inherited descriptor (number 100) that
+/// the worker did not mean to pass, as a missing `CLOEXEC` would.
+#[cfg(feature = "confinement-test")]
+fn attempt_with_stray_fd(what: &str) -> String {
+    let (stray, _keep) = StdUnix::pair().unwrap();
+    let raw = stray.as_raw_fd();
+    let cfg = bin_config(Confine::BestEffort);
+    let (mut cmd, _c, _w, _ends) = command(&cfg, &["--test-attempt", what]);
+    // SAFETY: dup2 between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 100) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn a_stray_inherited_descriptor_is_closed_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let out = attempt_with_stray_fd("fds");
+        let fds: Vec<i32> = out
+            .trim()
+            .trim_start_matches("fds: ")
+            .split(',')
+            .map(|f| f.parse().unwrap())
+            .collect();
+        assert!(!fds.contains(&100), "fd 100 reached the host: {out}");
+        // Stdio, the two sockets, and /proc/self/statm (in the config
+        // pipe's place: it was read and closed).
+        assert_eq!(fds, [0, 1, 2, 3, 4, 5], "{out}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killing_the_pid_the_worker_knows_kills_the_host_test() {
+    let (mut cmd, control, _worker, ends) = command(&bin_config(Confine::BestEffort), &[]);
+    let mut child = cmd.spawn().unwrap();
+    drop(ends);
+    // SAFETY: we own the socket.
+    let cs = unsafe { inherited(OwnedFd::from(control).into_raw_fd_for_test()) }.unwrap();
+    let mut client = IsolateHostClient::new(channel_over(cs).await.unwrap());
+    let hello = client.hello(HelloRequest {}).await.unwrap().into_inner();
+    assert_eq!(hello.pid, child.id(), "Hello reports the pid the worker spawned");
+    let c = hello.confinement.unwrap();
+    if !c.pid_namespace {
+        eprintln!("LAYER UNAVAILABLE HERE: pid namespace ({:?})", c.notes);
+        return;
+    }
+    // The serving process is the spawned one's only child.
+    let pid = child.id();
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
+    let host: u32 = children.trim().parse().unwrap();
+    let ns = |p: u32| std::fs::read_link(format!("/proc/{p}/ns/pid")).ok();
+    assert_ne!(ns(host), ns(std::process::id()), "the host has its own PID namespace");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let t = Instant::now();
+    loop {
+        let state = std::fs::read_to_string(format!("/proc/{host}/stat")).unwrap_or_default();
+        // Gone, or a zombie waiting for init to reap it.
+        if state.is_empty() || state.contains(") Z") {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "the host outlived its parent: {state}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(client.hello(HelloRequest {}).await.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The compiler is confined on the same terms (review findings 3 and 10).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "confinement-test")]
+fn compile_attempt(what: &str) -> (std::process::ExitStatus, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wasm");
+    std::fs::copy(fixture("cmd"), &input).unwrap();
+    std::fs::create_dir(dir.path().join("out")).unwrap();
+    let out = Command::new(BIN)
+        .args(["compile", "--confine", "best-effort", "--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(dir.path().join("out").join("x.cwasm"))
+        .args(["--test-attempt", what])
+        .output()
+        .unwrap();
+    (out.status, String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[test]
+fn the_compiler_reports_every_layer_and_honours_confine_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |confine: &str| {
+        let o = Command::new(BIN)
+            .args(["compile", "--confine", confine, "--input"])
+            .arg(fixture("cmd"))
+            .arg("--output")
+            .arg(dir.path().join(format!("{confine}.cwasm")))
+            .output()
+            .unwrap();
+        (o.status, String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let (status, out) = run("enforce");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    if v["kind"] == "confinement" {
+        eprintln!("LAYER UNAVAILABLE HERE: compiler enforce refused: {v}");
+        assert_eq!(status.code(), Some(3));
+    } else {
+        assert_eq!(v["ok"], true, "{v}");
+        let c = &v["confinement"];
+        for layer in [
+            "userNamespace",
+            "networkNamespace",
+            "pidNamespace",
+            "mountRoot",
+            "noNewPrivs",
+            "landlock",
+            "seccomp",
+        ] {
+            assert_eq!(c[layer], true, "{layer}: {v}");
+        }
+        assert!(dir.path().join("enforce.cwasm").is_file());
+    }
+    let (status, out) = run("off");
+    assert!(status.success(), "{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["confinement"]["seccomp"], false, "{v}");
+    let (status, _) = run("sometimes");
+    assert_eq!(status.code(), Some(2), "clap refuses an unknown level");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn the_compiler_is_refused_what_the_host_is_refused_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let c = hello_confinement();
+        if c.seccomp {
+            for what in ["socket", "execve", "fork", "ptrace", "sigio-fcntl:1", "kill:1"] {
+                let (status, out) = compile_attempt(what);
+                assert_eq!(status.signal(), Some(libc::SIGSYS), "{what}: {status:?} {out}");
+            }
+        }
+        let enoent = format!("Some({})", libc::ENOENT);
+        if c.mount_root {
+            for what in ["open-outside", "open-proc", "stat-outside", "readlink-outside"] {
+                let (status, out) = compile_attempt(what);
+                // `readlink` is not on the compiler's allowlist at all.
+                if what == "readlink-outside" && c.seccomp {
+                    assert_eq!(status.signal(), Some(libc::SIGSYS), "{what}: {out}");
+                    continue;
+                }
+                assert!(status.success(), "{what}: {status:?}");
+                assert!(out.contains(&enoent), "{what}: {out}");
+            }
+        }
+        let (_, out) = compile_attempt("read-inside");
+        assert!(out.contains("bytes"), "the input is readable: {out}");
+        let (_, out) = compile_attempt("write-inside");
+        assert!(
+            out.contains(&format!("Some({})", libc::EROFS))
+                || out.contains(&format!("Some({})", libc::EACCES)),
+            "the input is read-only: {out}"
+        );
+        let (_, out) = compile_attempt("write-output");
+        assert!(out.contains("wrote"), "the output directory is writable: {out}");
+        let (_, out) = compile_attempt("pid");
+        if c.pid_namespace {
+            assert_eq!(out.trim(), "pid 1");
+        }
+        let (_, out) = compile_attempt("fds");
+        assert_eq!(out.trim(), "fds: 0,1,2", "{out}");
+    }
 }

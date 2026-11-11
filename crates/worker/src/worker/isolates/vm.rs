@@ -658,6 +658,20 @@ impl VmBackend for ChildVms {
             );
         };
         let owner = Self::owner_of(task);
+        // An owner is bound to its job and task: a reference registered by
+        // another job's (or task's) isolate is never this caller's.
+        if let Some(registered) = lock(&self.task_manager).isolate_owner(&owner).cloned() {
+            if registered.job_id != task.job_id || registered.task_name != task.task_name {
+                return failure(
+                    VmErrorKind::VmChildGone,
+                    format!(
+                        "isolate {} belongs to another task; no child of it is reachable from \
+                         {}/{}",
+                        task.isolate_id, task.job_id, task.task_name
+                    ),
+                );
+            }
+        }
         let Some(op) = request.op else {
             return failure(VmErrorKind::VmFailed, "the request names no operation");
         };
@@ -1139,6 +1153,32 @@ mod tests {
         let orphan = exec(&vms, &session, &kept.id, &["true"], b"", 1000).await;
         assert_eq!(kind(&orphan), Some(VmErrorKind::VmChildGone), "{orphan:?}");
         assert!(message(&orphan).contains("owner ended"), "{orphan:?}");
+    }
+
+    /// An owner reference is bound to its job and task: the same id named
+    /// from another job or another task reaches none of its children.
+    #[tokio::test]
+    async fn another_jobs_or_tasks_isolate_cannot_use_a_child_test() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = node(&temp);
+        let me = isolate("run-sess7", true);
+        let child = acquire(&vms, &me).await;
+        assert!(child.error.is_none(), "{child:?}");
+        for (job, task) in [("other-job", "run"), (JOB, "other-task")] {
+            let thief = IsolateTaskRef {
+                job_id: job.into(),
+                task_name: task.into(),
+                ..me.clone()
+            };
+            let stolen = exec(&vms, &thief, &child.id, &["true"], b"", 1000).await;
+            assert_eq!(kind(&stolen), Some(VmErrorKind::VmChildGone), "{stolen:?}");
+            assert!(message(&stolen).contains("belongs to another task"), "{stolen:?}");
+            let more = acquire(&vms, &thief).await;
+            assert_eq!(kind(&more), Some(VmErrorKind::VmChildGone), "{more:?}");
+        }
+        // The owner itself still drives it.
+        let mine = exec(&vms, &me, &child.id, &["true"], b"", 5000).await;
+        assert_eq!(mine.exec.map(|r| r.exit), Some(0));
     }
 
     /// `fetch` reaches a child's port only where the child has its own port

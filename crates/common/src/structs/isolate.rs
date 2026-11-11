@@ -40,7 +40,7 @@ pub const ISOLATE_RUNTIME: &str = "isolate";
 pub const ISOLATES_CAPABILITY: &str = "isolates";
 
 /// Default `resources.memoryMax` for an isolate, in MiB: the cap on its
-/// linear memory (calls entry 21).
+/// linear memory (calls entry 45).
 pub const DEFAULT_MEMORY_MAX_MIB: u64 = 128;
 
 /// The largest `resources.memoryMax` an isolate may declare, in MiB: a
@@ -503,7 +503,7 @@ impl IsolateTaskConfig {
     }
 }
 
-/// The error for a missing `limits.cpu` or `limits.wall` (calls entry 21).
+/// The error for a missing `limits.cpu` or `limits.wall` (calls entry 45).
 const LIMITS_REQUIRED: &str = "config.limits.cpu and config.limits.wall are required (budgets \
                                differ by orders of magnitude between a webhook and an agent \
                                loop; there is no default)";
@@ -649,10 +649,9 @@ pub fn is_isolate_task(task: &TaskConfig) -> bool {
 /// `:`. Consumers compare names this function produced; none parses one.
 pub fn cordon_name(job_id: &str, config: &IsolateTaskConfig) -> String {
     match config.cordon {
-        IsolateCordon::Namespace => format!(
-            "ns:{}",
-            crate::structs::namespace::job_namespace(job_id)
-        ),
+        IsolateCordon::Namespace => {
+            format!("ns:{}", crate::structs::namespace::job_namespace(job_id))
+        }
         IsolateCordon::Job => format!("job:{job_id}"),
         IsolateCordon::Shared => "shared".to_string(),
     }
@@ -765,15 +764,16 @@ pub fn validate_tenant_key(key: &str) -> Result<(), String> {
 }
 
 /// The error `instance promote` answers for an isolate session (calls entry
-/// 10), when `task` is an isolate task.
+/// 24), when `task` is an isolate task. `legion:isolate/state` is not named:
+/// it is checkpointed on the session's node only, so it does not outlive it.
 pub fn promote_refusal(task: &TaskConfig) -> Option<String> {
-    is_isolate_task(task).then(|| {
-        "isolate sessions cannot be promoted (a keyed instance is an allocation each); give the \
-         session a stable id with an idempotency key, and keep what must outlive the node in \
-         legion:isolate/state or an upstream store"
-            .to_string()
-    })
+    is_isolate_task(task).then(|| PROMOTE_REFUSAL.to_string())
 }
+
+/// The text of [`promote_refusal`].
+pub const PROMOTE_REFUSAL: &str = "isolate sessions cannot be promoted (a keyed instance is an \
+     allocation each); give the session a stable id with an idempotency key, and keep what must \
+     outlive its node in an upstream store";
 
 /// Fill an isolate task's resource defaults at submit (plan §6.11), ahead
 /// of the cluster's `taskResourceDefaults`: `memoryMax` 128 MiB, `memory`
@@ -864,7 +864,7 @@ fn validate_isolate_task(config: &JobConfig, task: &TaskConfig) -> Result<(), St
         ));
     }
 
-    // Promotion never applies (calls entry 10).
+    // Promotion never applies (calls entry 24).
     if task
         .stateful
         .as_ref()
@@ -899,8 +899,16 @@ fn validate_isolate_task(config: &JobConfig, task: &TaskConfig) -> Result<(), St
             return Err(format!(
                 "{prefix}: suspend.{field} does not apply to an isolate: an isolate hibernates \
                  to its own checkpoint format at a turn boundary, and wakes on its next \
-                 request\nHint: remove suspend.{field}; idle.after, keepFor, durability, and \
-                 onWorkerStop apply"
+                 request\nHint: remove suspend.{field}; idle.after, keepFor, and durability \
+                 apply"
+            ));
+        }
+        if suspend.on_worker_stop.is_some() {
+            return Err(format!(
+                "{prefix}: suspend.onWorkerStop does not apply to an isolate: a worker that \
+                 stops always hibernates its session isolates (their state is checkpointed and \
+                 they wake on their next call on that node)\nHint: remove \
+                 suspend.onWorkerStop"
             ));
         }
         // Not built yet: the node keeps an isolate's checkpoint in its own
@@ -1683,6 +1691,14 @@ mod isolate_test {
             json!({ "idle": { "after": "1m" }, "keepFor": "2h", "durability": "local" }),
         );
         check(vec![task, machine()]).unwrap();
+        // onWorkerStop is not honored for isolates: refused, not ignored.
+        let task = with(
+            isolate_task(config.clone()),
+            &["suspend"],
+            json!({ "onWorkerStop": "checkpoint" }),
+        );
+        let err = check(vec![task, machine()]).unwrap_err();
+        assert!(err.contains("suspend.onWorkerStop does not apply"), "{err}");
         // `store` is refused at submit, so `job validate` says so.
         let task = with(
             isolate_task(config.clone()),
@@ -1779,9 +1795,12 @@ mod isolate_test {
         assert_eq!(vm_task_name(task, &parsed).as_deref(), Some("machine"));
         assert_eq!(memory_max_mib(task), 128);
         assert_eq!(reservation_mib(task), 16);
-        assert!(promote_refusal(task)
-            .unwrap()
-            .contains("cannot be promoted"));
+        assert_eq!(
+            promote_refusal(task).unwrap(),
+            "isolate sessions cannot be promoted (a keyed instance is an allocation each); give \
+             the session a stable id with an idempotency key, and keep what must outlive its \
+             node in an upstream store"
+        );
         assert!(promote_refusal(&config.tasks[1]).is_none());
     }
 

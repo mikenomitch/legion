@@ -177,12 +177,19 @@ pub fn confinement_layers(confinement: Option<&host::Confinement>) -> (Vec<Strin
         (confinement.no_new_privs, "no-new-privs"),
         (confinement.landlock, "landlock"),
         (confinement.seccomp, "seccomp"),
+        (confinement.mount_root, "mount-root"),
+        (confinement.pid_namespace, "pid-ns"),
     ] {
         if on {
             applied.push(name.to_string());
         } else {
             missing.push(name.to_string());
         }
+    }
+    // Landlock scopes depend on the kernel (ABI 6): reported when present,
+    // never required.
+    if confinement.landlock_scopes {
+        applied.push("landlock-scopes".to_string());
     }
     (applied, missing)
 }
@@ -283,6 +290,18 @@ mod plan_test {
             ..Default::default()
         }));
         assert_eq!(applied, vec!["userns", "seccomp"]);
-        assert_eq!(missing, vec!["netns", "no-new-privs", "landlock"]);
+        assert_eq!(
+            missing,
+            vec!["netns", "no-new-privs", "landlock", "mount-root", "pid-ns"]
+        );
+        // Landlock scopes are reported when present and never missing.
+        let (applied, missing) = confinement_layers(Some(&host::Confinement {
+            mount_root: true,
+            pid_namespace: true,
+            landlock_scopes: true,
+            ..Default::default()
+        }));
+        assert_eq!(applied, vec!["mount-root", "pid-ns", "landlock-scopes"]);
+        assert!(!missing.contains(&"landlock-scopes".to_string()));
     }
 }

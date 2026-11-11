@@ -886,6 +886,11 @@ const NO_SANDBOX_RUNS: &str = "needs /dev/kvm: a sandbox session run needs exec,
 /// A session task `machine` the isolate task's VM runs go to: `exec`
 /// standing in for a sandbox, or a real `sandbox`.
 fn machine(runtime: &str) -> Value {
+    machine_running(runtime, json!(["sh", "/legion/run/main.py"]))
+}
+
+/// [`machine`] with this `run.command`.
+fn machine_running(runtime: &str, command: Value) -> Value {
     let config = match runtime {
         "exec" => json!({ "command": ["sleep", "600"] }),
         _ => json!({ "image": "busybox:1.36", "command": ["sleep", "600"] }),
@@ -899,11 +904,8 @@ fn machine(runtime: &str) -> Value {
             "mode": "session",
             "envelope": { "resources": { "cpu": 400, "memory": 512 } },
         },
-        // The entry (staged as main.py) and the run's args.
-        "run": {
-            "command": ["sh", "-c", "echo entry=$(cat main.py); echo args=$*", "sh"],
-            "wall": "30s",
-        },
+        // Runs the entry (staged as main.py); a run's args follow it.
+        "run": { "command": command, "wall": "30s" },
         "children": { "max": 4, "orphanAfter": "5m" },
     })
 }
@@ -924,10 +926,11 @@ fn vm_isolate(lifetime: &str, children_max: Option<u32>) -> Value {
 }
 
 async fn vm_cluster(runtime: &str, lifetime: &str, children_max: Option<u32>) -> Cluster {
-    let cluster = Cluster::start(
-        Images::Fixture("runner.wasm"),
-        json!([vm_isolate(lifetime, children_max), machine(runtime)]),
-    )
+    vm_cluster_with(vm_isolate(lifetime, children_max), machine(runtime)).await
+}
+
+async fn vm_cluster_with(isolate: Value, machine: Value) -> Cluster {
+    let cluster = Cluster::start(Images::Fixture("runner.wasm"), json!([isolate, machine]))
     .await
     .expect("cluster");
     cluster.wait_for("run", true).await.expect("isolate task");
@@ -962,7 +965,11 @@ async fn check_vm_tier_runs(cluster: &Cluster) {
     let mut sessions = Vec::new();
     for _ in 0..2 {
         let reply = cluster
-            .run(vm_run_request("vm", &["a", "b c"], "print(1)"))
+            .run(vm_run_request(
+                "vm",
+                &["a", "b c"],
+                "echo hello from the vm; echo args=$*; echo env=$LEGION_RUN_ARGS",
+            ))
             .await
             .expect("vm run");
         assert_eq!(reply.tier, "vm", "{reply:?}");
@@ -973,8 +980,9 @@ async fn check_vm_tier_runs(cluster: &Cluster) {
         assert_eq!(reply.exit, Some(0), "{reply:?}");
         assert_eq!(
             String::from_utf8_lossy(&reply.stdout),
-            "entry=print(1)\nargs=a b c\n",
-            "the entry staged as main.py, the args appended to run.command"
+            "hello from the vm\nargs=a b c\nenv=[\"a\",\"b c\"]\n",
+            "the entry staged as main.py, the args appended to run.command (which ends \
+             with it) and exported as LEGION_RUN_ARGS"
         );
         assert!(reply.wall_micros > 0 && reply.isolate_start.is_empty());
         sessions.push(reply.session_id.clone());
@@ -999,7 +1007,7 @@ async fn check_disabled_runtime_goes_to_the_vm(cluster: &Cluster) {
         ..Default::default()
     }]));
     let reply = cluster
-        .run(vm_run_request("auto", &[], "print(2)"))
+        .run(vm_run_request("auto", &[], "echo two"))
         .await
         .expect("auto run");
     assert_eq!(reply.tier, "vm", "{reply:?}");
@@ -1178,4 +1186,54 @@ async fn isolates_own_sandbox_child_vms() {
     let cluster = vm_cluster("sandbox", "session", Some(1)).await;
     check_session_child_vm(&cluster).await;
     check_children_max(&cluster).await;
+}
+
+/// `args` on the VM tier are appended only to a `run.command` that ends
+/// with the staged entry; anything else is refused before it runs, and the
+/// args are still readable as `LEGION_RUN_ARGS` without them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vm_tier_args_need_a_command_that_ends_with_the_entry() {
+    let cluster = vm_cluster_with(
+        vm_isolate("request", None),
+        machine_running(
+            "exec",
+            json!(["sh", "-c", "echo env=$LEGION_RUN_ARGS; echo argv=$*", "sh"]),
+        ),
+    )
+    .await;
+    use legion::structs::runtime_state::{RuntimeDisable, RuntimeDisableSet};
+    let gate = cluster.task_manager.lock().unwrap().runtime_gate();
+    for tier in ["vm", "auto"] {
+        if tier == "auto" {
+            // auto goes to the VM here because the runtime is disabled: the
+            // refusal comes with the tier decision, before anything runs.
+            gate.replace(RuntimeDisableSet::new(vec![RuntimeDisable {
+                runtime: "isolate".into(),
+                ..Default::default()
+            }]));
+        }
+        let err = cluster
+            .run(vm_run_request(tier, &["--rm", "-rf"], "echo hi"))
+            .await
+            .expect_err("args refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{tier}: {err:?}");
+        assert!(
+            err.message()
+                .contains("run.command does not end with /legion/run/main.py"),
+            "{err:?}"
+        );
+    }
+    gate.replace(RuntimeDisableSet::new(vec![]));
+    assert_eq!(invocations(&cluster).await, 0, "nothing ran in an isolate");
+    assert_eq!(vm_runs(&cluster).await, 0, "nothing ran in a VM");
+    assert!(cluster.sessions().is_empty());
+    let reply = cluster
+        .run(vm_run_request("vm", &[], "echo hi"))
+        .await
+        .expect("no args");
+    assert_eq!(
+        String::from_utf8_lossy(&reply.stdout),
+        "env=[]\nargv=\n",
+        "{reply:?}"
+    );
 }

@@ -1186,8 +1186,9 @@
         {
             # Isolate task (see docs/task-runtime-isolate.md): a session task
             # whose units are WebAssembly isolates in a node's
-            # `legion-isolate` host, started in microseconds and charged a
-            # few MiB each. `legion session run maximal-demo --task snippets
+            # `legion-isolate` host, started in tens of microseconds (one to
+            # three milliseconds for the `js` and `python` images) and
+            # charged a few MiB each. `legion session run maximal-demo --task snippets
             # --file main.py` runs one; a run picks its tier (isolate or VM)
             # before it starts. Nothing per isolate is written to the store:
             # Legion places only the generated `snippets-envelope` (on

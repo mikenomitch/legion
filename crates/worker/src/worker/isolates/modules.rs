@@ -137,6 +137,31 @@ impl Compiler {
     /// Run `legion-isolate compile` with a timeout and an address-space
     /// limit, and read its report.
     fn compile(&self, input: &Path, output: &Path) -> Result<(), String> {
+        // At most COMPILE_CONCURRENCY compiles on the node at once.
+        let _slot = CompileSlot::take();
+        // The compiler reads from a private directory holding only this
+        // input, so the directory it may read is never every job's
+        // artifacts.
+        let private = self
+            .fallback_dir
+            .parent()
+            .unwrap_or(&self.fallback_dir)
+            .join("compile-inputs");
+        std::fs::create_dir_all(&private)
+            .map_err(|err| format!("creating {}: {err}", private.display()))?;
+        let scratch = tempfile::Builder::new()
+            .prefix("in-")
+            .tempdir_in(&private)
+            .map_err(|err| format!("creating a compile directory: {err}"))?;
+        let copy = scratch.path().join("module.wasm");
+        if std::fs::hard_link(input, &copy).is_err() {
+            std::fs::copy(input, &copy)
+                .map_err(|err| format!("copying the module to compile: {err}"))?;
+        }
+        self.compile_from(&copy, output)
+    }
+
+    fn compile_from(&self, input: &Path, output: &Path) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         let started = Instant::now();
         let mut command = std::process::Command::new(&self.binary.path);
@@ -146,6 +171,12 @@ impl Compiler {
             .arg(input)
             .arg("--output")
             .arg(output)
+            .arg("--confine")
+            .arg(match self.config.confine {
+                crate::structs::isolate::ConfineMode::Enforce => "enforce",
+                crate::structs::isolate::ConfineMode::BestEffort => "best-effort",
+                crate::structs::isolate::ConfineMode::Off => "off",
+            })
             .args(super::binary::engine_args(&self.config))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -440,6 +471,36 @@ pub fn read_beneath(root: &Path, relative: &Path, cap: u64) -> Result<Vec<u8>, S
         return Err(format!("it is over the {cap}-byte limit for an entry"));
     }
     Ok(content)
+}
+
+/// Compiles allowed at once on a node.
+const COMPILE_CONCURRENCY: usize = 2;
+
+static COMPILES: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// One of the node's [`COMPILE_CONCURRENCY`] compile slots, held for a
+/// compile (blocking: compiles run on blocking threads).
+struct CompileSlot;
+
+impl CompileSlot {
+    fn take() -> Self {
+        let (count, freed) = &COMPILES;
+        let mut held = count.lock().unwrap_or_else(|p| p.into_inner());
+        while *held >= COMPILE_CONCURRENCY {
+            held = freed.wait(held).unwrap_or_else(|p| p.into_inner());
+        }
+        *held += 1;
+        CompileSlot
+    }
+}
+
+impl Drop for CompileSlot {
+    fn drop(&mut self) {
+        let (count, freed) = &COMPILES;
+        let mut held = count.lock().unwrap_or_else(|p| p.into_inner());
+        *held = held.saturating_sub(1);
+        freed.notify_one();
+    }
 }
 
 /// The `cwasm` derived-content directory, which every host may read.

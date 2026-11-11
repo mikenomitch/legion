@@ -188,9 +188,6 @@ pub fn stop_hint(reason: &str, limit: &str, has_vm: bool) -> String {
         ("limits", "cpu") => format!("raise config.limits.cpu{vm}"),
         ("limits", "wall") => format!("raise config.limits.wall{vm}"),
         ("limits", "memory") => format!("raise resources.memoryMax{vm}"),
-        ("limits", "output") => "raise config.limits.output, or write large results to a file \
-                                 the caller gets"
-            .into(),
         ("limits", _) => format!("raise the task's config.limits{vm}"),
         ("unsupported", _) if has_vm => "rerun with --tier vm (this code's next auto run on this \
                                          node goes to a VM on its own), or pass --fallback vm \

@@ -662,8 +662,7 @@ impl ManagerDaemonService {
                 denied
             }
         };
-        acl::enforce(identity, AclResource::Scale, AclAction::Write, &read_scope)
-            .map_err(hide)?;
+        acl::enforce(identity, AclResource::Scale, AclAction::Write, &read_scope).map_err(hide)?;
         // A move suspends and resumes the session, which is `job:write`.
         acl::enforce(
             identity,

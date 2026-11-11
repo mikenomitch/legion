@@ -137,6 +137,23 @@ impl IsolateWorker for WorkerService {
         // ACL: node-local, as `egress`.
         let request = request.into_inner();
         let (supervisor, task) = self.task(request.origin.as_ref())?;
+        // Children are owned by the isolate's id: the host must name an
+        // isolate the worker issued it for this very job and task.
+        if !supervisor.issued(&self.cordon, &task) {
+            warn!(
+                cordon = %self.cordon,
+                job_id = %task.job_id,
+                task = %task.task_name,
+                "An isolate host named an isolate the worker did not give it; VM call refused"
+            );
+            return Err(Status::permission_denied(format!(
+                "{} {} of task {}/{} is not an isolate this worker gave the host",
+                if task.session { "session" } else { "invocation" },
+                task.isolate_id,
+                task.job_id,
+                task.task_name
+            )));
+        }
         let vm_task = supervisor.vm_task_of(&task.job_id, &task.task_name);
         Ok(Response::new(
             supervisor

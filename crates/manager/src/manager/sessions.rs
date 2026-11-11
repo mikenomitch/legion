@@ -1662,7 +1662,7 @@ pub async fn start(
             Ok(()) if isolate => {
                 // The node's answer is the confirmation: a session isolate
                 // never appears in the node's session report, so nothing
-                // is recorded in the index (isolate-runtime calls entry 3).
+                // is recorded in the index (isolate-runtime calls entry 4).
                 reservation.settle(Settle::Released);
                 metrics.session_starts_total.inc(&["started"]);
                 debug!(session_id, node_id = %node_id, "Session isolate started");

@@ -57,7 +57,7 @@ pub(crate) const STATE_QUOTA_BYTES: u64 = 1 << 20;
 /// How long a drain gives in-flight invocations at worker shutdown.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
-type TaskKey = (String, String);
+pub(crate) type TaskKey = (String, String);
 
 /// Whether a task can take work.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +227,22 @@ pub struct IsolateSupervisor {
     ingress: Mutex<HashMap<TaskKey, Vec<super::ingress::IngressServer>>>,
     /// Where guest output goes: the envelope allocations' task logs.
     guest_logs: RwLock<Option<super::guest_logs::GuestLogs>>,
+    /// Invocations in flight: (cordon, job, task, invocation id). A host
+    /// may act as a request or tenant isolate (child VMs) only while the
+    /// worker has such an invocation open with it.
+    inflight: Mutex<std::collections::HashSet<(String, String, String, String)>>,
+}
+
+/// Removes an in-flight invocation when the call ends, however it ends.
+pub(crate) struct Inflight<'a> {
+    supervisor: &'a IsolateSupervisor,
+    key: (String, String, String, String),
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        lock(&self.supervisor.inflight).remove(&self.key);
+    }
 }
 
 impl std::fmt::Debug for IsolateSupervisor {
@@ -289,6 +305,7 @@ impl IsolateSupervisor {
             alloc_root: Mutex::new(None),
             ingress: Mutex::new(HashMap::new()),
             guest_logs: RwLock::new(None),
+            inflight: Mutex::new(Default::default()),
         })
     }
 
@@ -1172,6 +1189,38 @@ impl IsolateSupervisor {
         })
     }
 
+    pub(crate) fn inflight(&self, cordon: &str, key: &TaskKey, id: &str) -> Inflight<'_> {
+        let entry = (
+            cordon.to_string(),
+            key.0.clone(),
+            key.1.clone(),
+            id.to_string(),
+        );
+        lock(&self.inflight).insert(entry.clone());
+        Inflight {
+            supervisor: self,
+            key: entry,
+        }
+    }
+
+    /// Whether the isolate a host request names is one this worker gave
+    /// that host's cordon: a session isolate of exactly that job and task
+    /// it holds, or an invocation of that task in flight on it. A host can
+    /// otherwise claim any id (child VMs are owned by these ids).
+    pub fn issued(&self, cordon: &str, task: &IsolateTaskRef) -> bool {
+        if task.session {
+            return lock(&self.sessions)
+                .get(&task.isolate_id)
+                .is_some_and(|r| r.job_id == task.job_id && r.task_name == task.task_name);
+        }
+        lock(&self.inflight).contains(&(
+            cordon.to_string(),
+            task.job_id.clone(),
+            task.task_name.clone(),
+            task.isolate_id.clone(),
+        ))
+    }
+
     pub fn vm_task_of(&self, job_id: &str, task_name: &str) -> Option<String> {
         lock(&self.state)
             .tasks
@@ -1687,6 +1736,7 @@ impl IsolateSupervisor {
                 get,
             })),
         };
+        let _inflight = self.inflight(&cordon, key, run_id);
         let mut client = conn.client.clone();
         let reply = client
             .invoke(invoke)
@@ -2125,9 +2175,9 @@ impl IsolateSupervisor {
         Some(reply)
     }
 
-    /// Hibernate a session isolate now. The protocol hibernates idle
-    /// sessions host-wide (`Reclaim{HIBERNATE}`), so every idle session in
-    /// its host replica goes too; they wake on their next call.
+    /// Hibernate this one session isolate now (`Reclaim{HIBERNATE}` with
+    /// `session_ids` = it); the host's other sessions stay resident. A busy
+    /// session answers FAILED_PRECONDITION.
     pub async fn hibernate(&self, session_id: &str) -> Result<(u64, u64, bool), Status> {
         let record = lock(&self.sessions)
             .get(session_id)
@@ -2516,6 +2566,7 @@ impl IsolateSupervisor {
         let tenant = tenant.as_str();
         let (_, conn) = self.pick_replica(&cordon, tenant, session_replica)?;
         let invocation_id = crate::structs::mint_session_id(task_name, &self.node_id);
+        let _inflight = self.inflight(&cordon, &key, &invocation_id);
         let mut client = conn.client.clone();
         let reply = client
             .invoke(host::InvokeRequest {

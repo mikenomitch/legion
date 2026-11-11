@@ -1159,7 +1159,7 @@ impl ManagerDaemonService {
                 ))
             })?;
         // An isolate session is never a keyed instance (isolate-runtime
-        // calls entry 10): refused before any write.
+        // calls entry 24): refused before any write.
         crate::structs::session::promotable(&task).map_err(Status::failed_precondition)?;
         if !new_id.is_empty() && !crate::structs::session::accepts_names(&task) {
             return Err(Status::invalid_argument(format!(
@@ -1265,7 +1265,11 @@ impl ManagerDaemonService {
 /// against NotFound for one that does not tells a caller who passed the
 /// coarse check which session ids exist. A caller who can read the job gets
 /// the real denial: it could see the session anyway.
-pub(super) fn hides_session(identity: &AclIdentity, read_scope: &AclScope, denied: &Status) -> bool {
+pub(super) fn hides_session(
+    identity: &AclIdentity,
+    read_scope: &AclScope,
+    denied: &Status,
+) -> bool {
     denied.code() == tonic::Code::PermissionDenied
         && !identity.allows(AclResource::Job, AclAction::Read, read_scope)
 }

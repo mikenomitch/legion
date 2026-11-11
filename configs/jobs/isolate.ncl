@@ -10,11 +10,13 @@
 #
 # `run` is the isolate task: each run gets a fresh Python isolate (CPython
 # compiled to WebAssembly) in its node's `legion-isolate` host, started in
-# well under a millisecond. A run that needs what an isolate lacks (native
-# packages, subprocesses, a filesystem) goes to `machine`, a sandbox session
-# task that takes runs, either because the caller asked (`--tier vm`) or
-# because the node's pre-flight check or its memory of earlier runs said so
-# (`tier = "auto"`, the default).
+# one to three milliseconds (tens of microseconds for a small compiled
+# component). A run that needs what an isolate lacks (native packages,
+# subprocesses, a persistent filesystem: an isolate has only an in-memory
+# scratch one) goes to `machine`, a sandbox session task that takes runs,
+# either because the caller asked (`--tier vm`) or because the node's
+# pre-flight check or its memory of earlier runs said so (`tier = "auto"`,
+# the default).
 #
 # Worker setup: workers need the `legion-isolate` binary beside the worker
 # (or LEGION_ISOLATE_BINARY) to advertise the `isolates` capability, and

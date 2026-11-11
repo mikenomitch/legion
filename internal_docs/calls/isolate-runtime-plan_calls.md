@@ -1000,7 +1000,7 @@ isolates (entry 44), so today a session isolate does not survive its node,
 and the refusal no longer recommends it:
 
 ```text
-FAILED_PRECONDITION: isolate sessions cannot be promoted (a keyed instance is an allocation each); give the session a stable id with an idempotency key, and keep what must outlive the node in legion:isolate/state or an upstream store
+FAILED_PRECONDITION: isolate sessions cannot be promoted (a keyed instance is an allocation each); give the session a stable id with an idempotency key, and keep what must outlive its node in an upstream store
 ```
 
 (Its `legion:isolate/state` half overstates: with `local` checkpoints the

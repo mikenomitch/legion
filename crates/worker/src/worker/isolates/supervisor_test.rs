@@ -76,7 +76,9 @@ impl IsolateHost for FakeHost {
                 no_new_privs: true,
                 landlock: true,
                 seccomp: true,
-                notes: vec![],
+                mount_root: true,
+                pid_namespace: true,
+                ..Default::default()
             }),
         }))
     }
@@ -672,7 +674,7 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
     assert_eq!((reply.cpu_ms, reply.cpu_micros), (2, 1_500));
     let hosts = h.launcher.hosts();
     assert_eq!(hosts.len(), 1);
-    assert_eq!(hosts[0].0.cordon, "ns:ns", "the namespace cordon by default");
+    assert_eq!(hosts[0].0.cordon, "ns:ns", "namespace cordon");
     let spec =
         hosts[0].1.state.lock().unwrap().tasks[&("ns/app".to_string(), "run".to_string())].clone();
     assert_eq!(
@@ -760,7 +762,8 @@ async fn isolate_only_fields_are_checked() {
     let mut call = run_call("ns/app", "run", &[("main.wasm", "hi")]);
     call.request.session_id = "s".into();
     let err = h.supervisor.run(call, None).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    // As the manager and the proto say.
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
         err.message().contains("lifetime = \"session\""),
         "{}",
@@ -1237,7 +1240,8 @@ async fn stats_fold_and_count() {
     assert_eq!(tasks[0].stopped["limits"], 1);
     assert_eq!(tasks[0].reservation_bytes, 16 << 20);
     assert_eq!(tasks[0].cordon, "ns:ns");
-    assert_eq!(hosts[0].confinement.len(), 5);
+    // The five original layers, a private mount root, a PID namespace.
+    assert_eq!(hosts[0].confinement.len(), 7);
     assert_eq!(hosts[0].engine_version, "wasmtime-fake");
     let (filtered, _) = h.supervisor.stats("other/job", "").await;
     assert!(filtered.is_empty());
@@ -1498,4 +1502,146 @@ async fn the_host_cgroup_follows_envelope_resizes() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(max(), (2560u64 << 20).to_string());
+}
+
+/// A host may act only as isolates the worker gave it: a session isolate
+/// of exactly that job and task, or an invocation in flight on its cordon.
+#[tokio::test]
+async fn hosts_may_name_only_isolates_the_worker_issued() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-own.1", "", "manager", "", "")
+        .await
+        .unwrap();
+    let named = |job: &str, task: &str, id: &str, session: bool| super::IsolateTaskRef {
+        job_id: job.into(),
+        task_name: task.into(),
+        envelope_allocation_id: 7,
+        isolate_id: id.into(),
+        tenant: String::new(),
+        session,
+    };
+    assert!(h.supervisor.issued("ns", &named("ns/app", "run", "run-own.1", true)));
+    assert!(!h.supervisor.issued("ns", &named("ns/app", "run", "run-nope.1", true)));
+    assert!(!h.supervisor.issued("ns", &named("ns/other", "run", "run-own.1", true)));
+    assert!(!h.supervisor.issued("ns", &named("ns/app", "web", "run-own.1", true)));
+    // Invocations: only while in flight, only on their cordon and task.
+    let key = ("ns/app".to_string(), "run".to_string());
+    let invocation = named("ns/app", "run", "inv-1", false);
+    assert!(!h.supervisor.issued("ns", &invocation));
+    {
+        let _open = h.supervisor.inflight("ns", &key, "inv-1");
+        assert!(h.supervisor.issued("ns", &invocation));
+        assert!(!h.supervisor.issued("shared", &invocation));
+        assert!(!h.supervisor.issued("ns", &named("ns/app", "web", "inv-1", false)));
+        assert!(!h.supervisor.issued("ns", &named("ns/x", "run", "inv-1", false)));
+    }
+    assert!(!h.supervisor.issued("ns", &invocation), "ended with the call");
+}
+
+/// A call in a session uses the session's tenant; naming another is
+/// refused.
+#[tokio::test]
+async fn a_session_call_naming_another_tenant_is_refused() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-t.1", "user-1", "manager", "", "")
+        .await
+        .unwrap();
+    let call = |tenant: &str| {
+        let mut call = run_call("ns/app", "run", &[("main.wasm", "count")]);
+        call.request.session_id = "run-t.1".into();
+        call.request.tenant = tenant.into();
+        call
+    };
+    let err = h.supervisor.run(call("user-2"), None).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("belongs to tenant \"user-1\""), "{err:?}");
+    h.supervisor.run(call("user-1"), None).await.unwrap();
+    h.supervisor.run(call(""), None).await.unwrap();
+}
+
+/// With `config.entry`, the entry is that file and the run's files are
+/// data; a run file named like the entry is refused.
+#[tokio::test]
+async fn config_entry_is_the_entry_and_run_files_are_data() {
+    let h = harness();
+    let config = json!({
+        "image": "python",
+        "entry": "main.py",
+        "lifetime": "request",
+        "limits": { "cpu": "100ms", "wall": "1s" },
+    });
+    let mut task = isolate_task("run", config);
+    task.artifacts = vec![serde_json::from_value(
+        json!({ "source": "https://example.com/main.py", "dest": "main.py" }),
+    )
+    .unwrap()];
+    h.supervisor.sync(vec![envelope("ns/app", task, 1024.0)]);
+    let reply = h
+        .supervisor
+        .run(run_call("ns/app", "run", &[("data.csv", "a,b")]), None)
+        .await
+        .unwrap();
+    assert_eq!(reply.exit, Some(0), "{reply:?}");
+    let err = h
+        .supervisor
+        .run(run_call("ns/app", "run", &[("main.py", "x")]), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("config.entry"), "{err:?}");
+}
+
+/// A host's checkpoint is checked before it is buffered: a session it
+/// holds, a declared size within the cap, and no more than it declared.
+#[tokio::test]
+async fn checkpoints_are_bounded_and_checked_first() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-c.1", "", "manager", "", "")
+        .await
+        .unwrap();
+    let worker = h.launcher.hosts()[0].1.worker.clone();
+    let send = |session: &str, declared: u64, body: Vec<u8>| {
+        let mut worker = worker.clone();
+        let chunks = vec![
+            CheckpointChunk {
+                part: Some(checkpoint_chunk::Part::Header(CheckpointHeader {
+                    origin: Some(origin("ns/app", "run", session)),
+                    engine_version: "wasmtime-fake".into(),
+                    module_id: "m".into(),
+                    bytes: declared,
+                    freed_bytes: 0,
+                })),
+            },
+            CheckpointChunk {
+                part: Some(checkpoint_chunk::Part::Data(body)),
+            },
+        ];
+        async move { worker.save_checkpoint(futures::stream::iter(chunks)).await }
+    };
+    let cap = super::service::MAX_CHECKPOINT_BYTES;
+    let err = send("run-c.1", cap + 1, vec![]).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+    let err = send("run-c.1", 4, vec![0; 64]).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+    let err = send("run-unknown.1", 4, vec![0; 4]).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    send("run-c.1", 4, vec![0; 4]).await.unwrap();
 }

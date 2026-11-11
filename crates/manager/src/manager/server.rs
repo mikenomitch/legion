@@ -7391,7 +7391,7 @@ impl Manager for ManagerDaemonService {
         }
         if crate::structs::isolate::is_isolate_task(task) {
             // A keyed instance is an allocation each (isolate-runtime calls
-            // entry 10): an isolate task has session isolates only.
+            // entry 24): an isolate task has session isolates only.
             return Err(Status::invalid_argument(format!(
                 "task {} runs on the isolate runtime, whose isolates are never keyed instances; \
                  omit instance_id\nHint: pass an idempotency key for a stable session id",

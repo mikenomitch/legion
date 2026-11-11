@@ -423,7 +423,7 @@ impl Host {
             protocol_version: PROTOCOL_VERSION,
             engine_version: ENGINE_VERSION.into(),
             compat_key: self.0.compat_key.clone(),
-            pid: std::process::id(),
+            pid: crate::confine::worker_visible_pid(),
             shards: self.0.shards.len() as u32,
             slots: c.slots,
             layout: self.0.params.layout as i32,
