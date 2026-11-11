@@ -943,12 +943,14 @@ A **cordon** is the set of isolates that share one host process on a node:
 
 | `config.cordon` | Cordon name | Who shares the process |
 | --- | --- | --- |
-| `namespace` (default) | the job's namespace | every isolate task of every job in that namespace |
+| `namespace` (default) | `ns:<namespace>` | every isolate task of every job in that namespace |
 | `job` | `job:<job id>` | this job's isolate tasks only |
 | `shared` | `shared` | every isolate task, from every namespace, that chose `shared` |
 
 `shared` is refused unless a namespace policy governing the job's namespace
 lists it in `isolateCordons` (see [Namespace policy](#namespace-policy)).
+The prefixes keep the kinds apart: a namespace named `shared` has the cordon
+`ns:shared`, not the shared cordon.
 
 A node runs one host process per cordon, and adds **replicas** when one
 process's slots are not enough for the cordon's tasks. Replicas are added,
@@ -975,9 +977,10 @@ only). `legion isolate stats` lists the layers in force for every host
 process (`confinement`); a layer missing from the list did not apply.
 
 With resource enforcement on and cgroup v2, each host process also runs in
-its own cgroup (`<cgroupParent>/isolate-hosts/<cordon>-<replica>`), with
-`memory.max` the sum of the cordon's envelopes on the node and `pids.max`
-1024. No `cpu.weight` is set on it.
+its own cgroup (`<cgroupParent>/isolate-hosts/<cordon>-<replica>`, with
+every character of the cordon name other than a letter, digit or `-`
+written as `_`, so `ns:default` is `ns_default-0`), with `memory.max` the
+sum of the cordon's envelopes on the node and `pids.max` 1024. No `cpu.weight` is set on it.
 
 The host holds no credentials, no TLS keys, no tokens, and no KV access. It
 reaches nothing but the two sockets its worker gave it, and every request it
@@ -1127,8 +1130,8 @@ listed one by one.
 
 ```console
 $ legion isolate stats code-runner
-NODE  TASK  CORDON   RESIDENT  ACTIVE  PAGED-OUT  HIBERNATED  QUEUED  INV/S  CPU-S/S  VM/MIN  CHILD-VMS  STOPPED  REFUSED  HOST-RSS  AGE
-w-17  run   default  412       3       0          0           0       88.0   0.31     1.5     0          7        0        612MiB    1.2s
+NODE  TASK  CORDON      RESIDENT  ACTIVE  PAGED-OUT  HIBERNATED  QUEUED  INV/S  CPU-S/S  VM/MIN  CHILD-VMS  STOPPED  REFUSED  HOST-RSS  AGE
+w-17  run   ns:default  412       3       0          0           0       88.0   0.31     1.5     0          7        0        612MiB    1.2s
 ```
 
 | Column (JSON key) | Meaning |

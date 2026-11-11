@@ -2,7 +2,7 @@
 //! `GetIsolateStats` from the heartbeat aggregates this manager keeps
 //! ([`crate::manager::isolates`]), and `GetIsolate`, a read forwarded to the
 //! node a session isolate's id names. Managers keep no record of isolates
-//! (isolate-runtime calls entry 3).
+//! (isolate-runtime calls entry 4).
 
 use super::*;
 use crate::manager::{isolates, sessions};
@@ -98,12 +98,21 @@ impl ManagerDaemonService {
         for node_id in &nodes {
             match get_isolate_on_node(&self.store, node_id, &session_id).await {
                 Ok(mut reply) => {
-                    acl::enforce(
+                    // A caller who cannot read the isolate's job is answered
+                    // as if the node did not hold it, so PermissionDenied
+                    // never tells it which ids exist (the coarse check above
+                    // still refuses a caller who can read no job at all).
+                    if let Err(denied) = acl::enforce(
                         &ident,
                         AclResource::Job,
                         AclAction::Read,
                         &AclScope::job(&reply.job_id),
-                    )?;
+                    ) {
+                        if denied.code() == tonic::Code::PermissionDenied {
+                            continue;
+                        }
+                        return Err(denied);
+                    }
                     if reply.node_id.is_empty() {
                         reply.node_id = node_id.clone();
                     }

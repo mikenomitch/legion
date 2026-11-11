@@ -643,27 +643,35 @@ impl ManagerDaemonService {
         size: ResourceSize,
     ) -> Result<Response<ResizeReply>, Status> {
         let session_id = inner.instance_id.as_str();
+        let not_found = || Status::not_found(format!("instance {session_id} not found"));
         let found = sessions::find(&self.store, session_id)
             .await
-            .ok_or_else(|| Status::not_found(format!("instance {session_id} not found")))?;
+            .ok_or_else(not_found)?;
         let job_id = found
             .status
             .as_ref()
             .map(|status| status.job_id.clone())
             .unwrap_or_default();
-        acl::enforce(
-            identity,
-            AclResource::Scale,
-            AclAction::Write,
-            &self.job_read_scope(&job_id),
-        )?;
+        let read_scope = self.job_read_scope(&job_id);
+        // A caller who cannot read the session's job is answered as for a
+        // missing id, never PermissionDenied (an existence oracle).
+        let hide = |denied: Status| {
+            if super::session_rpcs::hides_session(identity, &read_scope, &denied) {
+                not_found()
+            } else {
+                denied
+            }
+        };
+        acl::enforce(identity, AclResource::Scale, AclAction::Write, &read_scope)
+            .map_err(hide)?;
         // A move suspends and resumes the session, which is `job:write`.
         acl::enforce(
             identity,
             AclResource::Job,
             AclAction::Write,
             &AclScope::job(&job_id),
-        )?;
+        )
+        .map_err(hide)?;
         let task_name = found
             .status
             .as_ref()
@@ -1144,11 +1152,17 @@ impl ManagerDaemonService {
             .as_ref()
             .map(|status| status.job_id.clone())
             .unwrap_or_default();
-        acl::enforce(
-            identity,
-            AclResource::Scale,
-            AclAction::Write,
-            &self.job_read_scope(&job_id),
+        let read_scope = self.job_read_scope(&job_id);
+        // A caller who cannot read the session's job is answered as for a
+        // missing id, never PermissionDenied (an existence oracle).
+        acl::enforce(identity, AclResource::Scale, AclAction::Write, &read_scope).map_err(
+            |denied| {
+                if super::session_rpcs::hides_session(identity, &read_scope, &denied) {
+                    not_found()
+                } else {
+                    denied
+                }
+            },
         )?;
         let metrics = crate::manager::telemetry::metrics();
         let mut reply = ResizeReply {

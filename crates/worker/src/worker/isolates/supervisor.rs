@@ -53,7 +53,7 @@ const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
 /// A warm tenant instance idle this long is dropped (`TaskSpec`).
 const TENANT_IDLE: Duration = Duration::from_secs(60);
 /// Bytes one tenant or session may keep in `legion:isolate/state`.
-const STATE_QUOTA_BYTES: u64 = 1 << 20;
+pub(crate) const STATE_QUOTA_BYTES: u64 = 1 << 20;
 /// How long a drain gives in-flight invocations at worker shutdown.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
@@ -1369,7 +1369,7 @@ impl IsolateSupervisor {
             .map(|task| task.resolved.lifetime)
             .unwrap_or_default();
         if !request.session_id.is_empty() && lifetime != IsolateLifetime::Session {
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::failed_precondition(format!(
                 "session_id applies only to an isolate task with lifetime = \"session\"; task {} \
                  has lifetime = \"{}\"",
                 call.task_name,
@@ -1433,8 +1433,24 @@ impl IsolateSupervisor {
                 .filter(|(path, _, _)| path != crate::structs::run::RUN_INPUT_FILE)
                 .map(|(path, _, _)| path.as_str())
                 .collect();
-            let entry_name =
-                crate::structs::isolate::run_entry(task.image(), &names).map(str::to_string);
+            // `config.entry` IS the entry (the host stages it from
+            // `TaskSpec.entry`): the run's files are data, and one named like
+            // the entry would shadow it, so it is refused.
+            let entry_name = if task.resolved.entry.is_some() {
+                if let Some(entry) = task.entry.as_ref() {
+                    if names.contains(&entry.path.as_str()) {
+                        return Err(Status::invalid_argument(format!(
+                            "file {} has the name of task {}'s config.entry, which is the \
+                             entry of every run; the run's files are data\nHint: rename the \
+                             file",
+                            entry.path, key.1
+                        )));
+                    }
+                }
+                None
+            } else {
+                crate::structs::isolate::run_entry(task.image(), &names).map(str::to_string)
+            };
             let source = match entry_name.as_deref() {
                 Some(name) => staged
                     .files
@@ -1614,6 +1630,7 @@ impl IsolateSupervisor {
             .get(key)
             .map(|task| task.cordon.clone())
             .ok_or_else(|| Status::unavailable("the task left this node; retry"))?;
+        let mut session_tenant = String::new();
         let session_replica = if request.session_id.is_empty() {
             None
         } else {
@@ -1628,9 +1645,18 @@ impl IsolateSupervisor {
                     ))
                 })?;
             record.last_active_unix_ms = crate::util::now_unix_ms();
+            check_session_tenant(&request.session_id, &record.tenant, &request.tenant)?;
+            session_tenant = record.tenant.clone();
             Some(record.replica)
         };
-        let (_, conn) = self.pick_replica(&cordon, &request.tenant, session_replica)?;
+        // A session's own tenant is the run's, everywhere (stats, egress
+        // origin, fairness).
+        let tenant = if request.session_id.is_empty() {
+            request.tenant.clone()
+        } else {
+            session_tenant
+        };
+        let (_, conn) = self.pick_replica(&cordon, &tenant, session_replica)?;
         let get: Vec<String> = staged
             .get
             .iter()
@@ -1651,7 +1677,7 @@ impl IsolateSupervisor {
             job_id: key.0.clone(),
             task_name: key.1.clone(),
             invocation_id: run_id.to_string(),
-            tenant: request.tenant.clone(),
+            tenant: tenant.clone(),
             session_id: request.session_id.clone(),
             call: Some(host::invoke_request::Call::Run(host::RunCall {
                 files,
@@ -1707,7 +1733,7 @@ impl IsolateSupervisor {
             );
         }
         if request.session_id.is_empty() {
-            let task = self.task_ref_for(&key.0, &key.1, run_id, &request.tenant, false);
+            let task = self.task_ref_for(&key.0, &key.1, run_id, &tenant, false);
             self.vm_backend()
                 .owner_ended(&task, "its run finished")
                 .await;
@@ -1748,11 +1774,6 @@ impl IsolateSupervisor {
                 "this node cannot start a VM for the run",
             ));
         };
-        let label = vm_reason_label(reason);
-        crate::telemetry::worker_metrics()
-            .isolate_vm_runs_total
-            .inc(&[label]);
-        *lock(&self.state).vm_runs.entry(key.clone()).or_default() += 1;
         // The entry is staged as the image's VM entry name, the other files
         // as sent.
         let entry_name = decided.entry_name.clone();
@@ -1775,7 +1796,36 @@ impl IsolateSupervisor {
                 executable,
             });
         }
-        let args = call.request.args.clone();
+        // A task with `config.entry`: its entry is that file, staged for the
+        // VM as the image's VM entry (the run's files are data).
+        let mut entry_name = entry_name;
+        if entry_name.is_none() {
+            let configured = lock(&self.state)
+                .tasks
+                .get(key)
+                .and_then(|task| task.entry.clone());
+            if let Some(entry) = configured {
+                let path = vm_entry.map(str::to_string).unwrap_or(entry.path.clone());
+                files.push(crate::structs::RunFile {
+                    path: path.clone(),
+                    content: entry.content,
+                    executable: false,
+                });
+                entry_name = Some(path);
+            }
+        }
+        let entry_path = format!(
+            "{}/{}",
+            crate::structs::run::RUN_DIR,
+            vm_entry
+                .map(str::to_string)
+                .or_else(|| entry_name.clone())
+                .unwrap_or_default()
+        );
+        let vm_args = crate::worker::task_manager::session_runs::VmArgs {
+            args: call.request.args.clone(),
+            entry_path,
+        };
         let request = RunSessionRequest {
             job_id: key.0.clone(),
             task_name: vm_task.clone(),
@@ -1798,9 +1848,14 @@ impl IsolateSupervisor {
                 request,
                 ticket_jti: call.ticket_jti.clone(),
             },
-            args,
+            Some(vm_args),
         )
         .await?;
+        // Counted once the VM run happened (a refused one did not).
+        crate::telemetry::worker_metrics()
+            .isolate_vm_runs_total
+            .inc(&[vm_reason_label(reason)]);
+        *lock(&self.state).vm_runs.entry(key.clone()).or_default() += 1;
         let elapsed = started.elapsed().as_millis() as u64;
         Ok(RunSessionResponse {
             tier: tier::TIER_VM.into(),
@@ -2440,22 +2495,25 @@ impl IsolateSupervisor {
             .get(&key)
             .map(|t| t.cordon.clone())
             .unwrap_or_default();
+        let mut tenant = tenant.to_string();
         let session_replica = if session_id.is_empty() {
             None
         } else {
-            Some(
-                lock(&self.sessions)
-                    .get(session_id)
-                    .filter(|r| r.job_id == job_id && r.task_name == task_name)
-                    .map(|r| r.replica)
-                    .ok_or_else(|| {
-                        Status::not_found(format!(
-                            "session isolate {session_id} is not on node {}",
-                            self.node_id
-                        ))
-                    })?,
-            )
+            let (replica, own) = lock(&self.sessions)
+                .get(session_id)
+                .filter(|r| r.job_id == job_id && r.task_name == task_name)
+                .map(|r| (r.replica, r.tenant.clone()))
+                .ok_or_else(|| {
+                    Status::not_found(format!(
+                        "session isolate {session_id} is not on node {}",
+                        self.node_id
+                    ))
+                })?;
+            check_session_tenant(session_id, &own, &tenant)?;
+            tenant = own;
+            Some(replica)
         };
+        let tenant = tenant.as_str();
         let (_, conn) = self.pick_replica(&cordon, tenant, session_replica)?;
         let invocation_id = crate::structs::mint_session_id(task_name, &self.node_id);
         let mut client = conn.client.clone();
@@ -2900,6 +2958,24 @@ struct Decided {
 /// The most `args` a run may carry, and their total size.
 pub const MAX_RUN_ARGS: usize = 64;
 pub const MAX_RUN_ARGS_BYTES: usize = 64 << 10;
+
+/// A call that names a session isolate may not name a different tenant:
+/// the session's own tenant is the call's.
+fn check_session_tenant(session_id: &str, own: &str, asked: &str) -> Result<(), Status> {
+    if !asked.is_empty() && asked != own {
+        return Err(Status::invalid_argument(format!(
+            "session isolate {session_id} belongs to {}, not tenant {asked:?}; a call in a \
+             session uses the session's tenant\nHint: drop the tenant (Legion-Tenant), or \
+             start a session for that tenant",
+            if own.is_empty() {
+                "no tenant".to_string()
+            } else {
+                format!("tenant {own:?}")
+            }
+        )));
+    }
+    Ok(())
+}
 
 fn check_args(args: &[String]) -> Result<(), Status> {
     if args.len() > MAX_RUN_ARGS {

@@ -129,6 +129,16 @@ pub async fn serve_ports(
 
 async fn answer(served: &Served, request: Request<Incoming>) -> Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
+    // A routing header given twice is ambiguous (which tenant? which
+    // session?): refused rather than first-wins.
+    for name in [TENANT_HEADER, SESSION_HEADER] {
+        if parts.headers.get_all(name).iter().count() > 1 {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                &format!("{name} may appear at most once in a request"),
+            );
+        }
+    }
     let header_text = |name: &str| {
         parts
             .headers
@@ -444,6 +454,19 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
         assert!(response.contains("Legion-Tenant"), "{response}");
+        // A routing header twice: 400, never first-wins.
+        for twice in [
+            "Legion-Tenant: a\r\nLegion-Tenant: b",
+            "Legion-Session: s-1\r\nlegion-session: s-2",
+        ] {
+            let response = send(
+                &socket,
+                &format!("GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n{twice}\r\n\r\n"),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(response.contains("at most once"), "{response}");
+        }
         assert_eq!(target.calls.lock().unwrap().len(), 1);
 
         // Dropping the server removes its socket.

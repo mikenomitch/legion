@@ -10194,7 +10194,7 @@ message IsolateTaskStats {
   string task_name = 2;
 
   // The cordon whose host process runs this task's isolates on the node
-  // (`config.cordon`): a namespace name, `job:<job id>`, or `shared`.
+  // (`config.cordon`): `ns:<namespace>`, `job:<job id>`, or `shared`.
   string cordon = 3;
 
   // Isolates with an instance in memory on the node now: running, idle,

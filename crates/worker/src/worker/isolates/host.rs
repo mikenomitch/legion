@@ -20,6 +20,16 @@ use tonic::transport::{Channel, Endpoint};
 /// are a few MiB; checkpoints are streamed.
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 
+/// The most `IsolateWorker` calls one host may have in flight (egress,
+/// child VMs, checkpoints, logs). Each egress call may buffer up to
+/// `isolate.maxBodyBytes` each way, so this also bounds what one host can
+/// make the worker hold.
+pub const MAX_HOST_CALLS: u32 = 256;
+
+/// The longest host stderr line the worker keeps; the rest of the line is
+/// dropped.
+pub const MAX_STDERR_LINE: usize = 4096;
+
 /// One host process the launcher started.
 pub struct Launched {
     pub client: IsolateHostClient<Channel>,
@@ -85,7 +95,11 @@ pub fn serve_over<S: IsolateWorker>(stream: tokio::net::UnixStream, service: S) 
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     tokio::spawn(async move {
         let incoming = tokio_stream::once(Ok::<_, std::io::Error>(stream));
+        // A host is not trusted with the worker's memory: bound how many
+        // calls it may have open at once on its one connection.
         if let Err(err) = tonic::transport::Server::builder()
+            .http2_max_concurrent_streams(Some(MAX_HOST_CALLS))
+            .concurrency_limit_per_connection(MAX_HOST_CALLS as usize)
             .add_service(server)
             .serve_with_incoming(incoming)
             .await
@@ -248,6 +262,10 @@ impl HostLauncher for ProcessLauncher {
             .with_context(|| format!("start {} host", self.binary.display()))?;
         drop((control_theirs, worker_theirs, config));
         let pid = child.id().unwrap_or_default();
+        // A pidfd names this process, not its number: signalling through it
+        // can never hit another process that reused the pid after the host
+        // exited and was reaped.
+        let pidfd = pidfd_open(pid);
         let mut cgroup = None;
         if let Some(dir) = self.cgroup_dir.as_ref() {
             match place_in_cgroup(dir, spawn, pid) {
@@ -264,9 +282,8 @@ impl HostLauncher for ProcessLauncher {
             let cordon = spawn.cordon.clone();
             let replica = spawn.replica;
             tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut lines = BoundedLines::new(stderr, MAX_STDERR_LINE);
+                while let Some(line) = lines.next().await {
                     if line.contains("ERROR") || line.contains("WARN") || line.contains("panicked")
                     {
                         info!(cordon = %cordon, replica, "isolate host: {line}");
@@ -286,13 +303,31 @@ impl HostLauncher for ProcessLauncher {
         });
         serve_over(tokio_stream(worker_ours)?, worker);
         let client = client_over(tokio_stream(control_ours)?).await?;
-        let kill = Box::new(move || {
-            if pid > 1 {
+        let alive = exited.clone();
+        let kill = Box::new(move || match pidfd.as_ref() {
+            Some(fd) => {
+                use std::os::fd::AsRawFd;
+                // SAFETY: pidfd_send_signal on a pidfd this closure owns.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+            // A kernel without pidfds (before 5.3): signal by pid only while
+            // the host has not been reaped, which narrows the reuse window
+            // to the instant between the check and the kill.
+            None if pid > 1 && alive.borrow().is_none() => {
                 // SAFETY: a plain kill(2) of the child we started.
                 unsafe {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
             }
+            None => {}
         });
         Ok(Launched {
             client,
@@ -301,6 +336,106 @@ impl HostLauncher for ProcessLauncher {
             kill,
             cgroup,
         })
+    }
+}
+
+/// `pidfd_open(2)`, or `None` where the kernel has none.
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if pid <= 1 {
+        return None;
+    }
+    // SAFETY: pidfd_open takes a pid and flags and returns a new fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    // SAFETY: a fresh descriptor this function owns.
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Lines from a reader, each cut at `max` bytes (the rest of an over-long
+/// line is skipped without being buffered), lossily decoded.
+pub struct BoundedLines<R> {
+    reader: R,
+    max: usize,
+    buf: Vec<u8>,
+    skipping: bool,
+    pending: std::collections::VecDeque<String>,
+    done: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
+    pub fn new(reader: R, max: usize) -> Self {
+        Self {
+            reader,
+            max,
+            buf: Vec::new(),
+            skipping: false,
+            pending: Default::default(),
+            done: false,
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(line) = self.pending.pop_front() {
+                return Some(line);
+            }
+            if self.done {
+                return None;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = self.reader.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                self.done = true;
+                if !self.buf.is_empty() {
+                    let line = String::from_utf8_lossy(&self.buf).into_owned();
+                    self.buf.clear();
+                    return Some(line);
+                }
+                continue;
+            }
+            for &byte in &chunk[..n] {
+                if byte == b'\n' {
+                    if !self.skipping || !self.buf.is_empty() {
+                        self.pending
+                            .push_back(String::from_utf8_lossy(&self.buf).into_owned());
+                    }
+                    self.buf.clear();
+                    self.skipping = false;
+                } else if self.skipping {
+                } else if self.buf.len() >= self.max {
+                    let mut line = String::from_utf8_lossy(&self.buf).into_owned();
+                    line.push_str(" [cut]");
+                    self.pending.push_back(line);
+                    self.buf.clear();
+                    self.skipping = true;
+                } else {
+                    self.buf.push(byte);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_lines_test {
+    use super::BoundedLines;
+
+    #[tokio::test]
+    async fn long_lines_are_cut_and_the_rest_skipped_test() {
+        let mut input = b"short\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 100_000));
+        input.extend(b"\nnext\ntail");
+        let mut lines = BoundedLines::new(&input[..], 16);
+        let mut got = Vec::new();
+        while let Some(line) = lines.next().await {
+            got.push(line);
+        }
+        assert_eq!(
+            got,
+            vec!["short", "xxxxxxxxxxxxxxxx [cut]", "next", "tail"]
+        );
     }
 }
 

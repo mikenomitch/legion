@@ -641,12 +641,18 @@ pub fn is_isolate_task(task: &TaskConfig) -> bool {
     task.runtime == ISOLATE_RUNTIME
 }
 
-/// The cordon an isolate of `job_id` with `config` runs in: the job's
-/// namespace, `job:<job id>`, or `shared`. One host process (or a set of
-/// replicas) per cordon per node.
+/// The cordon an isolate of `job_id` with `config` runs in:
+/// `ns:<namespace>`, `job:<job id>`, or `shared`. One host process (or a set
+/// of replicas) per cordon per node. The prefixes keep the three kinds
+/// apart: a namespace named `shared` (or `job`) is `ns:shared` (`ns:job`),
+/// never the shared cordon or a job's, and a namespace name cannot contain
+/// `:`. Consumers compare names this function produced; none parses one.
 pub fn cordon_name(job_id: &str, config: &IsolateTaskConfig) -> String {
     match config.cordon {
-        IsolateCordon::Namespace => crate::structs::namespace::job_namespace(job_id).to_string(),
+        IsolateCordon::Namespace => format!(
+            "ns:{}",
+            crate::structs::namespace::job_namespace(job_id)
+        ),
         IsolateCordon::Job => format!("job:{job_id}"),
         IsolateCordon::Shared => "shared".to_string(),
     }
@@ -1760,8 +1766,8 @@ mod isolate_test {
         let task = &config.tasks[0];
         let parsed = IsolateTaskConfig::of(task).unwrap().unwrap();
         assert!(IsolateTaskConfig::of(&config.tasks[1]).unwrap().is_none());
-        assert_eq!(cordon_name("team-a/code-runner", &parsed), "team-a");
-        assert_eq!(cordon_name("code-runner", &parsed), "default");
+        assert_eq!(cordon_name("team-a/code-runner", &parsed), "ns:team-a");
+        assert_eq!(cordon_name("code-runner", &parsed), "ns:default");
         let mut by_job = parsed.clone();
         by_job.cordon = IsolateCordon::Job;
         assert_eq!(
@@ -1777,6 +1783,36 @@ mod isolate_test {
             .unwrap()
             .contains("cannot be promoted"));
         assert!(promote_refusal(&config.tasks[1]).is_none());
+    }
+
+    /// Review finding 7: a namespace's cordon can never be the shared
+    /// cordon or a job's, whatever the namespace is called.
+    #[test]
+    fn a_namespace_cordon_never_collides_with_the_shared_or_a_job_cordon_test() {
+        let config = job(vec![isolate_task(base_config()), machine()]);
+        let parsed = IsolateTaskConfig::of(&config.tasks[0]).unwrap().unwrap();
+        assert_eq!(parsed.cordon, IsolateCordon::Namespace);
+        let mut shared = parsed.clone();
+        shared.cordon = IsolateCordon::Shared;
+        let mut by_job = parsed.clone();
+        by_job.cordon = IsolateCordon::Job;
+        // `shared` and `job` are valid namespace names ...
+        crate::structs::namespace::validate_namespace_name("shared").unwrap();
+        crate::structs::namespace::validate_namespace_name("job").unwrap();
+        // ... but a namespace name cannot carry the `:` a prefix would need.
+        crate::structs::namespace::validate_namespace_name("job:x").unwrap_err();
+        crate::structs::namespace::validate_namespace_name("ns:x").unwrap_err();
+        let in_shared_ns = cordon_name("shared/app", &parsed);
+        assert_eq!(in_shared_ns, "ns:shared");
+        assert_ne!(in_shared_ns, cordon_name("shared/app", &shared));
+        assert_ne!(in_shared_ns, cordon_name("other/app", &shared));
+        let in_job_ns = cordon_name("job/app", &parsed);
+        assert_eq!(in_job_ns, "ns:job");
+        for job_id in ["job/app", "app", "x/job", "shared/app"] {
+            assert_ne!(in_job_ns, cordon_name(job_id, &by_job));
+            assert_ne!(in_shared_ns, cordon_name(job_id, &by_job));
+            assert_ne!(cordon_name(job_id, &by_job), cordon_name(job_id, &shared));
+        }
     }
 
     #[test]

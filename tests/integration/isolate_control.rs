@@ -574,7 +574,7 @@ fn task_stats(task: &str, resident: u32) -> IsolateTaskStats {
     IsolateTaskStats {
         job_id: JOB.into(),
         task_name: task.into(),
-        cordon: "default".into(),
+        cordon: "ns:default".into(),
         resident,
         active: 2,
         invocations_per_second: 840.0,
@@ -844,7 +844,7 @@ async fn a_session_isolate_is_reached_by_the_tag_in_its_id_test() -> R<()> {
         .expect_err("the node holds no such isolate");
     assert_eq!(err.code(), Code::NotFound, "{err:?}");
 
-    // Promotion: FAILED_PRECONDITION with the calls-entry-10 text, and no
+    // Promotion: FAILED_PRECONDITION with the calls-entry-24 text, and no
     // instance row.
     let err = cluster
         .svc
@@ -860,7 +860,7 @@ async fn a_session_isolate_is_reached_by_the_tag_in_its_id_test() -> R<()> {
         err.message().starts_with(
             "isolate sessions cannot be promoted (a keyed instance is an allocation each); \
              give the session a stable id with an idempotency key, and keep what must outlive \
-             the node in legion:isolate/state or an upstream store"
+             its node in an upstream store"
         ),
         "{err:?}"
     );
@@ -931,7 +931,7 @@ async fn isolate_stats_come_from_heartbeats_test() -> R<()> {
             }],
             isolate_hosts: vec![
                 IsolateHostStats {
-                    cordon: "default".into(),
+                    cordon: "ns:default".into(),
                     rss_bytes: 64 << 20,
                     ..Default::default()
                 },
@@ -1002,9 +1002,12 @@ async fn isolate_stats_come_from_heartbeats_test() -> R<()> {
 }
 
 /// GetIsolate checks coarsely before it asks the node and against the
-/// isolate's own job after: a caller who cannot read that job gets
-/// PermissionDenied, never the data. GetIsolateStats checks before it
-/// reads the job.
+/// isolate's own job after: a caller who cannot read that job gets the
+/// same NotFound as for an id no node holds, never the data and never a
+/// PermissionDenied that would tell it the id exists. The session verbs
+/// that reach an isolate by its tag (GetInstance, PromoteInstance) answer
+/// alike. A caller with no credential gets the coarse denial.
+/// GetIsolateStats checks before it reads the job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_isolate_enforces_the_isolates_job_acl_test() -> R<()> {
     let cluster = Cluster::new(
@@ -1039,8 +1042,66 @@ async fn get_isolate_enforces_the_isolates_job_acl_test() -> R<()> {
         ))
     };
     assert_eq!(get(&reader).await?.into_inner().job_id, JOB);
-    let err = get(&outsider).await.expect_err("not its job");
-    assert_eq!(err.code(), Code::PermissionDenied, "{err:?}");
+    let missing = legion::structs::mint_session_id(TASK, "w-1");
+    let get_id = |token: &str, id: &str| {
+        cluster.svc.get_isolate(with_token(
+            GetIsolateRequest {
+                session_id: id.into(),
+                ..Default::default()
+            },
+            token,
+        ))
+    };
+    let hidden = get(&outsider).await.expect_err("not its job");
+    assert_eq!(hidden.code(), Code::NotFound, "{hidden:?}");
+    let absent = get_id(&outsider, &missing).await.expect_err("no such id");
+    assert_eq!(absent.code(), Code::NotFound, "{absent:?}");
+    assert_eq!(
+        hidden.message(),
+        absent.message().replace(&missing, &id),
+        "an existing id reads as a missing one"
+    );
+    let anonymous = cluster
+        .svc
+        .get_isolate(Request::new(GetIsolateRequest {
+            session_id: id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("no credential");
+    assert_ne!(anonymous.code(), Code::NotFound, "{anonymous:?}");
+    assert_ne!(anonymous.code(), Code::Ok, "{anonymous:?}");
+
+    // The session verbs that find the isolate by its tag answer alike.
+    let instance = |token: &str, id: &str| {
+        cluster.svc.get_instance(with_token(
+            GetInstanceRequest {
+                instance_id: id.into(),
+            },
+            token,
+        ))
+    };
+    assert!(instance(&reader, &id).await.is_ok());
+    let hidden = instance(&outsider, &id).await.expect_err("not its job");
+    let absent = instance(&outsider, &missing).await.expect_err("no such id");
+    assert_eq!(hidden.code(), Code::NotFound, "{hidden:?}");
+    assert_eq!(absent.code(), Code::NotFound, "{absent:?}");
+    assert_eq!(hidden.message(), absent.message().replace(&missing, &id));
+    let promote = |token: &str, id: &str| {
+        cluster.svc.promote_instance(with_token(
+            PromoteInstanceRequest {
+                instance_id: id.into(),
+                new_id: String::new(),
+                idempotency_key: None,
+            },
+            token,
+        ))
+    };
+    let hidden = promote(&outsider, &id).await.expect_err("not its job");
+    let absent = promote(&outsider, &missing).await.expect_err("no such id");
+    assert_eq!(hidden.code(), Code::NotFound, "{hidden:?}");
+    assert_eq!(absent.code(), Code::NotFound, "{absent:?}");
+    assert_eq!(hidden.message(), absent.message().replace(&missing, &id));
 
     let stats = |token: &str, job: &str| {
         cluster.svc.get_isolate_stats(with_token(

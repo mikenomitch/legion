@@ -2,7 +2,7 @@
 //! the latest isolate aggregates each node sent on its heartbeat, held in
 //! memory beside usage, and the pure helpers the isolate RPCs build on.
 //!
-//! Managers keep no record of isolates (isolate-runtime calls entry 3): a
+//! Managers keep no record of isolates (isolate-runtime calls entry 4): a
 //! node reports one aggregate per isolate task (`HeartbeatRequest.
 //! isolate_tasks`) and one row per isolate host process (`isolate_hosts`),
 //! and this table keeps only the latest of each per node. Like usage, it is
@@ -440,13 +440,13 @@ mod isolates_test {
         let now = Instant::now();
         table.ingest(
             "w-1",
-            vec![task_stats("j", "run", "default", 3)],
-            vec![host("default", 0)],
+            vec![task_stats("j", "run", "ns:default", 3)],
+            vec![host("ns:default", 0)],
             now,
         );
         table.ingest(
             "w-1",
-            vec![task_stats("j", "run", "default", 5)],
+            vec![task_stats("j", "run", "ns:default", 5)],
             vec![],
             now,
         );
@@ -466,13 +466,13 @@ mod isolates_test {
         table.ingest(
             "w-2",
             vec![
-                task_stats("j", "run", "default", 7),
+                task_stats("j", "run", "ns:default", 7),
                 task_stats("j", "other", "job:j", 1),
-                task_stats("k", "run", "default", 9),
+                task_stats("k", "run", "ns:default", 9),
             ],
             vec![
-                host("default", 1),
-                host("default", 0),
+                host("ns:default", 1),
+                host("ns:default", 0),
                 host("job:j", 0),
                 host("shared", 0),
             ],
@@ -480,8 +480,8 @@ mod isolates_test {
         );
         table.ingest(
             "w-1",
-            vec![task_stats("k", "run", "default", 2)],
-            vec![host("default", 0)],
+            vec![task_stats("k", "run", "ns:default", 2)],
+            vec![host("ns:default", 0)],
             start,
         );
         let later = start + Duration::from_millis(1_500);
@@ -500,7 +500,7 @@ mod isolates_test {
             .collect();
         assert_eq!(
             hosts,
-            [("default", 0), ("default", 1), ("job:j", 0)],
+            [("job:j", 0), ("ns:default", 0), ("ns:default", 1)],
             "shared serves neither"
         );
 

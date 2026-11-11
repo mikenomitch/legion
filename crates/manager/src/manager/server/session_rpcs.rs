@@ -469,7 +469,8 @@ impl ManagerDaemonService {
     }
 
     /// The running session with this id, once `action` on its job is
-    /// enforced. `None` when no session has the id.
+    /// enforced. `None` when no session has the id, or when the caller
+    /// cannot read the session's job ([`hides_session`]).
     pub(super) async fn find_session(
         &self,
         identity: &AclIdentity,
@@ -484,7 +485,14 @@ impl ManagerDaemonService {
             .as_ref()
             .map(|status| status.job_id.clone())
             .unwrap_or_default();
-        acl::enforce(identity, AclResource::Job, action, &AclScope::job(&job_id))?;
+        let scope = AclScope::job(&job_id);
+        if let Err(denied) = acl::enforce(identity, AclResource::Job, action, &scope) {
+            return if hides_session(identity, &scope, &denied) {
+                Ok(None)
+            } else {
+                Err(denied)
+            };
+        }
         Ok(Some(found))
     }
 
@@ -511,7 +519,14 @@ impl ManagerDaemonService {
                     .as_ref()
                     .map(|status| status.job_id.clone())
                     .unwrap_or_default();
-                acl::enforce(identity, AclResource::Job, action, &AclScope::job(&job_id))?;
+                let scope = AclScope::job(&job_id);
+                if let Err(denied) = acl::enforce(identity, AclResource::Job, action, &scope) {
+                    return if hides_session(identity, &scope, &denied) {
+                        Ok(None)
+                    } else {
+                        Err(denied)
+                    };
+                }
                 Ok(Some(*found))
             }
             sessions::Located::Evicted(message) => Err(Status::not_found(message)),
@@ -1242,6 +1257,17 @@ impl ManagerDaemonService {
         );
         Ok(Response::new(recorded.into_reply(false)))
     }
+}
+
+/// Whether a denial on a session's job is answered as the verb's ordinary
+/// not-found: when it is a PermissionDenied and the caller cannot even read
+/// the job (`read_scope`). Otherwise PermissionDenied for an id that exists
+/// against NotFound for one that does not tells a caller who passed the
+/// coarse check which session ids exist. A caller who can read the job gets
+/// the real denial: it could see the session anyway.
+pub(super) fn hides_session(identity: &AclIdentity, read_scope: &AclScope, denied: &Status) -> bool {
+    denied.code() == tonic::Code::PermissionDenied
+        && !identity.allows(AclResource::Job, AclAction::Read, read_scope)
 }
 
 /// A gRPC code from its name as a node reports it in a

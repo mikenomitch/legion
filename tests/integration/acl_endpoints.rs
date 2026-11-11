@@ -224,7 +224,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("RunSession", Plane::Protected("job:write")),
         // Isolate aggregates from the heartbeats, and a session isolate read
         // forwarded to its node: `job:read` (GetIsolate checks coarsely
-        // first, then against the job the node reports).
+        // first, then against the job the node reports, answering a caller
+        // who cannot read that job NotFound, as for a missing id).
         ("GetIsolateStats", Plane::Protected("job:read")),
         ("GetIsolate", Plane::Protected("job:read")),
         // Snapshots are their own resource: a memory snapshot holds the

@@ -411,13 +411,13 @@ mod isolate_cmd_test {
                 tasks,
                 hosts: vec![
                     IsolateHostStats {
-                        cordon: "default".into(),
+                        cordon: "ns:default".into(),
                         replica: 0,
                         rss_bytes: 3 << 20,
                         ..Default::default()
                     },
                     IsolateHostStats {
-                        cordon: "default".into(),
+                        cordon: "ns:default".into(),
                         replica: 1,
                         rss_bytes: 1 << 20,
                         ..Default::default()
@@ -435,7 +435,7 @@ mod isolate_cmd_test {
 
     #[test]
     fn isolate_stats_json_is_one_task_or_several_test() {
-        let one = stats_json(&reply(vec![task("run", "default", 48213)]), "");
+        let one = stats_json(&reply(vec![task("run", "ns:default", 48213)]), "");
         assert_eq!(one["task"], "run");
         let node = &one["nodes"][0];
         assert_eq!(node["node"], "w-17");
@@ -449,7 +449,7 @@ mod isolate_cmd_test {
 
         let several = stats_json(
             &reply(vec![
-                task("run", "default", 1),
+                task("run", "ns:default", 1),
                 task("web", "job:code-runner", 2),
             ]),
             "",

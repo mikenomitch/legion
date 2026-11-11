@@ -672,7 +672,7 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
     assert_eq!((reply.cpu_ms, reply.cpu_micros), (2, 1_500));
     let hosts = h.launcher.hosts();
     assert_eq!(hosts.len(), 1);
-    assert_eq!(hosts[0].0.cordon, "ns", "the namespace cordon by default");
+    assert_eq!(hosts[0].0.cordon, "ns:ns", "the namespace cordon by default");
     let spec =
         hosts[0].1.state.lock().unwrap().tasks[&("ns/app".to_string(), "run".to_string())].clone();
     assert_eq!(
@@ -713,7 +713,7 @@ async fn a_task_is_prepared_and_runs_in_its_cordons_host() {
         .iter()
         .map(|(s, _)| s.cordon.clone())
         .collect();
-    assert_eq!(cordons, vec!["ns", "job:ns/alone"]);
+    assert_eq!(cordons, vec!["ns:ns", "job:ns/alone"]);
     let (_, hosts) = h.supervisor.stats("", "").await;
     assert_eq!(hosts.len(), 2);
     // The last task of a cordon leaving stops its host.
@@ -1236,7 +1236,7 @@ async fn stats_fold_and_count() {
     assert_eq!(tasks[0].invocations, 4);
     assert_eq!(tasks[0].stopped["limits"], 1);
     assert_eq!(tasks[0].reservation_bytes, 16 << 20);
-    assert_eq!(tasks[0].cordon, "ns");
+    assert_eq!(tasks[0].cordon, "ns:ns");
     assert_eq!(hosts[0].confinement.len(), 5);
     assert_eq!(hosts[0].engine_version, "wasmtime-fake");
     let (filtered, _) = h.supervisor.stats("other/job", "").await;
@@ -1475,7 +1475,7 @@ async fn the_host_cgroup_follows_envelope_resizes() {
         .run(run_call("ns/app", "run", &[("main.wasm", "x")]), None)
         .await
         .unwrap();
-    let max = || std::fs::read_to_string(root.join("ns-0/memory.max")).unwrap();
+    let max = || std::fs::read_to_string(root.join("ns:ns-0/memory.max")).unwrap();
     assert_eq!(max(), (1024u64 << 20).to_string());
     // The envelope grows: memory.max follows.
     h.supervisor.sync(vec![envelope("ns/app", task(), 2048.0)]);

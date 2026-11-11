@@ -421,6 +421,8 @@ struct Prepared {
     spec: super::SessionSpec,
     run: ResolvedRun,
     command: Vec<String>,
+    /// `LEGION_RUN_ARGS` (a JSON array) for an isolate's VM-tier run.
+    run_args: Option<String>,
     /// (path relative to the run directory, bytes, executable).
     files: Vec<(String, Vec<u8>, bool)>,
     /// (path as asked, path relative to the run directory).
@@ -505,10 +507,18 @@ pub fn isolate_only_field(request: &RunSessionRequest) -> Option<&'static str> {
     }
 }
 
+/// The `args` of an isolate run sent to its VM task, and the run-directory
+/// path its entry is staged at (`/legion/run/main.py`).
+#[derive(Debug, Clone, Default)]
+pub struct VmArgs {
+    pub args: Vec<String>,
+    pub entry_path: String,
+}
+
 fn prepare(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     call: &RunCall,
-    extra_args: &[String],
+    vm_args: Option<&VmArgs>,
 ) -> Result<Prepared, Status> {
     let spec = task_manager
         .lock()
@@ -559,10 +569,33 @@ fn prepare(
         }
         request.command.clone()
     };
-    // An isolate run sent to its VM task: the run's `args` follow the VM
-    // task's own program (the worker builds this, not the caller).
+    // An isolate run sent to its VM task: the run's `args` are appended
+    // only where they are script arguments by construction, a `run.command`
+    // ending with the staged entry's path; elsewhere they would change the
+    // command line of a program the caller (with only job:write) does not
+    // choose, so they are refused. They are always also exported as
+    // `LEGION_RUN_ARGS` for a wrapper to read.
     let mut command = command;
-    command.extend(extra_args.iter().cloned());
+    let mut run_args = None;
+    if let Some(vm) = vm_args {
+        if !vm.args.is_empty() {
+            if command.last().map(String::as_str) != Some(vm.entry_path.as_str()) {
+                return Err(Status::failed_precondition(format!(
+                    "task {}'s run.command does not end with {}, so arguments cannot be passed \
+                     to it safely; the run carries {} args\nHint: end the VM task's \
+                     run.command with {} (e.g. [\"python3\", \"{}\"]), read LEGION_RUN_ARGS in \
+                     a wrapper, or send the arguments in --input",
+                    call.task_name,
+                    vm.entry_path,
+                    vm.args.len(),
+                    vm.entry_path,
+                    vm.entry_path
+                )));
+            }
+            command.extend(vm.args.iter().cloned());
+        }
+        run_args = Some(serde_json::to_string(&vm.args).unwrap_or_else(|_| "[]".into()));
+    }
     let StagedFiles {
         files,
         get,
@@ -576,6 +609,7 @@ fn prepare(
         spec,
         run,
         command,
+        run_args,
         files,
         get,
         has_input,
@@ -591,20 +625,21 @@ pub async fn run_session(
     node_id: String,
     call: RunCall,
 ) -> Result<RunSessionResponse, Status> {
-    run_session_with_args(task_manager, launch_pool, node_id, call, Vec::new()).await
+    run_session_with_args(task_manager, launch_pool, node_id, call, None).await
 }
 
-/// [`run_session`] with `extra_args` appended to the task's command: the
-/// VM tier of an isolate run (docs/task-runtime-isolate.md), whose `args`
-/// go to the VM task's own `run.command`.
+/// [`run_session`] for the VM tier of an isolate run
+/// (docs/task-runtime-isolate.md): its `args` follow the VM task's own
+/// `run.command` only when that ends with the staged entry (see
+/// [`VmArgs`]), and are exported as `LEGION_RUN_ARGS`.
 pub async fn run_session_with_args(
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
     node_id: String,
     call: RunCall,
-    extra_args: Vec<String>,
+    vm_args: Option<VmArgs>,
 ) -> Result<RunSessionResponse, Status> {
-    let prepared = prepare(&task_manager, &call, &extra_args)?;
+    let prepared = prepare(&task_manager, &call, vm_args.as_ref())?;
     if call.request.dry_run {
         let reason = task_manager
             .lock()
@@ -1231,6 +1266,9 @@ fn execute(
     let mut opts = ExecOptions::new(rewrite_run_dir(&prepared.command, &target.run_dir), false);
     opts.env
         .insert("LEGION_RUN_DIR".into(), target.run_dir.clone());
+    if let Some(args) = prepared.run_args.as_ref() {
+        opts.env.insert("LEGION_RUN_ARGS".into(), args.clone());
+    }
     if prepared.has_input {
         opts.env.insert(
             "LEGION_RUN_INPUT".into(),
