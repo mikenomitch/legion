@@ -88,10 +88,13 @@ fn session_tasks_in_scope(store: &Store, disable: &RuntimeDisable) -> R<Vec<(Str
                 .cached_task_configs_for_job_config(&allocation.job_config_id)
                 .unwrap_or_default();
             for (_, task) in tasks {
-                let session = task
-                    .stateful
-                    .as_ref()
-                    .is_some_and(|stateful| stateful.mode == InstanceMode::Session);
+                // Stored session tasks are normalized to `keyed` with an
+                // envelope.
+                let session = crate::structs::session::is_session_task(&task)
+                    || task
+                        .stateful
+                        .as_ref()
+                        .is_some_and(|stateful| stateful.mode == InstanceMode::Session);
                 if session && task.runtime == disable.runtime {
                     seen.insert((allocation.job_id.clone(), task.name), ());
                 }

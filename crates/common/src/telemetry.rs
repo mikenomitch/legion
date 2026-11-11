@@ -47,6 +47,13 @@ const DURATION_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Bucket bounds (seconds) for an isolate's instantiation: microseconds
+/// for a pooled slot, milliseconds for a large image.
+const ISOLATE_INSTANTIATE_BUCKETS: &[f64] = &[
+    0.000_01, 0.000_025, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.0025, 0.005, 0.01, 0.025,
+    0.05, 0.1,
+];
+
 /// Bucket bounds (seconds) for suspend and resume, which run from tens of
 /// milliseconds (a disk suspend, a small restore) to a minute (a multi-GiB
 /// memory capture on slow disk).
@@ -2575,6 +2582,39 @@ pub struct WorkerMetrics {
     /// drove (docs/session-runs.md): `ran` (the command exited), `stopped`
     /// (a limit stopped it), `failed` (it could not start or finish).
     pub session_runs_total: Arc<CounterVec>,
+    /// `legion_isolate_instantiate_seconds{image}` — time to a ready
+    /// isolate instance for a run (docs/task-runtime-isolate.md), by image
+    /// (`python`, `js`, or `module`). Warm starts are not observed.
+    pub isolate_instantiate_seconds: Arc<HistogramVec>,
+    /// `legion_isolate_turns_total` — isolate turns run on this node.
+    pub isolate_turns_total: Arc<Counter>,
+    /// `legion_isolate_cpu_microseconds_total` — CPU isolates used.
+    pub isolate_cpu_microseconds_total: Arc<Counter>,
+    /// `legion_isolate_resident{tier}` — isolates by tier now: `hot`,
+    /// `paged_out`, `hibernated`.
+    pub isolate_resident: Arc<GaugeVec>,
+    /// `legion_isolate_wakes_total{from}` — isolate starts by kind:
+    /// `fresh`, `warm`, `paged`, `hibernated`.
+    pub isolate_wakes_total: Arc<CounterVec>,
+    /// `legion_isolate_limit_total{limit}` — invocations stopped by a
+    /// limit: `cpu`, `wall`, `memory` (`limits.output` truncates, never stops).
+    pub isolate_limit_total: Arc<CounterVec>,
+    /// `legion_isolate_vm_runs_total{reason}` — runs of isolate tasks sent
+    /// to a VM: `requested`, `disabled`, `import`, `memo`.
+    pub isolate_vm_runs_total: Arc<CounterVec>,
+    /// `legion_isolate_child_vms` — child VMs isolates own on this node.
+    pub isolate_child_vms: Arc<Gauge>,
+    /// `legion_isolate_stopped_total{reason}` — invocations stopped before
+    /// they finished: `limits`, `unsupported`, `trap`, `ended`.
+    pub isolate_stopped_total: Arc<CounterVec>,
+    /// `legion_isolate_compile_seconds` — one module compile.
+    pub isolate_compile_seconds: Arc<Histogram>,
+    /// `legion_isolate_host_rss_bytes{cordon}` — each cordon's host
+    /// processes' resident set, summed over replicas.
+    pub isolate_host_rss_bytes: Arc<GaugeVec>,
+    /// `legion_isolate_slots{cordon,state}` — memory slots of a cordon's
+    /// hosts, `used` or `free`.
+    pub isolate_slots: Arc<GaugeVec>,
     /// `legion_session_checkpoints_skipped_total` — periodic session
     /// checkpoints (`suspend.checkpointEvery`) a node skipped because its
     /// backlog would not let it capture them within one interval.
@@ -2725,6 +2765,103 @@ impl WorkerMetrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let isolate_instantiate_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_instantiate_seconds",
+                help: "Time to a ready isolate instance for a run, by image (python|js|module). Warm starts are not observed.",
+                labels: &["image"],
+            },
+            bounds: ISOLATE_INSTANTIATE_BUCKETS,
+            series: Series::new(),
+        });
+        let isolate_turns_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_isolate_turns_total",
+                help: "Isolate turns run on this node.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let isolate_cpu_microseconds_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_isolate_cpu_microseconds_total",
+                help: "CPU time isolates used on this node, in microseconds.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let isolate_resident = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_resident",
+                help: "Isolates on this node by tier (hot|paged_out|hibernated).",
+                labels: &["tier"],
+            },
+            series: Series::new(),
+        });
+        let isolate_wakes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_wakes_total",
+                help: "Isolate starts on this node by kind (fresh|warm|paged|hibernated).",
+                labels: &["from"],
+            },
+            series: Series::new(),
+        });
+        let isolate_limit_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_limit_total",
+                help: "Isolate invocations stopped by a limit (cpu|wall|memory).",
+                labels: &["limit"],
+            },
+            series: Series::new(),
+        });
+        let isolate_vm_runs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_vm_runs_total",
+                help: "Runs of isolate tasks sent to a VM, by reason (requested|disabled|import|memo).",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let isolate_child_vms = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_isolate_child_vms",
+                help: "Child VMs isolates own on this node.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let isolate_stopped_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_stopped_total",
+                help: "Isolate invocations stopped before they finished, by reason (limits|unsupported|trap|ended).",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let isolate_compile_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_isolate_compile_seconds",
+                help: "Time to compile one isolate module on this node.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(CHECKPOINT_DURATION_BUCKETS),
+        });
+        let isolate_host_rss_bytes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_host_rss_bytes",
+                help: "Resident set of each cordon's isolate host processes, summed over replicas.",
+                labels: &["cordon"],
+            },
+            series: Series::new(),
+        });
+        let isolate_slots = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_isolate_slots",
+                help: "Memory slots of a cordon's isolate hosts, by state (used|free).",
+                labels: &["cordon", "state"],
+            },
+            series: Series::new(),
         });
         let content_store_bytes = Arc::new(GaugeVec {
             meta: FamilyMeta {
@@ -3017,6 +3154,18 @@ impl WorkerMetrics {
             Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_window) as Arc<dyn RenderMetric>,
             Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_instantiate_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_turns_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_cpu_microseconds_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_resident) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_wakes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_limit_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_vm_runs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_child_vms) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_stopped_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_compile_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_host_rss_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&isolate_slots) as Arc<dyn RenderMetric>,
             Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
@@ -3071,6 +3220,18 @@ impl WorkerMetrics {
             claim_overload_refusals_total,
             claim_window,
             edge_session_starts_total,
+            isolate_instantiate_seconds,
+            isolate_turns_total,
+            isolate_cpu_microseconds_total,
+            isolate_resident,
+            isolate_wakes_total,
+            isolate_limit_total,
+            isolate_vm_runs_total,
+            isolate_child_vms,
+            isolate_stopped_total,
+            isolate_compile_seconds,
+            isolate_host_rss_bytes,
+            isolate_slots,
             session_runs_total,
             session_checkpoints_skipped_total,
             session_evictions_total,

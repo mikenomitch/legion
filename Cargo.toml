@@ -32,7 +32,10 @@ include = [
 #   crates/manager  legion-manager  the manager, scheduler, and state store
 # plus `proto/`, the generated wire types (`legion-proto`), `guest/`, the
 # in-guest agent that ships as its own static binary
-# (docs/task-runtime-sandbox.md, "The guest agent"),
+# (docs/task-runtime-sandbox.md, "The guest agent"), `crates/isolate`, the
+# isolate host that ships as its own binary, `legion-isolate`, and is the
+# only crate that links wasmtime (docs/task-runtime-isolate.md, "The host
+# process"),
 # and the scaling-plugin SDK (`legion-scaling-plugin`,
 # docs/autoscaling-plugins.md), so `cargo test --all` builds and tests it.
 # The example plugins under `plugins/` are separate crates built by build.rs
@@ -47,6 +50,7 @@ members = [
     "crates/common",
     "crates/worker",
     "crates/manager",
+    "crates/isolate",
     "examples/scaling-plugins/rust",
 ]
 # What a bare `cargo build` / `cargo test` / `cargo test --lib <filter>`
@@ -167,6 +171,31 @@ wasmi = { version = "=2.0.0", default-features = false, features = ["std", "stab
 # Only to name `LimiterError` in the plugin memory cap; wasmi does not
 # re-export it.
 wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] }
+# The isolate runtime's engine (docs/task-runtime-isolate.md). Only
+# `legion-isolate` (crates/isolate) depends on these: the worker supervises
+# that binary and never links the engine itself. Pinned exactly, because a
+# compiled module is only loadable by the engine version that compiled it and
+# an engine upgrade is a deliberate, reviewed change (it re-runs the
+# guest-escape regression corpus). No default features: no Winch, no Pulley,
+# no profiling, no on-disk cache.
+wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "cranelift", "pooling-allocator", "component-model", "async", "std", "anyhow", "memory-protection-keys", "parallel-compilation"] }
+# WASI 0.2 only: the host has no WASI 0.3 world yet, and `p3` would pull in
+# the engine's component-model-async machinery the host turns off.
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "=50.0.1" }
+# No default features: the isolate host sends every outbound request to its
+# worker (`WasiHttpHooks::send_request`), so it links no HTTP/TLS client.
+wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2"] }
+# The compiler validates every component with the newest parser before
+# Cranelift sees it (docs/task-runtime-isolate.md, "Compilation").
+wasmparser = "0.263.0"
+# The isolate host's seccomp allowlist (crates/isolate/src/confine).
+seccompiler = "0.5.0"
+# The RNG traits wasmtime-wasi 50 takes (rand 0.10), for a per-instance,
+# kernel-seeded generator in the isolate host.
+rand_010 = { package = "rand", version = "0.10.3", default-features = false, features = ["std", "std_rng", "sys_rng"] }
+# WebAssembly text, for the isolate host's guest-escape regression corpus.
+wat = "1.263.0"
 # Key material is wiped from memory when dropped.
 zeroize = "1"
 tabled = "0.16.0"

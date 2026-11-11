@@ -141,6 +141,18 @@ fn same_owner(a: &OwnerRef, b: &OwnerRef) -> bool {
     a.kind == b.kind && a.id == b.id
 }
 
+pub use crate::structs::children::OWNER_ISOLATE;
+
+/// An isolate that owns child VMs on this node, registered by the isolate
+/// supervisor's VM backend while the isolate lives (`isolates::vm`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsolateOwner {
+    pub owner: OwnerRef,
+    pub job_id: String,
+    /// The isolate task, whose `children` block admits the child.
+    pub task_name: String,
+}
+
 /// A running unit of this node that can own children, and its task.
 #[derive(Debug, Clone)]
 pub struct LocalOwner {
@@ -168,11 +180,40 @@ impl WorkerTaskManager {
             .or_else(|| self.session_spec(job_id, task_name).map(|spec| spec.task))
     }
 
-    /// Whether a session with this id runs or sleeps on this node.
+    /// Register an isolate as a live owner of child VMs (`isolates::vm`).
+    pub fn register_isolate_owner(&mut self, owner: IsolateOwner) {
+        self.isolate_owners
+            .insert(children::owner_label(&owner.owner), owner);
+    }
+
+    /// The isolate is gone: forget it as an owner. Its children end on the
+    /// next [`Self::reconcile_children`] unless they were ended already.
+    pub fn unregister_isolate_owner(&mut self, owner: &OwnerRef) -> Option<IsolateOwner> {
+        self.isolate_owners.remove(&children::owner_label(owner))
+    }
+
+    /// A registered isolate owner, by its reference.
+    pub fn isolate_owner(&self, owner: &OwnerRef) -> Option<&IsolateOwner> {
+        self.isolate_owners.get(&children::owner_label(owner))
+    }
+
+    /// Every registered isolate owner.
+    pub fn isolate_owners(&self) -> Vec<IsolateOwner> {
+        self.isolate_owners.values().cloned().collect()
+    }
+
+    /// Whether a session with this id runs or sleeps on this node: as a
+    /// claim, or as a session isolate that owns children.
     fn session_is_here(&self, session_id: &str) -> bool {
-        self.claims
-            .by_instance(session_id)
-            .is_some_and(|claim| claim.is_session())
+        self.isolate_owners
+            .contains_key(&children::owner_label(&children::owner_ref(
+                OWNER_SESSION,
+                session_id,
+            )))
+            || self
+                .claims
+                .by_instance(session_id)
+                .is_some_and(|claim| claim.is_session())
             || self
                 .idle_sessions
                 .get(session_id)
@@ -287,12 +328,109 @@ impl WorkerTaskManager {
         })
     }
 
+    /// How to dial port `port` of `child`, a running child session of the
+    /// isolate `owner`, for the isolate's `vm.fetch` (`isolates::vm`).
+    ///
+    /// A child with its own port space (a gated or TAP-wired sandbox, a
+    /// gated namespace) is dialed on any port it listens on. A child that
+    /// shares the node's network (host mode) is dialed only on one of its
+    /// own advertised ports: any other loopback port is the node's.
+    pub fn isolate_child_dial(
+        &self,
+        owner: &OwnerRef,
+        child: &str,
+        port: u16,
+    ) -> Result<crate::worker::netd::ingress::TaskTarget, String> {
+        use crate::worker::netd::attach::Attachment;
+        if !self
+            .child_link(child)
+            .is_some_and(|link| same_owner(&link.owner, owner))
+        {
+            return Err(format!("no child {child} of this isolate"));
+        }
+        let key = self
+            .claims
+            .by_instance(child)
+            .filter(|claim| claim.is_session())
+            .map(|claim| claim.local_key)
+            .ok_or_else(|| format!("child {child} is not running"))?;
+        let (Some(allocation), Some(task)) =
+            (self.allocations.get(&key), self.task_configs.get(&key))
+        else {
+            return Err(format!("child {child} is not running yet"));
+        };
+        if !self.instances.contains_key(&key) || self.terminated.contains_key(&key) {
+            return Err(format!("child {child} is not running"));
+        }
+        let network = allocation.network.clone().unwrap_or_default();
+        let payload = TaskAllocation {
+            allocation_id: key,
+            task_runtime: task.runtime.clone(),
+            task_config: task.config.to_string(),
+            ..Default::default()
+        };
+        let attachment = Attachment::of(&payload, &network, &self.alloc_root);
+        let own_port_space = matches!(
+            attachment,
+            Attachment::Netns { .. } | Attachment::GuestVsock { .. } | Attachment::GuestTap { .. }
+        );
+        let declared = network
+            .ports
+            .iter()
+            .find(|declared| declared.bind_port() == port || declared.host_port == port);
+        let (label, port) = match (own_port_space, declared) {
+            (_, Some(declared)) => (declared.name.clone(), declared.bind_port()),
+            (true, None) => (String::new(), port),
+            (false, None) => {
+                return Err(format!(
+                    "child {child} shares the node's network, so only its own ports can be \
+                     fetched, and {port} is not one of them (its ports: {})",
+                    if network.ports.is_empty() {
+                        "none".to_string()
+                    } else {
+                        network
+                            .ports
+                            .iter()
+                            .map(|p| format!("{} ({})", p.bind_port(), p.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ))
+            }
+        };
+        Ok(crate::worker::netd::ingress::TaskTarget {
+            dial: attachment.task_dial(),
+            label,
+            port,
+        })
+    }
+
     /// Find the owner a start names among the units of `job_id` this node
     /// runs. An empty `kind` tries a session, then an instance, then an
     /// allocation id.
     pub fn resolve_local_owner(&self, job_id: &str, requested: &OwnerRef) -> Option<LocalOwner> {
         let wants = |kind: &str| requested.kind.is_empty() || requested.kind == kind;
         let id = requested.id.as_str();
+        // An isolate that registered itself as an owner: its task is the
+        // isolate task its envelope carries the spec of.
+        for kind in [OWNER_SESSION, OWNER_ISOLATE] {
+            if !wants(kind) {
+                continue;
+            }
+            let Some(isolate) = self
+                .isolate_owners
+                .get(&children::owner_label(&children::owner_ref(kind, id)))
+                .filter(|isolate| isolate.job_id == job_id)
+            else {
+                continue;
+            };
+            let task = self.session_spec(job_id, &isolate.task_name)?.task;
+            return Some(LocalOwner {
+                owner: isolate.owner.clone(),
+                job_id: job_id.to_string(),
+                task,
+            });
+        }
         if wants(OWNER_SESSION) {
             let running = self
                 .claims
@@ -702,6 +840,16 @@ impl WorkerTaskManager {
                         at: now,
                     },
                 );
+                continue;
+            }
+            // An isolate owner is this node's to judge, by its registration.
+            if link.owner.kind == OWNER_ISOLATE && !link.remote {
+                if !self
+                    .isolate_owners
+                    .contains_key(&children::owner_label(&link.owner))
+                {
+                    orphans.push(child);
+                }
                 continue;
             }
             if link.owner.kind != OWNER_SESSION || link.remote {

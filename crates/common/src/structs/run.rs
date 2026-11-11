@@ -155,6 +155,54 @@ pub fn validate_run(task: &crate::structs::TaskConfig) -> Result<(), String> {
         .map_err(|err| format!("{prefix}: {err}"))
 }
 
+/// Whether runs of `task` are accepted: it has a `run` block, or it is an
+/// `isolate` task, which takes runs natively (its budgets are
+/// `config.limits`, its entry the run's main file).
+pub fn takes_runs(task: &crate::structs::TaskConfig) -> bool {
+    task.run.is_some() || crate::structs::isolate::is_isolate_task(task)
+}
+
+/// The budgets of one run of a task, from whichever block it takes runs by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLimits {
+    /// The run's deadline.
+    pub wall: Duration,
+    /// `wall` as written, for messages.
+    pub wall_text: String,
+    /// The most stdout plus stderr the reply returns.
+    pub output: u64,
+    /// CPU time summed over the run's turns: an isolate's
+    /// `config.limits.cpu`. `None` for a `run` block, which has none.
+    pub cpu: Option<Duration>,
+}
+
+/// The budgets of one run of `task`: its `run` block's `wall` and `output`,
+/// or an isolate task's `config.limits`. The error is [`no_run_block`]'s
+/// text for a task that takes no runs (`job_id` names the job in it), or
+/// the field's own for a block submit would have refused.
+pub fn run_limits(job_id: &str, task: &crate::structs::TaskConfig) -> Result<RunLimits, String> {
+    if let Some(run) = task.run.as_ref() {
+        let resolved = run.resolve()?;
+        return Ok(RunLimits {
+            wall: resolved.wall,
+            wall_text: resolved.wall_text,
+            output: resolved.output,
+            cpu: None,
+        });
+    }
+    if crate::structs::isolate::is_isolate_task(task) {
+        let resolved =
+            crate::structs::isolate::IsolateTaskConfig::from_value(&task.config)?.resolve()?;
+        return Ok(RunLimits {
+            wall: resolved.wall,
+            wall_text: resolved.wall_text,
+            output: resolved.output,
+            cpu: Some(resolved.cpu),
+        });
+    }
+    Err(no_run_block(job_id, &task.name))
+}
+
 /// The error a run on a task without a `run` block answers.
 pub fn no_run_block(job_id: &str, task_name: &str) -> String {
     format!(
@@ -338,6 +386,42 @@ mod tests {
             .contains("task machine: run.wall"));
         task.run = None;
         validate_run(&task).unwrap();
+    }
+
+    #[test]
+    fn isolates_take_runs_with_their_config_limits_test() {
+        let isolate = parsed_task(serde_json::json!({
+            "name": "run",
+            "runtime": "isolate",
+            "config": {
+                "image": "python",
+                "limits": { "cpu": "100ms", "wall": "30s", "output": "64KiB" },
+            },
+            "stateful": {
+                "mode": "session",
+                "envelope": { "resources": { "cpu": 400, "memory": 256 } },
+            },
+        }));
+        assert!(takes_runs(&isolate));
+        let limits = run_limits("code-runner", &isolate).unwrap();
+        assert_eq!(limits.wall, Duration::from_secs(30));
+        assert_eq!(limits.wall_text, "30s");
+        assert_eq!(limits.output, 64 * 1024);
+        assert_eq!(limits.cpu, Some(Duration::from_millis(100)));
+
+        let mut machine = isolate.clone();
+        machine.runtime = "exec".into();
+        assert!(!takes_runs(&machine));
+        assert_eq!(
+            run_limits("code-runner", &machine).unwrap_err(),
+            no_run_block("code-runner", "run")
+        );
+        machine.run = Some(run("5m", None));
+        assert!(takes_runs(&machine));
+        let limits = run_limits("code-runner", &machine).unwrap();
+        assert_eq!(limits.wall, Duration::from_secs(300));
+        assert_eq!(limits.output, MAX_RUN_OUTPUT);
+        assert_eq!(limits.cpu, None);
     }
 
     #[test]

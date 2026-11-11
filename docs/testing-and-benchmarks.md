@@ -152,6 +152,66 @@ holds `crate::support::DYNAMIC_PORT_GATE`.
     failover. They are here, not beside the worker code, because the worker
     crate cannot see the manager.
 
+### The isolate runtime's tests
+
+The [isolate runtime](task-runtime-isolate.md) has tests in three places:
+
+- **`crates/isolate/tests/`**, the `legion-isolate` crate's own:
+  `run.rs`, `lifetimes.rs`, `admission.rs`, and `http.rs` drive an
+  in-process host with a fake worker; `scratch.rs` runs a real wasi-libc
+  guest against the in-memory filesystem; `binary.rs` starts the real
+  binary on socketpairs as a worker would; `escape_corpus.rs` is the
+  guest-escape regression corpus, run against every memory layout the
+  machine supports and meant to be rerun on every engine upgrade.
+  The guests are Rust crates under `tests/guests/` (not workspace members,
+  built for `wasm32-wasip2` by `tests/guests/build.sh`), and the built
+  components are checked in as `tests/fixtures/*.wasm`, since CI has no wasm
+  target. Rebuild them after changing a guest.
+- **Confinement** tests in `binary.rs` need the binary built with
+  test-only hooks: `cargo test -p legion-isolate --features
+  confinement-test`. Without the feature they are ignored. The hooks let a
+  test make the confined host or compiler attempt a forbidden action and
+  leave chosen layers out (`--test-skip seccomp,pidns,scopes,mount,landlock,userns,setattr`),
+  so each layer is shown to stop its attacks on its own; they exist only in
+  a build with the feature. A test whose layer the machine does not offer
+  (user namespaces refused to an unprivileged user, as on Ubuntu 24.04;
+  Landlock scopes on a kernel older than ABI 6; mounting a tmpfs without
+  root) prints `LAYER UNAVAILABLE HERE:` or `SKIP-REASON:` and returns, and
+  fails instead when the machine does offer it but the host did not apply
+  it. The ordinary Cargo Test job runs them as the unprivileged `runner`
+  user, so the namespace layers skip there; the **Isolate Confinement
+  Tests** CI job runs `cargo test -p legion-isolate --features
+  confinement-test --test binary` as root, where every layer the kernel
+  offers applies.
+- **Image tests** (`crates/isolate/tests/images.rs`) need the built images
+  and are all ignored, since CI does not build them:
+  `crates/isolate/images/build.sh`, then `cargo test -p legion-isolate
+  --test images -- --ignored`. `LEGION_ISOLATE_IMAGES` names another images
+  directory. `binary.rs`'s ignored
+  `both_language_images_run_in_the_confined_binary_test` runs both images
+  through the real compiler and host under `enforce`, which is what finds
+  a system call missing from an allowlist.
+- **`tests/integration/`**: `isolate::` (the worker's supervisor driving the
+  real binary; it takes `LEGION_ISOLATE_BINARY`, else builds it with
+  `cargo build -p legion-isolate`, and fails rather than skips without it).
+  Its `cluster` harness (`isolate::cluster`) starts a manager on raft, a
+  real worker on the mTLS worker plane, and real hosts, and enters through
+  the manager's `RunSession`; `isolate::http_e2e` sends HTTP in through the
+  supervisor's ingress socket and out through the real egress datapath.
+  The VM-tier and child-VM tests use an `exec` session task as a stand-in
+  VM task, stored without submit validation, because the sandbox's Linux
+  development backend takes no `exec`; their sandbox variants need
+  `/dev/kvm` and are ignored. `isolate_control::` is the manager's half
+  against fake nodes, and `isolate_images::`
+  (`tests/integration/isolate_images.rs`) runs the built images through
+  the whole stack, including an end-to-end timing; it is ignored without
+  the built images (`cargo test --test integration isolate_images:: --
+  --ignored --nocapture`).
+
+`cargo bench -p legion-isolate --bench isolate_bench` measures a fresh
+instance per call, a call on a warm runner, and a call whose guest awaits
+the worker.
+
 ## Running Tests
 
 Primary command:

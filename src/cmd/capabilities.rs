@@ -630,7 +630,7 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "session.run",
-            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--command <ARG>...]",
+            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--tier auto|isolate|vm] [--tenant <KEY>] [--session <ID>] [--arg <ARG>]... [--fallback vm] [--command <ARG>...]",
             grpc: Some("Manager/RunSession"),
             summary: "Run once in a fresh, single-use session of a session task with a `run` \
                  block and return stdout, stderr, the exit status, result.json as `result`, and \
@@ -638,9 +638,39 @@ pub fn catalog() -> Vec<Capability> {
                  is ok:true with `stopped`. Needs job:write; --command also needs exec:write \
                  and run.allowCommand. --idempotency-key is per node (reply kept 10 minutes); \
                  --dry-run runs nothing. With --node and --ticket it is Worker/RunSession, with \
-                 no manager on the path.",
+                 no manager on the path. On an isolate task no run block is needed: the code \
+                 runs in an isolate or a VM, chosen before it runs (--tier, default auto); the \
+                 reply adds `tier`, `tierReason`, and `nextTier` (the tier to ask for next time \
+                 for the same code), and microsecond-precise cpuMs/wallMs. --tenant keys warm \
+                 instances, --arg passes arguments to the code (job:write only), --session runs \
+                 in a session isolate, and --fallback vm reruns a run \
+                 stopped in the isolate once in a VM (`ranTwice`: your code ran twice).",
             mutates: true,
             read_only_safe: false,
+        },
+        Capability {
+            name: "isolate.stats",
+            cli: "legion isolate stats <JOB> [--task <TASK>]",
+            grpc: Some("Manager/GetIsolateStats"),
+            summary: "Per-node aggregates of a job's isolate tasks from the nodes' heartbeats: \
+                 resident, active, paged-out, and hibernated isolates, invocations and CPU per \
+                 second, VM runs per minute, child VMs, stops by reason and limit, refusals, \
+                 memory, the host processes serving them, and how old each report is \
+                 (`ageMs`). Isolates are never listed one by one. Needs job:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "isolate.get",
+            cli: "legion isolate get <SESSION_ID> [--on-node <NODE>]",
+            grpc: Some("Manager/GetIsolate"),
+            summary: "Describe one session isolate by asking the node its id names: state (hot, \
+                 paged_out, hibernated, empty), tenant, invocations, memory and state bytes, \
+                 checkpoint, and child VMs. --on-node names the node for an id derived from an \
+                 idempotency key. Unavailable (retryable) when the node cannot be reached. Needs \
+                 job:read on the isolate's job.",
+            mutates: false,
+            read_only_safe: true,
         },
         Capability {
             name: "session.start",

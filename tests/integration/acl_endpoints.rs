@@ -222,6 +222,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // command also needs `exec:write` (the matrix is in
         // `a_run_with_a_callers_command_needs_exec_write_test`).
         ("RunSession", Plane::Protected("job:write")),
+        // Isolate aggregates from the heartbeats, and a session isolate read
+        // forwarded to its node: `job:read` (GetIsolate checks coarsely
+        // first, then against the job the node reports, answering a caller
+        // who cannot read that job NotFound, as for a missing id).
+        ("GetIsolateStats", Plane::Protected("job:read")),
+        ("GetIsolate", Plane::Protected("job:read")),
         // Snapshots are their own resource: a memory snapshot holds the
         // workload's in-memory secrets, which `job:write` must not imply.
         // RestoreInstance also needs `job:write` (it replaces an allocation);
@@ -1408,6 +1414,26 @@ async fn call_endpoint(
                 legion::structs::RunSessionRequest {
                     job_id: JOB_NAME.into(),
                     dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetIsolateStats" => svc
+            .get_isolate_stats(req(
+                legion::structs::GetIsolateStatsRequest {
+                    job_id: JOB_NAME.into(),
+                    task_name: String::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetIsolate" => svc
+            .get_isolate(req(
+                legion::structs::GetIsolateRequest {
+                    session_id: "run-acl-probe".into(),
                     ..Default::default()
                 },
                 token,
@@ -3782,6 +3808,111 @@ async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
         );
         // The host grant admits it.
         run(spec(name, task), platform.clone())
+            .await
+            .unwrap_or_else(|status| panic!("{name} with the host grant: {status}"));
+    }
+    Ok(())
+}
+
+/// A `file://` source is host-level whatever names it (worker-plane-auth
+/// plan §6.16): the root worker copies the node's file into the task. An
+/// isolate task's `config.module.source` is fetched the same way, so it is
+/// gated exactly as a `file://` artifact on a container is: refused without
+/// `host = true`, admitted with it, and an `https://` module needs nothing.
+#[tokio::test]
+async fn file_sources_need_the_host_grant_whatever_names_them_test() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "deployer",
+        "",
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "platform",
+        "",
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"], "host": true}]"#,
+    )?;
+    let mint = |policy: &str| {
+        authenticator
+            .mint_token(&svc.store, policy, "client", &[policy.into()], None)
+            .map(|(_, secret)| secret)
+            .map_err(|s| anyhow!(s.to_string()))
+    };
+    let deployer = mint("deployer")?;
+    let platform = mint("platform")?;
+    let run = |name: &str, task: serde_json::Value, secret: String| {
+        let svc = &svc;
+        let spec = serde_json::json!({ "name": name, "tasks": [task] }).to_string();
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    namespace: Default::default(),
+                    parsed_jobspec: spec,
+                    submissions: vec![],
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
+                    expected_version: None,
+                },
+                Some(&secret),
+            ))
+            .await
+        }
+    };
+    let container_with_file_artifact = serde_json::json!({
+        "name": "web", "runtime": "container", "count": 1,
+        "config": { "image": "alpine", "command": ["echo", "ok"] },
+        "artifacts": ["file:///etc/hostname"],
+        "resources": {}, "constraints": {},
+    });
+    let isolate = |source: &str| {
+        serde_json::json!({
+            "name": "run", "runtime": "isolate",
+            "config": {
+                "module": { "source": source, "sha256": "ab".repeat(32) },
+                "lifetime": "request",
+                "limits": { "cpu": "1s", "wall": "10s" },
+            },
+            "stateful": {
+                "mode": "session",
+                "envelope": { "resources": { "cpu": 1000, "memory": 1024 } },
+            },
+        })
+    };
+
+    // The control: a module served over https is not host-level.
+    run(
+        "https-module",
+        isolate("https://example.com/handler.wasm"),
+        deployer.clone(),
+    )
+    .await
+    .expect("an https module needs no host grant");
+
+    for (name, task, why) in [
+        (
+            "file-artifact",
+            container_with_file_artifact,
+            "fetches artifact file:///etc/hostname from the node's own filesystem",
+        ),
+        (
+            "file-module",
+            isolate("file:///etc/hostname"),
+            "fetches its isolate module file:///etc/hostname from the node's own filesystem",
+        ),
+    ] {
+        let status = run(name, task.clone(), deployer.clone())
+            .await
+            .expect_err("a file:// source needs the host grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}");
+        assert!(
+            status.message().contains("host-level") && status.message().contains(why),
+            "{name}: {}",
+            status.message()
+        );
+        run(name, task, platform.clone())
             .await
             .unwrap_or_else(|status| panic!("{name} with the host grant: {status}"));
     }

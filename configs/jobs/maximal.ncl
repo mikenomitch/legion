@@ -1184,6 +1184,139 @@
             },
         },
         {
+            # Isolate task (see docs/task-runtime-isolate.md): a session task
+            # whose units are WebAssembly isolates in a node's
+            # `legion-isolate` host, started in tens of microseconds (one to
+            # three milliseconds for the `js` and `python` images) and
+            # charged a few MiB each. `legion session run maximal-demo --task snippets
+            # --file main.py` runs one; a run picks its tier (isolate or VM)
+            # before it starts. Nothing per isolate is written to the store:
+            # Legion places only the generated `snippets-envelope` (on
+            # workers with the `isolates` capability), and the node's
+            # isolate supervisor does the rest.
+            name = "snippets",
+            runtime = "isolate",
+            group = "snippets",
+            config = {
+                # What runs: a built-in image, "js" or "python" (pin a build
+                # with "python@sha256:<hex>"). Exactly one of image and
+                # module.
+                image = "python",
+                # The script every invocation runs, staged from `artifacts`
+                # below: a path relative to the task directory, or
+                # "${artifact.<name>}". Images only. Omit it for dynamic
+                # code, which each run brings as its main file.
+                entry = "main.py",
+                # Your own WebAssembly component instead of an image: an
+                # https://, s3://, oci://, or file:// URL (file:// makes the
+                # task host-level) and its SHA-256.
+                # module = { source = "oci://ghcr.io/acme/handler:1.4", sha256 = "<64 hex>" },
+                # "request" (default): a fresh instance per invocation.
+                # "tenant": one warm instance per tenant key (the run's
+                # --tenant, or the Legion-Tenant header). "session": an
+                # addressable instance with a session id, hibernated when
+                # idle (it may then set `suspend`).
+                lifetime = "request",
+                # Per-invocation budgets. cpu and wall are required (no
+                # default); a run past one stops with stopped.reason =
+                # "limits".
+                limits = {
+                    cpu = "100ms",      # CPU per invocation, turns summed
+                    wall = "30s",       # wall clock per invocation, at most "24h"
+                    output = "1MiB",    # stdout + stderr returned (default and max "1MiB")
+                },
+                # Which host process the isolates share: "namespace"
+                # (default), "job" (a host for this job alone), or "shared"
+                # (only where a namespace policy lists it in isolateCordons).
+                cordon = "namespace",
+                # The VM tier: the sibling sandbox session task a tier =
+                # "vm" run executes in (its `run` block), which must be in
+                # children.tasks. Absent: runs always run as isolates.
+                vm = {
+                    task = "snippets-vm",   # default: the only entry in children.tasks
+                    memoFor = "1h",         # default "1h": route a code hash that needed a VM straight to one
+                },
+                # Environment every isolate sees. Default {}.
+                env = { MODE = "demo" },
+            },
+            # Delivers config.entry. An isolate task takes artifacts only
+            # for its entry.
+            artifacts = [
+                { source = "https://example.com/snippets/main.py", dest = "main.py" },
+            ],
+            # Reservation and ceiling, as for every runtime: `memory` is
+            # what one resident isolate is charged against the envelope
+            # (default: the image's idle size), `memoryMax` the cap on its
+            # linear memory (default 128, at most 4096 and the worker's
+            # isolate.maxMemory). `cpu` is a weight in the host's shard
+            # scheduler (default 10).
+            resources = { cpu = 10, memory = 16, memoryMax = 128 },
+            stateful = {
+                mode = "session",
+                envelope = { resources = { cpu = 16000, memory = 32768 } },
+            },
+            # The VM task, which this task's isolates may also start as a
+            # child they drive.
+            children = { tasks = ["snippets-vm"], max = 1 },
+            # Ingress and egress go through the node datapath, gated, bound
+            # for the envelope: an HTTP handler declares a port, and egress
+            # follows the policy and `connect` upstreams (credentials are
+            # injected by the node, never seen by the isolate).
+            network = {
+                ports = [{ name = "http" }],
+                egress = { allow = ["api.openai.com"] },
+            },
+            connect = {
+                upstreams = [
+                    {
+                        name = "openai",
+                        to = "https://api.openai.com",
+                        credentials = [
+                            { header = "Authorization", prefix = "Bearer ", from = { kv = "secrets/openai" } },
+                        ],
+                    },
+                ],
+            },
+            # Place the envelopes (constraints and affinities carry onto
+            # `snippets-envelope`, which also requires the `isolates`
+            # capability).
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "edge",
+            },
+        },
+        {
+            # The isolate task's VM (config.vm.task above): an ordinary
+            # sandbox session task that takes runs. A tier = "vm" run of
+            # `snippets` stages its entry as /legion/run/main.py (main.mjs
+            # for js) and executes `run.command` here, in a fresh microVM.
+            name = "snippets-vm",
+            runtime = "sandbox",
+            group = "snippets-vm",
+            config = {
+                image = "python:3.13-slim",
+                command = ["sleep", "infinity"],
+                vcpus = 1,
+                # No NIC. A gated sandbox session is not available yet, so
+                # this VM gets no datapath (and no `connect`).
+                network = { mode = "none" },
+            },
+            resources = { cpu = 1000, memory = 1024 },
+            stateful = {
+                mode = "session",
+                envelope = { resources = { cpu = 8000, memory = 16384 } },
+            },
+            run = { command = ["python3", "/legion/run/main.py"], wall = "5m" },
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
+            },
+        },
+        {
             # microVM sandbox (see docs/task-kind-sandbox.md). Same shape as
             # the container kind plus what a VM needs: guest size and a
             # kernel. Persistent state is a *block-mode volume*: a guest

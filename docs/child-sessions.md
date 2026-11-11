@@ -101,8 +101,15 @@ to it, `{ kind, id }`, and the kind decides who says the owner has ended:
 | `session` | a session id | the node running it |
 | `instance` | a keyed or slot instance id, which outlives its allocations | the managers |
 | `allocation` | an allocation id, for an owner with no instance identity (a service replica, a batch run) | the managers |
+| `isolate` | an invocation id: a request or tenant [isolate](task-runtime-isolate.md#child-vms) that called `vm.acquire()` | the node running it; the children end with the invocation |
 
-Callers may leave the kind out; Legion works it out from the id. An
+Callers may leave the kind out; Legion works it out from the id. The
+`isolate` kind is set only by the node, when an isolate starts a child VM;
+a session isolate owns its children as an ordinary `session` owner, found
+on the node its id names. Managers keep no record of isolates, so they skip
+`isolate` owners and leave judging them to the node. The node binds an
+isolate owner to its job and task, and acts on a child only for an
+isolate it is running for that job and task. An
 allocation that belongs to an instance is always owned through the
 instance, so the reference survives a reschedule.
 
@@ -116,7 +123,10 @@ record lives:
 
 ## Starting a child
 
-There are three ways in, and the same checks behind each.
+There are three ways in, and the same checks behind each. An
+[isolate](task-runtime-isolate.md#child-vms) has a fourth: `vm.acquire()`
+starts a child of its task's VM task on its own node, checked against the
+isolate task's `children` block like a start from inside.
 
 | Who | How | Authorized by |
 | --- | --- | --- |

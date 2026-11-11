@@ -8,6 +8,7 @@
   - `crates/common/` — `legion-common`: domain types in `structs/` (which re-exports the generated proto types), the config language, autoscaling policy, bundled app manifests, cluster TLS, the metrics registry in `telemetry.rs`, tracing utilities, constants.
   - `proto/` — `legion-proto`: `proto/legion.proto` and the types `proto/build.rs` generates from it via `tonic-build`.
   - `guest/` — `legion-guest`, the in-guest agent.
+  - `crates/isolate/` — `legion-isolate`, the isolate runtime's host and module compiler, its own binary: the only crate that links wasmtime, depending on `legion-proto` alone; the guest contract in `wit/`, the `js`/`python` images in `images/`.
 - Each crate re-exports the modules below it, so paths are what they were as one crate: `crate::structs::Job` and `crate::prelude::*` everywhere, `legion::manager::…` in tests and plugins.
 - Across crates: an item another crate uses is `pub`, not `pub(crate)`; an inherent `impl` must be in the crate that defines the type, so behavior a lower crate's type needs from an upper crate is an extension trait beside the code that needs it (`EvalExt`, `ContentStoreTargetExt`); a lower crate never calls up — move the item down, or keep a list on each side with a test that they match.
 - Configs and examples: `configs/` (manager, worker, TLS dev certs, job demos).
@@ -283,6 +284,7 @@ knowingly accepted a limitation or trade-off.
   `docs/jobs-tasks-and-scheduling.md`, `docs/state-store.md`
 - `docs/plugin-system.md`, `docs/task-runtime-plugins.md`, `docs/task-runtime-exec.md`,
   `docs/task-runtime-container.md`, `docs/task-runtime-noop.md`,
+  `docs/task-runtime-isolate.md`,
   `docs/rollout-strategy-plugins.md`
 - `docs/artifacts.md`, `docs/kv-store.md`, `docs/auth-and-acls.md`,
   `docs/workload-identity.md`, `docs/cert-manager.md`, `docs/stateful-workloads.md`,

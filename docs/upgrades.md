@@ -475,6 +475,22 @@ and scheduling plugins load there). A stale plugin is refused at load instead
 of crashing the process. See
 [plugin-system.md](plugin-system.md#build-fingerprint-required-for-dynamic-plugins).
 
+## The isolate host binary
+
+`legion-isolate`, the [isolate runtime](task-runtime-isolate.md)'s host and
+compiler, ships beside the worker as its own binary and is not covered by
+`protocol_version`. It has a protocol version of its own with the worker:
+at start the worker runs `legion-isolate engine-info` and uses the binary
+only when the versions match exactly, so upgrade the two together. A worker
+whose binary does not match advertises no `isolates` capability and takes
+no isolate envelope.
+
+Compiled modules are keyed by the engine's compatibility key (which
+`engine-info` prints): a new engine version, a changed `isolate.layout`,
+or, with `layout = "small"`, a changed `isolate.maxMemory` recompiles every
+module on its first use on each node. Hibernation checkpoints of session isolates hold only their `state`
+map, so they restore across an engine upgrade.
+
 ## Build-version skew expectations
 
 `build_version` is informational and never causes rejection. Only

@@ -1136,7 +1136,42 @@ Session starts on the node ([session-mode.md](session-mode.md)) add two:
   [session runs](session-runs.md) this node drove, by `outcome`: `ran` (the
   command exited, with any status), `stopped` (`run.wall`, memory, or the
   session ending stopped it), `failed` (the run could not start or finish).
-  A retry answered from a kept reply is not counted.
+  A retry answered from a kept reply is not counted. Runs on
+  [isolate](task-runtime-isolate.md) tasks are counted here too, in either
+  tier.
+
+The [isolate runtime](task-runtime-isolate.md#observing) adds these
+families. None has a `job` or `task` label (per-task numbers are in
+`legion isolate stats`), and the CPU counter is in microseconds:
+
+- **`legion_isolate_instantiate_seconds{image}`** (histogram): time to a
+  ready instance for an invocation, by `image` (`python`, `js`, `module`).
+  Warm starts are not observed. Buckets run from 10 µs to 100 ms.
+- **`legion_isolate_turns_total`** (counter): isolate turns run on this node.
+- **`legion_isolate_cpu_microseconds_total`** (counter): CPU time isolates
+  used on this node, in microseconds.
+- **`legion_isolate_resident{tier}`** (gauge): isolates on this node by
+  `tier`: `hot`, `paged_out`, `hibernated`.
+- **`legion_isolate_wakes_total{from}`** (counter): isolate starts by kind:
+  `fresh`, `warm`, `paged`, `hibernated`.
+- **`legion_isolate_stopped_total{reason}`** (counter): invocations stopped
+  before they finished, by `reason`: `limits`, `unsupported`, `trap`,
+  `ended`.
+- **`legion_isolate_limit_total{limit}`** (counter): invocations stopped by
+  a limit, by `limit`: `cpu`, `wall`, `memory`. `limits.output` truncates
+  and never stops a run, so it has no value here.
+- **`legion_isolate_vm_runs_total{reason}`** (counter): runs of isolate
+  tasks sent to the VM tier, by `reason`: `requested`, `disabled`
+  (the runtime is disabled), `import` (the pre-flight scan), `memo`.
+- **`legion_isolate_child_vms`** (gauge): child VMs isolates own on this
+  node.
+- **`legion_isolate_compile_seconds`** (histogram): time to compile one
+  isolate module on this node.
+- **`legion_isolate_host_rss_bytes{cordon}`** (gauge): resident set of each
+  cordon's host processes, summed over its replicas. `cordon` is the
+  cordon's name: `ns:<namespace>`, `job:<job id>`, or `shared`.
+- **`legion_isolate_slots{cordon,state}`** (gauge): memory slots of a
+  cordon's host processes, by `state`: `used`, `free`.
 
 Every task start on the node adds one histogram:
 

@@ -22,6 +22,19 @@
 
 tonic::include_proto!("legion");
 
+/// The node-local protocol between a worker and the `legion-isolate` host
+/// processes it supervises, generated from `isolate_host.proto`. Internal:
+/// both ends run on one node, and the two are versioned together by
+/// [`isolate_host::PROTOCOL_VERSION`], not by wire-compatibility rules.
+pub mod isolate_host {
+    tonic::include_proto!("legion.isolate.host");
+
+    /// Bumped on any incompatible change to `isolate_host.proto`. A host
+    /// refuses a `HostConfig` carrying another version, and a worker refuses
+    /// a host whose `Hello` reports another.
+    pub const PROTOCOL_VERSION: u32 = 1;
+}
+
 mod redacted;
 
 /// The text of `legion.proto` this crate was generated from. Tests and the

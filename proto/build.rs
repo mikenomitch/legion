@@ -40,6 +40,10 @@ fn main() {
         // The include path doubles as tonic-build's `rerun-if-changed`
         // watch, so it names this directory and nothing wider: with the
         // repository root, editing a doc or a UI file re-ran this script.
-        .compile_protos(&["legion.proto"], &["."])
+        //
+        // `isolate_host.proto` is the node-local protocol between a worker
+        // and its `legion-isolate` host processes; it is its own package
+        // and is not part of the public API.
+        .compile_protos(&["legion.proto", "isolate_host.proto"], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 }

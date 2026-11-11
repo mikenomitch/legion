@@ -1,0 +1,6 @@
+package legion-test:cmd;
+
+world cmd {
+  import wasi:http/outgoing-handler@0.2.12;
+  import wasi:random/random@0.2.12;
+}

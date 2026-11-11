@@ -81,6 +81,12 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         // A manager certificate (a routed `Manager.RunSession`, authorized
         // there), or a session ticket for the job and task.
         ("RunSession", &[Caller::Manager, Caller::Ticket]),
+        // Isolate aggregates: read by a manager for `Manager.GetIsolateStats`
+        // (docs/task-runtime-isolate.md).
+        ("GetIsolateStats", &[Caller::Manager]),
+        // One session isolate: the manager's routed read, or a session
+        // ticket, as `GetSession`.
+        ("GetIsolate", &[Caller::Manager, Caller::Ticket]),
         // App views and actions: the manager authorized the viewer and
         // signed an assertion; the worker only delivers.
         ("ForwardAppRequest", &[Caller::Manager]),
@@ -309,6 +315,19 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .run_session(legion::structs::RunSessionRequest {
                 job_id: "job".into(),
                 task_name: "workspace".into(),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
+        // No isolate supervisor on this worker: FailedPrecondition once
+        // admitted.
+        "GetIsolateStats" => client
+            .get_isolate_stats(legion::structs::GetIsolateStatsRequest::default())
+            .await
+            .map(|_| ()),
+        "GetIsolate" => client
+            .get_isolate(legion::structs::GetIsolateRequest {
+                session_id: "run-not-here".into(),
                 ..Default::default()
             })
             .await

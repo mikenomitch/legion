@@ -465,6 +465,13 @@ pub trait PressureSource {
     /// get back (deflate sandbox balloons). Default: nothing to undo,
     /// `memory.reclaim` holds nothing.
     fn relax(&mut self) {}
+    /// The node's isolate hosts (docs/task-runtime-isolate.md), which are
+    /// not allocations: give back up to `bytes` by paging idle isolates
+    /// out (`reclaim` step) or hibernating idle session isolates
+    /// (`suspend` step). Returns the bytes given back. Default: no isolates.
+    fn isolates(&mut self, _hibernate: bool, _bytes: u64) -> u64 {
+        0
+    }
 }
 
 /// The step runner. Holds per-episode state: an episode starts when a
@@ -484,6 +491,8 @@ pub struct PressureResponder {
     under_pressure: bool,
     /// Whether `reclaim` acted this episode, so its end relaxes it.
     reclaimed: bool,
+    /// Steps that already asked the isolate hosts this episode.
+    isolate_steps: HashSet<PressureStep>,
 }
 
 impl PressureResponder {
@@ -495,6 +504,7 @@ impl PressureResponder {
             evicted: HashSet::new(),
             under_pressure: false,
             reclaimed: false,
+            isolate_steps: HashSet::new(),
         }
     }
 
@@ -534,6 +544,7 @@ impl PressureResponder {
         self.under_pressure = self.settings.triggered(&memory);
         if !self.under_pressure {
             self.acted.clear();
+            self.isolate_steps.clear();
             self.last_action = None;
             if std::mem::take(&mut self.reclaimed) {
                 source.relax();
@@ -565,8 +576,17 @@ impl PressureResponder {
                 .collect();
             let mut actions = Vec::new();
             let mut freed_total = 0u64;
+            // Isolate hosts first, once per step per episode: idle isolates
+            // are the cheapest memory on the node to give back.
+            let mut isolate_freed = 0u64;
+            if matches!(step, PressureStep::Reclaim | PressureStep::Suspend)
+                && self.isolate_steps.insert(step)
+            {
+                isolate_freed = source.isolates(step == PressureStep::Suspend, shortfall);
+                freed_total = isolate_freed;
+            }
             for candidate in ordered {
-                if !actions.is_empty() && freed_total >= shortfall {
+                if (!actions.is_empty() || isolate_freed > 0) && freed_total >= shortfall {
                     break;
                 }
                 self.acted.insert((step, candidate.allocation_id));
@@ -623,7 +643,7 @@ impl PressureResponder {
                 action.snapshot_id = snapshot_id;
                 actions.push(action);
             }
-            if !actions.is_empty() {
+            if !actions.is_empty() || isolate_freed > 0 {
                 self.last_action = Some(now);
                 return actions;
             }
@@ -784,6 +804,28 @@ impl LivePressureSource {
 }
 
 impl PressureSource for LivePressureSource {
+    fn isolates(&mut self, hibernate: bool, bytes: u64) -> u64 {
+        let isolates = self
+            .task_manager
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .isolates();
+        match isolates {
+            Some(isolates) => {
+                let freed = isolates.reclaim_blocking(hibernate, bytes);
+                if freed > 0 {
+                    info!(
+                        step = if hibernate { "suspend" } else { "reclaim" },
+                        freed_bytes = freed,
+                        "Memory pressure: isolate hosts gave memory back"
+                    );
+                }
+                freed
+            }
+            None => 0,
+        }
+    }
+
     fn node_memory(&mut self) -> Option<NodeMemoryUsage> {
         crate::worker::usage::read_node_memory()
     }
@@ -1130,6 +1172,9 @@ mod tests {
         relaxed: u32,
         /// Fraction of the requested bytes `reclaim` actually frees.
         reclaim_yield: f64,
+        /// What the isolate hosts give back per ask, and the asks.
+        isolate_yield: u64,
+        isolate_asks: Vec<(bool, u64)>,
     }
 
     impl FakeNode {
@@ -1148,6 +1193,8 @@ mod tests {
                 failing_suspends: Vec::new(),
                 relaxed: 0,
                 reclaim_yield: 0.0,
+                isolate_yield: 0,
+                isolate_asks: Vec::new(),
             }
         }
     }
@@ -1192,6 +1239,35 @@ mod tests {
         fn relax(&mut self) {
             self.relaxed += 1;
         }
+        fn isolates(&mut self, hibernate: bool, bytes: u64) -> u64 {
+            self.isolate_asks.push((hibernate, bytes));
+            self.isolate_yield
+        }
+    }
+
+    /// Isolate hosts are asked first, once per step per episode, and what
+    /// they give back counts: enough of it ends the step without touching
+    /// an allocation.
+    #[test]
+    fn isolate_hosts_give_memory_back_before_allocations() {
+        let mut node = FakeNode::new(500, vec![candidate(1, Band::Low, 400, 1900)]);
+        node.isolate_yield = 2 * GIB;
+        let mut responder = PressureResponder::new(settings(1.0));
+        let start = Instant::now();
+        let actions = responder.tick(start, 1_000, &mut node);
+        assert!(actions.is_empty(), "the isolates covered the shortfall");
+        assert_eq!(node.isolate_asks.len(), 1);
+        assert!(
+            !node.isolate_asks[0].0,
+            "paging out first, at the reclaim step"
+        );
+        assert!(node.reclaimed.is_empty() && node.evicted.is_empty());
+        // Still short after settle: the next step runs, the isolates are not
+        // asked to page out again this episode.
+        node.isolate_yield = 0;
+        let actions = responder.tick(start + Duration::from_secs(6), 7_000, &mut node);
+        assert_eq!(actions[0].step, "reclaim");
+        assert_eq!(node.isolate_asks.len(), 1);
     }
 
     /// The Phase 2 acceptance scenario with fakes: two bursting tasks on a

@@ -235,6 +235,54 @@
     #     # sessions whose task sets suspend.onWorkerStop = "checkpoint".
     #     stopCheckpointTimeout = "60s",
     # },
+    # `isolate` runtime settings (docs/task-runtime-isolate.md): where the
+    # `legion-isolate` binary and the built images are, and how each
+    # cordon's host process is sized and confined. A worker that finds the
+    # binary advertises the `isolates` capability, which isolate tasks'
+    # envelopes require. Absent: every default below.
+    # isolate = {
+    #     # The host binary. Default: `legion-isolate` beside this worker's
+    #     # executable, then LEGION_ISOLATE_BINARY. Absolute.
+    #     binary = "/usr/local/bin/legion-isolate",
+    #     # The largest resources.memoryMax an isolate may have here, and the
+    #     # size of one memory slot. Default "4GiB", at most "4GiB".
+    #     maxMemory = "4GiB",
+    #     # Memory slots per host process: the most isolates one process
+    #     # holds resident. Default 10000; at most 16000 with guard-pages
+    #     # (each slot reserves address space). A cordon that needs more runs
+    #     # another host process.
+    #     slotsPerHost = 10000,
+    #     # Shard threads per host process. 0 (the default) is one per CPU
+    #     # the host may run on.
+    #     shards = 0,
+    #     # How often the epoch ticker advances: how late a CPU limit or a
+    #     # slice can be noticed. Default "1ms".
+    #     epoch = "1ms",
+    #     # How long a turn runs before it yields its shard. Default "5ms",
+    #     # at least `epoch`.
+    #     slice = "5ms",
+    #     # Idle time before a resident isolate's private pages are paged
+    #     # out. Default "2s"; "0s" never pages out.
+    #     pageOutAfter = "2s",
+    #     # What separates cordons: "process" (the default and the only
+    #     # value available: a confined host process each). "vm" (a microVM
+    #     # per cordon) is not built yet and is refused at startup.
+    #     cordonBoundary = "process",
+    #     # How memory slots are laid out: "guard-pages" (default), "mpk"
+    #     # (x86-64 Linux with PKU; denser), or "small" (densest, slower).
+    #     layout = "guard-pages",
+    #     # How strictly a host confines itself before it serves: "enforce"
+    #     # (default; every layer applies or the host exits), "best-effort",
+    #     # or "off" (development only).
+    #     confine = "enforce",
+    #     # The directory of built image components and their manifest.
+    #     # Default: `isolate-images` beside this worker's executable, then
+    #     # LEGION_ISOLATE_IMAGES. Absolute.
+    #     images = "/var/lib/legion/isolate-images",
+    #     # The largest request or response body a host buffers. Default
+    #     # "16MiB".
+    #     maxBodyBytes = "16MiB",
+    # },
     # The host guard (docs/network-handlers.md, "The host guard"): the fixed
     # floor of destinations no allocation on this node may reach through the
     # datapath — loopback, the node's own addresses, link-local (cloud

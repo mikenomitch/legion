@@ -76,6 +76,7 @@ async fn main() -> R<()> {
         Some(("boot-ticket", sub_matches)) => cmd::boot_ticket::handle(sub_matches).await?,
         Some(("sandbox", sub_matches)) => cmd::sandbox::handle(sub_matches).await?,
         Some(("session", sub_matches)) => cmd::session::handle(sub_matches).await?,
+        Some(("isolate", sub_matches)) => cmd::isolate::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some(("audit", sub_matches)) => cmd::governance::handle_audit(sub_matches).await?,

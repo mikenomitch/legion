@@ -3,7 +3,8 @@
 //!
 //! A namespace policy selects namespaces by glob and governs the jobs in
 //! them: an aggregate quota per priority band, job and namespace counts,
-//! allowed and default pools, allowed runtimes and host volumes. Reading
+//! allowed and default pools, allowed runtimes, host volumes, and isolate
+//! cordon kinds (`isolateCordons`). Reading
 //! needs `acl:read` and writing `acl:write`; a tenant sees the limits that
 //! bind it through `legion namespace get`. Every subcommand takes
 //! `--json`/`-j` and emits the standard [`crate::cmd::output`] envelope.
@@ -51,8 +52,9 @@ pub fn config() -> Command {
         .help("Namespace policy name");
     Command::new("policy")
         .about(
-            "Namespace policies: quota, counts, pools, runtimes and host volumes for every \
-             namespace a glob matches (needs acl:read / acl:write)",
+            "Namespace policies: quota, counts, pools, runtimes, host volumes, and isolate \
+             cordon kinds (isolateCordons) for every namespace a glob matches (needs acl:read / \
+             acl:write)",
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -168,6 +170,7 @@ fn rules_summary(policy: &NamespacePolicy) -> String {
         "pools",
         "runtimes",
         "hostVolumes",
+        "isolateCordons",
     ]
     .iter()
     .filter(|key| object.get(**key).is_some())
@@ -210,7 +213,11 @@ pub fn print_status(status: &NamespacePolicyStatus, indent: &str) {
     if let Some(max) = object.get("maxNamespaces").and_then(Value::as_u64) {
         println!("{indent}  namespaces: {} / {max}", status.namespaces);
     }
-    for (key, label) in [("runtimes", "runtimes"), ("hostVolumes", "host volumes")] {
+    for (key, label) in [
+        ("runtimes", "runtimes"),
+        ("hostVolumes", "host volumes"),
+        ("isolateCordons", "isolate cordons"),
+    ] {
         if let Some(list) = object.get(key).and_then(Value::as_array) {
             let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
             println!("{indent}  {label}: [{}]", names.join(", "));

@@ -49,6 +49,15 @@ pub enum Attachment {
     /// at `proxy`, and the runtime confines the task to those listeners
     /// (Seatbelt for `exec`, pf for an Apple container VM). Fails closed.
     Confined { proxy: SocketAddr },
+    /// An isolate task's envelope allocation (runtime `envelope`, its
+    /// network carried over from the isolate task and always gated): no
+    /// process, no namespace, no guest. The datapath binds Unix sockets in
+    /// `dir` (`<allocs>/<id>/.isolate`), one per task-facing port — the
+    /// egress proxy and each `connect` upstream — which the isolate
+    /// supervisor dials on its isolates' behalf, and ingress dials the
+    /// socket the supervisor serves per advertised port
+    /// ([`isolate_ingress_socket`]). Fails closed.
+    Isolate { dir: PathBuf },
 }
 
 impl Attachment {
@@ -58,6 +67,17 @@ impl Attachment {
     /// scratch dir.
     pub fn of(allocation: &TaskAllocation, network: &AllocNetwork, alloc_root: &Path) -> Self {
         let sandbox = allocation.task_runtime == "sandbox";
+        // An isolate envelope has no process to confine and no guest: its
+        // listeners are the supervisor's sockets, whatever the node is
+        // (`Confined` included). Checked first so a macOS node's assigned
+        // egress-proxy port is not bound for nothing.
+        if allocation.task_runtime == crate::structs::session::ENVELOPE_RUNTIME
+            && network.is_gated()
+        {
+            return Attachment::Isolate {
+                dir: isolate_dir(alloc_root, allocation.allocation_id),
+            };
+        }
         if let Some(proxy) = network
             .is_confined()
             .then(|| network.egress_proxy.as_deref()?.parse().ok())
@@ -91,7 +111,10 @@ impl Attachment {
     pub fn is_gated(&self) -> bool {
         matches!(
             self,
-            Attachment::Netns { .. } | Attachment::GuestVsock { .. } | Attachment::Confined { .. }
+            Attachment::Netns { .. }
+                | Attachment::GuestVsock { .. }
+                | Attachment::Confined { .. }
+                | Attachment::Isolate { .. }
         )
     }
 
@@ -120,11 +143,29 @@ impl Attachment {
         }
     }
 
+    /// An isolate envelope's socket dir, which holds its datapath sockets.
+    pub fn isolate_dir(&self) -> Option<&Path> {
+        match self {
+            Attachment::Isolate { dir } => Some(dir),
+            _ => None,
+        }
+    }
+
     /// Whether the allocation's upstream VIPs are bound on the node. A gated
     /// sandbox guest serves its VIPs itself (its agent relays them), so the
-    /// node binds none for it.
+    /// node binds none for it; an isolate addresses an upstream by name, so
+    /// it has no use for one.
     pub fn serves_vips(&self) -> bool {
-        !matches!(self, Attachment::GuestVsock { .. })
+        !matches!(
+            self,
+            Attachment::GuestVsock { .. } | Attachment::Isolate { .. }
+        )
+    }
+
+    /// Whether the allocation gets a per-allocation resolver. An isolate
+    /// has no resolver of its own: the worker resolves on its behalf.
+    pub fn wants_resolver(&self) -> bool {
+        !matches!(self, Attachment::Isolate { .. })
     }
 
     /// Whether every port the allocation advertises is fronted by an ingress
@@ -133,7 +174,9 @@ impl Attachment {
     pub fn fronts_every_port(&self) -> bool {
         matches!(
             self,
-            Attachment::GuestVsock { .. } | Attachment::GuestTap { .. }
+            Attachment::GuestVsock { .. }
+                | Attachment::GuestTap { .. }
+                | Attachment::Isolate { .. }
         )
     }
 
@@ -144,6 +187,7 @@ impl Attachment {
     pub fn listen(&self, ip: IpAddr, port: u16) -> ListenAddr {
         match self {
             Attachment::GuestVsock { scratch } => ListenAddr::Unix(guest_socket(scratch, port)),
+            Attachment::Isolate { dir } => ListenAddr::Unix(isolate_socket(dir, port)),
             Attachment::Netns { path } => ListenAddr::Tcp {
                 netns: Some(path.clone()),
                 addr: SocketAddr::new(ip, port),
@@ -170,6 +214,7 @@ impl Attachment {
             Attachment::GuestTap { scratch } => TaskDial::Bridge {
                 scratch: scratch.clone(),
             },
+            Attachment::Isolate { dir } => TaskDial::Isolate { dir: dir.clone() },
         }
     }
 }
@@ -177,6 +222,28 @@ impl Attachment {
 /// A sandbox's scratch dir (`<allocs>/<id>/.sandbox`).
 fn sandbox_scratch(alloc_root: &Path, allocation_id: i64) -> PathBuf {
     crate::task_plugins::sandbox_dir_for(&alloc_root.join(allocation_id.to_string()))
+}
+
+/// An isolate envelope's socket dir (`<allocs>/<id>/.isolate`).
+pub fn isolate_dir(alloc_root: &Path, allocation_id: i64) -> PathBuf {
+    alloc_root
+        .join(allocation_id.to_string())
+        .join(ISOLATE_DIR_NAME)
+}
+
+/// The name of an isolate envelope's socket dir inside its allocation dir.
+pub const ISOLATE_DIR_NAME: &str = ".isolate";
+
+/// The socket an isolate envelope's listener for task-facing port `port`
+/// binds (the egress proxy's 1080, an upstream's local port).
+pub fn isolate_socket(dir: &Path, port: u16) -> PathBuf {
+    dir.join(format!("net.sock_{port}"))
+}
+
+/// The socket the isolate supervisor serves for an advertised port of an
+/// isolate task, by its label, which ingress dials.
+pub fn isolate_ingress_socket(dir: &Path, label: &str) -> PathBuf {
+    dir.join(format!("ingress.sock_{label}"))
 }
 
 /// The VMM's host socket for a guest-initiated stream to host port `port`.
@@ -299,6 +366,66 @@ mod tests {
             Attachment::of(&allocation(7, "exec", "{}"), &host, root),
             Attachment::Host
         );
+    }
+
+    /// An isolate task's envelope (runtime `envelope`, its gated network
+    /// carried over from the isolate task) gets Unix sockets in its own dir,
+    /// on any node, fails closed, serves no VIPs and needs no resolver, and
+    /// ingress dials the supervisor's socket for the port's label. An
+    /// envelope without a network block stays as it is.
+    #[test]
+    fn an_isolate_envelope_attaches_through_its_socket_dir_test() {
+        let root = Path::new("/allocs");
+        let envelope = |id| allocation(id, crate::structs::session::ENVELOPE_RUNTIME, "{}");
+        let dir = PathBuf::from("/allocs/9/.isolate");
+        let attachment = Attachment::of(&envelope(9), &network(MODE_GATED), root);
+        assert_eq!(attachment, Attachment::Isolate { dir: dir.clone() });
+        assert_eq!(attachment.isolate_dir(), Some(dir.as_path()));
+        assert!(attachment.is_gated());
+        assert!(!attachment.serves_vips());
+        assert!(!attachment.wants_resolver());
+        assert!(attachment.fronts_every_port());
+        assert!(attachment.netns().is_none() && attachment.guest_vsock().is_none());
+        assert_eq!(attachment.egress_proxy(), None);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            attachment.listen(ip, 1080),
+            ListenAddr::Unix("/allocs/9/.isolate/net.sock_1080".into())
+        );
+        assert_eq!(
+            attachment.task_dial(),
+            TaskDial::Isolate { dir: dir.clone() }
+        );
+        assert!(attachment.task_dial().gated());
+        assert_eq!(
+            isolate_ingress_socket(&dir, "http"),
+            PathBuf::from("/allocs/9/.isolate/ingress.sock_http")
+        );
+        // On a node without namespaces too: no assigned proxy port.
+        let confined = AllocNetwork {
+            mode: Some(MODE_GATED.into()),
+            egress_proxy: Some("127.0.0.1:20017".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Attachment::of(&envelope(9), &confined, root),
+            Attachment::Isolate { dir }
+        );
+        // An envelope with no network (every session task but an isolate
+        // task) and every other runtime are as before.
+        assert_eq!(
+            Attachment::of(&envelope(9), &AllocNetwork::default(), root),
+            Attachment::Host
+        );
+        assert_eq!(
+            Attachment::of(&envelope(9), &network(MODE_HOST), root),
+            Attachment::Host
+        );
+        assert!(Attachment::Host.wants_resolver());
+        assert!(Attachment::GuestVsock {
+            scratch: "/s".into()
+        }
+        .wants_resolver());
     }
 
     #[test]

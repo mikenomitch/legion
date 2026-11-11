@@ -20,6 +20,7 @@ pub mod eval;
 pub mod exec;
 pub mod exec_ws;
 pub mod governance;
+pub mod isolates;
 pub mod job_templates;
 pub mod leader_forward;
 pub(crate) mod node_group_members;

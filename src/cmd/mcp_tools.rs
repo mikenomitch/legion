@@ -182,6 +182,13 @@ rpc_tools! {
     "legion_scaling_defaults_apply" => "ApplyScalingDefaults", apply_scaling_defaults(ApplyScalingDefaultsRequest), true,
         "Apply task-autoscaling defaults (operator:write). dry_run reports the effect.",
         props(&[("defaults_json", "string", "The defaults document as JSON."), ("dry_run", "boolean", "Validate and report only."), ("force", "boolean", "Apply despite warnings."), ("idempotency_key", "string", "Retry-safety key.")], &["defaults_json"]);
+    // --- Isolates (docs/task-runtime-isolate.md, "Observing") ---
+    "legion_isolate_stats" => "GetIsolateStats", get_isolate_stats(GetIsolateStatsRequest), false,
+        "Per-node aggregates of a job's isolate tasks, from the nodes' heartbeats: resident, active, paged-out, and hibernated isolates, invocation and CPU rates, VM runs, child VMs, stops by reason and limit, refusals, memory, and the host processes that serve them (age_ms says how old each report is). Isolates are never listed one by one.",
+        props(&[("job_id", "string", "The job (ns/name or a bare name in default)."), ("task_name", "string", "One isolate task (default: every isolate task of the job).")], &["job_id"]);
+    "legion_isolate_get" => "GetIsolate", get_isolate(GetIsolateRequest), false,
+        "Describe one session isolate by asking the node its id names: state (hot, paged_out, hibernated, empty), tenant, invocations, memory and state bytes, checkpoint, and child VMs. Unavailable (retryable) when the node cannot be reached.",
+        props(&[("session_id", "string", "The session isolate's id."), ("node_id", "string", "The node to ask, for an id that carries no node tag (one derived from an idempotency key).")], &["session_id"]);
     // --- Snapshots ---
     "legion_snapshot_alias_delete" => "DeleteSnapshotAlias", delete_snapshot_alias(DeleteSnapshotAliasRequest), true,
         "Delete a snapshot's name (the snapshot itself stays).",

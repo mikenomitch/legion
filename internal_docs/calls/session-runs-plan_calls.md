@@ -80,7 +80,7 @@ unaffected.
 `message`, `hint`, and `retryable`. A stop is the run's outcome, with stdout,
 stderr, and timings an agent needs, which an error envelope would drop. It
 is the rule the isolate plan's first draft introduced (isolate-runtime calls
-entry 8 records the move).
+entry 18 records the move).
 
 ---
 

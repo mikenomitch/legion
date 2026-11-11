@@ -131,7 +131,7 @@ fn bring_loopback_up() -> R<()> {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").or_else(|_| {
         // Loopback is down, so binding to it fails; an unbound datagram
         // socket is enough for the ioctl.
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }

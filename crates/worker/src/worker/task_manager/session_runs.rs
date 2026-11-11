@@ -421,6 +421,8 @@ struct Prepared {
     spec: super::SessionSpec,
     run: ResolvedRun,
     command: Vec<String>,
+    /// `LEGION_RUN_ARGS` (a JSON array) for an isolate's VM-tier run.
+    run_args: Option<String>,
     /// (path relative to the run directory, bytes, executable).
     files: Vec<(String, Vec<u8>, bool)>,
     /// (path as asked, path relative to the run directory).
@@ -429,44 +431,20 @@ struct Prepared {
     start_wait: Duration,
 }
 
-fn prepare(
-    task_manager: &Arc<Mutex<WorkerTaskManager>>,
-    call: &RunCall,
-) -> Result<Prepared, Status> {
-    let spec = task_manager
-        .lock()
-        .map_err(|_| Status::internal("Task manager lock poisoned"))?
-        .session_spec(&call.job_id, &call.task_name)
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                super::SessionRefusal::NoEnvelope {
-                    job_id: call.job_id.clone(),
-                    task_name: call.task_name.clone(),
-                }
-                .to_string(),
-            )
-        })?;
-    let run = spec
-        .task
-        .run
-        .as_ref()
-        .ok_or_else(|| Status::failed_precondition(no_run_block(&call.job_id, &call.task_name)))?
-        .resolve()
-        .map_err(|err| Status::failed_precondition(format!("task {}: {err}", call.task_name)))?;
-    let request = &call.request;
-    let command = if request.command.is_empty() {
-        run.command.clone()
-    } else {
-        if !run.allow_command {
-            return Err(Status::failed_precondition(command_not_allowed(
-                &call.task_name,
-            )));
-        }
-        if request.command[0].trim().is_empty() {
-            return Err(Status::invalid_argument("command's first element is empty"));
-        }
-        request.command.clone()
-    };
+/// A run's files, input, and `get` paths, checked: relative paths with no
+/// `..`, no file staged twice, `input` JSON, at most [`MAX_RUN_STAGED`]
+/// bytes together.
+pub struct StagedFiles {
+    /// (path relative to the run directory, bytes, executable). `input`
+    /// is staged as [`RUN_INPUT_FILE`].
+    pub files: Vec<(String, Vec<u8>, bool)>,
+    /// (path as asked, path relative to the run directory).
+    pub get: Vec<(String, String)>,
+    pub has_input: bool,
+}
+
+/// Check a run request's staging (shared with isolate runs).
+pub fn staged_files(request: &RunSessionRequest) -> Result<StagedFiles, Status> {
     let mut staged = 0u64;
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -507,6 +485,131 @@ fn prepare(
             .map_err(|err| Status::invalid_argument(format!("get {err}")))?;
         get.push((path.clone(), relative));
     }
+    Ok(StagedFiles {
+        files,
+        get,
+        has_input,
+    })
+}
+
+/// The isolate-only field a request sets, if any.
+pub fn isolate_only_field(request: &RunSessionRequest) -> Option<&'static str> {
+    if !request.tier.trim().is_empty() {
+        Some("tier")
+    } else if !request.tenant.is_empty() {
+        Some("tenant")
+    } else if !request.session_id.is_empty() {
+        Some("session_id")
+    } else if !request.args.is_empty() {
+        Some("args")
+    } else {
+        None
+    }
+}
+
+/// The `args` of an isolate run sent to its VM task, and the run-directory
+/// path its entry is staged at (`/legion/run/main.py`).
+#[derive(Debug, Clone, Default)]
+pub struct VmArgs {
+    pub args: Vec<String>,
+    pub entry_path: String,
+}
+
+/// Whether a VM-tier run's `args` may follow `command`: only when its last
+/// element is exactly the staged entry's path (no normalization: a command
+/// ending with `/legion/run/./main` or `/legion/run/main/` does not count).
+/// The entry path is fixed per task, never a name the caller chose
+/// (`isolates::supervisor::stage_for_vm`).
+pub fn vm_args_follow_command(command: &[String], entry_path: &str) -> bool {
+    command.last().map(String::as_str) == Some(entry_path)
+}
+
+fn prepare(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    call: &RunCall,
+    vm_args: Option<&VmArgs>,
+) -> Result<Prepared, Status> {
+    let spec = task_manager
+        .lock()
+        .map_err(|_| Status::internal("Task manager lock poisoned"))?
+        .session_spec(&call.job_id, &call.task_name)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                super::SessionRefusal::NoEnvelope {
+                    job_id: call.job_id.clone(),
+                    task_name: call.task_name.clone(),
+                }
+                .to_string(),
+            )
+        })?;
+    if crate::structs::isolate::is_isolate_task(&spec.task) {
+        // The server sends isolate tasks to the isolate supervisor; reaching
+        // here means this node has none.
+        return Err(Status::failed_precondition(format!(
+            "task {} runs on the isolate runtime, which this node does not run (no \
+             legion-isolate binary)",
+            call.task_name
+        )));
+    }
+    if let Some(field) = isolate_only_field(&call.request) {
+        return Err(Status::invalid_argument(format!(
+            "{field} applies only to tasks of the isolate runtime; task {} runs on {}",
+            call.task_name, spec.task.runtime
+        )));
+    }
+    let run = spec
+        .task
+        .run
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition(no_run_block(&call.job_id, &call.task_name)))?
+        .resolve()
+        .map_err(|err| Status::failed_precondition(format!("task {}: {err}", call.task_name)))?;
+    let request = &call.request;
+    let command = if request.command.is_empty() {
+        run.command.clone()
+    } else {
+        if !run.allow_command {
+            return Err(Status::failed_precondition(command_not_allowed(
+                &call.task_name,
+            )));
+        }
+        if request.command[0].trim().is_empty() {
+            return Err(Status::invalid_argument("command's first element is empty"));
+        }
+        request.command.clone()
+    };
+    // An isolate run sent to its VM task: the run's `args` are appended
+    // only where they are script arguments by construction, a `run.command`
+    // ending with the staged entry's path; elsewhere they would change the
+    // command line of a program the caller (with only job:write) does not
+    // choose, so they are refused. They are always also exported as
+    // `LEGION_RUN_ARGS` for a wrapper to read.
+    let mut command = command;
+    let mut run_args = None;
+    if let Some(vm) = vm_args {
+        if !vm.args.is_empty() {
+            if !vm_args_follow_command(&command, &vm.entry_path) {
+                return Err(Status::failed_precondition(format!(
+                    "task {}'s run.command does not end with {}, so arguments cannot be passed \
+                     to it safely; the run carries {} args\nHint: end the VM task's \
+                     run.command with {} (e.g. [\"python3\", \"{}\"]), read LEGION_RUN_ARGS in \
+                     a wrapper, or send the arguments in --input",
+                    call.task_name,
+                    vm.entry_path,
+                    vm.args.len(),
+                    vm.entry_path,
+                    vm.entry_path
+                )));
+            }
+            command.extend(vm.args.iter().cloned());
+        }
+        run_args = Some(serde_json::to_string(&vm.args).unwrap_or_else(|_| "[]".into()));
+    }
+    let StagedFiles {
+        files,
+        get,
+        has_input,
+    } = staged_files(request)?;
     let start_wait = request
         .wait_timeout_seconds
         .map(|seconds| Duration::from_secs(u64::from(seconds.max(1))).min(MAX_START_WAIT))
@@ -515,6 +618,7 @@ fn prepare(
         spec,
         run,
         command,
+        run_args,
         files,
         get,
         has_input,
@@ -530,7 +634,21 @@ pub async fn run_session(
     node_id: String,
     call: RunCall,
 ) -> Result<RunSessionResponse, Status> {
-    let prepared = prepare(&task_manager, &call)?;
+    run_session_with_args(task_manager, launch_pool, node_id, call, None).await
+}
+
+/// [`run_session`] for the VM tier of an isolate run
+/// (docs/task-runtime-isolate.md): its `args` follow the VM task's own
+/// `run.command` only when that ends with the staged entry (see
+/// [`VmArgs`]), and are exported as `LEGION_RUN_ARGS`.
+pub async fn run_session_with_args(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
+    node_id: String,
+    call: RunCall,
+    vm_args: Option<VmArgs>,
+) -> Result<RunSessionResponse, Status> {
+    let prepared = prepare(&task_manager, &call, vm_args.as_ref())?;
     if call.request.dry_run {
         let reason = task_manager
             .lock()
@@ -546,6 +664,7 @@ pub async fn run_session(
                 command: prepared.command,
                 wall: prepared.run.wall_text,
                 output_bytes: prepared.run.output,
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -555,22 +674,73 @@ pub async fn run_session(
         .lock()
         .map_err(|_| Status::internal("Task manager lock poisoned"))?
         .run_registry();
-    let key = call
-        .request
+    let job_id = call.job_id.clone();
+    let task_name = call.task_name.clone();
+    let request = call.request.clone();
+    let driver_node = node_id.clone();
+    let driver_registry = registry.clone();
+    run_keyed(
+        &registry,
+        &job_id,
+        &task_name,
+        &node_id,
+        &request,
+        move |run_id| async move {
+            let result = drive(
+                &task_manager,
+                &launch_pool,
+                &driver_registry,
+                &driver_node,
+                &call,
+                prepared,
+                &run_id,
+            )
+            .await;
+            let metrics = crate::telemetry::worker_metrics();
+            metrics.session_runs_total.inc(&[match &result {
+                Ok(reply) if reply.stopped.is_some() => "stopped",
+                Ok(_) => "ran",
+                Err(_) => "failed",
+            }]);
+            result
+        },
+    )
+    .await
+}
+
+/// Run `run` once per idempotency key (docs/session-runs.md): a request
+/// with no key gets a minted run id; a keyed one derives its id from the
+/// key and the request's content, and a retry is answered from the kept
+/// reply or waits for the attempt in flight. `run` is driven by a detached
+/// task, so a caller that hangs up does not cancel it half way. Shared by
+/// session runs and isolate runs.
+pub async fn run_keyed<F, Fut>(
+    registry: &Arc<RunRegistry>,
+    job_id: &str,
+    task_name: &str,
+    node_id: &str,
+    request: &RunSessionRequest,
+    run: F,
+) -> Result<RunSessionResponse, Status>
+where
+    F: FnOnce(String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<RunSessionResponse, Status>> + Send + 'static,
+{
+    let key = request
         .idempotency_key
         .as_deref()
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
     let (run_id, ticket) = if key.is_empty() {
-        (crate::structs::mint_session_id("run", &node_id), None)
+        (crate::structs::mint_session_id("run", node_id), None)
     } else {
         // A key names one request, not just one string: the request's own
         // content is part of the id, so another caller of the same job and
         // task who reuses a key with different files or input starts its own
         // run and is never answered with this one's stored reply.
-        let key = format!("{key}\n{}", request_fingerprint(&call.request));
-        let run_id = derived_run_id(&call.job_id, &call.task_name, &key);
+        let key = format!("{key}\n{}", request_fingerprint(request));
+        let run_id = derived_run_id(job_id, task_name, &key);
         match registry.begin(&run_id, crate::util::now_unix_ms()) {
             Begin::Done(reply) => {
                 return Ok(RunSessionResponse {
@@ -604,22 +774,7 @@ pub async fn run_session(
     // Detached: a caller that hangs up must not cancel the run between its
     // start and its end, where the session would be left running.
     let driver = tokio::spawn(async move {
-        let result = drive(
-            &task_manager,
-            &launch_pool,
-            &registry,
-            &node_id,
-            &call,
-            prepared,
-            &run_id,
-        )
-        .await;
-        let metrics = crate::telemetry::worker_metrics();
-        metrics.session_runs_total.inc(&[match &result {
-            Ok(reply) if reply.stopped.is_some() => "stopped",
-            Ok(_) => "ran",
-            Err(_) => "failed",
-        }]);
+        let result = run(run_id).await;
         if let Some(ticket) = ticket {
             ticket.settle(&result, crate::util::now_unix_ms());
         }
@@ -787,14 +942,14 @@ async fn drive(
 
 /// What one exec into the session produced.
 #[derive(Debug, Default)]
-struct Captured {
-    exit: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
-    timed_out: bool,
-    session_gone: bool,
-    elapsed: Duration,
+pub(crate) struct Captured {
+    pub(crate) exit: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) timed_out: bool,
+    pub(crate) session_gone: bool,
+    pub(crate) elapsed: Duration,
 }
 
 #[derive(Default)]
@@ -808,7 +963,7 @@ struct Sink {
 /// Run one command in the session and capture its output, up to `budget`
 /// bytes of stdout plus stderr, killing it at `deadline` or when the
 /// session ends under it.
-fn exec_capture(
+pub(crate) fn exec_capture(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     session_id: &str,
     local_key: i64,
@@ -917,12 +1072,13 @@ fn exec_capture(
 }
 
 /// The shell that writes one staged file: stdin to `$1`, mode `$2`.
-const STAGE_SCRIPT: &str = r#"set -e; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1""#;
+pub(crate) const STAGE_SCRIPT: &str =
+    r#"set -e; mkdir -p "$(dirname "$1")"; cat > "$1"; chmod "$2" "$1""#;
 
 /// The shell that reads at most `$2` bytes of the file `$1`.
-const FETCH_SCRIPT: &str = r#"[ -f "$1" ] && head -c "$2" "$1""#;
+pub(crate) const FETCH_SCRIPT: &str = r#"[ -f "$1" ] && head -c "$2" "$1""#;
 
-fn shell(script: &str, args: &[&str]) -> ExecOptions {
+pub(crate) fn shell(script: &str, args: &[&str]) -> ExecOptions {
     let mut command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
     command.push("legion-run".to_string());
     command.extend(args.iter().map(|arg| arg.to_string()));
@@ -1119,6 +1275,9 @@ fn execute(
     let mut opts = ExecOptions::new(rewrite_run_dir(&prepared.command, &target.run_dir), false);
     opts.env
         .insert("LEGION_RUN_DIR".into(), target.run_dir.clone());
+    if let Some(args) = prepared.run_args.as_ref() {
+        opts.env.insert("LEGION_RUN_ARGS".into(), args.clone());
+    }
     if prepared.has_input {
         opts.env.insert(
             "LEGION_RUN_INPUT".into(),
@@ -1426,6 +1585,20 @@ fn request_fingerprint(request: &RunSessionRequest) -> String {
     part(&(request.command.len() as u64).to_be_bytes());
     for arg in &request.command {
         part(arg.as_bytes());
+    }
+    // Isolate runs: where and for whom it runs is part of what it is.
+    if !(request.tier.is_empty()
+        && request.tenant.is_empty()
+        && request.session_id.is_empty()
+        && request.args.is_empty())
+    {
+        part(request.tier.as_bytes());
+        part(request.tenant.as_bytes());
+        part(request.session_id.as_bytes());
+        part(&(request.args.len() as u64).to_be_bytes());
+        for arg in &request.args {
+            part(arg.as_bytes());
+        }
     }
     hasher
         .finalize()

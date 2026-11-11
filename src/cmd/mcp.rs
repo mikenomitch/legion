@@ -184,7 +184,7 @@ fn namespace_policy_apply_schema() -> Value {
         "properties": {
             "policy": {
                 "type": "object",
-                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob], autoscale?: { the jobspec autoscale record without checks; min must be a multiple of count of at least \"1x\" } }. An unset allowlist allows everything; an empty one allows nothing."
+                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob], isolateCordons?: [\"namespace\" | \"job\" | \"shared\"] (the isolate cordon kinds its namespaces may use; shared is refused unless a governing policy lists it), autoscale?: { the jobspec autoscale record without checks; min must be a multiple of count of at least \"1x\" } }. An unset allowlist allows everything; an empty one allows nothing."
             },
             "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts (and autoscaled tasks whose policy it would invalidate), without writing." },
             "force": { "type": "boolean", "description": "Apply even when the policy's autoscale leaves some autoscaled tasks' policies invalid; they are held until fixed." },
@@ -1496,7 +1496,7 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_session_run",
-            description: "Run code once in a fresh, single-use session of a session task that declares a `run` block (exec, container or sandbox runtime), in one call: the node starts the session, stages `files` and `input` under /legion/run/ (input as input.json, its path in LEGION_RUN_INPUT), executes the task's run.command once, and ends the session whatever happens. Returns stdout, stderr, exit, `result` (the JSON the command wrote to /legion/run/result.json, else null), the `get` files, wallMs and cpuMs. Read the reply's structure: `exit` set means your code ran (non-zero is your code failing); `stopped` set (reason wall|memory|session_ended, with a hint) means a limit stopped it and exit is null; an error envelope means Legion could not run it (RESOURCE_EXHAUSTED and UNAVAILABLE are retryable). Pass idempotency_key so a retry does not run the code twice, and keep retries on the node a reply or error named (node_id): idempotency is per node, with the reply kept 10 minutes. dry_run answers which node would take it and whether it has room. `command` replaces run.command and needs run.allowCommand plus exec:write. Mutating; needs job:write.",
+            description: "Run code once in a fresh, single-use session of a session task that declares a `run` block (exec, container or sandbox runtime), in one call: the node starts the session, stages `files` and `input` under /legion/run/ (input as input.json, its path in LEGION_RUN_INPUT), executes the task's run.command once, and ends the session whatever happens. Returns stdout, stderr, exit, `result` (the JSON the command wrote to /legion/run/result.json, else null), the `get` files, wallMs and cpuMs. Read the reply's structure: `exit` set means your code ran (non-zero is your code failing); `stopped` set (reason wall|memory|session_ended, with a hint) means a limit stopped it and exit is null; an error envelope means Legion could not run it (RESOURCE_EXHAUSTED and UNAVAILABLE are retryable). Pass idempotency_key so a retry does not run the code twice, and keep retries on the node a reply or error named (node_id): idempotency is per node, with the reply kept 10 minutes. dry_run answers which node would take it and whether it has room. `command` replaces run.command and needs run.allowCommand plus exec:write. On a task of the isolate runtime no run block is needed: the code runs in an isolate (microsecond start, under the task's config.limits) or a fresh VM, chosen before it runs by `tier` (auto by default), and the reply adds `tier`, `tierReason`, and `nextTier`. Keep `nextTier` per code and pass it as `tier` the next time you run the same code, so a wrong guess is paid once; a run stopped in the isolate (stopped.reason unsupported or limits) stays stopped, and `fallback: \"vm\"` makes this tool send it again in a VM, which runs your code a second time (the reply then says ranTwice). Mutating; needs job:write.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1524,7 +1524,12 @@ fn core_tool_defs() -> Vec<ToolDef> {
                     "idempotency_key": { "type": "string", "description": "Per-node retry key; the reply is kept 10 minutes." },
                     "node_id": { "type": "string", "description": "Run on this node (a retry names the node the first attempt reported)." },
                     "wait_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long to wait for the session to start (default 60)." },
-                    "dry_run": { "type": "boolean", "description": "Answer the node and its room; run nothing." }
+                    "dry_run": { "type": "boolean", "description": "Answer the node and its room; run nothing. On an isolate task it also answers the tier auto would pick, the source's imports, and those missing from the image." },
+                    "tier": { "type": "string", "enum": ["auto", "isolate", "vm"], "description": "Isolate tasks only: where the run happens. auto (default) decides before anything runs; pass a previous reply's nextTier for the same code." },
+                    "tenant": { "type": "string", "description": "Isolate tasks only: who the run is for (keys warm instances and the per-tenant queue; up to 128 printable ASCII bytes)." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Isolate tasks only: arguments for the code being run (sys.argv[1:], process.argv.slice(2); appended to the VM task's run.command for a VM run). At most 64, 64 KiB together." },
+                    "session_id": { "type": "string", "description": "Isolate tasks with config.lifetime = \"session\" only: run in this session isolate, on the node its id names." },
+                    "fallback": { "type": "string", "enum": ["vm"], "description": "Isolate tasks only: when the run is stopped in the isolate and the reply's nextTier is vm, send it again with tier vm. Runs your code a second time, in a VM; the reply says ranTwice. Not with session_id or dry_run." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -2773,15 +2778,52 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     .unwrap_or(false),
                 ticket: String::new(),
                 node_id: opt_str_arg(&args, "node_id").unwrap_or_default(),
+                tier: opt_str_arg(&args, "tier").unwrap_or_default(),
+                tenant: opt_str_arg(&args, "tenant").unwrap_or_default(),
+                session_id: opt_str_arg(&args, "session_id").unwrap_or_default(),
+                args: strings("args"),
+            };
+            let fallback = match opt_str_arg(&args, "fallback").as_deref() {
+                None | Some("") => false,
+                Some("vm") if !request.session_id.is_empty() || request.dry_run => {
+                    return Err("fallback cannot be combined with session_id or dry_run: a \
+                                fallback reruns the code in a fresh VM"
+                        .into())
+                }
+                Some("vm") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "fallback {other:?} is not supported; the only one is \"vm\""
+                    ))
+                }
+            };
+            let run_failed = |status: tonic::Status| {
+                let err = CliError::from_status("run failed", &status);
+                serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
             };
             let mut client = connect().await?;
-            match client.run_session(request).await {
-                Ok(reply) => Ok(crate::cmd::session::run_reply_json(&reply.into_inner())),
-                Err(status) => {
-                    let err = CliError::from_status("run failed", &status);
-                    Err(serde_json::to_string(&err)
-                        .unwrap_or_else(|_| status.message().to_string()))
+            let first = client
+                .run_session(request.clone())
+                .await
+                .map_err(run_failed)?
+                .into_inner();
+            // The tool's own second request, never the server's.
+            match fallback
+                .then(|| crate::cmd::session::fallback_vm_request(&first, &request))
+                .flatten()
+            {
+                Some(second) => {
+                    let mut reply = client
+                        .run_session(second)
+                        .await
+                        .map_err(run_failed)?
+                        .into_inner();
+                    reply.tier_reason = crate::cmd::session::fallback_reason(&first);
+                    let mut data = crate::cmd::session::run_reply_json(&reply);
+                    data["ranTwice"] = json!(true);
+                    Ok(data)
                 }
+                None => Ok(crate::cmd::session::run_reply_json(&first)),
             }
         }
         "legion_session_nodes" => {

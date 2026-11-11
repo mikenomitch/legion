@@ -226,9 +226,16 @@ pub fn config() -> Command {
              (docs/session-runs.md): start the session, stage --file and --input under \
              /legion/run/, execute the task's run.command, print its stdout and stderr, and end \
              the session. Exits with the command's status; 124 when the run was stopped by \
-             run.wall, 125 when it was stopped for another reason.\n\nGoes through a manager \
-             (job:write) by default. With --node and --ticket it talks to one worker directly, \
-             with no manager on the path.",
+             run.wall (or, in an isolate, by config.limits.wall), 125 when it was stopped for \
+             another reason.\n\nOn a task of the isolate runtime (docs/task-runtime-isolate.md) \
+             the run needs no run block: the node runs the file named main.<ext> (else the \
+             first --file) in an isolate under the task's config.limits, or in a VM of the \
+             task's VM task. --tier picks where (auto decides before anything runs); the reply \
+             says where it ran (tier, tierReason) and where this code should run next time \
+             (nextTier). A run stopped in an isolate stays stopped; --fallback vm runs your \
+             code a second time, in a VM.\n\nGoes through a manager (job:write) by default. \
+             With --node and --ticket it talks to one worker directly, with no manager on the \
+             path.",
         )
         .arg(Arg::new("job").value_name("JOB").required(true))
         .arg(
@@ -337,6 +344,49 @@ pub fn config() -> Command {
                     "Inside a task: ask this node's worker over the allocation's API socket \
                      (LEGION_ADDR = unix://...), with no token. The jobspec decides what the \
                      task may run; --task is required",
+                ),
+        )
+        .arg(
+            Arg::new("tier")
+                .long("tier")
+                .value_name("TIER")
+                .value_parser(["auto", "isolate", "vm"])
+                .help(
+                    "Isolate tasks only: where the run happens. auto (the default) decides \
+                     before anything runs, from the source's imports and the node's memo of \
+                     code that needed a VM; isolate runs it in an isolate; vm in a fresh VM of \
+                     the task's VM task (config.vm.task)",
+                ),
+        )
+        .arg(Arg::new("tenant").long("tenant").value_name("KEY").help(
+            "Isolate tasks only: who the run is for. Keys the warm instance of \
+                     config.lifetime = \"tenant\" and the node's per-tenant queue (up to 128 \
+                     printable ASCII bytes)",
+        ))
+        .arg(Arg::new("session").long("session").value_name("ID").help(
+            "Isolate tasks with config.lifetime = \"session\" only: run in this \
+                     existing session isolate, on the node its id names, instead of a fresh one",
+        ))
+        .arg(
+            Arg::new("arg")
+                .long("arg")
+                .value_name("ARG")
+                .action(clap::ArgAction::Append)
+                .allow_hyphen_values(true)
+                .help("An argument for the code being run (isolate tasks). Repeatable"),
+        )
+        .arg(
+            Arg::new("fallback")
+                .long("fallback")
+                .value_name("TIER")
+                .value_parser(["vm"])
+                .conflicts_with_all(["session", "dry-run"])
+                .help(
+                    "Isolate tasks only: when the run is stopped in the isolate (an unsupported \
+                     call or a limit) and the reply says nextTier = vm, send it again with \
+                     --tier vm. This runs your code a second time, in a VM: use it only for \
+                     code that is safe to run twice. The reply then says ranTwice. Legion \
+                     itself never reruns a run",
                 ),
         )
         .arg(json_flag())
@@ -598,17 +648,32 @@ fn bytes_json(bytes: &[u8]) -> (Option<String>, Option<String>) {
 /// A run's reply in the envelope's `data` shape (docs/session-runs.md,
 /// "The reply"). Shared with the MCP tool.
 pub fn run_reply_json(reply: &RunSessionResponse) -> Value {
+    let text_or_null = |text: &str| {
+        if text.is_empty() {
+            Value::Null
+        } else {
+            json!(text)
+        }
+    };
     if let Some(dry) = reply.dry_run.as_ref() {
-        return json!({
+        let mut data = json!({
             "dryRun": true,
             "task": reply.task_name,
             "node": dry.node_id,
             "hasRoom": dry.has_room,
-            "reason": if dry.reason.is_empty() { Value::Null } else { json!(dry.reason) },
+            "reason": text_or_null(&dry.reason),
             "command": dry.command,
             "wall": dry.wall,
             "outputBytes": dry.output_bytes,
         });
+        // Isolate tasks: the pre-flight check's verdict.
+        if !dry.tier.is_empty() {
+            data["tier"] = json!(dry.tier);
+            data["tierReason"] = text_or_null(&dry.tier_reason);
+            data["imports"] = json!(dry.imports);
+            data["missingImports"] = json!(dry.missing_imports);
+        }
+        return data;
     }
     let stream = |bytes: &[u8]| match bytes_json(bytes) {
         (Some(text), _) => json!(text),
@@ -629,7 +694,7 @@ pub fn run_reply_json(reply: &RunSessionResponse) -> Value {
             })
         })
         .collect();
-    json!({
+    let mut data = json!({
         "task": reply.task_name,
         "node": reply.node_id,
         "sessionId": reply.session_id,
@@ -649,14 +714,36 @@ pub fn run_reply_json(reply: &RunSessionResponse) -> Value {
             "hint": stop.hint,
         })),
         "deduplicated": reply.deduplicated,
-    })
+    });
+    // Isolate tasks (docs/task-runtime-isolate.md): where the code ran, why,
+    // and where it should run next time. Absent for every other runtime.
+    if !reply.tier.is_empty() {
+        data["tier"] = json!(reply.tier);
+        data["tierReason"] = text_or_null(&reply.tier_reason);
+        data["nextTier"] = text_or_null(&reply.next_tier);
+        if reply.vm_ms > 0 {
+            data["vmMs"] = json!(reply.vm_ms);
+        }
+        if !reply.isolate_start.is_empty() {
+            data["isolateStart"] = json!(reply.isolate_start);
+        }
+        // An isolate measures in microseconds: milliseconds with a fraction.
+        if reply.tier == "isolate" && (reply.cpu_micros > 0 || reply.wall_micros > 0) {
+            data["cpuMs"] = json!(reply.cpu_micros as f64 / 1000.0);
+            data["wallMs"] = json!(reply.wall_micros as f64 / 1000.0);
+        }
+    }
+    data
 }
 
 /// The exit status `legion session run` ends with: the command's own, 124
-/// for a run stopped by `run.wall`, 125 for any other stop.
+/// for a run stopped by `run.wall` (or an isolate's `limits.wall`), 125 for
+/// any other stop.
 pub fn run_exit_code(reply: &RunSessionResponse) -> i32 {
     match reply.stopped.as_ref() {
         Some(stop) if stop.reason == "wall" => 124,
+        // An isolate's `config.limits.wall` is the same deadline.
+        Some(stop) if stop.reason == "limits" && stop.limit == "wall" => 124,
         Some(_) => 125,
         None => match reply.exit {
             Some(0) | None => 0,
@@ -716,7 +803,113 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .get_one::<String>("on-node")
             .cloned()
             .unwrap_or_default(),
+        tier: matches
+            .get_one::<String>("tier")
+            .cloned()
+            .unwrap_or_default(),
+        tenant: matches
+            .get_one::<String>("tenant")
+            .cloned()
+            .unwrap_or_default(),
+        session_id: matches
+            .get_one::<String>("session")
+            .cloned()
+            .unwrap_or_default(),
+        args: matches
+            .get_many::<String>("arg")
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect(),
     };
+    let fallback = matches.get_one::<String>("fallback").is_some();
+    let first = output::resolve(
+        format,
+        "Failed to run",
+        send_run(matches, request.clone(), &local).await?,
+    )?;
+    // `--fallback vm`: the caller's second request, never the server's.
+    let (reply, ran_twice) = match fallback
+        .then(|| fallback_vm_request(&first, &request))
+        .flatten()
+    {
+        Some(second) => {
+            let reason = fallback_reason(&first);
+            if !format.is_json() {
+                eprintln!("legion: {reason}; running it again with --tier vm (--fallback vm)");
+            }
+            let mut reply = output::resolve(
+                format,
+                "Failed to run the fallback in a VM",
+                send_run(matches, second, &local).await?,
+            )?;
+            reply.tier_reason = reason;
+            (reply, true)
+        }
+        None => (first, false),
+    };
+    print_run_reply(format, matches, &reply, ran_twice)?;
+    let code = run_exit_code(&reply);
+    if code != 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// The second request `--fallback vm` sends: the same run with `tier =
+/// "vm"`, when the first was stopped in the isolate and its reply says the
+/// code belongs in a VM. A caller's idempotency key becomes
+/// `<key>:fallback`, so a retry of the whole command finds both runs.
+pub fn fallback_vm_request(
+    first: &RunSessionResponse,
+    request: &RunSessionRequest,
+) -> Option<RunSessionRequest> {
+    let stop = first.stopped.as_ref()?;
+    if first.tier != "isolate"
+        || first.next_tier != "vm"
+        || !matches!(stop.reason.as_str(), "unsupported" | "limits")
+    {
+        return None;
+    }
+    Some(RunSessionRequest {
+        tier: "vm".into(),
+        idempotency_key: request
+            .idempotency_key
+            .as_ref()
+            .map(|key| format!("{key}:fallback")),
+        ..request.clone()
+    })
+}
+
+/// The `tierReason` a fallback reply carries: `fallback: stopped in the
+/// isolate, <reason> (<what stopped it>)`.
+pub fn fallback_reason(first: &RunSessionResponse) -> String {
+    let Some(stop) = first.stopped.as_ref() else {
+        return "fallback".into();
+    };
+    let head = if !stop.limit.is_empty() {
+        stop.limit.clone()
+    } else {
+        let detail = stop.detail.trim();
+        let head = detail.split(':').next().unwrap_or(detail).trim();
+        head.chars().take(80).collect()
+    };
+    if head.is_empty() {
+        format!("fallback: stopped in the isolate, {}", stop.reason)
+    } else {
+        format!("fallback: stopped in the isolate, {} ({head})", stop.reason)
+    }
+}
+
+/// Send one run where the flags say: the allocation's API socket
+/// (`--local`), one worker (`--node`), or a manager.
+async fn send_run(
+    matches: &ArgMatches,
+    request: RunSessionRequest,
+    local: &impl Fn(String) -> anyhow::Error,
+) -> R<Result<RunSessionResponse, tonic::Status>> {
     let result = if matches.get_flag("local") {
         let address = crate::cmd::helpers::manager_address();
         let path = crate::cmd::helpers::unix_socket_path(&address).ok_or_else(|| {
@@ -745,9 +938,23 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .await
             .map(tonic::Response::into_inner)
     };
-    let reply = output::resolve(format, "Failed to run", result)?;
+    Ok(result)
+}
+
+/// Print a run's reply: the JSON envelope, or the program's stdout on
+/// stdout and Legion's notes on stderr.
+fn print_run_reply(
+    format: OutputFormat,
+    matches: &ArgMatches,
+    reply: &RunSessionResponse,
+    ran_twice: bool,
+) -> R<()> {
     if format.is_json() {
-        output::print_success(&run_reply_json(&reply));
+        let mut data = run_reply_json(reply);
+        if ran_twice {
+            data["ranTwice"] = json!(true);
+        }
+        output::print_success(&data);
     } else if let Some(dry) = reply.dry_run.as_ref() {
         println!(
             "{} would run on {} ({})",
@@ -761,6 +968,13 @@ async fn run(matches: &ArgMatches) -> R<()> {
         );
         println!("command: {}", dry.command.join(" "));
         println!("wall: {}, output: {} bytes", dry.wall, dry.output_bytes);
+        if !dry.tier.is_empty() {
+            println!("tier: {} ({})", dry.tier, dry.tier_reason);
+            println!("imports: {}", dry.imports.join(", "));
+            if !dry.missing_imports.is_empty() {
+                println!("not in the image: {}", dry.missing_imports.join(", "));
+            }
+        }
     } else {
         use std::io::Write;
         let _ = std::io::stdout().write_all(&reply.stdout);
@@ -806,6 +1020,9 @@ async fn run(matches: &ArgMatches) -> R<()> {
                 ),
             }
         }
+        if let Some(note) = tier_note(reply, ran_twice) {
+            eprintln!("{note}");
+        }
         if let Some(stop) = reply.stopped.as_ref() {
             eprintln!(
                 "legion: run stopped ({}): {}\nHint: {}",
@@ -815,13 +1032,30 @@ async fn run(matches: &ArgMatches) -> R<()> {
             eprintln!("legion: answered from the kept reply of an earlier run (deduplicated)");
         }
     }
-    let code = run_exit_code(&reply);
-    if code != 0 {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::process::exit(code);
-    }
     Ok(())
+}
+
+/// The stderr note for a run of an isolate task: where it ran and why, and
+/// the tier to ask for next time when that is another. `None` for a run on
+/// any other runtime.
+pub fn tier_note(reply: &RunSessionResponse, ran_twice: bool) -> Option<String> {
+    if reply.tier.is_empty() {
+        return None;
+    }
+    let mut note = format!("legion: ran in the {} tier", reply.tier);
+    if !reply.tier_reason.is_empty() {
+        note.push_str(&format!(" ({})", reply.tier_reason));
+    }
+    if ran_twice {
+        note.push_str("; your code ran twice, the second time in a VM");
+    }
+    if !reply.next_tier.is_empty() && reply.stopped.is_none() {
+        note.push_str(&format!(
+            "; run this code with --tier {} next time",
+            reply.next_tier
+        ));
+    }
+    Some(note)
 }
 
 async fn edge_client(
@@ -1476,5 +1710,251 @@ mod session_cmd_test {
             ..Default::default()
         };
         assert_eq!(run_reply_json(&dry)["hasRoom"], true);
+        assert!(run_reply_json(&dry).get("tier").is_none());
+    }
+
+    /// A non-isolate reply carries none of the isolate keys, so its shape is
+    /// what it was before the isolate runtime.
+    #[test]
+    fn a_non_isolate_reply_has_no_isolate_keys_test() {
+        let data = run_reply_json(&RunSessionResponse {
+            wall_ms: 412,
+            cpu_ms: 7,
+            cpu_micros: 7_000,
+            ..Default::default()
+        });
+        let mut keys: Vec<&String> = data.as_object().expect("object").keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "cpuMs",
+                "deduplicated",
+                "exit",
+                "files",
+                "node",
+                "result",
+                "runId",
+                "sessionId",
+                "stderr",
+                "stdout",
+                "stopped",
+                "task",
+                "truncated",
+                "wallMs"
+            ]
+        );
+        assert_eq!(data["cpuMs"], 7);
+        assert_eq!(data["wallMs"], 412);
+        assert_eq!(tier_note(&RunSessionResponse::default(), false), None);
+    }
+
+    fn isolate_stop(reason: &str, limit: &str, detail: &str) -> RunSessionResponse {
+        RunSessionResponse {
+            task_name: "run".into(),
+            node_id: "w-17".into(),
+            tier: "isolate".into(),
+            tier_reason: "auto: no imports outside the image".into(),
+            next_tier: "vm".into(),
+            cpu_micros: 1_200,
+            wall_micros: 3_000,
+            cpu_ms: 1,
+            wall_ms: 3,
+            stopped: Some(crate::structs::RunStop {
+                reason: reason.into(),
+                limit: limit.into(),
+                detail: detail.into(),
+                hint: "rerun with --tier vm".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_isolate_reply_renders_tier_fields_and_fractional_ms_test() {
+        let ran = RunSessionResponse {
+            task_name: "run".into(),
+            tier: "isolate".into(),
+            tier_reason: "auto: no imports outside the image".into(),
+            exit: Some(0),
+            cpu_micros: 3_100,
+            wall_micros: 4_000,
+            cpu_ms: 3,
+            wall_ms: 4,
+            isolate_start: "warm".into(),
+            ..Default::default()
+        };
+        let data = run_reply_json(&ran);
+        assert_eq!(data["tier"], "isolate");
+        assert_eq!(data["tierReason"], "auto: no imports outside the image");
+        assert_eq!(data["nextTier"], Value::Null);
+        assert_eq!(data["cpuMs"], 3.1);
+        assert_eq!(data["wallMs"], 4.0);
+        assert_eq!(data["isolateStart"], "warm");
+        assert!(data.get("vmMs").is_none(), "only for a VM run");
+        assert!(data.get("ranTwice").is_none());
+        assert_eq!(
+            tier_note(&ran, false).as_deref(),
+            Some("legion: ran in the isolate tier (auto: no imports outside the image)")
+        );
+
+        let vm = RunSessionResponse {
+            task_name: "machine".into(),
+            tier: "vm".into(),
+            tier_reason: "auto: import torch is not in image python".into(),
+            next_tier: "vm".into(),
+            exit: Some(0),
+            wall_ms: 1890,
+            vm_ms: 231,
+            ..Default::default()
+        };
+        let data = run_reply_json(&vm);
+        assert_eq!(data["vmMs"], 231);
+        assert_eq!(data["wallMs"], 1890, "a VM run keeps whole milliseconds");
+        assert_eq!(data["nextTier"], "vm");
+        assert!(data.get("isolateStart").is_none());
+        assert!(tier_note(&vm, true).expect("note").ends_with(
+            "your code ran twice, the second time in a VM; run this code with --tier vm next time"
+        ));
+
+        let dry = RunSessionResponse {
+            task_name: "run".into(),
+            dry_run: Some(crate::structs::RunDryRun {
+                node_id: "w-17".into(),
+                has_room: true,
+                tier: "vm".into(),
+                tier_reason: "auto: import torch is not in image python".into(),
+                imports: vec!["json".into(), "torch".into()],
+                missing_imports: vec!["torch".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let data = run_reply_json(&dry);
+        assert_eq!(data["tier"], "vm");
+        assert_eq!(data["imports"], json!(["json", "torch"]));
+        assert_eq!(data["missingImports"], json!(["torch"]));
+    }
+
+    #[test]
+    fn isolate_stops_exit_124_for_wall_and_125_otherwise_test() {
+        assert_eq!(run_exit_code(&isolate_stop("limits", "wall", "")), 124);
+        assert_eq!(run_exit_code(&isolate_stop("limits", "cpu", "")), 125);
+        assert_eq!(run_exit_code(&isolate_stop("unsupported", "", "")), 125);
+        assert_eq!(run_exit_code(&isolate_stop("trap", "", "")), 125);
+    }
+
+    #[test]
+    fn fallback_reruns_only_an_isolate_stop_that_points_at_a_vm_test() {
+        let request = RunSessionRequest {
+            job_id: "code-runner".into(),
+            task_name: "run".into(),
+            idempotency_key: Some("k1".into()),
+            tenant: "acme".into(),
+            args: vec!["--rows".into(), "10".into()],
+            ..Default::default()
+        };
+        let unsupported = isolate_stop(
+            "unsupported",
+            "",
+            "subprocess.run: processes are not available in an isolate",
+        );
+        let second = fallback_vm_request(&unsupported, &request).expect("falls back");
+        assert_eq!(second.tier, "vm");
+        assert_eq!(second.idempotency_key.as_deref(), Some("k1:fallback"));
+        assert_eq!(second.tenant, "acme");
+        assert_eq!(second.args, ["--rows", "10"]);
+        assert_eq!(
+            fallback_reason(&unsupported),
+            "fallback: stopped in the isolate, unsupported (subprocess.run)"
+        );
+        let limits = isolate_stop("limits", "cpu", "exceeded its 100ms CPU limit (100.4ms)");
+        assert!(fallback_vm_request(&limits, &request).is_some());
+        assert_eq!(
+            fallback_reason(&limits),
+            "fallback: stopped in the isolate, limits (cpu)"
+        );
+        let no_key = RunSessionRequest {
+            idempotency_key: None,
+            ..request.clone()
+        };
+        assert_eq!(
+            fallback_vm_request(&limits, &no_key).and_then(|r| r.idempotency_key),
+            None
+        );
+
+        // No VM to go to, a trap, a run that finished, or a VM run: no rerun.
+        let mut no_vm = limits.clone();
+        no_vm.next_tier.clear();
+        assert!(fallback_vm_request(&no_vm, &request).is_none());
+        assert!(fallback_vm_request(&isolate_stop("trap", "", "boom"), &request).is_none());
+        let finished = RunSessionResponse {
+            stopped: None,
+            ..limits.clone()
+        };
+        assert!(fallback_vm_request(&finished, &request).is_none());
+        let vm_stop = RunSessionResponse {
+            tier: "vm".into(),
+            ..limits
+        };
+        assert!(fallback_vm_request(&vm_stop, &request).is_none());
+    }
+
+    #[test]
+    fn run_parses_the_isolate_flags_test() {
+        let matches = config()
+            .try_get_matches_from([
+                "session",
+                "run",
+                "code-runner",
+                "--file",
+                "snippet.py",
+                "--tier",
+                "isolate",
+                "--tenant",
+                "acme",
+                "--fallback",
+                "vm",
+                "--arg",
+                "--rows",
+                "--arg",
+                "10",
+                "-j",
+            ])
+            .expect("parses");
+        let (_, run) = matches.subcommand().expect("run");
+        assert_eq!(
+            run.get_one::<String>("tier").map(String::as_str),
+            Some("isolate")
+        );
+        assert_eq!(
+            run.get_one::<String>("tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            run.get_one::<String>("fallback").map(String::as_str),
+            Some("vm")
+        );
+        let args: Vec<&String> = run.get_many::<String>("arg").unwrap().collect();
+        assert_eq!(args, ["--rows", "10"]);
+        for bad in [
+            &["session", "run", "j", "--tier", "gpu"][..],
+            &["session", "run", "j", "--fallback", "isolate"],
+            &[
+                "session",
+                "run",
+                "j",
+                "--fallback",
+                "vm",
+                "--session",
+                "run-x.y",
+            ],
+            &["session", "run", "j", "--fallback", "vm", "--dry-run"],
+        ] {
+            assert!(config().try_get_matches_from(bad).is_err(), "{bad:?}");
+        }
+        assert!(config()
+            .try_get_matches_from(["session", "run", "j", "--session", "run-x.y"])
+            .is_ok());
     }
 }

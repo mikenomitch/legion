@@ -4265,13 +4265,24 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 .validate()
                 .with_context(|| format!("invalid devices config in worker config {path_str}"))?;
         }
-        // The top-level `content`, `contentStore`, `sessions`, and `devices`
-        // blocks ride in the artifacts payload (see `WorkerArtifactsPayload`).
+        let isolate = wcp
+            .isolate
+            .as_ref()
+            .map(|isolate| {
+                let resolved = isolate.with_defaults();
+                resolved.validate().map(|()| resolved)
+            })
+            .transpose()
+            .with_context(|| format!("invalid isolate config in worker config {path_str}"))?;
+        // The top-level `content`, `contentStore`, `sessions`, `devices`,
+        // and `isolate` blocks ride in the artifacts payload (see
+        // `WorkerArtifactsPayload`).
         let artifacts = if wcp.artifacts.is_none()
             && wcp.content.is_none()
             && wcp.content_store.is_none()
             && wcp.sessions.is_none()
             && wcp.devices.is_none()
+            && isolate.is_none()
         {
             String::new()
         } else {
@@ -4281,6 +4292,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 content_store: wcp.content_store.clone(),
                 sessions: wcp.sessions.clone(),
                 devices: wcp.devices.clone(),
+                isolate,
             })?
         };
 
@@ -4664,6 +4676,53 @@ mod tests {
             settings.budgets,
             crate::content_store::ContentBudgetSpecs::default()
         );
+        Ok(())
+    }
+
+    /// The shipped worker config's commented `isolate` block, uncommented,
+    /// loads and validates: every field it documents is a real one with a
+    /// value a node can run with.
+    #[test]
+    fn the_default_worker_config_isolate_block_parses_when_uncommented_test() -> R<()> {
+        let path = concat!(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+            "/configs/workers/default.ncl"
+        );
+        // Shipped commented out: the defaults apply.
+        assert!(parse_worker_config(path)?.isolate.is_none());
+        let text = std::fs::read_to_string(path)?;
+        let mut inside = false;
+        let mut uncommented = 0;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if line.trim_start() == "# isolate = {" {
+                    inside = true;
+                }
+                let out = if inside {
+                    uncommented += 1;
+                    line.replacen("# ", "", 1)
+                } else {
+                    line.to_string()
+                };
+                if inside && line.trim_start() == "# }," {
+                    inside = false;
+                }
+                out
+            })
+            .collect();
+        assert!(uncommented > 10, "found the isolate block");
+        let dir = Builder::new().prefix("legion-isolate-config-").tempdir()?;
+        let edited = dir.path().join("default.ncl");
+        std::fs::write(&edited, lines.join("\n"))?;
+        let config = parse_worker_config(edited.to_str().context("utf-8")?)?;
+        let isolate = config.isolate.context("isolate block")?.with_defaults();
+        isolate.validate()?;
+        assert_eq!(
+            isolate.binary.as_deref(),
+            Some("/usr/local/bin/legion-isolate")
+        );
+        assert_eq!(isolate.slots_per_host, 10_000);
         Ok(())
     }
 

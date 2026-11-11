@@ -70,6 +70,16 @@ redirect their child process to those files
 to a file descriptor instead of a pipe to the worker. So logging keeps working,
 and tasks keep running, across worker restarts.
 
+**Isolates.** An [`isolate`](task-runtime-isolate.md#logs) task has no
+process of its own. The output of its HTTP and session-isolate invocations
+is appended by the worker to the **envelope allocation's** `stdout.log` and
+`stderr.log`, once per invocation when it ends, each line prefixed with
+`[isolate <id>]` (and ` tenant=<key>` when it has one), a line cut at
+16 KiB, control characters other than tab written as visible `\xHH`, and
+each job and task limited to 512 KiB of log per second under a per-host
+ceiling ([details](task-runtime-isolate.md#logs)). Runs in request and
+tenant isolates return their output in the run's reply instead.
+
 > **Note on custom task plugins:** a plugin captures logs automatically if it
 > spawns its work with `spawn_task_process` after calling
 > `configure_task_log_capture(&mut cmd, runtime)` (as `exec`/`container` do). A

@@ -158,6 +158,13 @@ impl Netd {
 
     /// Persist inputs to `store` after every change, and restore from it
     /// ([`Self::restore`]).
+    /// The forwarder this datapath drives: its upstream listeners, egress
+    /// proxies and ingress listeners. The isolate supervisor's egress
+    /// (`isolates::egress::NetdEgress`) dials through it.
+    pub fn forwarder(&self) -> &Arc<UpstreamForwarder> {
+        &self.forwarder
+    }
+
     pub fn with_state_store(mut self, store: NetdStateStore) -> Self {
         self.state = Some(store);
         self

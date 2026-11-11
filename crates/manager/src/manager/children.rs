@@ -490,6 +490,12 @@ pub fn owner_notices(store: &Store, node_id: &str) -> Vec<OwnerNotice> {
     let key = watch_key(store);
     let mut notices = Vec::new();
     for ((kind, id), child) in owners {
+        // A request or tenant isolate is known only to its node, which
+        // reaps its children itself (docs/task-runtime-isolate.md): no
+        // manager has a record to judge it by, so none ever does.
+        if kind == children::OWNER_ISOLATE {
+            continue;
+        }
         let owner = children::owner_ref(&kind, &id);
         if children::raft_owned(&owner) {
             match raft_owner_state(store, &owner) {

@@ -1,0 +1,28 @@
+/// The worlds Legion's language images are built against: the `image`
+/// world of `legion:isolate` (crates/isolate/wit/legion-isolate.wit) plus
+/// the WASI interfaces a language runtime needs beyond what its toolchain
+/// adds by itself. Both toolchains add the rest of WASI 0.2 (filesystem,
+/// clocks, random, cli, and for CPython sockets) on their own.
+package legion:images@0.1.0;
+
+/// The `python` image (componentize-py). `wasi:http/outgoing-handler` is
+/// what `legion.fetch` sends through; `wasi:cli/environment` is read at
+/// each instance's first run, because the environment CPython saw while it
+/// was pre-initialized is the build machine's, not the isolate's.
+world python {
+  include legion:isolate/image@0.1.0;
+  import wasi:http/outgoing-handler@0.2.12;
+  import wasi:cli/environment@0.2.12;
+}
+
+/// The `js` image (componentize-js / StarlingMonkey). StarlingMonkey imports
+/// `wasi:http` for `fetch` and `wasi:filesystem` itself; the runner reads
+/// the entry file through `wasi:filesystem`, which is named here so the
+/// runner gets bindings for it, and builds `process.env` from
+/// `wasi:cli/environment`.
+world js {
+  include legion:isolate/image@0.1.0;
+  import wasi:cli/environment@0.2.12;
+  import wasi:filesystem/types@0.2.12;
+  import wasi:filesystem/preopens@0.2.12;
+}

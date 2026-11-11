@@ -16,6 +16,7 @@ pub mod forwarder;
 pub mod handoff;
 pub mod identity;
 pub mod idle;
+pub mod isolates;
 pub mod launch_pool;
 pub mod log_sink;
 pub mod logs;

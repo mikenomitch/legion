@@ -415,6 +415,14 @@ fn envelope_task(task: &TaskConfig) -> R<TaskConfig> {
         "operator": "contains",
         "value": SESSIONS_CAPABILITY,
     }));
+    let isolate = crate::structs::isolate::is_isolate_task(task);
+    if isolate {
+        constraints.push(json!({
+            "key": "capabilities",
+            "operator": "contains",
+            "value": crate::structs::isolate::ISOLATES_CAPABILITY,
+        }));
+    }
     let name = envelope_task_name(&task.name);
     let mut envelope_task = TaskConfig::new(&name, ENVELOPE_RUNTIME);
     envelope_task.group = name;
@@ -423,7 +431,46 @@ fn envelope_task(task: &TaskConfig) -> R<TaskConfig> {
     envelope_task.constraints = Value::Array(constraints);
     envelope_task.permit = task.permit.clone();
     envelope_task.affinities = task.affinities.clone();
+    if isolate {
+        carry_isolate_datapath(task, &mut envelope_task)?;
+    }
     Ok(envelope_task)
+}
+
+/// An isolate task's datapath rides its envelope (isolate-runtime brief,
+/// "Architecture" 5): the envelope allocation is the only allocation an
+/// isolate task has on a node, so the node binds the task's egress policy,
+/// `connect` upstreams (with their credential injection), and ingress
+/// ports for it, always gated, and the isolate supervisor dials and serves
+/// those listeners on the isolates' behalf.
+///
+/// Written in the desugared form `TaskConfig::normalize_network` stores,
+/// so a stored config's envelope is the one parsing it again generates.
+fn carry_isolate_datapath(task: &TaskConfig, envelope: &mut TaskConfig) -> R<()> {
+    if task.network.is_none() && task.connect.is_none() {
+        return Ok(());
+    }
+    let mut network = Some(task.network.clone().unwrap_or_default());
+    if let Some(network) = network.as_mut() {
+        network.mode = crate::structs::netpolicy::MODE_GATED.to_string();
+    }
+    let mut service = None;
+    crate::structs::network::normalize_task_network(&envelope.name, &mut network, &mut service)?;
+    let mut connect = task.connect.clone();
+    crate::structs::network::normalize_task_connect(&envelope.name, &mut connect)?;
+    envelope.network = network;
+    envelope.connect = connect;
+    Ok(())
+}
+
+/// Whether a session of `task` may be promoted to a keyed instance. An
+/// isolate session may not (isolate-runtime calls entry 34): the error is
+/// the `FAILED_PRECONDITION` text `instance promote` answers.
+pub fn promotable(task: &TaskConfig) -> Result<(), String> {
+    match crate::structs::isolate::promote_refusal(task) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// Constraints in array form, from either the map shorthand
@@ -579,7 +626,20 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
         }
     }
     let network = task.network.as_ref();
-    if network.is_some_and(|network| !network.ports.is_empty() || network.declares_policy())
+    if crate::structs::isolate::is_isolate_task(task) {
+        // An isolate's ports, egress policy, and `connect` upstreams are
+        // bound for its envelope ([`carry_isolate_datapath`]), always gated:
+        // the node's datapath serves that allocation, and the isolate
+        // supervisor serves and dials its listeners for the isolates.
+        // `validate_isolate_tasks` refuses any mode but gated.
+        if task.service.is_some() {
+            bail!(
+                "task {name} is an isolate task and declares a service. Isolates take requests \
+                 on network.ports through their envelope, which registers no service\nHint: \
+                 remove service and declare network.ports = [{{ name = \"http\" }}]"
+            );
+        }
+    } else if network.is_some_and(|network| !network.ports.is_empty() || network.declares_policy())
         || task.service.is_some()
         || task.connect.is_some()
         || network.is_some_and(|network| {
@@ -969,6 +1029,92 @@ mod session_test {
             json!({ "resources": { "cpu": 1 }, "constraints": {} })
         );
         Ok(())
+    }
+
+    fn isolate_job(extra: Value) -> JobConfig {
+        let mut task = json!({
+            "name": "run",
+            "runtime": crate::structs::isolate::ISOLATE_RUNTIME,
+            "config": { "image": "python", "limits": { "cpu": "100ms", "wall": "30s" } },
+            "resources": { "cpu": 10, "memory": 16 },
+            "stateful": {
+                "mode": "session",
+                "envelope": { "resources": { "cpu": 16000, "memory": 32768 } },
+            },
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            task[key] = value.clone();
+        }
+        serde_json::from_value(json!({ "name": "code-runner", "task": task })).expect("job")
+    }
+
+    /// Isolate-runtime brief, "Architecture" 5: the envelope carries the
+    /// isolate task's datapath, gated, and the isolates capability.
+    #[test]
+    fn an_isolate_envelope_carries_its_datapath_and_capability_test() -> R<()> {
+        let config = isolate_job(json!({
+            "network": { "ports": [{ "name": "http" }], "egress": { "allow": ["api.openai.com"] } },
+            "connect": { "upstreams": [{ "name": "openai", "to": "https://api.openai.com" }] },
+        }));
+        let task = &config.tasks[0];
+        validate_session_task(task)?;
+        let envelope = &config.tasks[1];
+        assert_eq!(envelope_serves(envelope), Some("run"));
+        let rules = envelope.constraints.as_array().unwrap();
+        assert!(rules
+            .iter()
+            .any(|rule| rule["value"] == crate::structs::isolate::ISOLATES_CAPABILITY));
+        let network = envelope.network.as_ref().expect("network carried");
+        assert_eq!(network.mode, crate::structs::netpolicy::MODE_GATED);
+        assert_eq!(network.ports.len(), 1);
+        assert!(network.egress.is_some());
+        assert_eq!(envelope.connect.as_ref().unwrap().upstreams.len(), 1);
+
+        // Idempotent: a stored config normalizes to itself.
+        let mut again = config.clone();
+        normalize_session_tasks(&mut again)?;
+        assert_eq!(again, config);
+
+        // `connect` alone still puts the envelope on the gated datapath.
+        let config = isolate_job(json!({
+            "connect": { "upstreams": [{ "name": "openai", "to": "https://api.openai.com" }] },
+        }));
+        let network = config.tasks[1].network.as_ref().expect("gated network");
+        assert_eq!(network.mode, crate::structs::netpolicy::MODE_GATED);
+
+        // No datapath declared: none carried, as for any envelope.
+        let config = isolate_job(json!({}));
+        assert!(config.tasks[1].network.is_none());
+        assert!(config.tasks[1].connect.is_none());
+        let rules = config.tasks[1].constraints.as_array().unwrap();
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn isolate_sessions_may_declare_a_datapath_but_no_service_and_are_never_promoted_test() {
+        let config = isolate_job(json!({ "service": { "name": "runner", "port": 8080 } }));
+        let err = validate_session_task(&config.tasks[0]).expect_err("service");
+        assert!(err.to_string().contains("declares a service"), "{err}");
+        assert_eq!(
+            promotable(&config.tasks[0]).unwrap_err(),
+            crate::structs::isolate::PROMOTE_REFUSAL
+        );
+
+        // Every other session task keeps today's refusal.
+        let mut task = session_task();
+        task.connect = Some(
+            serde_json::from_value(json!({
+                "upstreams": [{ "name": "openai", "to": "https://api.openai.com" }],
+            }))
+            .unwrap(),
+        );
+        let mut config = job(vec![task]);
+        normalize_session_tasks(&mut config).unwrap();
+        let err = validate_session_task(&config.tasks[0]).expect_err("connect");
+        assert!(err.to_string().contains("connect upstreams"), "{err}");
+        assert!(config.tasks[1].connect.is_none());
+        promotable(&config.tasks[0]).unwrap();
     }
 
     #[test]

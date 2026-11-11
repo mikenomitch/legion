@@ -238,6 +238,7 @@ it resumes.
 | --- | --- | --- | --- |
 | `exec`, `container` | Live: the cgroup's `memory.low`. | Live: the cgroup's `memory.max`. A ceiling below what the unit uses now is `refused` unless `--force`. | Live: the cgroup's `cpu.weight`. |
 | `sandbox` | Live: `memory.low` on the VMM's cgroup, and the floor the pressure response reclaims down to. | Down: the balloon inflates by the difference. Back up to the boot size: the balloon deflates. Above the boot size: `needs_restart`. | Live for the VMM's threads (`cpu.weight`). The guest keeps its vCPU count. |
+| `isolate` (session isolates) | Live: the reservation the isolate is charged against its envelope; refused when it does not fit the envelope. | Live, up and down, but never below the memory the isolate uses now (`refused`, a resize never takes memory back); above the worker's `isolate.maxMemory` (one memory slot), `needs_restart`. Kept across hibernation. | `not_supported`: an isolate's CPU is its task's weight in the host's scheduler, not a per-session amount. |
 | `envelope` | Not resized this way. A session envelope resizes through `stateful.envelope` ([elastic envelopes](session-mode.md#elastic-envelopes)). | | |
 | Every other runtime, including plugins that predate resize | `not_supported` | `not_supported` | `not_supported` |
 

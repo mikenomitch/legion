@@ -179,6 +179,14 @@ pub struct WorkerDaemonService {
 }
 
 impl WorkerDaemonService {
+    /// The isolate supervisor, on a node that runs isolates.
+    fn isolates(&self) -> Option<Arc<crate::worker::isolates::IsolateSupervisor>> {
+        self.task_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.isolates())
+    }
+
     /// Take a launch slot, or refuse the start as retryable on another node.
     async fn launch_slot(&self) -> Result<crate::worker::launch_pool::LaunchSlot, Status> {
         self.launch_pool
@@ -216,6 +224,30 @@ impl WorkerDaemonService {
         // an ordinary dispatch, distinguished by the `provisional` block and
         // by whether the payload yet has an allocation id.
         if let Some(provisional) = allocation.provisional.clone() {
+            // A session isolate (docs/task-runtime-isolate.md): opened by the
+            // isolate supervisor, with no claim and no launch slot.
+            if allocation.allocation_id == 0
+                && session_start
+                && allocation.task_runtime == crate::structs::isolate::ISOLATE_RUNTIME
+            {
+                let isolates = self.isolates().ok_or_else(|| {
+                    Status::failed_precondition("this node does not run the isolate runtime")
+                })?;
+                let started = isolates
+                    .start_session(
+                        &allocation.job_id,
+                        &allocation.task_name,
+                        &provisional.instance_id,
+                        "",
+                        "manager",
+                        &provisional.ticket_jti,
+                        "",
+                    )
+                    .await?;
+                return Ok(PostWorkReply {
+                    message: format!("Session isolate {} started", started.session_id),
+                });
+            }
             if allocation.allocation_id == 0 {
                 let slot = self.launch_slot().await?;
                 // An idempotent `store` start creates its manifest first, so
@@ -751,11 +783,29 @@ impl Worker for WorkerDaemonService {
         } else {
             request.reason
         };
-        let stopped = self
-            .task_manager
-            .lock()
-            .map_err(|_| Status::internal("Task manager lock poisoned"))?
-            .stop_sessions(&request.session_ids, &format!("requested ({reason})"));
+        let mut ids = request.session_ids;
+        let mut stopped = Vec::new();
+        if let Some(isolates) = self.isolates() {
+            let (isolate_ids, others): (Vec<String>, Vec<String>) =
+                ids.into_iter().partition(|id| isolates.knows_session(id));
+            ids = others;
+            for id in isolate_ids {
+                if isolates
+                    .stop_session(&id, &format!("requested ({reason})"))
+                    .await
+                {
+                    stopped.push(id);
+                }
+            }
+        }
+        if !ids.is_empty() {
+            stopped.extend(
+                self.task_manager
+                    .lock()
+                    .map_err(|_| Status::internal("Task manager lock poisoned"))?
+                    .stop_sessions(&ids, &format!("requested ({reason})")),
+            );
+        }
         Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
     }
 
@@ -795,6 +845,39 @@ impl Worker for WorkerDaemonService {
             crate::worker::task_manager::resize::recall_resize(&request.session_id, &keyed)
         {
             return Ok(Response::new(kept));
+        }
+        if let (ResizeTarget::Session(session_id), Some(isolates)) = (&target, self.isolates()) {
+            if isolates.knows_session(session_id) {
+                let to = request.to.unwrap_or_default();
+                let (outcome, message, from, to, job_id, task_name) = isolates
+                    .resize_session(
+                        session_id,
+                        to.memory,
+                        to.memory_max,
+                        to.cpu,
+                        request.dry_run,
+                    )
+                    .await?;
+                let reply = crate::structs::ResizeSessionReply {
+                    outcome: outcome.to_string(),
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    message,
+                    node_id: self.node_id.clone(),
+                    job_id,
+                    task_name,
+                    runtime: crate::structs::isolate::ISOLATE_RUNTIME.to_string(),
+                    ..Default::default()
+                };
+                if outcome == "applied" && !request.dry_run {
+                    crate::worker::task_manager::resize::remember_resize(
+                        &request.session_id,
+                        &keyed,
+                        &reply,
+                    );
+                }
+                return Ok(Response::new(reply));
+            }
         }
         let size = requested_size(request.to.as_ref());
         let task_manager = self.task_manager.clone();
@@ -854,7 +937,29 @@ impl Worker for WorkerDaemonService {
             request.reason
         };
         let mut reply = crate::structs::SuspendSessionsReply::default();
+        let isolates = self.isolates();
         for session_id in request.session_ids {
+            if let Some(isolates) = isolates.as_ref().filter(|i| i.knows_session(&session_id)) {
+                match isolates.hibernate(&session_id).await {
+                    Ok((bytes, generation, already)) => {
+                        reply.suspended.push(crate::structs::SuspendedSession {
+                            snapshot_id: format!("{session_id}.{generation}"),
+                            session_id,
+                            kind: "isolate-state".into(),
+                            bytes,
+                            already_suspended: already,
+                            durability: "local".into(),
+                            published_url: String::new(),
+                        });
+                    }
+                    Err(status) => reply.failed.push(crate::structs::SessionSleepFailure {
+                        session_id,
+                        code: format!("{:?}", status.code()),
+                        message: status.message().to_string(),
+                    }),
+                }
+                continue;
+            }
             let task_manager = self.task_manager.clone();
             let id = session_id.clone();
             let trigger = reason.clone();
@@ -919,6 +1024,23 @@ impl Worker for WorkerDaemonService {
         crate::worker::plane::require_manager(&request, "ResumeSession")?;
         let request = request.into_inner();
         tracing::Span::current().record("session_id", request.session_id.as_str());
+        // A session isolate wakes on its next call: nothing is made now.
+        if let Some(isolates) = self.isolates() {
+            if let Some(session) = isolates.session_status(&request.session_id) {
+                return Ok(Response::new(crate::structs::ResumeSessionReply {
+                    generation: session.generation,
+                    already_running: session.state == "running",
+                    resumed_from: if session.state == "running" {
+                        String::new()
+                    } else {
+                        "checkpoint".into()
+                    },
+                    session: Some(session),
+                    node_id: self.node_id.clone(),
+                    moved_from: String::new(),
+                }));
+            }
+        }
         let slot = self.launch_slot().await?;
         let task_manager = self.task_manager.clone();
         let session_id = request.session_id.clone();
@@ -1016,11 +1138,16 @@ impl Worker for WorkerDaemonService {
                 Some(self.verify_session_ticket(&request.ticket, "GetSession")?)
             }
         };
-        let session = self
+        let mut session = self
             .task_manager
             .lock()
             .map_err(|_| Status::internal("Task manager lock poisoned"))?
             .session_status(&request.session_id);
+        if session.is_none() {
+            session = self
+                .isolates()
+                .and_then(|isolates| isolates.session_status(&request.session_id));
+        }
         let Some(session) = session else {
             return Err(self.session_not_here(&request.session_id));
         };
@@ -1079,6 +1206,33 @@ impl Worker for WorkerDaemonService {
         span.record("job", job.as_str());
         span.record("task", task.as_str());
 
+        // A session isolate (docs/task-runtime-isolate.md): the supervisor
+        // opens it, with no claim and no launch slot.
+        if let Some(isolates) = self
+            .isolates()
+            .filter(|isolates| isolates.is_isolate_task(&job, &task))
+        {
+            let key = request.idempotency_key.trim();
+            let session_id = if key.is_empty() {
+                crate::structs::mint_session_id(&task, &self.node_id)
+            } else {
+                edge::edge_derived_session_id(&job, &task, key)
+            };
+            let started = isolates
+                .start_session(&job, &task, &session_id, "", "edge", &claims.jti, key)
+                .await?;
+            span.record("session_id", started.session_id.as_str());
+            return Ok(Response::new(crate::structs::StartSessionReply {
+                session_id: started.session_id,
+                node_id: self.node_id.clone(),
+                state: "running".into(),
+                deduplicated: started.deduplicated,
+                resumed_from: String::new(),
+                generation: 1,
+                moved_from: String::new(),
+                owner: None,
+            }));
+        }
         if !request.resume_id.trim().is_empty() {
             return self
                 .resume_from_edge(&request, claims, job, task)
@@ -1201,6 +1355,23 @@ impl Worker for WorkerDaemonService {
         span.record("task", task.as_str());
         // The ticket is a credential: it goes no further than this check.
         request.ticket.clear();
+        if let Some(isolates) = self
+            .isolates()
+            .filter(|isolates| isolates.is_isolate_task(&job, &task))
+        {
+            return isolates
+                .run(
+                    crate::worker::task_manager::session_runs::RunCall {
+                        job_id: job,
+                        task_name: task,
+                        request,
+                        ticket_jti,
+                    },
+                    Some(self.launch_pool.clone()),
+                )
+                .await
+                .map(Response::new);
+        }
         crate::worker::task_manager::session_runs::run_session(
             self.task_manager.clone(),
             self.launch_pool.clone(),
@@ -1214,6 +1385,74 @@ impl Worker for WorkerDaemonService {
         )
         .await
         .map(Response::new)
+    }
+
+    /// This node's isolate aggregates, polled from its hosts now
+    /// (docs/task-runtime-isolate.md, "Observing").
+    #[instrument(err, skip_all)]
+    async fn get_isolate_stats(
+        &self,
+        request: Request<crate::structs::GetIsolateStatsRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateStatsReply>, Status> {
+        // ACL: worker-plane. Caller class: manager.
+        crate::worker::plane::require_manager(&request, "GetIsolateStats")?;
+        let request = request.into_inner();
+        let isolates = self.isolates().ok_or_else(|| {
+            Status::failed_precondition("this node does not run the isolate runtime")
+        })?;
+        let (tasks, hosts) = isolates.stats(&request.job_id, &request.task_name).await;
+        Ok(Response::new(crate::structs::GetIsolateStatsReply {
+            nodes: vec![crate::structs::IsolateNodeStats {
+                node_id: self.node_id.clone(),
+                tasks,
+                hosts,
+                age_ms: 0,
+            }],
+        }))
+    }
+
+    /// One session isolate on this node, resident or hibernated, with the
+    /// children it owns.
+    #[instrument(err, skip_all)]
+    async fn get_isolate(
+        &self,
+        request: Request<crate::structs::GetIsolateRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateReply>, Status> {
+        // ACL: worker-plane. Caller classes: manager, ticket.
+        let caller = crate::worker::plane::caller_of(&request, "GetIsolate")?;
+        let request = request.into_inner();
+        let ticket = match caller {
+            crate::worker::plane::Caller::Manager(_) => None,
+            crate::worker::plane::Caller::Ticket => {
+                Some(self.verify_session_ticket(&request.ticket, "GetIsolate")?)
+            }
+        };
+        let not_here = || {
+            Status::not_found(format!(
+                "not_found: node {} holds no session isolate {}",
+                self.node_id, request.session_id
+            ))
+        };
+        let isolates = self.isolates().ok_or_else(not_here)?;
+        let mut reply = isolates
+            .get_isolate(&request.session_id)
+            .await
+            .ok_or_else(not_here)?;
+        if let Some(ticket) = ticket {
+            ticket.allows(&reply.job_id, &reply.task_name)?;
+        }
+        reply.children = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .child_infos(
+                &crate::structs::children::owner_ref(
+                    crate::structs::children::OWNER_SESSION,
+                    &reply.session_id,
+                ),
+                &self.node_id,
+            );
+        Ok(Response::new(reply))
     }
 
     /// End one session from a session ticket.
@@ -1233,6 +1472,18 @@ impl Worker for WorkerDaemonService {
         let request = request.into_inner();
         tracing::Span::current().record("session_id", request.session_id.as_str());
         let ticket = self.verify_session_ticket(&request.ticket, "StopSession")?;
+        if let Some(isolates) = self.isolates() {
+            if let Some((job, task)) = isolates.session_owner(&request.session_id) {
+                ticket.allows(&job, &task)?;
+                let stopped = isolates
+                    .stop_session(&request.session_id, "requested (edge stop)")
+                    .await;
+                return Ok(Response::new(crate::structs::StopSessionReply {
+                    stopped,
+                    node_id: self.node_id.clone(),
+                }));
+            }
+        }
         let mut manager = self
             .task_manager
             .lock()

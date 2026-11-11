@@ -19,6 +19,18 @@ A crate may depend only on the crates below it:
 static binary. It depends on nothing else of Legion's; `legion-common`, the
 worker, and the binary use it.
 
+`legion-isolate` (`crates/isolate/`) is the [isolate](task-runtime-isolate.md)
+runtime's host process and module compiler, built as its own binary,
+`legion-isolate`. It is the only crate that links the WebAssembly engine
+(wasmtime, pinned to an exact version), and it depends on `legion-proto`
+alone, for the node-local protocol the worker speaks to it
+(`proto/isolate_host.proto`). Nothing of Legion's depends on it: the worker
+starts the binary and talks to it over inherited sockets. Keeping it apart
+keeps the engine out of the worker's address space and build, lets the host
+confine itself without affecting the worker, and lets an engine upgrade ship
+as a new binary. It is a workspace member but not a default member, so a
+bare `cargo build` does not build it: use `cargo build -p legion-isolate`.
+
 The order is `proto` → `common` → `worker` → `manager` → `legion`. The manager
 sits above the worker because it validates jobs against the task runtimes
 and can run a worker in its own process; the worker never calls into the

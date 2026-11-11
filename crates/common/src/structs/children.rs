@@ -20,6 +20,13 @@ pub const OWNER_INSTANCE: &str = "instance";
 /// managers decide.
 pub const OWNER_ALLOCATION: &str = "allocation";
 
+/// `OwnerRef.kind` for a request or tenant isolate that owns a child VM
+/// (docs/task-runtime-isolate.md): the invocation or warm instance, known
+/// only to the node that runs it. A session isolate owns its children as a
+/// [`OWNER_SESSION`]. Managers never judge an `isolate` owner: no manager
+/// has a record of it, so only its node can say when it ended.
+pub const OWNER_ISOLATE: &str = "isolate";
+
 /// `--owner self`: the calling allocation's own unit, on the API socket.
 pub const OWNER_SELF: &str = "self";
 

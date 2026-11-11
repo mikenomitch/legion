@@ -3124,6 +3124,14 @@ pub struct WorkerConfigAlt {
     /// means no devices.
     #[serde(default)]
     pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
+    /// `isolate` runtime settings for workers of this type
+    /// (docs/task-runtime-isolate.md): where the `legion-isolate` binary
+    /// and the built images are, and how each cordon's host process is
+    /// sized and confined. Absent means the defaults. Carried to the worker
+    /// resolved, in the artifacts payload
+    /// ([`WorkerArtifactsPayload::isolate`]).
+    #[serde(default)]
+    pub isolate: Option<crate::structs::isolate::WorkerIsolateConfig>,
 }
 
 /// Worker-type `container` block. Carried to the worker as JSON in
@@ -3730,6 +3738,12 @@ pub struct WorkerArtifactsPayload {
     /// spec dirs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
+    /// The top-level `isolate` block, resolved (defaults filled, validated
+    /// at manager startup), riding the same payload for the same reason.
+    /// `None` when the worker type sets no `isolate` block: the worker uses
+    /// [`crate::structs::isolate::WorkerIsolateConfigFull::default`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolate: Option<crate::structs::isolate::WorkerIsolateConfigFull>,
 }
 
 /// A worker's `sessions` block (docs/session-mode.md, "No split brain").

@@ -282,10 +282,14 @@ impl EvalRun<'_> {
         }
         let namespace = crate::structs::namespace::job_namespace(&self.job_id);
         for (task_id, task) in store.cached_task_configs_for_job_config(&self.job_config_id)? {
-            let session = task
-                .stateful
-                .as_ref()
-                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Session);
+            // A stored session task is normalized to `keyed` with an
+            // envelope (`session::is_session_task`); the raw mode is kept
+            // for a config read before normalization.
+            let session = crate::structs::session::is_session_task(&task)
+                || task
+                    .stateful
+                    .as_ref()
+                    .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Session);
             if session {
                 continue;
             }

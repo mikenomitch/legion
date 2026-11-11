@@ -1608,8 +1608,30 @@ pub async fn start(
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
     let owner = child.map(|child| child.owner.clone());
+    let isolate = crate::structs::isolate::is_isolate_task(task);
+    if isolate {
+        refuse_isolate_start(job_id, task)?;
+    }
     if let Some(session_id) = derived_id {
-        if let Some(existing) = find(store, session_id).await {
+        // A session isolate is in no index: the node this manager sent the
+        // first attempt to is asked instead.
+        let existing = match find(store, session_id).await {
+            Some(existing) => Some(existing),
+            None if isolate => match remembered_run_node(&isolate_start_key(session_id)) {
+                Some(node_id) => get_on_node(store, &node_id, session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|status| IndexedSession {
+                        node_id,
+                        status: Some(status),
+                        recent: false,
+                    }),
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(existing) = existing {
             metrics.session_starts_total.inc(&["deduplicated"]);
             return Ok(StartedSession {
                 session_id: session_id.to_string(),
@@ -1666,7 +1688,7 @@ pub async fn start(
         );
     }
     refresh_room(store, job_id, &task.name).await?;
-    let needs = resource_amounts(&task.resources);
+    let needs = route_needs(task);
     let placement = crate::structs::session::placement(task);
     let mut first = match reserve(store, job_id, &task.name, &needs, &[], placement) {
         Ok(reservation) => Some(reservation),
@@ -1754,6 +1776,10 @@ pub async fn start(
                 minted.as_str()
             }
         };
+        if isolate && derived_id.is_some() {
+            // Before the call, as for a keyed run: a retry finds this node.
+            remember_run_node(&isolate_start_key(session_id), &node_id);
+        }
         match send_start(
             store,
             config,
@@ -1766,6 +1792,21 @@ pub async fn start(
         )
         .await
         {
+            Ok(()) if isolate => {
+                // The node's answer is the confirmation: a session isolate
+                // never appears in the node's session report, so nothing
+                // is recorded in the index (isolate-runtime calls entry 4).
+                reservation.settle(Settle::Released);
+                metrics.session_starts_total.inc(&["started"]);
+                debug!(session_id, node_id = %node_id, "Session isolate started");
+                return Ok(StartedSession {
+                    session_id: session_id.to_string(),
+                    node_id,
+                    state: "running".into(),
+                    deduplicated: false,
+                    owner,
+                });
+            }
             Ok(()) => {
                 let status = SessionStatus {
                     owner: owner.clone(),
@@ -1851,6 +1892,30 @@ pub async fn start(
     )))
 }
 
+/// The refusal for starting an isolate task's session when its isolates
+/// are not addressable (`config.lifetime` other than `session`).
+fn refuse_isolate_start(job_id: &str, task: &TaskConfig) -> Result<(), Status> {
+    let config = crate::structs::isolate::IsolateTaskConfig::from_value(&task.config)
+        .map_err(|err| Status::failed_precondition(format!("task {}: {err}", task.name)))?;
+    if config.lifetime == crate::structs::isolate::IsolateLifetime::Session {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "task {} of job {job_id} is an isolate task with config.lifetime = \"{}\": its \
+         isolates live for one run and cannot be started as sessions\nHint: run code in it with \
+         `legion session run {job_id} --task {}` (RunSession), or set config.lifetime = \
+         \"session\" for addressable session isolates",
+        task.name,
+        config.lifetime.as_str(),
+        task.name
+    )))
+}
+
+/// The key a keyed start of a session isolate remembers its node under.
+fn isolate_start_key(session_id: &str) -> String {
+    format!("isolate-start:{session_id}")
+}
+
 /// Which node this manager sent a keyed run to, so a retry through it
 /// reaches the node that kept the reply (docs/session-runs.md,
 /// "Idempotency"). In memory and per manager: a retry through another
@@ -1924,13 +1989,26 @@ pub async fn run(
 ) -> Result<crate::structs::RunSessionResponse, Status> {
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
-    if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
-        metrics.session_runs_total.inc(&["runtime_disabled"]);
-        return Err(
-            crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id).to_status(),
-        );
+    let isolate = crate::structs::isolate::is_isolate_task(task);
+    // An isolate run that a VM can take is the node's to decide while the
+    // isolate runtime is disabled (it runs in the VM, plan §13); every
+    // other run is refused here once instead of once per node.
+    let has_vm = isolate && crate::manager::isolates::vm_task(task, &config.tasks).is_some();
+    if crate::manager::isolates::refuse_disabled_up_front(task, &request.tier, has_vm) {
+        if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
+            metrics.session_runs_total.inc(&["runtime_disabled"]);
+            return Err(crate::structs::runtime_state::RuntimeDisabledRefusal::new(
+                disable, job_id,
+            )
+            .to_status());
+        }
     }
     let key = request.idempotency_key.clone().unwrap_or_default();
+    // A run in a session isolate goes to the node its id names, and only
+    // there.
+    if isolate && !request.session_id.trim().is_empty() && request.node_id.trim().is_empty() {
+        return run_in_session_isolate(store, &request, wall, &key).await;
+    }
     let pinned = if !request.node_id.trim().is_empty() {
         Some(request.node_id.trim().to_string())
     } else if !key.is_empty() {
@@ -1954,7 +2032,7 @@ pub async fn run(
     }
 
     refresh_room(store, job_id, &task.name).await?;
-    let needs = resource_amounts(&task.resources);
+    let needs = route_needs(task);
     let placement = crate::structs::session::placement(task);
     let mut refusals = Vec::new();
     let mut tried: Vec<String> = Vec::new();
@@ -2029,6 +2107,75 @@ pub async fn run(
         refusals.join("; "),
         full_hint(task),
     )))
+}
+
+/// What the router holds against an envelope for one start or run of
+/// `task`. An isolate holds nothing at the router: its node admits it
+/// against the envelope with no round trip (one resident isolate is a few
+/// MiB, and the managers' index never sees isolates, so a reservation here
+/// would only throttle a burst the node would take), and a node that is
+/// full answers RESOURCE_EXHAUSTED, which moves the run to the next node.
+fn route_needs(task: &TaskConfig) -> BTreeMap<String, f64> {
+    if crate::structs::isolate::is_isolate_task(task) {
+        BTreeMap::new()
+    } else {
+        resource_amounts(&task.resources)
+    }
+}
+
+/// Run in an existing session isolate: send the run to the node its id's
+/// tag names (the first that holds it, when two nodes share a tag). The
+/// node wakes the isolate if it is hibernated.
+async fn run_in_session_isolate(
+    store: &Store,
+    request: &crate::structs::RunSessionRequest,
+    wall: Duration,
+    key: &str,
+) -> Result<crate::structs::RunSessionResponse, Status> {
+    let metrics = crate::manager::telemetry::metrics();
+    let session_id = request.session_id.trim();
+    let Some(tag) = crate::structs::session_node_tag(session_id) else {
+        metrics.session_runs_total.inc(&["refused"]);
+        return Err(Status::not_found(format!(
+            "session isolate {session_id} carries no node tag (an id derived from an \
+             idempotency key), so the router cannot find its node\nHint: name its node with \
+             node_id (--on-node)"
+        )));
+    };
+    let nodes = nodes_for_tag(store, tag);
+    if nodes.is_empty() {
+        metrics.session_runs_total.inc(&["refused"]);
+        return Err(Status::not_found(format!(
+            "no node matches the tag of session isolate {session_id} (the node left the \
+             cluster, or the id is mistyped)"
+        )));
+    }
+    let mut last = None;
+    for node_id in &nodes {
+        if !key.is_empty() && !request.dry_run {
+            remember_run_node(key, node_id);
+        }
+        match send_run(store, node_id, request, wall).await {
+            Ok(reply) => {
+                metrics.session_runs_total.inc(&[if reply.deduplicated {
+                    "deduplicated"
+                } else {
+                    "ran"
+                }]);
+                return Ok(reply);
+            }
+            // Two nodes can share a tag: the other may hold it.
+            Err(status) if status.code() == tonic::Code::NotFound => last = Some(status),
+            Err(status) => {
+                metrics.session_runs_total.inc(&["failed"]);
+                return Err(status);
+            }
+        }
+    }
+    metrics.session_runs_total.inc(&["refused"]);
+    Err(last.unwrap_or_else(|| {
+        Status::not_found(format!("no node holds session isolate {session_id}"))
+    }))
 }
 
 /// What to do about full envelopes. An elastic envelope below its ceiling
@@ -2124,7 +2271,7 @@ async fn send_start(
 
 /// The worker plane's mTLS client for a node (one cached channel per
 /// address), and the target its errors name.
-fn worker_client(
+pub fn worker_client(
     store: &Store,
     node_id: &str,
 ) -> Result<

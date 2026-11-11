@@ -18,7 +18,11 @@ Not built, and why:
   built. A sandbox run boots its VM.
 - **The isolate fields** (`--source`, `tier`, `tierReason`, `nextTier`, and
   isolate tasks answering `RunSession` natively). They belong to the isolate
-  runtime, which does not exist; the proto has none of them.
+  runtime, which does not exist; the proto has none of them. *Update
+  2026-11-11:* built with the [isolate runtime](isolate-runtime-plan.md),
+  except `--source`: an isolate run executes the files it is sent
+  (`main.<ext>`, else the first). It also added `tenant`, `session_id`, and
+  `args` ([isolate calls entry 40](../calls/isolate-runtime-plan_calls.md#40-runs-gained-tenant-session_id-and-args)).
 - **Sibling runs over the API socket.** The call is served, but only the
   child-sessions plan's `children.tasks` can declare that one task may run
   another (calls entry 14).
