@@ -440,6 +440,8 @@ function callerFrame(file) {
   return !file.startsWith('/') || file.startsWith(RUN_DIR + '/');
 }
 
+const WRAPPER_PREFIX = '(async function () {';
+
 const MODULE_SYNTAX = /^\s*(?:import\s*(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*))/m;
 
 function formatError(e) {
@@ -453,9 +455,6 @@ function formatError(e) {
     return `Uncaught ${text}`;
   }
   const lines = [`Uncaught ${e.name}: ${e.message}`];
-  if (e instanceof SyntaxError && e.fileName && callerFrame(e.fileName)) {
-    lines.push(`    at ${e.fileName}:${e.lineNumber}:${e.columnNumber}`);
-  }
   for (const frame of String(e.stack || '').split('\n')) {
     const m = /^(.*?)@(.*):(\d+):(\d+)$/.exec(frame);
     if (!m || !callerFrame(m[2])) continue;
@@ -524,7 +523,7 @@ async function run(req) {
     let fn;
     try {
       fn = (0, eval)(
-        `(async function () {${source}\n;return typeof result === 'undefined' ? undefined : result;\n})\n//# sourceURL=${entry}`,
+        `${WRAPPER_PREFIX}${source}\n;return typeof result === 'undefined' ? undefined : result;\n})\n//# sourceURL=${entry}`,
       );
     } catch (e) {
       // StarlingMonkey cannot link a module from source at run time
@@ -533,6 +532,12 @@ async function run(req) {
         unsupported(
           'ES module syntax (import/export): modules are not available in an isolate; write the entry as a script or run with --tier vm',
         );
+      }
+      if (e instanceof SyntaxError && typeof e.lineNumber === 'number') {
+        // The entry starts on the wrapper's first line, after its prefix.
+        const column = e.lineNumber === 1 ? e.columnNumber - WRAPPER_PREFIX.length : e.columnNumber;
+        console.error(`Uncaught SyntaxError: ${e.message}\n    at ${entry}:${e.lineNumber}:${column}`);
+        return { exit: 1 };
       }
       throw e;
     }

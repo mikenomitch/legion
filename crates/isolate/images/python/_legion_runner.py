@@ -30,6 +30,116 @@ from wit_world.imports import environment as _environment
 RUN_DIR = "/legion/run"
 
 # ---------------------------------------------------------------------------
+# The standard library, from memory
+# ---------------------------------------------------------------------------
+#
+# componentize-py snapshots the interpreter after this module ran but does
+# not ship the library's files: at run time `/python` does not exist, so a
+# module not imported during the build could not be imported at all. The
+# runner therefore compiles the whole library while the image is built and
+# keeps it in the snapshot as one compressed blob, and a finder at the front
+# of `sys.meta_path` loads a module from it on first import. Its pages are
+# shared by every instance; only modules a run imports cost it memory.
+
+SKIP = {
+    # Not code a run can use: the test suite, IDLE, Tk, turtle demos,
+    # installers, and modules that only print or open a browser.
+    "test", "idlelib", "tkinter", "turtle", "turtledemo", "ensurepip", "venv",
+    "pydoc_data", "antigravity", "this", "__hello__", "__phello__", "lib2to3",
+    # The runner installs a stub in its place (below).
+    "ctypes",
+}
+
+
+def _compile_library():
+    import _imp
+    import marshal
+    import zlib
+
+    root = os.path.dirname(os.__file__)
+    index, chunks, offset = {}, [], 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = dirpath[len(root):].strip("/")
+        parts = rel.split("/") if rel else []
+        if parts and (parts[0] in SKIP or "__init__.py" not in filenames or "__pycache__" in parts):
+            dirnames[:] = []
+            continue
+        dirnames.sort()
+        for fn in sorted(filenames):
+            if not fn.endswith(".py"):
+                continue
+            stem = fn[:-3]
+            is_pkg = stem == "__init__"
+            name = ".".join(parts if is_pkg else parts + [stem])
+            if not name or name.split(".")[0] in SKIP or _imp.is_frozen(name):
+                continue
+            path = os.path.join(dirpath, fn)
+            with open(path, "rb") as f:
+                source = f.read()
+            try:
+                code = compile(source, path, "exec", dont_inherit=True)
+            except SyntaxError:
+                continue
+            data = zlib.compress(marshal.dumps(code), 6)
+            index[name] = (offset, len(data), is_pkg, path)
+            chunks.append(data)
+            offset += len(data)
+    return b"".join(chunks), index
+
+
+_LIBRARY, _LIBRARY_INDEX = _compile_library()
+
+
+class _LibraryLoader:
+    """Loads a standard-library module from the image's compiled library."""
+
+    @staticmethod
+    def create_module(spec):
+        return None
+
+    @staticmethod
+    def get_code(name):
+        import marshal
+        import zlib
+
+        offset, size, _pkg, _path = _LIBRARY_INDEX[name]
+        return marshal.loads(zlib.decompress(_LIBRARY[offset : offset + size]))
+
+    @classmethod
+    def exec_module(cls, module):
+        exec(cls.get_code(module.__spec__.name), module.__dict__)
+
+    @staticmethod
+    def is_package(name):
+        return _LIBRARY_INDEX[name][2]
+
+    @staticmethod
+    def get_source(name):
+        return None
+
+
+class _LibraryFinder:
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        entry = _LIBRARY_INDEX.get(name)
+        if entry is None:
+            return None
+        import importlib.util
+
+        spec = importlib.util.spec_from_loader(name, _LibraryLoader, origin=entry[3], is_package=entry[2])
+        spec.has_location = True
+        if entry[2]:
+            spec.submodule_search_locations = [os.path.dirname(entry[3])]
+        return spec
+
+    @staticmethod
+    def invalidate_caches():
+        pass
+
+
+sys.meta_path.insert(0, _LibraryFinder)
+
+# ---------------------------------------------------------------------------
 # What an isolate cannot do: stubs that stop the run, by name.
 # ---------------------------------------------------------------------------
 
@@ -226,64 +336,94 @@ def _install_http():
 
 
 # ---------------------------------------------------------------------------
+# asyncio without sockets
+# ---------------------------------------------------------------------------
+
+
+def _install_asyncio():
+    """asyncio's default loop needs a socketpair to wake itself, which an
+    isolate cannot make. This loop runs coroutines, tasks, futures and
+    timers (it sleeps through wasi:clocks between them); anything that needs
+    a socket or a thread stops the run by name, as everywhere else."""
+    import asyncio
+    import asyncio.events
+    import time
+
+    class _Waiter:
+        def select(self, timeout=None):
+            if timeout is None:
+                raise RuntimeError(
+                    "asyncio: the event loop has nothing left to wait for "
+                    "(an isolate has no sockets, subprocesses or threads to wake it)"
+                )
+            if timeout > 0:
+                time.sleep(timeout)
+            return []
+
+        def close(self):
+            pass
+
+        def get_map(self):
+            return {}
+
+    class IsolateEventLoop(asyncio.BaseEventLoop):
+        """The event loop of an isolate (crates/isolate/images/README.md)."""
+
+        def __init__(self):
+            super().__init__()
+            self._selector = _Waiter()
+
+        def _process_events(self, event_list):
+            pass
+
+        def _write_to_self(self):
+            pass
+
+    for name in (
+        "create_connection", "create_server", "create_datagram_endpoint", "create_unix_connection",
+        "create_unix_server", "getaddrinfo", "getnameinfo", "sock_connect", "sock_accept",
+        "sock_recv", "sock_sendall", "connect_accepted_socket",
+    ):
+        stub = _stub("asyncio.loop." + name, SOCKETS)
+
+        async def method(self, *args, _stub=stub, **kwargs):
+            _stub()
+
+        setattr(IsolateEventLoop, name, method)
+    for name in ("subprocess_exec", "subprocess_shell"):
+        stub = _stub("asyncio.loop." + name, PROCESSES)
+
+        async def method(self, *args, _stub=stub, **kwargs):
+            _stub()
+
+        setattr(IsolateEventLoop, name, method)
+
+    asyncio.IsolateEventLoop = IsolateEventLoop
+    asyncio.events._BaseDefaultEventLoopPolicy._loop_factory = IsolateEventLoop
+    asyncio.DefaultEventLoopPolicy._loop_factory = IsolateEventLoop
+    asyncio.SelectorEventLoop = IsolateEventLoop
+    asyncio.EventLoop = IsolateEventLoop
+
+
+# ---------------------------------------------------------------------------
 # Image setup (runs once, while the image is pre-initialized)
 # ---------------------------------------------------------------------------
 
 _install_stubs()
 _install_http()
+_install_asyncio()
 
-# The standard library is only what is imported here. componentize-py
-# snapshots the interpreter after this module ran and does not ship the
-# library's files: at run time `/python` is not there, so a module that was
-# not imported while the image was built cannot be imported at all. So the
-# image imports every standard-library module and submodule that imports
-# cleanly under WASI, minus the ones below (README.md, "The standard
-# library").
-SKIP = {
-    # Not code a run can use: the test suite, IDLE, Tk, turtle demos,
-    # installers, and modules that only print or open a browser.
-    "test", "idlelib", "tkinter", "turtle", "turtledemo", "ensurepip", "venv",
-    "pydoc_data", "antigravity", "this", "__hello__", "__phello__", "lib2to3",
-    # The runner installs a stub in its place (below).
-    "ctypes",
-}
-SKIP_PREFIXES = tuple(n + "." for n in SKIP)
-
-
-def _preload():
-    import pkgutil
-    import warnings
-
-    loaded, failed = [], []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        names = sorted(set(sys.stdlib_module_names) | set(sys.builtin_module_names))
-        for name in names:
-            if name in SKIP or name in sys.modules:
-                continue
-            try:
-                importlib.import_module(name)
-                loaded.append(name)
-            except BaseException:
-                failed.append(name)
-        for name in names:
-            mod = sys.modules.get(name)
-            path = getattr(mod, "__path__", None)
-            if not path or name in SKIP:
-                continue
-            for info in pkgutil.walk_packages(path, name + ".", onerror=lambda _n: None):
-                sub = info.name
-                if sub.startswith(SKIP_PREFIXES) or ".test" in sub or sub in sys.modules:
-                    continue
-                try:
-                    importlib.import_module(sub)
-                    loaded.append(sub)
-                except BaseException:
-                    failed.append(sub)
-    return loaded, failed
-
-
-PRELOADED, NOT_PRELOADED = _preload()
+# Commonly used modules, imported into the snapshot so a run does not pay
+# for them; everything else in the standard library loads from the image's
+# library on first import (README.md, "Preloaded modules").
+PRELOAD = (
+    "base64", "collections", "csv", "dataclasses", "datetime", "decimal",
+    "functools", "hashlib", "io", "itertools", "json", "math", "random", "re",
+    "statistics", "string", "textwrap", "time", "typing", "uuid",
+)
+for _name in PRELOAD:
+    importlib.import_module(_name)
+del _name
 
 
 def _install_ctypes_stub():
@@ -346,18 +486,46 @@ def _first_run():
         os.environ[k] = v
 
 
+class _RunDirFinder:
+    """Finds modules in the run directory and remembers which, so the next
+    run (whose run directory holds other files) does not see them."""
+
+    names = set()
+
+    @classmethod
+    def find_spec(cls, name, path=None, target=None):
+        import importlib.machinery
+
+        if path is None:
+            path = [RUN_DIR]
+        elif not any(str(p).startswith(RUN_DIR) for p in path):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path, target)
+        if spec is not None:
+            cls.names.add(name)
+        return spec
+
+    @staticmethod
+    def invalidate_caches():
+        pass
+
+
+# After the built-in and frozen importers (a file cannot shadow those, as in
+# CPython) and the library, before the path finder.
+sys.meta_path.insert(
+    next((i for i, f in enumerate(sys.meta_path) if getattr(f, "__name__", "") == "PathFinder"), len(sys.meta_path)),
+    _RunDirFinder,
+)
+
+
 def _forget_run_dir_modules():
     """The run directory is emptied between runs: modules imported from it
     belong to the run that imported them."""
-    prefix = RUN_DIR + "/"
-    for name, mod in list(sys.modules.items()):
-        f = getattr(mod, "__file__", None)
-        if isinstance(f, str) and f.startswith(prefix):
-            del sys.modules[name]
-    # importlib.invalidate_caches() would import importlib.metadata, which
-    # the image does not have; the path finders' caches are what matter.
-    for finder in list(sys.path_importer_cache.values()):
-        if finder is not None and hasattr(finder, "invalidate_caches"):
+    for name in _RunDirFinder.names:
+        sys.modules.pop(name, None)
+    _RunDirFinder.names.clear()
+    for path, finder in list(sys.path_importer_cache.items()):
+        if str(path).startswith(RUN_DIR) and finder is not None:
             finder.invalidate_caches()
 
 

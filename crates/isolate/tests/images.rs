@@ -103,6 +103,13 @@ fn load(name: &'static str) -> Image {
     std::fs::create_dir_all(&cache).unwrap();
     let cwasm = cache.join(format!("{name}-{}.cwasm", &key[..16]));
     if !cwasm.exists() {
+        // Artifacts of earlier builds of this image are stale.
+        for old in std::fs::read_dir(&cache).unwrap().flatten() {
+            let n = old.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&format!("{name}-")) && n.ends_with(".cwasm") {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
         let t = Instant::now();
         let art = engine
             .precompile_component(&bytes)
@@ -882,9 +889,12 @@ async fn python_stdlib_test() {
     // in the image too (time.strptime imports _strptime on first use).
     let src = r#"
 import asyncio, datetime, time, xml.etree.ElementTree as ET, email.mime.text, sqlite3, zlib, decimal
+async def tick(n):
+    await asyncio.sleep(0.002)
+    return n
 async def main():
-    await asyncio.sleep(0)
-    return 5
+    a, b = await asyncio.gather(tick(2), tick(3))
+    return a + b
 db = sqlite3.connect(":memory:")
 db.execute("create table t (x)")
 db.execute("insert into t values (41)")

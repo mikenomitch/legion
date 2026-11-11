@@ -302,10 +302,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
+    /// job, task, tenant, session, and the call.
+    type Seen = (String, String, String, String, HttpCall);
+
     /// Records what it was called with and answers by the path.
     #[derive(Default)]
     struct FakeTarget {
-        calls: Mutex<Vec<(String, String, String, String, HttpCall)>>,
+        calls: Mutex<Vec<Seen>>,
     }
 
     #[tonic::async_trait]
@@ -402,8 +405,7 @@ mod tests {
             "{response}"
         );
         assert!(response.ends_with("made"), "{response}");
-        let calls = target.calls.lock().unwrap();
-        let (job, task, tenant, session, call) = &calls[0];
+        let (job, task, tenant, session, call) = target.calls.lock().unwrap()[0].clone();
         assert_eq!(
             (
                 job.as_str(),
@@ -426,7 +428,6 @@ mod tests {
                 "{gone} reached the guest: {names:?}"
             );
         }
-        drop(calls);
 
         // Over the body cap: 413, and the target never sees it.
         let response = send(
