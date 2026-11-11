@@ -70,11 +70,10 @@ fn isolate_binary() -> PathBuf {
         })
 }
 
-/// Hosts run unconfined here: a best-effort-confined host does not answer
-/// its first call yet (see `a_best_effort_confined_host_answers_hello`),
-/// and these tests are about the supervisor, not confinement.
+/// Hosts confine themselves as far as the kernel allows
+/// (`isolate.confine = "best-effort"`), as a node's would.
 fn worker_config() -> WorkerIsolateConfigFull {
-    config_confined(ConfineMode::Off)
+    config_confined(ConfineMode::BestEffort)
 }
 
 fn config_confined(confine: ConfineMode) -> WorkerIsolateConfigFull {
@@ -194,7 +193,7 @@ struct Node {
 /// A supervisor with the real launcher and compiler, whose `python` image
 /// is the given fixture.
 fn node(image_fixture: &str) -> Node {
-    node_confined(image_fixture, ConfineMode::Off)
+    node_confined(image_fixture, ConfineMode::BestEffort)
 }
 
 fn node_confined(image_fixture: &str, confine: ConfineMode) -> Node {
@@ -410,7 +409,6 @@ async fn a_killed_host_is_restarted_and_the_next_run_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host bug: under confine = best-effort the host serves but its first call fails with a transport error"]
 async fn a_best_effort_confined_host_answers_hello() {
     let node = node_confined("cmd.wasm", ConfineMode::BestEffort);
     node.supervisor

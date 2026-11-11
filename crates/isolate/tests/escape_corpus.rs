@@ -128,7 +128,7 @@ fn i32v(x: u32) -> wasmtime::Val {
 fn out_of_bounds_accesses_trap_and_touch_nothing_test() {
     for p in layouts() {
         let engine = engine(&p);
-        let module = Module::new(&engine, PROBE).unwrap();
+        let module = Module::new(&engine, wat::parse_str(PROBE).unwrap()).unwrap();
         let mut neighbour = probe(&engine, &module, 0xab);
         let before_n = neighbour.digest();
         let widths: [(&str, &str, u32); 5] = [
@@ -204,7 +204,7 @@ fn out_of_bounds_accesses_trap_and_touch_nothing_test() {
 fn cve_2023_26489_shifted_address_wraps_in_32_bits_test() {
     for p in layouts() {
         let engine = engine(&p);
-        let module = Module::new(&engine, PROBE).unwrap();
+        let module = Module::new(&engine, wat::parse_str(PROBE).unwrap()).unwrap();
         let mut me = probe(&engine, &module, 0);
         me.mem.data_mut(&mut me.store)[..8].copy_from_slice(&0x1122334455667788u64.to_le_bytes());
         let f = me
