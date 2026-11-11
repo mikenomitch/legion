@@ -15285,6 +15285,15 @@ message RunSessionRequest {
   // The run is routed to the node the id names, wakes the isolate if it
   // is hibernated, and leaves it running afterwards.
   string session_id = 14;
+
+  // Tasks of the `isolate` runtime only: arguments for the code being
+  // run. A command component reads them as its program arguments, and a
+  // language image passes them to the script (`sys.argv[1:]`,
+  // `process.argv.slice(2)`). When the run goes to a VM they are appended
+  // to the VM task's `run.command`. Unlike `command`, they do not replace
+  // what runs, so they need no more than `job:write`. At most 64
+  // arguments and 64 KiB together.
+  repeated string args = 15;
 }
 
 // One file staged for a run.
