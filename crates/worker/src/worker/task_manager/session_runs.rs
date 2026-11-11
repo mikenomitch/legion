@@ -498,6 +498,8 @@ pub fn isolate_only_field(request: &RunSessionRequest) -> Option<&'static str> {
         Some("tenant")
     } else if !request.session_id.is_empty() {
         Some("session_id")
+    } else if !request.args.is_empty() {
+        Some("args")
     } else {
         None
     }
@@ -506,6 +508,7 @@ pub fn isolate_only_field(request: &RunSessionRequest) -> Option<&'static str> {
 fn prepare(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     call: &RunCall,
+    extra_args: &[String],
 ) -> Result<Prepared, Status> {
     let spec = task_manager
         .lock()
@@ -556,6 +559,10 @@ fn prepare(
         }
         request.command.clone()
     };
+    // An isolate run sent to its VM task: the run's `args` follow the VM
+    // task's own program (the worker builds this, not the caller).
+    let mut command = command;
+    command.extend(extra_args.iter().cloned());
     let StagedFiles {
         files,
         get,
@@ -584,7 +591,20 @@ pub async fn run_session(
     node_id: String,
     call: RunCall,
 ) -> Result<RunSessionResponse, Status> {
-    let prepared = prepare(&task_manager, &call)?;
+    run_session_with_args(task_manager, launch_pool, node_id, call, Vec::new()).await
+}
+
+/// [`run_session`] with `extra_args` appended to the task's command: the
+/// VM tier of an isolate run (docs/task-runtime-isolate.md), whose `args`
+/// go to the VM task's own `run.command`.
+pub async fn run_session_with_args(
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+    launch_pool: Arc<crate::worker::launch_pool::LaunchPool>,
+    node_id: String,
+    call: RunCall,
+    extra_args: Vec<String>,
+) -> Result<RunSessionResponse, Status> {
+    let prepared = prepare(&task_manager, &call, &extra_args)?;
     if call.request.dry_run {
         let reason = task_manager
             .lock()
@@ -1519,10 +1539,18 @@ fn request_fingerprint(request: &RunSessionRequest) -> String {
         part(arg.as_bytes());
     }
     // Isolate runs: where and for whom it runs is part of what it is.
-    if !(request.tier.is_empty() && request.tenant.is_empty() && request.session_id.is_empty()) {
+    if !(request.tier.is_empty()
+        && request.tenant.is_empty()
+        && request.session_id.is_empty()
+        && request.args.is_empty())
+    {
         part(request.tier.as_bytes());
         part(request.tenant.as_bytes());
         part(request.session_id.as_bytes());
+        part(&(request.args.len() as u64).to_be_bytes());
+        for arg in &request.args {
+            part(arg.as_bytes());
+        }
     }
     hasher
         .finalize()

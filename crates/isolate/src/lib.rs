@@ -15,11 +15,14 @@
 pub mod account;
 pub mod checkpoint;
 pub mod compile;
+pub mod confine;
 pub mod engine;
 pub mod guest;
 pub mod host;
 pub mod module;
+pub mod run_host;
 pub mod scratch;
+pub mod service;
 pub mod shard;
 pub mod turn;
 pub mod worker_api;

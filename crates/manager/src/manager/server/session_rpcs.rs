@@ -190,6 +190,8 @@ impl ManagerDaemonService {
             &request.command,
         )
         .map_err(|(code, message)| Status::new(code, message))?;
+        crate::manager::isolates::check_run_args(&request.job_id, task, &request.args)
+            .map_err(Status::invalid_argument)?;
         let isolate = crate::structs::isolate::is_isolate_task(task);
         let wall = if isolate {
             // No `run` block: the budgets are `config.limits`, and a run that
@@ -254,7 +256,12 @@ impl ManagerDaemonService {
                         (&file.path, format!("{:x}", Sha256::digest(&file.content)))
                     })
                     .collect::<Vec<_>>(),
-                (&request.tier, &request.tenant, &request.session_id),
+                (
+                    &request.tier,
+                    &request.tenant,
+                    &request.session_id,
+                    &request.args,
+                ),
             ),
         );
         request.idempotency_key = (!scoped.is_empty()).then_some(scoped);

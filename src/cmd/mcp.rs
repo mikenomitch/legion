@@ -1527,6 +1527,7 @@ fn core_tool_defs() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "description": "Answer the node and its room; run nothing. On an isolate task it also answers the tier auto would pick, the source's imports, and those missing from the image." },
                     "tier": { "type": "string", "enum": ["auto", "isolate", "vm"], "description": "Isolate tasks only: where the run happens. auto (default) decides before anything runs; pass a previous reply's nextTier for the same code." },
                     "tenant": { "type": "string", "description": "Isolate tasks only: who the run is for (keys warm instances and the per-tenant queue; up to 128 printable ASCII bytes)." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Isolate tasks only: arguments for the code being run (sys.argv[1:], process.argv.slice(2); appended to the VM task's run.command for a VM run). At most 64, 64 KiB together." },
                     "session_id": { "type": "string", "description": "Isolate tasks with config.lifetime = \"session\" only: run in this session isolate, on the node its id names." },
                     "fallback": { "type": "string", "enum": ["vm"], "description": "Isolate tasks only: when the run is stopped in the isolate and the reply's nextTier is vm, send it again with tier vm. Runs your code a second time, in a VM; the reply says ranTwice. Not with session_id or dry_run." }
                 },
@@ -2780,6 +2781,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 tier: opt_str_arg(&args, "tier").unwrap_or_default(),
                 tenant: opt_str_arg(&args, "tenant").unwrap_or_default(),
                 session_id: opt_str_arg(&args, "session_id").unwrap_or_default(),
+                args: strings("args"),
             };
             let fallback = match opt_str_arg(&args, "fallback").as_deref() {
                 None | Some("") => false,

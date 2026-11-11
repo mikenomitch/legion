@@ -30,6 +30,7 @@ struct HostState {
     sessions: HashMap<String, (u64, bool)>,
     invocations: u64,
     stopped: BTreeMap<String, u64>,
+    last_args: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -124,6 +125,7 @@ impl IsolateHost for FakeHost {
                 ..Default::default()
             }));
         };
+        self.state.lock().unwrap().last_args = run.args.clone();
         let entry = run
             .files
             .iter()
@@ -1020,4 +1022,38 @@ async fn stats_fold_and_count() {
     assert_eq!(hosts[0].engine_version, "wasmtime-fake");
     let (filtered, _) = h.supervisor.stats("other/job", "").await;
     assert!(filtered.is_empty());
+}
+
+#[tokio::test]
+async fn args_reach_the_host_and_are_bounded() {
+    let h = harness();
+    h.supervisor
+        .sync(vec![envelope("ns/app", isolate_task("run", module_config("request")), 1024.0)]);
+    let mut call = run_call("ns/app", "run", &[("main.wasm", "x")]);
+    call.request.args = vec!["spin".into(), "1".into()];
+    h.supervisor.run(call.clone(), None).await.unwrap();
+    assert_eq!(
+        h.launcher.hosts()[0].1.state.lock().unwrap().last_args,
+        vec!["spin", "1"]
+    );
+    // A keyed retry with other args is another request.
+    call.request.idempotency_key = Some("k".into());
+    let first = h.supervisor.run(call.clone(), None).await.unwrap();
+    call.request.args = vec!["echo".into()];
+    let other = h.supervisor.run(call.clone(), None).await.unwrap();
+    assert!(!other.deduplicated);
+    assert_ne!(first.run_id, other.run_id);
+    call.request.args = vec!["a".into(); 65];
+    assert_eq!(h.supervisor.run(call.clone(), None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    call.request.args = vec!["a".repeat(70 << 10)];
+    assert_eq!(h.supervisor.run(call, None).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    // Elsewhere args are an isolate-only field.
+    let generic = RunSessionRequest {
+        args: vec!["x".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::worker::task_manager::session_runs::isolate_only_field(&generic),
+        Some("args")
+    );
 }

@@ -1222,6 +1222,7 @@ impl IsolateSupervisor {
             crate::structs::isolate::validate_tenant_key(&request.tenant)
                 .map_err(Status::invalid_argument)?;
         }
+        check_args(&request.args)?;
         let key = self.known_task(&call.job_id, &call.task_name)?;
         let lifetime = lock(&self.state)
             .tasks
@@ -1488,7 +1489,7 @@ impl IsolateSupervisor {
                 files,
                 input: request.input.clone(),
                 entry: decided.entry_name.clone().unwrap_or_default(),
-                args: Vec::new(),
+                args: request.args.clone(),
                 get,
             })),
         };
@@ -1603,6 +1604,7 @@ impl IsolateSupervisor {
                 executable,
             });
         }
+        let args = call.request.args.clone();
         let request = RunSessionRequest {
             job_id: key.0.clone(),
             task_name: vm_task.clone(),
@@ -1610,11 +1612,12 @@ impl IsolateSupervisor {
             tier: String::new(),
             tenant: String::new(),
             session_id: String::new(),
+            args: Vec::new(),
             idempotency_key: None,
             ..call.request.clone()
         };
         let started = Instant::now();
-        let reply = crate::worker::task_manager::session_runs::run_session(
+        let reply = crate::worker::task_manager::session_runs::run_session_with_args(
             task_manager,
             launch_pool,
             self.node_id.clone(),
@@ -1624,6 +1627,7 @@ impl IsolateSupervisor {
                 request,
                 ticket_jti: call.ticket_jti.clone(),
             },
+            args,
         )
         .await?;
         let elapsed = started.elapsed().as_millis() as u64;
@@ -2532,6 +2536,26 @@ struct Decided {
     image: Option<String>,
     /// The run's entry file, relative to the run directory.
     entry_name: Option<String>,
+}
+
+/// The most `args` a run may carry, and their total size.
+pub const MAX_RUN_ARGS: usize = 64;
+pub const MAX_RUN_ARGS_BYTES: usize = 64 << 10;
+
+fn check_args(args: &[String]) -> Result<(), Status> {
+    if args.len() > MAX_RUN_ARGS {
+        return Err(Status::invalid_argument(format!(
+            "the run has {} args; at most {MAX_RUN_ARGS}",
+            args.len()
+        )));
+    }
+    let bytes: usize = args.iter().map(String::len).sum();
+    if bytes > MAX_RUN_ARGS_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "the run's args are {bytes} bytes together; at most {MAX_RUN_ARGS_BYTES} (64 KiB)"
+        )));
+    }
+    Ok(())
 }
 
 /// The `legion_isolate_vm_runs_total` reason label for a tier reason.

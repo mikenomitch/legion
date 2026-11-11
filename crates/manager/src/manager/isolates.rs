@@ -293,6 +293,44 @@ pub fn check_run_fields(
     Ok(())
 }
 
+/// The most arguments one run of an isolate task takes
+/// (`RunSessionRequest.args`).
+pub const MAX_RUN_ARGS: usize = 64;
+
+/// The most bytes a run's arguments take together.
+pub const MAX_RUN_ARGS_BYTES: usize = 64 * 1024;
+
+/// Check `RunSessionRequest.args`: isolate tasks only, at most
+/// [`MAX_RUN_ARGS`] arguments and [`MAX_RUN_ARGS_BYTES`] together. Every
+/// refusal is INVALID_ARGUMENT.
+pub fn check_run_args(job_id: &str, task: &TaskConfig, args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    if !crate::structs::isolate::is_isolate_task(task) {
+        return Err(format!(
+            "args applies only to tasks of the isolate runtime; task {} of job {job_id} runs on \
+             {}\nHint: drop args (--arg), or replace the command with --command",
+            task.name, task.runtime
+        ));
+    }
+    if args.len() > MAX_RUN_ARGS {
+        return Err(format!(
+            "{} args, over the {MAX_RUN_ARGS}-argument maximum for one run\nHint: pass large or \
+             many values in --input or a --file instead",
+            args.len()
+        ));
+    }
+    let bytes: usize = args.iter().map(String::len).sum();
+    if bytes > MAX_RUN_ARGS_BYTES {
+        return Err(format!(
+            "args take {bytes} bytes together, over the {MAX_RUN_ARGS_BYTES}-byte maximum for one \
+             run\nHint: pass large values in --input or a --file instead"
+        ));
+    }
+    Ok(())
+}
+
 /// The isolate task's VM task, when it has one and it is in `tasks`.
 pub fn vm_task<'a>(task: &TaskConfig, tasks: &'a [TaskConfig]) -> Option<&'a TaskConfig> {
     let config = crate::structs::isolate::IsolateTaskConfig::of(task).ok()??;
@@ -557,6 +595,31 @@ mod isolates_test {
         assert_eq!(code, tonic::Code::FailedPrecondition);
         assert!(message.contains("lifetime = \"request\""), "{message}");
         assert!(check_run_fields("j", &session, "", "", "run-abc.def", &[]).is_ok());
+    }
+
+    #[test]
+    fn isolate_run_args_are_bounded_and_isolate_only() {
+        let isolate = task("run", "isolate", isolate_config("request", false));
+        let exec = task("web", "exec", json!({}));
+        assert!(check_run_args("j", &exec, &[]).is_ok());
+        assert!(check_run_args("j", &isolate, &["--rows".into(), "10".into()]).is_ok());
+        let err = check_run_args("j", &exec, &["x".into()]).unwrap_err();
+        assert!(
+            err.starts_with("args applies only to tasks of the isolate runtime"),
+            "{err}"
+        );
+        let many: Vec<String> = (0..=MAX_RUN_ARGS).map(|i| i.to_string()).collect();
+        assert!(check_run_args("j", &isolate, &many[..MAX_RUN_ARGS]).is_ok());
+        let err = check_run_args("j", &isolate, &many).unwrap_err();
+        assert!(
+            err.starts_with("65 args, over the 64-argument maximum"),
+            "{err}"
+        );
+        let big = vec!["x".repeat(MAX_RUN_ARGS_BYTES / 2); 2];
+        assert!(check_run_args("j", &isolate, &big).is_ok());
+        let bigger = vec!["x".repeat(MAX_RUN_ARGS_BYTES / 2 + 1); 2];
+        let err = check_run_args("j", &isolate, &bigger).unwrap_err();
+        assert!(err.contains("over the 65536-byte maximum"), "{err}");
     }
 
     #[test]

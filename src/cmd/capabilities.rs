@@ -630,7 +630,7 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "session.run",
-            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--tier auto|isolate|vm] [--tenant <KEY>] [--session <ID>] [--fallback vm] [--command <ARG>...]",
+            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--tier auto|isolate|vm] [--tenant <KEY>] [--session <ID>] [--arg <ARG>]... [--fallback vm] [--command <ARG>...]",
             grpc: Some("Manager/RunSession"),
             summary: "Run once in a fresh, single-use session of a session task with a `run` \
                  block and return stdout, stderr, the exit status, result.json as `result`, and \
@@ -642,7 +642,8 @@ pub fn catalog() -> Vec<Capability> {
                  runs in an isolate or a VM, chosen before it runs (--tier, default auto); the \
                  reply adds `tier`, `tierReason`, and `nextTier` (the tier to ask for next time \
                  for the same code), and microsecond-precise cpuMs/wallMs. --tenant keys warm \
-                 instances, --session runs in a session isolate, and --fallback vm reruns a run \
+                 instances, --arg passes arguments to the code (job:write only), --session runs \
+                 in a session isolate, and --fallback vm reruns a run \
                  stopped in the isolate once in a VM (`ranTwice`: your code ran twice).",
             mutates: true,
             read_only_safe: false,

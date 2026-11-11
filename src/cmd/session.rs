@@ -366,6 +366,14 @@ pub fn config() -> Command {
                      existing session isolate, on the node its id names, instead of a fresh one",
         ))
         .arg(
+            Arg::new("arg")
+                .long("arg")
+                .value_name("ARG")
+                .action(clap::ArgAction::Append)
+                .allow_hyphen_values(true)
+                .help("An argument for the code being run (isolate tasks). Repeatable"),
+        )
+        .arg(
             Arg::new("fallback")
                 .long("fallback")
                 .value_name("TIER")
@@ -805,6 +813,12 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .get_one::<String>("session")
             .cloned()
             .unwrap_or_default(),
+        args: matches
+            .get_many::<String>("arg")
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect(),
     };
     let fallback = matches.get_one::<String>("fallback").is_some();
     let first = output::resolve(
@@ -1741,6 +1755,7 @@ mod session_cmd_test {
             task_name: "run".into(),
             idempotency_key: Some("k1".into()),
             tenant: "acme".into(),
+            args: vec!["--rows".into(), "10".into()],
             ..Default::default()
         };
         let unsupported = isolate_stop(
@@ -1752,6 +1767,7 @@ mod session_cmd_test {
         assert_eq!(second.tier, "vm");
         assert_eq!(second.idempotency_key.as_deref(), Some("k1:fallback"));
         assert_eq!(second.tenant, "acme");
+        assert_eq!(second.args, ["--rows", "10"]);
         assert_eq!(
             fallback_reason(&unsupported),
             "fallback: stopped in the isolate, unsupported (subprocess.run)"
@@ -1803,6 +1819,10 @@ mod session_cmd_test {
                 "acme",
                 "--fallback",
                 "vm",
+                "--arg",
+                "--rows",
+                "--arg",
+                "10",
                 "-j",
             ])
             .expect("parses");
@@ -1819,6 +1839,8 @@ mod session_cmd_test {
             run.get_one::<String>("fallback").map(String::as_str),
             Some("vm")
         );
+        let args: Vec<&String> = run.get_many::<String>("arg").unwrap().collect();
+        assert_eq!(args, ["--rows", "10"]);
         for bad in [
             &["session", "run", "j", "--tier", "gpu"][..],
             &["session", "run", "j", "--fallback", "isolate"],

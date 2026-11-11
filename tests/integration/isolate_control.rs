@@ -428,6 +428,12 @@ impl Cluster {
     /// The job: an isolate task whose VM task is a sibling session task
     /// with a `run` block, each with an envelope per node.
     fn submit(&self, lifetime: &str) -> R<()> {
+        self.submit_as(lifetime, "job_reschedule")
+    }
+
+    /// [`Cluster::submit`] with the eval kind to run (`job_submit` for an
+    /// update of a job already submitted).
+    fn submit_as(&self, lifetime: &str, kind: &str) -> R<()> {
         let spec = json!({
             "name": JOB,
             "tasks": [
@@ -471,7 +477,7 @@ impl Cluster {
             )?;
             let config_id = self.store().get_job_config(JOB)?.id();
             self.store()
-                .enqueue_eval("job_reschedule", Some(JOB), Some(&config_id), None, None)?;
+                .enqueue_eval(kind, Some(JOB), Some(&config_id), None, None)?;
             while let Some(eval) = self.store().claim_eval()? {
                 eval.handle(self.store())?;
                 self.store().complete_eval(&eval.id, true)?;
@@ -568,6 +574,7 @@ async fn an_isolate_run_reaches_the_node_with_its_fields_test() -> R<()> {
             files: vec![file("main.py", "print(42)\n")],
             tier: "isolate".into(),
             tenant: "acme".into(),
+            args: vec!["--rows".into(), "10".into()],
             ..Default::default()
         })
         .await?;
@@ -584,6 +591,7 @@ async fn an_isolate_run_reaches_the_node_with_its_fields_test() -> R<()> {
     assert_eq!(sent.task_name, TASK);
     assert_eq!(sent.tier, "isolate");
     assert_eq!(sent.tenant, "acme");
+    assert_eq!(sent.args, ["--rows", "10"]);
 
     // A burst of concurrent runs is not throttled by the router as if each
     // were a full session: every one reaches the node.
@@ -632,6 +640,10 @@ async fn isolate_fields_are_refused_where_they_do_not_apply_test() -> R<()> {
             session_id: "machine-x.y".into(),
             ..Default::default()
         },
+        RunSessionRequest {
+            args: vec!["--rows".into()],
+            ..Default::default()
+        },
     ] {
         let err = cluster
             .run(RunSessionRequest {
@@ -645,6 +657,16 @@ async fn isolate_fields_are_refused_where_they_do_not_apply_test() -> R<()> {
             .message()
             .contains("applies only to tasks of the isolate runtime"));
     }
+
+    let err = cluster
+        .run(RunSessionRequest {
+            task_name: TASK.into(),
+            args: (0..65).map(|i| i.to_string()).collect(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("too many args");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 
     let err = cluster
         .run(RunSessionRequest {
@@ -1034,6 +1056,10 @@ async fn a_disabled_isolate_runtime_keeps_the_envelope_and_auto_runs_test() -> R
     .await?;
     assert_eq!(cluster.envelope_nodes(TASK), ["w-1"], "the envelope placed");
     assert_eq!(cluster.envelope_nodes(VM_TASK), ["w-1"]);
+    // An update of the job is not held back by the disabled runtime: the
+    // isolate task is a session task, never placed itself.
+    cluster.submit_as("tenant", "job_submit")?;
+    assert_eq!(cluster.envelope_nodes(TASK), ["w-1"]);
 
     let reply = cluster
         .run(RunSessionRequest {
