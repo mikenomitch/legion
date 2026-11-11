@@ -65,6 +65,12 @@ compatibility aliases. (b) would turn the mistake into "no node has the
 resource `cpus`", a placement failure with no pointer to the cause. Public
 doc: [resource-enforcement.md](../../docs/resource-enforcement.md).
 
+**Follow-up (decided in review).** The refusal is temporary. `cpus` comes
+back meaning a number of cores, converted to MHz per node from its
+fingerprinted per-core frequency, rather than at a fixed rate; tracked in
+`TODO.md` under Placement features. Refusing it now keeps the name free for
+that meaning instead of shipping a third one in between.
+
 ## 3. A net plugin a running job uses cannot be deleted
 
 **The call.** `DeleteNetPlugin` is refused while a job that is not stopped

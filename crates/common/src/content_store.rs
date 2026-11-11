@@ -217,14 +217,7 @@ impl ContentDigest {
     }
 
     fn from_hasher(hasher: Sha256) -> Self {
-        let digest = hasher.0.finish();
-        let mut out = String::with_capacity(7 + 64);
-        out.push_str("sha256:");
-        for byte in digest.as_ref() {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-        }
-        ContentDigest(out)
+        ContentDigest(format!("sha256:{}", hasher.hex()))
     }
 
     /// The full `sha256:<hex>` form.
@@ -1548,6 +1541,24 @@ impl Sha256 {
 
     fn update(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
+    }
+
+    /// The digest as 64 lowercase hex characters.
+    fn hex(self) -> String {
+        use std::fmt::Write as _;
+        let digest = self.0.finish();
+        let mut out = String::with_capacity(64);
+        for byte in digest.as_ref() {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    /// The hex digest of one buffer.
+    fn hex_of(bytes: &[u8]) -> String {
+        let mut hasher = Self::new();
+        hasher.update(bytes);
+        hasher.hex()
     }
 }
 

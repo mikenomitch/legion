@@ -204,12 +204,12 @@ impl Recipe {
             hasher.update(b"\0");
             hasher.update(value.as_bytes());
         }
-        format!("{:x}", hasher.finalize())
+        hasher.hex()
     }
 }
 
 fn fingerprint(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", Sha256::hex_of(bytes))
 }
 
 /// One committed derived entry.

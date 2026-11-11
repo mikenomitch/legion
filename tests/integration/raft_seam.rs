@@ -253,6 +253,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "unblock_evals",
     "update_app_object_status",
     "wake_timed_out_gangs",
+    // Child sessions and resize.
+    "create_keyed_child_instance",
+    "end_orphaned_keyed_children",
+    "set_task_resize",
+    "clear_task_resize",
+    "set_instance_size",
+    "replace_allocations_for_resize",
 ];
 
 /// Replicated public methods with no same-named `_apply` fn — either
@@ -336,18 +343,29 @@ const DELEGATED_BODIES: &[&str] = &[
     "sync_object_kinds",
     "update_app_object_status",
     "wake_timed_out_gangs",
+    // Child sessions and resize: inlined statements or composed bodies.
+    "end_orphaned_keyed_children",
+    "set_task_resize",
+    "clear_task_resize",
+    "set_instance_size",
+    "replace_allocations_for_resize",
 ];
 
 /// `_apply` bodies that no op is named after: each is called from the
 /// closure of a classified op with a different name, so it has no lane of
 /// its own (`resize_envelope_apply` runs inside the scheduler lane's
 /// `group_commit` op, the two gang bodies inside `gang_member_lost`,
-/// `insert_first_keyring_row_apply` inside `initialize_keyring`).
+/// `insert_first_keyring_row_apply` inside `initialize_keyring`,
+/// `resize_allocation_apply` inside `group_commit`, and
+/// `cascade_keyed_children_apply` inside the job stop and destroy bodies and
+/// `end_orphaned_keyed_children`).
 const SHARED_APPLY_BODIES: &[&str] = &[
     "decide_gang_loss",
     "insert_first_keyring_row",
     "resize_envelope",
     "stop_failed_gang_job",
+    "cascade_keyed_children",
+    "resize_allocation",
 ];
 
 /// Public mutating methods that are deliberately NOT replicated — they route
@@ -425,6 +443,8 @@ fn lane_for(method: &str) -> Lane {
         | "upsert_acl_user"
         | "upsert_manager_config"
         | "upsert_saved_state_query"
+        | "set_task_resize"
+        | "clear_task_resize"
         | "apply_scale_write"
         | "clear_scaling_pause"
         | "close_scaling_action"
@@ -502,6 +522,10 @@ fn lane_for(method: &str) -> Lane {
         | "delete_volume"
         | "mark_volume_destroyed"
         | "sync_task_volume_claims"
+        | "create_keyed_child_instance"
+        | "end_orphaned_keyed_children"
+        | "set_instance_size"
+        | "replace_allocations_for_resize"
         | "abandon_resume"
         | "apply_snapshot_report"
         | "begin_fork"

@@ -178,8 +178,6 @@
     #
     # Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     # by default; the flags exist as escape hatches.
-    # lazy_version_sample: RETIRED (no effect, warns once). Plans now take
-    # their fence epochs from their own capacity snapshot.
     # plan_apply_coalescing = true, # false = one commit/raft propose per plan
     # plan_apply_batch_max = 16,    # max plans per group commit (1-128)
     # Job-intake group commit (docs/scheduler-and-eval-loop.md): concurrent

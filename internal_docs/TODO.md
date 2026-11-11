@@ -232,6 +232,16 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       only within one job spec (`crates/manager/src/manager/scheduler/policy.rs`).
 - [ ] **Worker-fingerprinted `disk` as a built-in schedulable resource**; today
       only operator-declared `config_attrs.resources.disk` feeds the `fit` index.
+- [ ] **Bring back `resources.cpus` as a core count, sized per node.** It is
+      refused at submit today ([todo-closeout calls #2](calls/todo-closeout-2026-11-10_calls.md));
+      it used to be an MHz alias for `cpu` that read like a CPU count. Bring it
+      back meaning cores, Docker/Kubernetes-style (`cpus = 0.5` is half a
+      core), converted to MHz with each node's fingerprinted per-core
+      frequency at placement, not a fixed rate, so `cpus = 1` reserves one
+      real core's worth on a 2.0 and a 3.5 GHz node alike. Decide how it
+      composes with `cpu` and `cores`, how the `fit` index sees a per-node
+      amount, and how the cgroup weight is derived; touches the plan path, so
+      it needs `scheduler_bench` numbers and a plan.
 - [ ] **Let a node override its builtin capacity** (`cpu`, `memory`, `cores`).
       A builtin name in a worker type's `resources` fails startup today
       ([calls](calls/node-resource-overrides_calls.md)). Decide replace vs
