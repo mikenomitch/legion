@@ -48,7 +48,11 @@ fn mono_base() -> Instant {
 }
 
 fn real_wall() -> Duration {
-    coarse(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default())
+    coarse(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 fn real_mono_ns() -> u64 {
@@ -101,7 +105,9 @@ impl wasmtime_wasi::HostWallClock for FrozenWallClock {
         CLOCK_RESOLUTION
     }
     fn now(&self) -> Duration {
-        TURN.with(|t| t.get()).map(|s| s.wall).unwrap_or_else(real_wall)
+        TURN.with(|t| t.get())
+            .map(|s| s.wall)
+            .unwrap_or_else(real_wall)
     }
 }
 

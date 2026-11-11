@@ -474,6 +474,14 @@ message ReclaimRequest {
   uint64 target_bytes = 2;
   // Only isolates idle at least this long. 0 = any idle isolate.
   uint64 min_idle_millis = 3;
+  // Narrow the request to these session isolates (suspending named
+  // sessions). Empty = no session filter.
+  repeated string session_ids = 4;
+  // Narrow the request to one job's isolates, or one task's (draining a
+  // disabled runtime for the jobs it covers). Empty = every task the host
+  // serves.
+  string job_id = 5;
+  string task_name = 6;
 }
 
 message ReclaimReply {

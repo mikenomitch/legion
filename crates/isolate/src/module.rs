@@ -67,10 +67,21 @@ fn link(l: &mut Linker<Ctx>) -> wasmtime::Result<()> {
 /// newest version of each package it implements. A guest may import an
 /// older patch release of the same minor version (wasmtime matches
 /// semver-compatibly); anything else is refused at compile time.
-pub const PROVIDED: &[(&str, &[&str], (u32, u32, u32))] = &[
+/// (package, interfaces, newest version).
+pub type Provided = (&'static str, &'static [&'static str], (u32, u32, u32));
+
+pub const PROVIDED: &[Provided] = &[
     ("wasi:io", &["error", "poll", "streams"], (0, 2, 12)),
-    ("wasi:clocks", &["wall-clock", "monotonic-clock"], (0, 2, 12)),
-    ("wasi:random", &["random", "insecure", "insecure-seed"], (0, 2, 12)),
+    (
+        "wasi:clocks",
+        &["wall-clock", "monotonic-clock"],
+        (0, 2, 12),
+    ),
+    (
+        "wasi:random",
+        &["random", "insecure", "insecure-seed"],
+        (0, 2, 12),
+    ),
     (
         "wasi:cli",
         &[
@@ -124,9 +135,7 @@ pub fn provided(name: &str) -> bool {
         *p == pkg
             && ifaces.contains(&iface)
             && match version.and_then(parse_version) {
-                Some((maj, min, patch)) => {
-                    (maj, min) == (newest.0, newest.1) && patch <= newest.2
-                }
+                Some((maj, min, patch)) => (maj, min) == (newest.0, newest.1) && patch <= newest.2,
                 None => version.is_none(),
             }
     })
@@ -262,9 +271,15 @@ mod module_test {
         assert!(provided("wasi:cli/environment@0.2.0"));
         assert!(provided("wasi:http/types@0.2.12"));
         assert!(provided("legion:isolate/state@0.1.0"));
-        assert!(!provided("wasi:cli/environment@0.2.13"), "newer than the host");
+        assert!(
+            !provided("wasi:cli/environment@0.2.13"),
+            "newer than the host"
+        );
         assert!(!provided("wasi:cli/environment@0.3.0"));
-        assert!(!provided("wasi:http/incoming-handler@0.2.0"), "an export, not an import");
+        assert!(
+            !provided("wasi:http/incoming-handler@0.2.0"),
+            "an export, not an import"
+        );
         assert!(!provided("wasi:nope/thing@0.2.0"));
         assert!(!provided("legion:isolate/runner@0.1.0"));
     }

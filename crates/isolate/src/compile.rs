@@ -212,10 +212,7 @@ mod compile_test {
 
     #[test]
     fn refuses_shared_memory_test() {
-        let c = wat::parse_str(
-            "(component (core module (memory 1 1 shared)))",
-        )
-        .unwrap();
+        let c = wat::parse_str("(component (core module (memory 1 1 shared)))").unwrap();
         let e = validate(&c).unwrap_err();
         assert_eq!(e.kind(), "invalid", "{e:?}");
     }

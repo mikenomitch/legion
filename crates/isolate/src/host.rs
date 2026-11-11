@@ -24,13 +24,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use legion_proto::isolate_host::{
-    invoke_reply, invoke_request, CheckpointHeader, ConfigureTaskReply, Confinement,
-    DrainReply, DrainRequest, File, HelloReply, HostConfig, HttpCall, HttpOutcome, Lifetime,
-    LoadModuleReply, LoadModuleRequest, LogBatch, LogLine, OpenSessionReply,
-    OpenSessionRequest, Origin, ReclaimLevel, ReclaimReply, ReclaimRequest,
-    RemoveTaskReply, RemoveTaskRequest, ResizeSessionReply, ResizeSessionRequest, RunCall,
-    RunOutcome, SessionInfo, StatsReply, Stopped, TaskSpec, TaskStats, UnloadModuleReply,
-    UnloadModuleRequest, PROTOCOL_VERSION,
+    invoke_reply, invoke_request, CheckpointHeader, ConfigureTaskReply, Confinement, DrainReply,
+    DrainRequest, File, HelloReply, HostConfig, HttpCall, HttpOutcome, Lifetime, LoadModuleReply,
+    LoadModuleRequest, LogBatch, LogLine, OpenSessionReply, OpenSessionRequest, Origin,
+    ReclaimLevel, ReclaimReply, ReclaimRequest, RemoveTaskReply, RemoveTaskRequest,
+    ResizeSessionReply, ResizeSessionRequest, RunCall, RunOutcome, SessionInfo, StatsReply,
+    Stopped, TaskSpec, TaskStats, UnloadModuleReply, UnloadModuleRequest, PROTOCOL_VERSION,
 };
 use legion_proto::isolate_host::{InvokeReply, InvokeRequest};
 use rand_010::RngExt as _;
@@ -49,8 +48,8 @@ use crate::module::LoadedModule;
 use crate::scratch::RUN_DIR;
 use crate::shard::{allowed_cpus, Shard};
 use crate::turn;
-use crate::world::runner;
 use crate::worker_api::WorkerApi;
+use crate::world::runner;
 
 /// Defaults for `HostConfig` fields left at 0.
 pub const DEFAULT_SLOTS: u32 = 1000;
@@ -77,7 +76,7 @@ fn unix_ms() -> i64 {
 }
 
 fn mib(bytes: u64) -> String {
-    if bytes >= 1 << 20 && bytes % (1 << 20) == 0 {
+    if bytes >= 1 << 20 && bytes.is_multiple_of(1 << 20) {
         format!("{}MiB", bytes >> 20)
     } else if bytes >= 1 << 20 {
         format!("{:.1}MiB", bytes as f64 / (1 << 20) as f64)
@@ -435,9 +434,8 @@ impl Host {
     // -- modules ------------------------------------------------------------
 
     fn inside_read_dirs(&self, path: &Path) -> Result<PathBuf, Status> {
-        let real = std::fs::canonicalize(path).map_err(|e| {
-            Status::not_found(format!("artifact {}: {e}", path.display()))
-        })?;
+        let real = std::fs::canonicalize(path)
+            .map_err(|e| Status::not_found(format!("artifact {}: {e}", path.display())))?;
         if self.0.read_dirs.iter().any(|d| real.starts_with(d)) {
             Ok(real)
         } else {
@@ -464,13 +462,14 @@ impl Host {
         let path = self.inside_read_dirs(Path::new(&req.artifact_path))?;
         // SAFETY: the path is inside a directory only the worker's compiler
         // writes (checked above, after resolving links).
-        let m = unsafe { LoadedModule::load(&self.0.engine, &self.0.linker, &req.module_id, &path) }
-            .map_err(|e| {
-                Status::failed_precondition(format!(
-                    "module {} cannot be loaded: {e:#}",
-                    req.module_id
-                ))
-            })?;
+        let m =
+            unsafe { LoadedModule::load(&self.0.engine, &self.0.linker, &req.module_id, &path) }
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "module {} cannot be loaded: {e:#}",
+                        req.module_id
+                    ))
+                })?;
         let r = reply(&m, false);
         self.0
             .modules
@@ -497,7 +496,13 @@ impl Host {
             )));
         }
         Ok(UnloadModuleReply {
-            unloaded: self.0.modules.lock().unwrap().remove(&req.module_id).is_some(),
+            unloaded: self
+                .0
+                .modules
+                .lock()
+                .unwrap()
+                .remove(&req.module_id)
+                .is_some(),
         })
     }
 
@@ -579,16 +584,19 @@ impl Host {
     #[instrument(skip_all, fields(job_id = %req.job_id, task = %req.task_name))]
     pub async fn remove_task(&self, req: RemoveTaskRequest) -> Result<RemoveTaskReply, Status> {
         let key = (req.job_id.clone(), req.task_name.clone());
-        let task = self
-            .0
-            .tasks
-            .lock()
-            .unwrap()
-            .remove(&key)
-            .ok_or_else(|| Status::not_found(format!("no task {}", task_name(&key.0, &key.1))))?;
+        let task =
+            self.0.tasks.lock().unwrap().remove(&key).ok_or_else(|| {
+                Status::not_found(format!("no task {}", task_name(&key.0, &key.1)))
+            })?;
         task.removed.store(true, Ordering::Release);
         let mut dropped = 0;
-        let tenants: Vec<_> = task.tenants.lock().unwrap().drain().map(|(_, h)| h).collect();
+        let tenants: Vec<_> = task
+            .tenants
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         let sessions: Vec<_> = {
             let mut s = self.0.sessions.lock().unwrap();
             let ids: Vec<_> = s
@@ -704,7 +712,11 @@ impl Host {
             nz(limits.wall_micros, DEFAULT_WALL),
             Duration::from_millis(self.0.cfg.slice_millis as u64),
         ));
-        let flow = (req.job_id.clone(), req.task_name.clone(), req.tenant.clone());
+        let flow = (
+            req.job_id.clone(),
+            req.task_name.clone(),
+            req.tenant.clone(),
+        );
         let weight = spec.cpu_weight.max(1);
         let job = Job {
             host: self.0.clone(),
@@ -820,8 +832,7 @@ impl Host {
         // metadata) does not depend on either. Linear memory never
         // survives hibernation, so there is nothing engine-specific to
         // refuse.
-        if header.engine_version != ENGINE_VERSION || header.module_id != task.module().module_id
-        {
+        if header.engine_version != ENGINE_VERSION || header.module_id != task.module().module_id {
             debug!(
                 engine = %header.engine_version,
                 module = %header.module_id,
@@ -941,7 +952,9 @@ impl Host {
             .unwrap()
             .get(&req.session_id)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("the host holds no session {}", req.session_id)))?;
+            .ok_or_else(|| {
+                Status::not_found(format!("the host holds no session {}", req.session_id))
+            })?;
         if req.memory_max_bytes > self.0.cfg.slot_bytes {
             return Err(Status::invalid_argument(format!(
                 "memoryMax {} is above this host's slot size {}",
@@ -996,8 +1009,7 @@ impl Host {
     // -- reclaim, stats, drain ---------------------------------------------
 
     fn holders(&self) -> Vec<Arc<Holder>> {
-        let mut all: Vec<Arc<Holder>> =
-            self.0.sessions.lock().unwrap().values().cloned().collect();
+        let mut all: Vec<Arc<Holder>> = self.0.sessions.lock().unwrap().values().cloned().collect();
         for t in self.0.tasks.lock().unwrap().values() {
             all.extend(t.tenants.lock().unwrap().values().cloned());
         }
@@ -1013,7 +1025,7 @@ impl Host {
             .filter_map(|h| h.idle_for().filter(|d| *d >= min_idle).map(|d| (d, h)))
             .collect();
         // Coldest first.
-        idle.sort_by(|a, b| b.0.cmp(&a.0));
+        idle.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
         let mut out = ReclaimReply::default();
         let level = ReclaimLevel::try_from(req.level).unwrap_or(ReclaimLevel::ReclaimPageOut);
         for (_, h) in idle {
@@ -1067,7 +1079,10 @@ impl Host {
             }
         };
         let task = self.task(&h.job, &h.task).ok();
-        let module_id = task.as_ref().map(|t| t.module().module_id.clone()).unwrap_or_default();
+        let module_id = task
+            .as_ref()
+            .map(|t| t.module().module_id.clone())
+            .unwrap_or_default();
         let meta = {
             let m = h.meta.lock().unwrap();
             SessionMeta {
@@ -1099,9 +1114,8 @@ impl Host {
             bytes: body.len() as u64,
             freed_bytes: freed,
         };
-        self.0.worker.save_checkpoint(header, body).await.map_err(|s| {
+        self.0.worker.save_checkpoint(header, body).await.inspect_err(|s| {
             warn!(session_id = %h.key, error = %s.message(), "checkpoint not saved; keeping the instance");
-            s
         })?;
         // The checkpoint holds the session now: forget it here.
         *guard = None;
@@ -1208,7 +1222,10 @@ impl Host {
             if self.0.inflight.load(Ordering::Acquire) == 0 {
                 break;
             }
-            if tokio::time::timeout_at(deadline.into(), notified).await.is_err() {
+            if tokio::time::timeout_at(deadline.into(), notified)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -1431,7 +1448,10 @@ impl Job {
             if self.evict_one_tenant() {
                 continue;
             }
-            if tokio::time::timeout_at(self.deadline(), freed).await.is_err() {
+            if tokio::time::timeout_at(self.deadline(), freed)
+                .await
+                .is_err()
+            {
                 return Err(self.refuse(format!(
                     "task {} holds its most resident isolates (maxResident {}) or the host \
                      has no free slot; none was freed within the queue timeout of {}",
@@ -1457,7 +1477,7 @@ impl Job {
             })
             .filter_map(|h| h.idle_for().map(|d| (d, h.clone())))
             .collect();
-        idle.sort_by(|a, b| b.0.cmp(&a.0));
+        idle.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
         idle.into_iter().any(|(_, h)| drop_if_idle(&h).is_some())
     }
 
@@ -1514,7 +1534,8 @@ impl Job {
                 job: self.spec.job_id.clone(),
                 task: self.spec.task_name.clone(),
                 lifetime: life,
-                tenant: (!self.inv.origin.tenant.is_empty()).then(|| self.inv.origin.tenant.clone()),
+                tenant: (!self.inv.origin.tenant.is_empty())
+                    .then(|| self.inv.origin.tenant.clone()),
                 session: holder
                     .filter(|h| h.kind == HolderKind::Session)
                     .map(|h| h.key.clone()),
@@ -1551,18 +1572,23 @@ impl Job {
         });
         store.data_mut().begin(self.inv.clone(), 0);
         let t = Instant::now();
-        let instance = self.module.pre.instantiate_async(&mut store).await.map_err(|e| {
-            let msg = format!("{e:#}");
-            if msg.contains("maximum concurrent") || msg.contains("limit of") {
-                self.refuse(format!("the isolate host has no free slot: {msg}"))
-            } else {
-                Status::failed_precondition(format!(
-                    "instantiating {}: {}",
-                    self.task.name(),
-                    first_line(&msg)
-                ))
-            }
-        })?;
+        let instance = self
+            .module
+            .pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| {
+                let msg = format!("{e:#}");
+                if msg.contains("maximum concurrent") || msg.contains("limit of") {
+                    self.refuse(format!("the isolate host has no free slot: {msg}"))
+                } else {
+                    Status::failed_precondition(format!(
+                        "instantiating {}: {}",
+                        self.task.name(),
+                        first_line(&msg)
+                    ))
+                }
+            })?;
         let us = t.elapsed().as_micros() as u64;
         let c = &self.task.counters;
         c.instantiations.fetch_add(1, Ordering::Relaxed);
@@ -1596,7 +1622,11 @@ impl Job {
                     .map_err(|_| {
                         self.refuse(format!(
                             "the {} instance of task {} stayed busy past the queue timeout",
-                            if h.kind == HolderKind::Session { "session" } else { "tenant" },
+                            if h.kind == HolderKind::Session {
+                                "session"
+                            } else {
+                                "tenant"
+                            },
                             self.task.name()
                         ))
                     })?,
@@ -1631,7 +1661,10 @@ impl Job {
                 let (state, resumed) = match &self.holder {
                     Some(h) => {
                         let mut m = h.meta.lock().unwrap();
-                        (Some(m.state.take().unwrap_or_default()), std::mem::take(&mut m.resumed))
+                        (
+                            Some(m.state.take().unwrap_or_default()),
+                            std::mem::take(&mut m.resumed),
+                        )
                     }
                     None => (None, false),
                 };
@@ -1685,7 +1718,11 @@ impl Job {
         // Outputs.
         let mut reply = InvokeReply {
             queue_micros: queue_us.saturating_sub(instantiate_us),
-            instantiate_micros: if start == "warm" || start == "paged" { 0 } else { instantiate_us },
+            instantiate_micros: if start == "warm" || start == "paged" {
+                0
+            } else {
+                instantiate_us
+            },
             start: start.into(),
             ..Default::default()
         };
@@ -1734,7 +1771,8 @@ impl Job {
         let state = live.store.data().state.clone();
         let c = &self.task.counters;
         c.invocations.fetch_add(1, Ordering::Relaxed);
-        c.turns.fetch_add(self.inv.turns.load(Ordering::Relaxed), Ordering::Relaxed);
+        c.turns
+            .fetch_add(self.inv.turns.load(Ordering::Relaxed), Ordering::Relaxed);
         // Includes the turn running now, which the shard charges after it.
         let cpu_us = self.inv.cpu_now_ns() / 1000;
         c.cpu_micros.fetch_add(cpu_us, Ordering::Relaxed);
@@ -1819,10 +1857,8 @@ impl Job {
                     // to `result.json` from the run directory.
                     Ok(CallResult::Exit(r.exit, r.result))
                 } else {
-                    let cmd = wasmtime_wasi::p2::bindings::Command::new(
-                        &mut live.store,
-                        &live.instance,
-                    )?;
+                    let cmd =
+                        wasmtime_wasi::p2::bindings::Command::new(&mut live.store, &live.instance)?;
                     let r = cmd.wasi_cli_run().call_run(&mut live.store).await?;
                     Ok(CallResult::Exit(if r.is_ok() { 0 } else { 1 }, None))
                 }
@@ -1878,7 +1914,10 @@ impl Job {
         let scratch = &live.store.data().scratch;
         let result = result.or_else(|| {
             scratch
-                .read_file(&format!("{RUN_DIR}/result.json"), self.host.cfg.max_body_bytes as usize)
+                .read_file(
+                    &format!("{RUN_DIR}/result.json"),
+                    self.host.cfg.max_body_bytes as usize,
+                )
                 .filter(|(_, truncated)| !truncated)
                 .and_then(|(b, _)| String::from_utf8(b).ok())
                 .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
@@ -1926,7 +1965,11 @@ impl Job {
         } else {
             call.authority.as_str()
         };
-        let path = if call.path.is_empty() { "/" } else { call.path.as_str() };
+        let path = if call.path.is_empty() {
+            "/"
+        } else {
+            call.path.as_str()
+        };
         let mut b = hyper::Request::builder()
             .method(call.method.as_str())
             .uri(format!(
@@ -1937,13 +1980,18 @@ impl Job {
             b = b.header(h.name.as_str(), h.value.as_slice());
         }
         use http_body_util::BodyExt;
-        let body = http_body_util::Full::new(Bytes::from(call.body.clone()))
-            .map_err(|never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} });
+        let body = http_body_util::Full::new(Bytes::from(call.body.clone())).map_err(
+            |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
+        );
         let req = b
             .body(body)
             .map_err(|e| wasmtime::format_err!("the request is not valid HTTP: {e}"))?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let req = live.store.data_mut().http().new_incoming_request(scheme, req)?;
+        let req = live
+            .store
+            .data_mut()
+            .http()
+            .new_incoming_request(scheme, req)?;
         let out = live.store.data_mut().http().new_response_outparam(tx)?;
         let proxy = wasmtime_wasi_http::p2::bindings::Proxy::new(&mut live.store, &live.instance)?;
         // The guest may set its response and keep writing the body before
@@ -1952,8 +2000,12 @@ impl Job {
         let response = async move {
             let resp: hyper::Response<_> = rx
                 .await
-                .map_err(|_| wasmtime::format_err!("the handler returned without setting a response"))?
-                .map_err(|code| wasmtime::format_err!("the handler answered with error {code:?}"))?;
+                .map_err(|_| {
+                    wasmtime::format_err!("the handler returned without setting a response")
+                })?
+                .map_err(|code| {
+                    wasmtime::format_err!("the handler answered with error {code:?}")
+                })?;
             let (parts, body) = resp.into_parts();
             let body = collect_body(body, max).await.map_err(|e| match e {
                 Some(e) => wasmtime::format_err!("reading the response body: {e:?}"),
@@ -1997,7 +2049,10 @@ impl Job {
     }
 
     fn forward_logs(&self, reply: &InvokeReply) {
-        let session = self.holder.as_ref().is_some_and(|h| h.kind == HolderKind::Session);
+        let session = self
+            .holder
+            .as_ref()
+            .is_some_and(|h| h.kind == HolderKind::Session);
         let http = matches!(self.call, invoke_request::Call::Http(_));
         if !(session || http) || (reply.stdout.is_empty() && reply.stderr.is_empty()) {
             return;

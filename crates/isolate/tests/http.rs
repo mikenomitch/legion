@@ -89,12 +89,21 @@ async fn a_tenant_handler_keeps_its_globals_and_a_request_one_does_not_test() {
     s.lifetime = Lifetime::Tenant as i32;
     h.host.configure_task(s).unwrap();
     for want in ["1", "1"] {
-        assert_eq!(body(&get(&h, "web", "a", http("GET", "/count")).await), want);
+        assert_eq!(
+            body(&get(&h, "web", "a", http("GET", "/count")).await),
+            want
+        );
     }
     for want in ["1", "2", "3"] {
-        assert_eq!(body(&get(&h, "warm", "a", http("GET", "/count")).await), want);
+        assert_eq!(
+            body(&get(&h, "warm", "a", http("GET", "/count")).await),
+            want
+        );
     }
-    assert_eq!(body(&get(&h, "warm", "b", http("GET", "/count")).await), "1");
+    assert_eq!(
+        body(&get(&h, "warm", "b", http("GET", "/count")).await),
+        "1"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -132,7 +141,10 @@ async fn egress_from_a_handler_goes_through_the_worker_with_its_origin_test() {
     let b = body(&r);
     assert!(b.starts_with("upstream 200\n"), "{b}");
     assert!(b.contains("x-upstream=yes"), "{b}");
-    assert!(b.ends_with("hello from http://api.internal/v1/thing"), "{b}");
+    assert!(
+        b.ends_with("hello from http://api.internal/v1/thing"),
+        "{b}"
+    );
     // The credential the worker injects on its side never reaches the guest.
     assert!(!b.to_lowercase().contains("authorization"), "{b}");
     let seen = h.worker.egress_seen.lock().unwrap().clone();
@@ -142,7 +154,12 @@ async fn egress_from_a_handler_goes_through_the_worker_with_its_origin_test() {
     assert_eq!(e.url, "http://api.internal/v1/thing");
     let o = e.origin.as_ref().unwrap();
     assert_eq!(
-        (o.job_id.as_str(), o.task_name.as_str(), o.tenant.as_str(), o.session),
+        (
+            o.job_id.as_str(),
+            o.task_name.as_str(),
+            o.tenant.as_str(),
+            o.session
+        ),
         ("j", "web", "acme", false)
     );
     assert!(o.isolate_id.starts_with("inv-"));
@@ -172,7 +189,11 @@ async fn egress_from_a_command_and_its_refusals_test() {
     });
     let r = h.run("j", "cmd", &["fetch", "http://up/x"]).await;
     assert_eq!(exit(&r), Some(1));
-    assert!(stdout(&r).contains("error=ErrorCode::HttpRequestDenied"), "{}", stdout(&r));
+    assert!(
+        stdout(&r).contains("error=ErrorCode::HttpRequestDenied"),
+        "{}",
+        stdout(&r)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -182,6 +203,10 @@ async fn egress_is_refused_locally_when_the_task_has_none_test() {
     s.egress = false;
     h.task(s);
     let r = h.run("j", "cmd", &["fetch", "http://up/x"]).await;
-    assert!(stdout(&r).contains("error=ErrorCode::HttpRequestDenied"), "{}", stdout(&r));
+    assert!(
+        stdout(&r).contains("error=ErrorCode::HttpRequestDenied"),
+        "{}",
+        stdout(&r)
+    );
     assert!(h.worker.egress_seen.lock().unwrap().is_empty());
 }

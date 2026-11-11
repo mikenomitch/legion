@@ -178,11 +178,7 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
         }
         "open-outside" => match std::fs::File::open("/etc/hostname") {
             Ok(_) => report("open-outside: opened".into()),
-            Err(e) => report(format!(
-                "open-outside: {} ({:?})",
-                e,
-                e.raw_os_error()
-            )),
+            Err(e) => report(format!("open-outside: {} ({:?})", e, e.raw_os_error())),
         },
         // Reads `cmd.cwasm` in the first read dir (what LoadModule does).
         "read-inside" => {

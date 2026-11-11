@@ -423,12 +423,18 @@ mod shard_test {
         let stop = Arc::new(AtomicBool::new(false));
         for _ in 0..50 {
             let stop = stop.clone();
-            let _ = shard.spawn(("j".into(), "t".into(), "hog".into()), 1, None, async move {
-                while !stop.load(Ordering::Relaxed) {
-                    spin_for(Duration::from_micros(500));
-                    yield_now().await;
-                }
-            });
+            // The receiver is dropped: the task runs on regardless.
+            drop(shard.spawn(
+                ("j".into(), "t".into(), "hog".into()),
+                1,
+                None,
+                async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        spin_for(Duration::from_micros(500));
+                        yield_now().await;
+                    }
+                },
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
         let t0 = Instant::now();

@@ -60,7 +60,10 @@ impl IsolateHost for HostService {
         &self,
         r: Request<RemoveTaskRequest>,
     ) -> Result<Response<RemoveTaskReply>, Status> {
-        self.host.remove_task(r.into_inner()).await.map(Response::new)
+        self.host
+            .remove_task(r.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn invoke(&self, r: Request<InvokeRequest>) -> Result<Response<InvokeReply>, Status> {

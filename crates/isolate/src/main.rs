@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use legion_isolate::{compile, confine};
 use legion_isolate::engine::{self, EngineParams};
+use legion_isolate::{compile, confine};
 use legion_proto::isolate_host::PROTOCOL_VERSION;
 
 /// Legion's isolate host and module compiler. Started by a worker; not meant
@@ -123,19 +123,19 @@ fn main() -> ExitCode {
                 Some(confine_compiler(&input, &output))
             };
             match compile::compile_file(&engine.params(), &input, &output) {
-            Ok(report) => {
-                let mut v = serde_json::to_value(&report).unwrap();
-                if let Some(c) = confinement {
-                    v["confinement"] = c;
+                Ok(report) => {
+                    let mut v = serde_json::to_value(&report).unwrap();
+                    if let Some(c) = confinement {
+                        v["confinement"] = c;
+                    }
+                    println!("{v}");
+                    ExitCode::SUCCESS
                 }
-                println!("{v}");
-                ExitCode::SUCCESS
+                Err(e) => {
+                    println!("{}", e.to_json());
+                    ExitCode::from(1)
+                }
             }
-            Err(e) => {
-                println!("{}", e.to_json());
-                ExitCode::from(1)
-            }
-        }
         }
     }
 }

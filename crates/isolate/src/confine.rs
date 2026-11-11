@@ -59,10 +59,8 @@ pub fn confine(level: Confine, plan: &Plan) -> Result<Confinement, String> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0 {
         c.no_new_privs = true;
     } else {
-        c.notes.push(format!(
-            "no_new_privs: {}",
-            std::io::Error::last_os_error()
-        ));
+        c.notes
+            .push(format!("no_new_privs: {}", std::io::Error::last_os_error()));
     }
     match landlock(plan) {
         Ok(()) => c.landlock = true,
@@ -110,9 +108,8 @@ fn namespaces() -> Result<(), String> {
     if unsafe { libc::unshare(flags) } != 0 {
         return Err(format!("unshare: {}", std::io::Error::last_os_error()));
     }
-    let write = |path: &str, s: String| {
-        std::fs::write(path, s).map_err(|e| format!("writing {path}: {e}"))
-    };
+    let write =
+        |path: &str, s: String| std::fs::write(path, s).map_err(|e| format!("writing {path}: {e}"));
     write("/proc/self/setgroups", "deny".into())?;
     write("/proc/self/uid_map", format!("65534 {uid} 1"))?;
     write("/proc/self/gid_map", format!("65534 {gid} 1"))?;
@@ -167,10 +164,16 @@ fn landlock(plan: &Plan) -> Result<(), String> {
         .create()
         .map_err(|e| e.to_string())?;
     ruleset = ruleset
-        .add_rules(path_beneath_rules(&plan.read_dirs, AccessFs::from_read(abi)))
+        .add_rules(path_beneath_rules(
+            &plan.read_dirs,
+            AccessFs::from_read(abi),
+        ))
         .map_err(|e| e.to_string())?;
     ruleset = ruleset
-        .add_rules(path_beneath_rules(&plan.write_dirs, AccessFs::from_all(abi)))
+        .add_rules(path_beneath_rules(
+            &plan.write_dirs,
+            AccessFs::from_all(abi),
+        ))
         .map_err(|e| e.to_string())?;
     let status = ruleset.restrict_self().map_err(|e| e.to_string())?;
     match status.ruleset {
@@ -264,8 +267,8 @@ pub const ALLOWED: &[(&str, i64)] = &[
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn seccomp() -> Result<(), String> {
     use seccompiler::{
-        apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
-        SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
+        apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+        SeccompFilter, SeccompRule, TargetArch,
     };
     // `LEGION_ISOLATE_SECCOMP=log` logs instead of killing (development:
     // find a missing syscall in the kernel log).
@@ -301,14 +304,10 @@ fn seccomp() -> Result<(), String> {
         libc::SYS_socketpair,
         vec![SeccompRule::new(vec![unix]).map_err(|e| e.to_string())?],
     );
-    let allow: BpfProgram = SeccompFilter::new(
-        rules,
-        mismatch,
-        SeccompAction::Allow,
-        TargetArch::x86_64,
-    )
-    .and_then(|f| f.try_into())
-    .map_err(|e| e.to_string())?;
+    let allow: BpfProgram =
+        SeccompFilter::new(rules, mismatch, SeccompAction::Allow, TargetArch::x86_64)
+            .and_then(|f| f.try_into())
+            .map_err(|e| e.to_string())?;
     let clone3: BpfProgram = SeccompFilter::new(
         BTreeMap::from([(libc::SYS_clone3, vec![])]),
         SeccompAction::Allow,

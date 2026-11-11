@@ -14,8 +14,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use legion_proto::isolate_host::{
     vm_request, EgressErrorKind, EgressRequest, Header, HttpCall, Lifetime, Origin, VmAcquire,
-    VmAttach, VmErrorKind, VmExec, VmFetch, VmGet, VmPut, VmRelease, VmReply, VmRequest,
-    VmResize,
+    VmAttach, VmErrorKind, VmExec, VmFetch, VmGet, VmPut, VmRelease, VmReply, VmRequest, VmResize,
 };
 use rand_010::rngs::{StdRng, SysRng};
 use rand_010::{RngExt as _, SeedableRng};
@@ -29,8 +28,8 @@ use wasmtime_wasi_io::streams::{OutputStream, StreamResult};
 use crate::account::MemoryAccount;
 use crate::scratch::{Scratch, ScratchCtx, ScratchView, RUN_DIR};
 use crate::turn;
-use crate::world::{control, state, vm};
 use crate::worker_api::WorkerApi;
+use crate::world::{control, state, vm};
 
 // ---------------------------------------------------------------------------
 // Stops
@@ -77,7 +76,7 @@ pub fn fmt_duration(d: Duration) -> String {
     let us = d.as_micros();
     if us < 1_000 {
         format!("{us}µs")
-    } else if us < 10_000_000 && us % 1_000_000 != 0 {
+    } else if us < 10_000_000 && !us.is_multiple_of(1_000_000) {
         let ms = us as f64 / 1000.0;
         if ms.fract() == 0.0 {
             format!("{}ms", ms as u64)
@@ -664,7 +663,10 @@ impl WasiHttpHooks for EgressHooks {
             };
             let mut timeout = inv.remaining_wall();
             if let Some(o) = &options {
-                for t in [o.connect_timeout, o.first_byte_timeout].into_iter().flatten() {
+                for t in [o.connect_timeout, o.first_byte_timeout]
+                    .into_iter()
+                    .flatten()
+                {
                     timeout = timeout.min(t);
                 }
             }

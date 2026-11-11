@@ -39,7 +39,8 @@ fn engine(p: &EngineParams) -> Engine {
     host_engine(
         p,
         PoolSize {
-            slots: 8,
+            // With MPK the slots are split across up to 15 key stripes.
+            slots: 64,
             async_stack_bytes: 256 << 10,
         },
     )
@@ -104,8 +105,9 @@ impl Probe {
         let d = self.mem.data(&self.store);
         (
             d.len(),
-            d.iter()
-                .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)),
+            d.iter().fold(0xcbf29ce484222325u64, |h, b| {
+                (h ^ *b as u64).wrapping_mul(0x100000001b3)
+            }),
         )
     }
 
@@ -141,7 +143,14 @@ fn out_of_bounds_accesses_trap_and_touch_nothing_test() {
         for (load, store, w) in widths {
             // Just past the end, at the end, far past it, and negative
             // (an i32 address of -1 is 4 GiB - 1).
-            for addr in [PAGE - w + 1, PAGE, PAGE + 4096, 0x8000_0000, 0xffff_ffff, u32::MAX - w + 1] {
+            for addr in [
+                PAGE - w + 1,
+                PAGE,
+                PAGE + 4096,
+                0x8000_0000,
+                0xffff_ffff,
+                u32::MAX - w + 1,
+            ] {
                 let mut me = probe(&engine, &module, 0x11);
                 let before = me.digest();
                 assert_eq!(
@@ -156,14 +165,25 @@ fn out_of_bounds_accesses_trap_and_touch_nothing_test() {
                     "{:?} {store} at {addr:#x}",
                     p.layout
                 );
-                assert_eq!(me.digest(), before, "{:?} {store} at {addr:#x} wrote", p.layout);
+                assert_eq!(
+                    me.digest(),
+                    before,
+                    "{:?} {store} at {addr:#x} wrote",
+                    p.layout
+                );
             }
         }
         let mut me = probe(&engine, &module, 0x11);
         for addr in [0x10u32, PAGE] {
-            assert_eq!(me.trap("load_offset", &[i32v(addr)]), Trap::MemoryOutOfBounds);
+            assert_eq!(
+                me.trap("load_offset", &[i32v(addr)]),
+                Trap::MemoryOutOfBounds
+            );
             let mut me2 = probe(&engine, &module, 0x11);
-            assert_eq!(me2.trap("store_offset", &[i32v(addr)]), Trap::MemoryOutOfBounds);
+            assert_eq!(
+                me2.trap("store_offset", &[i32v(addr)]),
+                Trap::MemoryOutOfBounds
+            );
         }
         for idx in [2u32, 0x7fff_ffff, 0xffff_ffff] {
             let mut me = probe(&engine, &module, 0x11);
@@ -175,7 +195,12 @@ fn out_of_bounds_accesses_trap_and_touch_nothing_test() {
             );
         }
         // Bulk operations past the end trap before writing anything.
-        for (dst, src, len) in [(PAGE - 8, 0, 16), (0, PAGE - 8, 16), (0, 0, PAGE + 1), (0xffff_fff0, 0, 32)] {
+        for (dst, src, len) in [
+            (PAGE - 8, 0, 16),
+            (0, PAGE - 8, 16),
+            (0, 0, PAGE + 1),
+            (0xffff_fff0, 0, 32),
+        ] {
             let mut me = probe(&engine, &module, 0x11);
             let before = me.digest();
             assert_eq!(
@@ -187,10 +212,18 @@ fn out_of_bounds_accesses_trap_and_touch_nothing_test() {
         for (dst, len) in [(PAGE - 8, 16), (1, PAGE), (0xffff_ff00, 0x100)] {
             let mut me = probe(&engine, &module, 0x11);
             let before = me.digest();
-            assert_eq!(me.trap("fill", &[i32v(dst), i32v(len)]), Trap::MemoryOutOfBounds);
+            assert_eq!(
+                me.trap("fill", &[i32v(dst), i32v(len)]),
+                Trap::MemoryOutOfBounds
+            );
             assert_eq!(me.digest(), before, "memory.fill wrote before trapping");
         }
-        assert_eq!(neighbour.digest(), before_n, "{:?}: the neighbour changed", p.layout);
+        assert_eq!(
+            neighbour.digest(),
+            before_n,
+            "{:?}: the neighbour changed",
+            p.layout
+        );
         // In-bounds accesses still work (the corpus is not vacuous).
         let f = neighbour
             .inst

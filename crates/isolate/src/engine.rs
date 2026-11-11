@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 
 use legion_proto::isolate_host::{HostConfig, SlotLayout};
 use sha2::{Digest, Sha256};
-use wasmtime::{Config, Engine, Enabled, InstanceAllocationStrategy, PoolingAllocationConfig};
+use wasmtime::{Config, Enabled, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
 
 /// `wasmtime-<version>`: what `HelloReply.engine_version` and checkpoints
 /// carry.
@@ -237,7 +237,11 @@ pub fn compat_key_for(engine: &Engine, p: &EngineParams) -> String {
     if p.layout == SlotLayout::Small {
         sha.update(p.slot_bytes_rounded().to_le_bytes());
     }
-    sha.update([p.spectre as u8, 1 /* epochs */, 0 /* concurrency */]);
+    sha.update([
+        p.spectre as u8,
+        1, /* epochs */
+        0, /* concurrency */
+    ]);
     let digest = sha.finalize();
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -262,7 +266,11 @@ mod engine_test {
             slot_bytes: 256 << 20,
             ..small
         };
-        assert_ne!(ks, compat_key(&small_big).unwrap(), "a small slot's size is");
+        assert_ne!(
+            ks,
+            compat_key(&small_big).unwrap(),
+            "a small slot's size is"
+        );
         let mpk = EngineParams {
             layout: SlotLayout::Mpk,
             ..base

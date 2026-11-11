@@ -102,8 +102,10 @@ fn setup(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> Host {
         has_vm: true,
         ..Default::default()
     };
-    host.configure_task(spec("cmd", "cmd", Lifetime::Request)).unwrap();
-    host.configure_task(spec("runner", "runner", Lifetime::Tenant)).unwrap();
+    host.configure_task(spec("cmd", "cmd", Lifetime::Request))
+        .unwrap();
+    host.configure_task(spec("runner", "runner", Lifetime::Tenant))
+        .unwrap();
     host
 }
 

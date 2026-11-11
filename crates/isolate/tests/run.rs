@@ -28,7 +28,10 @@ async fn a_run_sees_args_env_input_and_the_run_dir_test() {
     assert!(out.contains("args=echo,x"), "{out}");
     assert!(out.contains("env FOO=bar"), "{out}");
     assert!(out.contains("env LEGION_RUN_DIR=/legion/run"), "{out}");
-    assert!(out.contains("env LEGION_RUN_INPUT=/legion/run/input.json"), "{out}");
+    assert!(
+        out.contains("env LEGION_RUN_INPUT=/legion/run/input.json"),
+        "{out}"
+    );
     assert!(out.contains("cwd=/legion/run"), "{out}");
     assert!(out.contains("input={\"a\":1}"), "{out}");
     assert_eq!(r.stderr, b"to stderr\n");
@@ -108,8 +111,15 @@ async fn cpu_limit_stops_a_spinning_guest_test() {
     let r = h.run("j", "cmd", &["spin"]).await;
     let (reason, limit, detail) = stopped(&r);
     assert_eq!((reason, limit), ("limits", "cpu"), "{detail}");
-    assert!(detail.starts_with("exceeded its 100ms CPU limit"), "{detail}");
-    assert!(r.cpu_micros >= 100_000 && r.cpu_micros < 400_000, "{}", r.cpu_micros);
+    assert!(
+        detail.starts_with("exceeded its 100ms CPU limit"),
+        "{detail}"
+    );
+    assert!(
+        r.cpu_micros >= 100_000 && r.cpu_micros < 400_000,
+        "{}",
+        r.cpu_micros
+    );
     assert!(t.elapsed() < Duration::from_secs(3));
     assert_eq!(exit(&r), None);
 }
@@ -194,10 +204,16 @@ async fn clocks_are_frozen_within_a_turn_and_coarse_test() {
     let w: Vec<u128> = words[1..4].iter().map(|x| x.parse().unwrap()).collect();
     assert_eq!(w[0], w[1], "wall clock frozen in a turn: {out}");
     assert!(w[2] > w[0], "advances across an await: {out}");
-    assert!(w.iter().all(|x| x % 1_000_000 == 0), "1ms resolution: {out}");
+    assert!(
+        w.iter().all(|x| x.is_multiple_of(1_000_000)),
+        "1ms resolution: {out}"
+    );
     assert_eq!(words[4], "mono_same=true", "{out}");
-    let adv: u128 = words[5].trim_start_matches("mono_advanced_ns=").parse().unwrap();
-    assert!(adv >= 5_000_000 && adv % 1_000_000 == 0, "{out}");
+    let adv: u128 = words[5]
+        .trim_start_matches("mono_advanced_ns=")
+        .parse()
+        .unwrap();
+    assert!(adv >= 5_000_000 && adv.is_multiple_of(1_000_000), "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -310,7 +326,10 @@ async fn compile_writes_a_loadable_artifact_and_reports_the_component_test() {
     )
     .unwrap();
     assert!(r.exports.cli_run);
-    assert!(r.imports.iter().any(|i| i.starts_with("wasi:cli/environment@")));
+    assert!(r
+        .imports
+        .iter()
+        .any(|i| i.starts_with("wasi:cli/environment@")));
     assert_eq!(r.bytes, std::fs::metadata(&out).unwrap().len());
     // No temporary file is left beside it.
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);

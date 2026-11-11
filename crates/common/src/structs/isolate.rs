@@ -85,20 +85,22 @@ pub const MAX_WALL: Duration = crate::structs::run::MAX_RUN_WALL;
 /// The largest `config.limits.output`: a run's reply is one message.
 pub const MAX_OUTPUT: u64 = crate::structs::run::MAX_RUN_OUTPUT;
 
-/// The `js` image's initial linear memory, in MiB. A placeholder until the
-/// image build measures it (plan Phase 0); the image manifest then carries
-/// the measured number.
-pub const JS_INITIAL_MEMORY_MIB: u64 = 24;
+/// The `js` image's initial linear memory, in MiB, rounded up: the image
+/// build measured 9,502,720 bytes (StarlingMonkey, componentize-js 0.23.0).
+/// Submit refuses a `memoryMax` below it; a node checks the exact number in
+/// its own image manifest when it prepares the task.
+pub const JS_INITIAL_MEMORY_MIB: u64 = 10;
 /// The `js` image's default reservation (`resources.memory`), in MiB: its
-/// expected idle private memory. A placeholder until the image build
-/// measures it.
-pub const JS_DEFAULT_RESERVATION_MIB: u64 = 4;
-/// The `python` image's initial linear memory, in MiB. A placeholder until
-/// the image build measures it.
-pub const PYTHON_INITIAL_MEMORY_MIB: u64 = 48;
-/// The `python` image's default reservation, in MiB. A placeholder until the
-/// image build measures it.
-pub const PYTHON_DEFAULT_RESERVATION_MIB: u64 = 16;
+/// idle private memory, measured at about 0.75 MiB per instance, rounded
+/// up.
+pub const JS_DEFAULT_RESERVATION_MIB: u64 = 1;
+/// The `python` image's initial linear memory, in MiB, rounded up: the
+/// image build measured 24,313,856 bytes (CPython 3.14, componentize-py
+/// 0.25.1).
+pub const PYTHON_INITIAL_MEMORY_MIB: u64 = 24;
+/// The `python` image's default reservation, in MiB: its idle private
+/// memory, measured at about 1.5 MiB per instance, rounded up.
+pub const PYTHON_DEFAULT_RESERVATION_MIB: u64 = 2;
 
 /// What Legion knows about one built-in image without loading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1544,12 +1546,12 @@ mod isolate_test {
         );
         let mut config = base_config();
         config["image"] = json!("js");
-        let task = with(isolate_task(config), &["resources", "memoryMax"], json!(16));
-        let task = with(task, &["resources", "memory"], json!(4));
+        let task = with(isolate_task(config), &["resources", "memoryMax"], json!(8));
+        let task = with(task, &["resources", "memory"], json!(1));
         assert_eq!(
             check(vec![task, machine()]).unwrap_err(),
-            "[isolate] code-runner/run: resources.memoryMax 16 MiB is below image \"js\"'s \
-             initial linear memory (24 MiB)"
+            "[isolate] code-runner/run: resources.memoryMax 8 MiB is below image \"js\"'s \
+             initial linear memory (10 MiB)"
         );
         let task = with(
             isolate_task(base_config()),
@@ -1759,9 +1761,9 @@ mod isolate_test {
         // Never above the ceiling.
         let mut task = TaskConfig::new("run", ISOLATE_RUNTIME);
         task.config = json!({ "image": "python" });
-        task.resources = json!({ "memoryMax": 8 });
+        task.resources = json!({ "memoryMax": 1 });
         normalize_task(&mut task);
-        assert_eq!(task.resources["memory"], json!(8));
+        assert_eq!(task.resources["memory"], json!(1));
 
         let mut other = TaskConfig::new("box", "sandbox");
         normalize_task(&mut other);

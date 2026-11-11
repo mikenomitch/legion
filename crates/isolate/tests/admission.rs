@@ -28,7 +28,10 @@ async fn max_active_refuses_after_the_queue_timeout_test() {
     });
     sleep_ms(150).await;
     let t = Instant::now();
-    let e = h.run_with("j", "cmd", "", "", run(&["echo"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "cmd", "", "", run(&["echo"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::ResourceExhausted);
     assert!(e.message().contains("maxActive 1"), "{}", e.message());
     assert!(t.elapsed() >= Duration::from_millis(90));
@@ -56,7 +59,10 @@ async fn a_queued_invocation_runs_when_room_frees_test() {
         .await
     });
     sleep_ms(50).await;
-    let r = h.run_with("j", "cmd", "", "", run(&["echo"])).await.unwrap();
+    let r = h
+        .run_with("j", "cmd", "", "", run(&["echo"]))
+        .await
+        .unwrap();
     assert_eq!(exit(&r), Some(0));
     assert!(r.queue_micros >= 150_000, "{}", r.queue_micros);
     first.await.unwrap().unwrap();
@@ -80,12 +86,18 @@ async fn max_resident_bounds_live_instances_test() {
         .await
     });
     sleep_ms(150).await;
-    let e = h.run_with("j", "cmd", "", "", run(&["echo"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "cmd", "", "", run(&["echo"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::ResourceExhausted);
     assert!(e.message().contains("maxResident 1"), "{}", e.message());
     first.await.unwrap().unwrap();
     // Room again once the first instance is gone.
-    let r = h.run_with("j", "cmd", "", "", run(&["echo"])).await.unwrap();
+    let r = h
+        .run_with("j", "cmd", "", "", run(&["echo"]))
+        .await
+        .unwrap();
     assert_eq!(exit(&r), Some(0));
 }
 
@@ -110,7 +122,10 @@ async fn host_slots_bound_instances_across_tasks_test() {
         .await
     });
     sleep_ms(150).await;
-    let e = h.run_with("j", "b", "", "", run(&["echo"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "b", "", "", run(&["echo"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::ResourceExhausted);
     first.await.unwrap().unwrap();
 }
@@ -144,13 +159,19 @@ async fn epoch_slicing_keeps_a_second_tenant_responsive_test() {
     let mut worst = Duration::ZERO;
     for _ in 0..5 {
         let t = Instant::now();
-        let r = h.run_with("j", "cmd", "small", "", run(&["echo"])).await.unwrap();
+        let r = h
+            .run_with("j", "cmd", "small", "", run(&["echo"]))
+            .await
+            .unwrap();
         assert_eq!(exit(&r), Some(0));
         worst = worst.max(t.elapsed());
     }
     // One shard, three spinning invocations: the small tenant still gets a
     // turn within a few slices (5 ms each), not after the hogs' 1.5 s.
-    assert!(worst < Duration::from_millis(150), "worst latency {worst:?}");
+    assert!(
+        worst < Duration::from_millis(150),
+        "worst latency {worst:?}"
+    );
     for hog in hogs {
         let r = hog.await.unwrap().unwrap();
         assert_eq!(stopped(&r).1, "cpu");
@@ -200,16 +221,20 @@ async fn remove_task_answers_not_found_after_test() {
         })
         .await
         .unwrap();
-    let e = h.run_with("j", "cmd", "", "", run(&["echo"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "cmd", "", "", run(&["echo"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::NotFound);
     // The module is unused now and can go.
-    assert!(h
-        .host
-        .unload_module(UnloadModuleRequest {
-            module_id: "cmd".into()
-        })
-        .unwrap()
-        .unloaded);
+    assert!(
+        h.host
+            .unload_module(UnloadModuleRequest {
+                module_id: "cmd".into()
+            })
+            .unwrap()
+            .unloaded
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -224,6 +249,9 @@ async fn a_draining_host_refuses_new_invocations_test() {
         })
         .await;
     assert_eq!(d.cut, 0);
-    let e = h.run_with("j", "cmd", "", "", run(&["echo"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "cmd", "", "", run(&["echo"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::Unavailable);
 }

@@ -12,6 +12,10 @@
 //! `HostConfig` and a [`worker_api::WorkerApi`], and [`service`] is the
 //! thin gRPC shell the binary puts around it.
 
+// `tonic::Status` is 176 bytes; the host's API returns it as the gRPC
+// shell does (as `legion-proto` allows it crate-wide).
+#![allow(clippy::result_large_err)]
+
 pub mod account;
 pub mod checkpoint;
 pub mod compile;

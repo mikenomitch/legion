@@ -59,15 +59,24 @@ async fn request_lifetime_never_reuses_an_instance_test() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tenant_lifetime_reuses_per_tenant_and_isolates_tenants_test() {
     let h = host_with(runner_spec("t", Lifetime::Tenant));
-    assert_eq!(result(&call(&h, "t", "a", "", &["count"]).await), "{\"count\":1}");
+    assert_eq!(
+        result(&call(&h, "t", "a", "", &["count"]).await),
+        "{\"count\":1}"
+    );
     let r = call(&h, "t", "a", "", &["count"]).await;
     assert_eq!(result(&r), "{\"count\":2}");
     assert_eq!(r.start, "warm");
     assert_eq!(r.instantiate_micros, 0);
     // Another tenant: its own instance and its own state.
-    assert_eq!(result(&call(&h, "t", "b", "", &["count"]).await), "{\"count\":1}");
+    assert_eq!(
+        result(&call(&h, "t", "b", "", &["count"]).await),
+        "{\"count\":1}"
+    );
     call(&h, "t", "a", "", &["set", "k", "from-a"]).await;
-    assert_eq!(result(&call(&h, "t", "a", "", &["get", "k"]).await), "\"from-a\"");
+    assert_eq!(
+        result(&call(&h, "t", "a", "", &["get", "k"]).await),
+        "\"from-a\""
+    );
     assert_eq!(result(&call(&h, "t", "b", "", &["get", "k"]).await), "\"\"");
     let info = result(&call(&h, "t", "b", "", &["info"]).await);
     assert!(info.contains("\"tenant\":\"b\""), "{info}");
@@ -129,7 +138,10 @@ async fn runner_exit_status_and_unsupported_test() {
     assert_eq!(stdout(&r), "ran unsupported\n");
     // The stopped instance was dropped: the next call is fresh.
     let r = call(&h, "t", "a", "", &["count"]).await;
-    assert_eq!((result(&r).as_str(), r.start.as_str()), ("{\"count\":1}", "fresh"));
+    assert_eq!(
+        (result(&r).as_str(), r.start.as_str()),
+        ("{\"count\":1}", "fresh")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -140,7 +152,10 @@ async fn a_session_hibernates_on_park_and_wakes_with_its_state_test() {
     assert_eq!(info.tier, "empty");
     call(&h, "s", "acme", "sess-1", &["set", "k", "kept"]).await;
     let r = call(&h, "s", "acme", "sess-1", &["count"]).await;
-    assert_eq!((result(&r).as_str(), r.start.as_str()), ("{\"count\":1}", "warm"));
+    assert_eq!(
+        (result(&r).as_str(), r.start.as_str()),
+        ("{\"count\":1}", "warm")
+    );
     let info = h.host.get_session("sess-1").unwrap();
     assert_eq!((info.tier.as_str(), info.invocations), ("hot", 2));
     assert_eq!(info.state_bytes, 5);
@@ -187,9 +202,17 @@ async fn an_idle_session_hibernates_after_its_idle_time_test() {
     open(&h, "s", "sess-idle").await;
     call(&h, "s", "acme", "sess-idle", &["set", "a", "1"]).await;
     sleep_ms(400).await;
-    assert!(h.worker.checkpoints.lock().unwrap().contains_key("sess-idle"));
+    assert!(h
+        .worker
+        .checkpoints
+        .lock()
+        .unwrap()
+        .contains_key("sess-idle"));
     let r = call(&h, "s", "acme", "sess-idle", &["get", "a"]).await;
-    assert_eq!((result(&r).as_str(), r.start.as_str()), ("\"1\"", "hibernated"));
+    assert_eq!(
+        (result(&r).as_str(), r.start.as_str()),
+        ("\"1\"", "hibernated")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -198,7 +221,9 @@ async fn reclaim_hibernates_sessions_and_drops_tenants_coldest_first_test() {
     c.shards = 2;
     let h = start(c);
     h.task(runner_spec("s", Lifetime::Session));
-    h.host.configure_task(runner_spec("t", Lifetime::Tenant)).unwrap();
+    h.host
+        .configure_task(runner_spec("t", Lifetime::Tenant))
+        .unwrap();
     open(&h, "s", "s1").await;
     call(&h, "s", "acme", "s1", &["set", "x", "y"]).await;
     call(&h, "t", "a", "", &["count"]).await;
@@ -215,7 +240,10 @@ async fn reclaim_hibernates_sessions_and_drops_tenants_coldest_first_test() {
     let r = call(&h, "t", "a", "", &["count"]).await;
     assert_eq!(r.start, "fresh");
     let r = call(&h, "s", "acme", "s1", &["get", "x"]).await;
-    assert_eq!((result(&r).as_str(), r.start.as_str()), ("\"y\"", "hibernated"));
+    assert_eq!(
+        (result(&r).as_str(), r.start.as_str()),
+        ("\"y\"", "hibernated")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -242,7 +270,10 @@ async fn page_out_marks_idle_instances_and_reports_paged_starts_test() {
     assert_eq!(result(&ra), "{\"count\":2}");
     assert_eq!(result(&rb), "{\"count\":2}");
     let starts = [ra.start.as_str(), rb.start.as_str()];
-    assert!(starts.contains(&"paged") && starts.contains(&"warm"), "{starts:?}");
+    assert!(
+        starts.contains(&"paged") && starts.contains(&"warm"),
+        "{starts:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -302,7 +333,10 @@ async fn close_session_ends_it_test() {
     call(&h, "s", "acme", "c1", &["count"]).await;
     assert!(h.host.close_session("c1", "done").await);
     assert!(!h.host.close_session("c1", "done").await);
-    let e = h.run_with("j", "s", "acme", "c1", run(&["count"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "s", "acme", "c1", run(&["count"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::NotFound);
 }
 
@@ -332,7 +366,10 @@ async fn closing_a_session_cuts_its_running_call_test() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_session_without_a_checkpoint_is_not_found_test() {
     let h = host_with(runner_spec("s", Lifetime::Session));
-    let e = h.run_with("j", "s", "", "nope", run(&["count"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "s", "", "nope", run(&["count"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::NotFound);
 }
 
@@ -353,12 +390,19 @@ async fn resize_session_grows_shrinks_and_never_takes_memory_back_test() {
     };
     // Grow.
     let r = h.host.resize_session(resize(96 << 20, 0)).await.unwrap();
-    assert_eq!((r.memory_max_bytes, r.memory_reservation_bytes), (96 << 20, 1 << 20));
+    assert_eq!(
+        (r.memory_max_bytes, r.memory_reservation_bytes),
+        (96 << 20, 1 << 20)
+    );
     // Shrink, still above what it uses.
     let r = h.host.resize_session(resize(8 << 20, 0)).await.unwrap();
     assert_eq!(r.memory_max_bytes, 8 << 20);
     // Below what it uses: refused.
-    let e = h.host.resize_session(resize(64 << 10, 0)).await.unwrap_err();
+    let e = h
+        .host
+        .resize_session(resize(64 << 10, 0))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);
     assert!(e.message().contains("never"), "{}", e.message());
     // Above the slot: refused.
@@ -380,16 +424,26 @@ async fn resize_session_grows_shrinks_and_never_takes_memory_back_test() {
     open(&h, "s", "rz2").await;
     open(&h, "s", "rz3").await;
     call(&h, "s", "acme", "rz2", &["count"]).await;
-    let e = h.run_with("j", "s", "acme", "rz3", run(&["count"])).await.unwrap_err();
+    let e = h
+        .run_with("j", "s", "acme", "rz3", run(&["count"]))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::ResourceExhausted);
     // The size survives hibernation through the checkpoint.
     call(&h, "s", "acme", "rz", &["park"]).await;
     sleep_ms(200).await;
     call(&h, "s", "acme", "rz", &["count"]).await;
-    let e = h.host.resize_session(resize(64 << 10, 0)).await.unwrap_err();
+    let e = h
+        .host
+        .resize_session(resize(64 << 10, 0))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition);
     let r = h.host.resize_session(resize(0, 0)).await.unwrap();
-    assert_eq!((r.memory_max_bytes, r.memory_reservation_bytes), (8 << 20, 2 << 20));
+    assert_eq!(
+        (r.memory_max_bytes, r.memory_reservation_bytes),
+        (8 << 20, 2 << 20)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -414,7 +468,10 @@ async fn open_session_takes_its_own_size_test() {
         })
         .await
         .unwrap();
-    assert_eq!((r.memory_max_bytes, r.memory_reservation_bytes), (4 << 20, 3 << 20));
+    assert_eq!(
+        (r.memory_max_bytes, r.memory_reservation_bytes),
+        (4 << 20, 3 << 20)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -423,11 +480,17 @@ async fn vm_calls_go_to_the_worker_with_the_origin_test() {
     s.has_vm = true;
     let h = host_with(s);
     let r = call(&h, "t", "acme", "", &["vm"]).await;
-    assert_eq!(result(&r), "{\"id\":\"child-1\",\"stdout\":\"ran echo hi\"}");
+    assert_eq!(
+        result(&r),
+        "{\"id\":\"child-1\",\"stdout\":\"ran echo hi\"}"
+    );
     let seen = h.worker.vm_seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 2);
     let o = seen[0].origin.as_ref().unwrap();
-    assert_eq!((o.job_id.as_str(), o.task_name.as_str(), o.tenant.as_str()), ("j", "t", "acme"));
+    assert_eq!(
+        (o.job_id.as_str(), o.task_name.as_str(), o.tenant.as_str()),
+        ("j", "t", "acme")
+    );
     match &seen[1].op {
         Some(vm_request::Op::Exec(e)) => {
             assert_eq!(e.id, "child-1");

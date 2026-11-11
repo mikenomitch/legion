@@ -243,7 +243,10 @@ pub fn run(args: &[&str]) -> RunCall {
 
 pub fn next_id() -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    format!("inv-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    format!(
+        "inv-{}",
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 pub fn stdout(r: &InvokeReply) -> String {

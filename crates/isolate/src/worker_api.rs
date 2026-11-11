@@ -111,7 +111,8 @@ impl WorkerApi for GrpcWorker {
 
     async fn vm(&self, req: VmRequest) -> Result<VmReply, Status> {
         let mut c = self.client.clone();
-        self.on_io(async move { Ok(c.vm(req).await?.into_inner()) }).await
+        self.on_io(async move { Ok(c.vm(req).await?.into_inner()) })
+            .await
     }
 
     async fn save_checkpoint(
@@ -129,8 +130,7 @@ impl WorkerApi for GrpcWorker {
                     part: Some(checkpoint_chunk::Part::Data(piece.to_vec())),
                 });
             }
-            Ok(c
-                .save_checkpoint(tokio_stream::iter(chunks))
+            Ok(c.save_checkpoint(tokio_stream::iter(chunks))
                 .await?
                 .into_inner())
         })

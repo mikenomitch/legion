@@ -53,7 +53,10 @@ impl IsolateWorker for Grpc {
             }
         }
         let header = header.ok_or_else(|| Status::invalid_argument("no header"))?;
-        self.0.save_checkpoint(header, body).await.map(Response::new)
+        self.0
+            .save_checkpoint(header, body)
+            .await
+            .map(Response::new)
     }
     type LoadCheckpointStream = ChunkStream;
     async fn load_checkpoint(
@@ -113,11 +116,19 @@ fn command(cfg: &HostConfig, extra: &[&str]) -> (Command, StdUnix, StdUnix, Chil
     let fds: [OwnedFd; 3] = [control_theirs.into(), worker_theirs.into(), cfg_read.into()];
     let raw: Vec<i32> = fds.iter().map(|f| f.as_raw_fd()).collect();
     let mut cmd = Command::new(BIN);
-    cmd.args(["host", "--control-fd", "3", "--worker-fd", "4", "--config-fd", "5"])
-        .args(extra)
-        .env("LEGION_ISOLATE_LOG", "warn")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args([
+        "host",
+        "--control-fd",
+        "3",
+        "--worker-fd",
+        "4",
+        "--config-fd",
+        "5",
+    ])
+    .args(extra)
+    .env("LEGION_ISOLATE_LOG", "warn")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     // SAFETY: dup2 into the child's fd 3..5 (clearing CLOEXEC) between fork
     // and exec; only async-signal-safe calls.
     unsafe {
@@ -194,7 +205,10 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
     eprintln!("confinement in this container: {c:?}");
     // What applies here (kernel 6.18, root in a Firecracker guest) is
     // asserted by `confinement_layers_report_what_the_kernel_offers_test`.
-    let info = std::process::Command::new(BIN).arg("engine-info").output().unwrap();
+    let info = std::process::Command::new(BIN)
+        .arg("engine-info")
+        .output()
+        .unwrap();
     let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
     assert_eq!(info["compatKey"], hello.compat_key);
 
@@ -208,7 +222,10 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
             .await
             .unwrap();
     }
-    h.client.configure_task(spec("j", "cmd", "cmd")).await.unwrap();
+    h.client
+        .configure_task(spec("j", "cmd", "cmd"))
+        .await
+        .unwrap();
     let inv = |task: &str, session: &str, args: &[&str]| InvokeRequest {
         job_id: "j".into(),
         task_name: task.into(),
@@ -217,18 +234,38 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
         call: Some(invoke_request::Call::Run(run(args))),
         ..Default::default()
     };
-    let r = h.client.invoke(inv("cmd", "", &["echo", "a"])).await.unwrap().into_inner();
+    let r = h
+        .client
+        .invoke(inv("cmd", "", &["echo", "a"]))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(exit(&r), Some(0), "{:?}", r);
     assert!(stdout(&r).contains("args=echo,a"));
     // Limits work the same in the confined process.
     let mut s = spec("j", "spin", "cmd");
     s.limits.as_mut().unwrap().cpu_micros = 50_000;
     h.client.configure_task(s).await.unwrap();
-    let r = h.client.invoke(inv("spin", "", &["spin"])).await.unwrap().into_inner();
+    let r = h
+        .client
+        .invoke(inv("spin", "", &["spin"]))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(stopped(&r).1, "cpu");
-    let r = h.client.invoke(inv("cmd", "", &["trap"])).await.unwrap().into_inner();
+    let r = h
+        .client
+        .invoke(inv("cmd", "", &["trap"]))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(stopped(&r).0, "trap");
-    let r = h.client.invoke(inv("cmd", "", &["sleep", "20"])).await.unwrap().into_inner();
+    let r = h
+        .client
+        .invoke(inv("cmd", "", &["sleep", "20"]))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(stdout(&r), "slept\n");
 
     // Egress over the worker socket.
@@ -238,7 +275,11 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
         .await
         .unwrap()
         .into_inner();
-    assert!(stdout(&r).contains("body=hello from http://up/x"), "{}", stdout(&r));
+    assert!(
+        stdout(&r).contains("body=hello from http://up/x"),
+        "{}",
+        stdout(&r)
+    );
     assert_eq!(h.worker.egress_seen.lock().unwrap().len(), 1);
 
     // A session: hibernate through SaveCheckpoint, wake through
@@ -255,7 +296,10 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
         })
         .await
         .unwrap();
-    h.client.invoke(inv("sess", "s1", &["set", "k", "v"])).await.unwrap();
+    h.client
+        .invoke(inv("sess", "s1", &["set", "k", "v"]))
+        .await
+        .unwrap();
     let rec = h
         .client
         .reclaim(ReclaimRequest {
@@ -266,12 +310,21 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
         .unwrap()
         .into_inner();
     assert_eq!(rec.hibernated, 1);
-    let r = h.client.invoke(inv("sess", "s1", &["get", "k"])).await.unwrap().into_inner();
+    let r = h
+        .client
+        .invoke(inv("sess", "s1", &["get", "k"]))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(outcome(&r).result, "\"v\"");
     assert_eq!(r.start, "hibernated");
     let st = h.client.stats(StatsRequest {}).await.unwrap().into_inner();
     assert!(st.rss_bytes > 0, "statm was opened before confinement");
-    assert!(h.child.try_wait().unwrap().is_none(), "{}", stderr_of(&mut h.child));
+    assert!(
+        h.child.try_wait().unwrap().is_none(),
+        "{}",
+        stderr_of(&mut h.child)
+    );
 }
 
 /// Confinement on, as a worker runs it: Hello and one Invoke over the
@@ -309,7 +362,10 @@ async fn hello_and_invoke_work_with_confinement_on_test() {
             })
             .await
             .unwrap();
-        client.configure_task(spec("j", "cmd", "cmd")).await.unwrap();
+        client
+            .configure_task(spec("j", "cmd", "cmd"))
+            .await
+            .unwrap();
         let r = client
             .invoke(InvokeRequest {
                 job_id: "j".into(),
@@ -323,7 +379,13 @@ async fn hello_and_invoke_work_with_confinement_on_test() {
             .into_inner();
         assert_eq!(exit(&r), Some(0), "{level:?}");
         if level == Confine::Enforce {
-            assert!(c.user_namespace && c.network_namespace && c.no_new_privs && c.landlock && c.seccomp);
+            assert!(
+                c.user_namespace
+                    && c.network_namespace
+                    && c.no_new_privs
+                    && c.landlock
+                    && c.seccomp
+            );
         }
         drop(client);
         let _ = child.kill();
@@ -466,7 +528,9 @@ fn confinement_layers_report_what_the_kernel_offers_test() {
             if !on {
                 eprintln!("LAYER UNAVAILABLE HERE: {name}");
                 assert!(
-                    c.notes.iter().any(|n| n.to_lowercase().contains(&name[..4].to_lowercase())),
+                    c.notes
+                        .iter()
+                        .any(|n| n.to_lowercase().contains(&name[..4].to_lowercase())),
                     "{name} missing without a note: {c:?}"
                 );
             }
@@ -490,14 +554,20 @@ fn assert_killed_by_seccomp(what: &str) {
 }
 
 #[test]
-#[cfg_attr(not(feature = "confinement-test"), ignore = "needs --features confinement-test")]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
 fn seccomp_kills_a_socket_call_test() {
     #[cfg(feature = "confinement-test")]
     assert_killed_by_seccomp("socket");
 }
 
 #[test]
-#[cfg_attr(not(feature = "confinement-test"), ignore = "needs --features confinement-test")]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
 fn seccomp_kills_execve_and_fork_test() {
     #[cfg(feature = "confinement-test")]
     {
@@ -507,14 +577,20 @@ fn seccomp_kills_execve_and_fork_test() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "confinement-test"), ignore = "needs --features confinement-test")]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
 fn seccomp_kills_ptrace_test() {
     #[cfg(feature = "confinement-test")]
     assert_killed_by_seccomp("ptrace");
 }
 
 #[test]
-#[cfg_attr(not(feature = "confinement-test"), ignore = "needs --features confinement-test")]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
 fn landlock_denies_files_outside_read_dirs_test() {
     #[cfg(feature = "confinement-test")]
     {
