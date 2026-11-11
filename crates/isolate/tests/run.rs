@@ -343,3 +343,73 @@ async fn compile_writes_a_loadable_artifact_and_reports_the_component_test() {
         })
         .unwrap();
 }
+
+/// The MPK layout end to end, where the CPU has protection keys: many live
+/// instances in one host, each isolated by its key stripe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mpk_layout_runs_many_instances_when_the_cpu_has_pku_test() {
+    use legion_isolate::engine::{mpk_available, EngineParams};
+    if !mpk_available() {
+        eprintln!("MPK is not available on this CPU; SLOT_LAYOUT_MPK is not exercised");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let params = EngineParams {
+        layout: SlotLayout::Mpk,
+        ..Default::default()
+    };
+    let art = dir.path().join("cmd.cwasm");
+    legion_isolate::compile::compile_file(&params, &fixture("cmd"), &art).unwrap();
+    let mut c = config();
+    c.layout = SlotLayout::Mpk as i32;
+    c.slots = 512;
+    c.shards = 2;
+    c.read_dirs = vec![dir.path().display().to_string()];
+    let h = start(c);
+    assert_ne!(
+        h.host.compat_key(),
+        legion_isolate::engine::compat_key(&EngineParams::default()).unwrap(),
+        "an MPK host has its own compat key"
+    );
+    h.host
+        .load_module(LoadModuleRequest {
+            module_id: "cmd".into(),
+            artifact_path: art.display().to_string(),
+        })
+        .unwrap();
+    let mut s = spec("j", "cmd", "cmd");
+    s.queue_timeout_millis = 10_000;
+    h.host.configure_task(s).unwrap();
+    // 64 concurrent instances, each sleeping so they are live together.
+    let t = std::time::Instant::now();
+    let mut all = Vec::new();
+    for i in 0..64 {
+        let host = h.host.clone();
+        all.push(tokio::spawn(async move {
+            host.invoke(InvokeRequest {
+                job_id: "j".into(),
+                task_name: "cmd".into(),
+                invocation_id: format!("mpk-{i}"),
+                call: Some(invoke_request::Call::Run(run(&["sleep", "200"]))),
+                ..Default::default()
+            })
+            .await
+        }));
+    }
+    let mut inst_us = Vec::new();
+    for a in all {
+        let r = a.await.unwrap().unwrap();
+        assert_eq!(stdout(&r), "slept\n", "{:?}", r.stopped);
+        inst_us.push(r.instantiate_micros);
+    }
+    inst_us.sort();
+    eprintln!(
+        "MPK: 64 concurrent instances in {:?}; instantiate p50 {}µs p99 {}µs",
+        t.elapsed(),
+        inst_us[32],
+        inst_us[63]
+    );
+    // The memory limit still holds under MPK.
+    let r = h.run("j", "cmd", &["alloc"]).await;
+    assert_eq!(stopped(&r).1, "memory");
+}

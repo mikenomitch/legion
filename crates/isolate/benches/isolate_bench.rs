@@ -138,6 +138,9 @@ fn bench(c: &mut Criterion) {
             assert!(r.stopped.is_none());
         })
     });
+    // Make the tenant instance resident before timing warm calls.
+    rt.block_on(host.invoke(invoke("runner", &["count"])))
+        .unwrap();
     g.bench_function("warm_runner", |b| {
         b.to_async(&rt).iter(|| async {
             let r = host.invoke(invoke("runner", &["count"])).await.unwrap();

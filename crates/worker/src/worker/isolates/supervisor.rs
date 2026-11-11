@@ -2040,6 +2040,9 @@ impl IsolateSupervisor {
                 level: host::ReclaimLevel::ReclaimHibernate as i32,
                 target_bytes: 0,
                 min_idle_millis: 0,
+                // Only this session: the host's other sessions stay resident.
+                session_ids: vec![session_id.to_string()],
+                ..Default::default()
             })
             .await
             .map_err(|status| self.host_error(&conn, &cordon, status))?;
@@ -2622,12 +2625,16 @@ impl IsolateSupervisor {
     /// to its cgroup's `memory.reclaim` (only where the node can page out);
     /// `Hibernate` hibernates idle sessions and drops idle tenants. Returns
     /// the bytes given back (an estimate).
+    ///
+    /// `cordons` narrows the hosts asked; `job_id` (non-empty) narrows each
+    /// host's reclaim to that job's isolates (`ReclaimRequest.job_id`).
     pub async fn reclaim(
         &self,
         level: host::ReclaimLevel,
         target_bytes: u64,
         min_idle: Duration,
         cordons: Option<&[String]>,
+        job_id: &str,
     ) -> u64 {
         if level == host::ReclaimLevel::ReclaimPageOut && self.paging_unavailable.is_some() {
             return 0;
@@ -2650,6 +2657,8 @@ impl IsolateSupervisor {
                     level: level as i32,
                     target_bytes: target_bytes.saturating_sub(freed),
                     min_idle_millis: min_idle.as_millis() as u64,
+                    job_id: job_id.to_string(),
+                    ..Default::default()
                 })
                 .await
             else {
@@ -2682,38 +2691,47 @@ impl IsolateSupervisor {
         } else {
             host::ReclaimLevel::ReclaimPageOut
         };
-        handle.block_on(self.reclaim(level, target_bytes, Duration::ZERO, None))
+        handle.block_on(self.reclaim(level, target_bytes, Duration::ZERO, None, ""))
     }
 
     /// One maintenance pass: discover tasks, hibernate drained jobs'
     /// sessions, evict checkpoints past `suspend.keepFor`.
     pub async fn maintain(&self) {
         self.sync_from_task_manager();
-        // `operator runtime disable isolate --drain`: hibernate session
-        // isolates of covered jobs (host-wide per cordon: the protocol has no
-        // per-task reclaim).
-        let drained: Vec<String> = {
+        // `operator runtime disable isolate --drain`: hibernate the session
+        // isolates of the covered jobs only (`ReclaimRequest.job_id`), in
+        // the cordons that serve them.
+        let drained: BTreeMap<String, Vec<String>> = {
             let state = lock(&self.state);
-            let mut cordons: Vec<String> = state
+            let mut by_job: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for task in state
                 .tasks
                 .values()
                 .filter(|task| self.gate.drains(ISOLATE_RUNTIME, &task.job_id))
-                .map(|task| task.cordon.clone())
-                .collect();
-            cordons.sort();
-            cordons.dedup();
-            cordons
+            {
+                let cordons = by_job.entry(task.job_id.clone()).or_default();
+                if !cordons.contains(&task.cordon) {
+                    cordons.push(task.cordon.clone());
+                }
+            }
+            by_job
         };
         if !drained.is_empty() {
-            let resident = lock(&self.sessions)
+            let resident: Vec<String> = lock(&self.sessions)
                 .records()
-                .any(|r| r.state == SessionState::Resident);
-            if resident {
+                .filter(|r| r.state == SessionState::Resident)
+                .map(|r| r.job_id.clone())
+                .collect();
+            for (job_id, cordons) in &drained {
+                if !resident.contains(job_id) {
+                    continue;
+                }
                 self.reclaim(
                     host::ReclaimLevel::ReclaimHibernate,
                     0,
                     Duration::ZERO,
-                    Some(&drained),
+                    Some(cordons),
+                    job_id,
                 )
                 .await;
             }
@@ -2763,7 +2781,7 @@ impl IsolateSupervisor {
                 me.maintain().await;
                 if !page_out_after.is_zero() && last_page_out.elapsed() >= page_out_after {
                     last_page_out = Instant::now();
-                    me.reclaim(host::ReclaimLevel::ReclaimPageOut, 0, page_out_after, None)
+                    me.reclaim(host::ReclaimLevel::ReclaimPageOut, 0, page_out_after, None, "")
                         .await;
                 }
             }

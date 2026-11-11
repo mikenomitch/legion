@@ -1018,16 +1018,29 @@ impl Host {
 
     #[instrument(skip_all, fields(level = req.level, target = req.target_bytes))]
     pub async fn reclaim(&self, req: ReclaimRequest) -> ReclaimReply {
-        let min_idle = Duration::from_millis(req.min_idle_millis);
+        let level = ReclaimLevel::try_from(req.level).unwrap_or(ReclaimLevel::ReclaimPageOut);
+        let named = !req.session_ids.is_empty();
+        // Named sessions are hibernated however briefly they have been idle;
+        // a session with a call in flight is never a candidate (`idle_for`
+        // is `None` while it is active) and is not counted.
+        let min_idle = if named && level == ReclaimLevel::ReclaimHibernate {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(req.min_idle_millis)
+        };
         let mut idle: Vec<(Duration, Arc<Holder>)> = self
             .holders()
             .into_iter()
+            .filter(|h| {
+                (!named || (h.kind == HolderKind::Session && req.session_ids.contains(&h.key)))
+                    && (req.job_id.is_empty() || h.job == req.job_id)
+                    && (req.task_name.is_empty() || h.task == req.task_name)
+            })
             .filter_map(|h| h.idle_for().filter(|d| *d >= min_idle).map(|d| (d, h)))
             .collect();
         // Coldest first.
         idle.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
         let mut out = ReclaimReply::default();
-        let level = ReclaimLevel::try_from(req.level).unwrap_or(ReclaimLevel::ReclaimPageOut);
         for (_, h) in idle {
             if req.target_bytes != 0 && out.bytes >= req.target_bytes {
                 break;

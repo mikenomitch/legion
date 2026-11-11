@@ -30,6 +30,10 @@ struct HostState {
     modules: Vec<String>,
     /// session id -> (counter, resident)
     sessions: HashMap<String, (u64, bool)>,
+    /// session id -> (job, task), from `OpenSession`.
+    session_tasks: HashMap<String, (String, String)>,
+    /// Every `Reclaim` asked of this host.
+    reclaims: Vec<ReclaimRequest>,
     invocations: u64,
     stopped: BTreeMap<String, u64>,
     last_args: Vec<String>,
@@ -254,6 +258,10 @@ impl IsolateHost for FakeHost {
         let request = request.into_inner();
         let mut state = self.state.lock().unwrap();
         let existed = state.sessions.contains_key(&request.session_id);
+        state.session_tasks.insert(
+            request.session_id.clone(),
+            (request.job_id.clone(), request.task_name.clone()),
+        );
         state
             .sessions
             .entry(request.session_id)
@@ -308,25 +316,34 @@ impl IsolateHost for FakeHost {
         request: Request<ReclaimRequest>,
     ) -> Result<Response<ReclaimReply>, Status> {
         let request = request.into_inner();
+        self.state.lock().unwrap().reclaims.push(request.clone());
         if request.level != ReclaimLevel::ReclaimHibernate as i32 {
             return Ok(Response::new(ReclaimReply::default()));
         }
-        let resident: Vec<(String, u64)> = self
-            .state
-            .lock()
-            .unwrap()
-            .sessions
-            .iter()
-            .filter(|(_, (_, resident))| *resident)
-            .map(|(id, (counter, _))| (id.clone(), *counter))
-            .collect();
+        // The filters, as the real host honors them: named sessions, one
+        // job's isolates, one task's.
+        let resident: Vec<(String, u64, String, String)> = {
+            let state = self.state.lock().unwrap();
+            state
+                .sessions
+                .iter()
+                .filter(|(_, (_, resident))| *resident)
+                .map(|(id, (counter, _))| {
+                    let (job, task) = state.session_tasks.get(id).cloned().unwrap_or_else(|| {
+                        state.tasks.keys().next().cloned().unwrap_or_default()
+                    });
+                    (id.clone(), *counter, job, task)
+                })
+                .filter(|(id, _, job, task)| {
+                    (request.session_ids.is_empty() || request.session_ids.contains(id))
+                        && (request.job_id.is_empty() || request.job_id == *job)
+                        && (request.task_name.is_empty() || request.task_name == *task)
+                })
+                .collect()
+        };
         let mut hibernated = 0;
-        for (id, counter) in resident {
+        for (id, counter, job, task) in resident {
             let body = counter.to_string().into_bytes();
-            let (job, task) = {
-                let state = self.state.lock().unwrap();
-                state.tasks.keys().next().cloned().unwrap_or_default()
-            };
             let chunks = vec![
                 CheckpointChunk {
                     part: Some(checkpoint_chunk::Part::Header(CheckpointHeader {
@@ -1331,4 +1348,108 @@ fn harness_with_book(dir: &std::path::Path) -> Arc<IsolateSupervisor> {
         max_map_count: 1 << 24,
         paging_unavailable: None,
     })
+}
+
+/// Whether the fake host holds this session resident.
+fn host_resident(h: &Harness, session_id: &str) -> bool {
+    h.launcher.hosts().iter().any(|(_, host)| {
+        host.state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session_id)
+            .is_some_and(|(_, resident)| *resident)
+    })
+}
+
+fn host_reclaims(h: &Harness) -> Vec<ReclaimRequest> {
+    h.launcher
+        .hosts()
+        .iter()
+        .flat_map(|(_, host)| host.state.lock().unwrap().reclaims.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn suspending_one_session_isolate_hibernates_only_that_one() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    for id in ["run-a.1", "run-b.1"] {
+        h.supervisor
+            .start_session("ns/app", "run", id, "", "manager", "", "")
+            .await
+            .unwrap();
+        let mut call = run_call("ns/app", "run", &[("main.wasm", "count")]);
+        call.request.session_id = id.into();
+        h.supervisor.run(call, None).await.unwrap();
+    }
+    assert!(host_resident(&h, "run-a.1") && host_resident(&h, "run-b.1"));
+    h.supervisor.hibernate("run-a.1").await.unwrap();
+    assert!(!host_resident(&h, "run-a.1"), "the named session hibernated");
+    assert!(host_resident(&h, "run-b.1"), "the other stays resident");
+    assert_eq!(
+        h.supervisor.session_status("run-b.1").unwrap().state,
+        "running"
+    );
+    let asked = host_reclaims(&h);
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].session_ids, vec!["run-a.1".to_string()]);
+    assert!(asked[0].job_id.is_empty() && asked[0].task_name.is_empty());
+}
+
+#[tokio::test]
+async fn a_drain_hibernates_only_the_covered_jobs_session_isolates() {
+    use crate::structs::runtime_state::{RuntimeDisable, RuntimeDisableSet};
+    let h = harness();
+    let shared = || {
+        let mut config = module_config("session");
+        config["cordon"] = json!("shared");
+        isolate_task("run", config)
+    };
+    // Two jobs in different namespaces sharing one host.
+    let mut other = envelope("b/app", shared(), 1024.0);
+    other.allocation_id = 8;
+    h.supervisor
+        .sync(vec![envelope("a/app", shared(), 1024.0), other]);
+    for (job, id) in [("a/app", "run-a.1"), ("b/app", "run-b.1")] {
+        h.supervisor
+            .start_session(job, "run", id, "", "manager", "", "")
+            .await
+            .unwrap();
+        let mut call = run_call(job, "run", &[("main.wasm", "count")]);
+        call.request.session_id = id.into();
+        h.supervisor.run(call, None).await.unwrap();
+    }
+    assert_eq!(h.launcher.hosts().len(), 1, "one shared host");
+    h.gate.replace(RuntimeDisableSet::new(vec![RuntimeDisable {
+        runtime: "isolate".into(),
+        namespaces: vec!["a".into()],
+        reason: "CVE".into(),
+        since: "now".into(),
+        by: "op".into(),
+        drain: true,
+    }]));
+    h.supervisor.maintain().await;
+    assert!(!host_resident(&h, "run-a.1"), "the covered job's session");
+    assert!(host_resident(&h, "run-b.1"), "another job's session stays");
+    assert_eq!(
+        h.supervisor.session_status("run-a.1").unwrap().state,
+        "suspended"
+    );
+    let asked = host_reclaims(&h);
+    assert!(
+        asked
+            .iter()
+            .all(|r| r.job_id == "a/app" && r.session_ids.is_empty()),
+        "{asked:?}"
+    );
+    // The pressure step stays host-wide.
+    h.supervisor
+        .reclaim(ReclaimLevel::ReclaimHibernate, 0, Duration::ZERO, None, "")
+        .await;
+    assert!(!host_resident(&h, "run-b.1"), "pressure hibernates every idle session");
 }

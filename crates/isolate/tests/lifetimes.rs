@@ -233,6 +233,7 @@ async fn reclaim_hibernates_sessions_and_drops_tenants_coldest_first_test() {
             level: ReclaimLevel::ReclaimHibernate as i32,
             target_bytes: 0,
             min_idle_millis: 0,
+            ..Default::default()
         })
         .await;
     assert_eq!((r.hibernated, r.dropped), (1, 1));
@@ -258,6 +259,7 @@ async fn page_out_marks_idle_instances_and_reports_paged_starts_test() {
             level: ReclaimLevel::ReclaimPageOut as i32,
             target_bytes: 1,
             min_idle_millis: 10,
+            ..Default::default()
         })
         .await;
     // One instance already meets the 1-byte target.
@@ -508,4 +510,83 @@ async fn vm_is_not_configured_without_a_vm_task_test() {
     assert!(String::from_utf8_lossy(&r.stderr).contains("NotConfigured"));
     assert!(h.worker.vm_seen.lock().unwrap().is_empty());
     let _ = Duration::ZERO;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_can_name_sessions_and_skips_a_busy_one_test() {
+    let mut s = runner_spec("s", Lifetime::Session);
+    s.limits.as_mut().unwrap().cpu_micros = 10_000_000;
+    let h = host_with(s);
+    for id in ["n1", "n2", "n3", "busy"] {
+        open(&h, "s", id).await;
+        call(&h, "s", "acme", id, &["set", "k", id]).await;
+    }
+    let host = h.host.clone();
+    let spin = tokio::spawn(async move {
+        host.invoke(InvokeRequest {
+            job_id: "j".into(),
+            task_name: "s".into(),
+            session_id: "busy".into(),
+            call: Some(invoke_request::Call::Run(run(&["spin"]))),
+            ..Default::default()
+        })
+        .await
+    });
+    sleep_ms(100).await;
+    let r = h
+        .host
+        .reclaim(ReclaimRequest {
+            level: ReclaimLevel::ReclaimHibernate as i32,
+            // Named sessions ignore the idle threshold.
+            min_idle_millis: 60_000,
+            session_ids: vec!["n1".into(), "n3".into(), "busy".into()],
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(
+        r.hibernated, 2,
+        "n1 and n3; busy is skipped and not counted"
+    );
+    let saved = h.worker.checkpoints.lock().unwrap().clone();
+    assert!(saved.contains_key("n1") && saved.contains_key("n3"));
+    assert!(!saved.contains_key("n2") && !saved.contains_key("busy"));
+    assert_eq!(h.host.get_session("n2").unwrap().tier, "hot");
+    assert!(h.host.get_session("busy").unwrap().active);
+    h.host.close_session("busy", "").await;
+    let _ = spin.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_can_be_limited_to_one_job_or_task_test() {
+    let h = start(config());
+    h.load("runner");
+    for (job, task) in [("j", "t"), ("j", "u"), ("k", "t")] {
+        let mut s = runner_spec(task, Lifetime::Tenant);
+        s.job_id = job.into();
+        h.host.configure_task(s).unwrap();
+        h.run_with(job, task, "a", "", run(&["count"]))
+            .await
+            .unwrap();
+    }
+    let reclaim = |job: &str, task: &str| ReclaimRequest {
+        level: ReclaimLevel::ReclaimHibernate as i32,
+        job_id: job.into(),
+        task_name: task.into(),
+        ..Default::default()
+    };
+    let r = h.host.reclaim(reclaim("j", "t")).await;
+    assert_eq!(r.dropped, 1);
+    let r = h.host.reclaim(reclaim("j", "")).await;
+    assert_eq!(r.dropped, 1, "only j/u was left in job j");
+    // Job k's instance is untouched: still warm.
+    let r = h
+        .run_with("k", "t", "a", "", run(&["count"]))
+        .await
+        .unwrap();
+    assert_eq!(r.start, "warm");
+    let r = h
+        .run_with("j", "t", "a", "", run(&["count"]))
+        .await
+        .unwrap();
+    assert_eq!(r.start, "fresh");
 }
