@@ -42,9 +42,9 @@ interface control {
 }
 
 /// Bytes that outlive the instance: scoped to the session for a session
-/// isolate (kept across hibernation, and across nodes with
-/// `suspend.durability = "store"`), and to the tenant for a tenant isolate
-/// (kept while the tenant's instance is warm, best effort).
+/// isolate (kept across hibernation, on the session's node), and to the
+/// tenant for a tenant isolate (kept while the tenant's instance is warm,
+/// best effort).
 interface state {
   variant state-error {
     /// A request isolate has no state to keep.

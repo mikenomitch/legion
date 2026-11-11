@@ -805,6 +805,18 @@ service Manager {
   //   once sessions end or envelopes are added.
   // - FailedPrecondition: no node holds an envelope for the task yet.
   //
+  // On a task of the `isolate` runtime (docs/task-runtime-isolate.md) a
+  // create starts a session isolate, and only for a task whose
+  // `config.lifetime` is `session`. The node's answer is the confirmation:
+  // a session isolate is never recorded in the managers' session index, so
+  // it does not appear in `ListInstances`, and later calls reach it by the
+  // node tag in its id. Isolate-specific errors:
+  // - InvalidArgument: `instance_id` on an isolate task (an isolate is
+  //   never a keyed instance).
+  // - FailedPrecondition: the task's `config.lifetime` is `request` or
+  //   `tenant`, whose isolates live for one run or one tenant and cannot
+  //   be started; run code in them with `RunSession`.
+  //
   // With `owner` the new unit is a child (docs/child-sessions.md): a
   // session child of a session task, or a keyed child of a keyed task,
   // whose row carries the owner reference and which the owner's stop or
@@ -1460,11 +1472,13 @@ service Manager {
   //
   // On a task of the `isolate` runtime (docs/task-runtime-isolate.md) the
   // run needs no `run` block and no session of its own: the node runs the
-  // caller's code in an isolate, which starts in microseconds, under the
-  // task's `config.limits`. Three request fields apply only there. `tier`
-  // picks where the run happens (`isolate`, `vm`, or `auto`, the default,
-  // which decides before anything runs); `tenant` says who the run is for;
-  // `session_id` runs in an existing session isolate. The reply then says
+  // caller's code in an isolate (tens of microseconds to start for a
+  // small component, one to three milliseconds for a language image),
+  // under the task's `config.limits`. Four request fields apply only
+  // there. `tier` picks where the run happens (`isolate`, `vm`, or `auto`,
+  // the default, which decides before anything runs); `tenant` says who
+  // the run is for; `session_id` runs in an existing session isolate;
+  // `args` are arguments for the code. The reply then says
   // where the code ran and why (`tier`, `tier_reason`) and which tier to
   // ask for next time (`next_tier`). A run happens in exactly one place:
   // Legion never moves a run between tiers and never runs one twice. A
@@ -1472,12 +1486,17 @@ service Manager {
   // support is a successful reply with `stopped` set and, when the task
   // has a VM task, `next_tier = "vm"`; rerunning it is the caller's
   // decision and a second request. Isolate-only errors:
-  // - InvalidArgument: `tier`, `tenant`, or `session_id` on a task of
-  //   another runtime; an unknown `tier`; `command` on an isolate task.
+  // - InvalidArgument: `tier`, `tenant`, `session_id`, or `args` on a task
+  //   of another runtime; an unknown `tier`; a `tenant` that is not a
+  //   valid tenant key; more than 64 `args` or 64 KiB of them; `command`
+  //   on an isolate task.
   // - FailedPrecondition: `tier = "vm"` on a task with no `config.vm`;
   //   `session_id` on a task whose `config.lifetime` is not `session`; the
-  //   task's module does not export what a run needs.
+  //   task's module does not export what a run needs, or failed to
+  //   compile on the node (the message is the compiler's).
   // - NotFound: `session_id` names no session isolate of the task.
+  // - Unavailable: the node is still compiling the task's module, or its
+  //   isolate host is restarting. Retryable.
   rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
 
   // Reports how many isolates each node holds for a job's `isolate` tasks
@@ -10223,8 +10242,7 @@ message IsolateTaskStats {
   // `unsupported`, `trap`, `ended`.
   map<string, uint64> stopped = 16;
 
-  // Invocations stopped by a limit, by limit: `cpu`, `wall`, `memory`,
-  // `output`.
+  // Invocations stopped by a limit, by limit: `cpu`, `wall`, `memory`.
   map<string, uint64> limits = 17;
 
   // Invocations refused with ResourceExhausted because the envelope or
@@ -10279,8 +10297,9 @@ message IsolateHostStats {
   string layout = 10;
 
   // The confinement in force, layer by layer: `userns`, `netns`,
-  // `no-new-privs`, `landlock`, `seccomp`. A layer missing from the list
-  // did not apply.
+  // `mount-root`, `pid-ns`, `no-new-privs`, `landlock`,
+  // `landlock-scopes`, `seccomp`. A layer missing from the list did not
+  // apply.
   repeated string confinement = 11;
 
   // Times the worker has restarted this host after it exited.
@@ -15275,8 +15294,8 @@ message RunSessionRequest {
   // Tasks of the `isolate` runtime only: the tenant key, saying who the
   // run is for. It keys the warm instance for `config.lifetime =
   // "tenant"`, and the per-tenant queue that keeps one tenant's runs from
-  // starving another's on a busy node. Any string up to 128 bytes; empty
-  // is the task's anonymous tenant.
+  // starving another's on a busy node. Up to 128 printable ASCII
+  // characters with no spaces; empty is the task's anonymous tenant.
   string tenant = 13;
 
   // Tasks of the `isolate` runtime with `config.lifetime = "session"`
@@ -15335,12 +15354,14 @@ message RunStop {
   // `config.limits` or its `resources.memoryMax`; `limit` names which),
   // `unsupported` (the code called something an isolate does not offer,
   // such as a subprocess; `detail` names it), `trap` (the guest crashed),
-  // or `ended` (its session isolate was stopped under it).
+  // or `ended` (its session isolate was stopped, its task was removed
+  // from the node, or the node's isolate host drained under it).
   string reason = 1;
 
   // The limit that stopped it, as the jobspec wrote it (`"30s"`). Empty
   // for `session_ended`. For an isolate's `limits` it is the limit's
-  // name: `cpu`, `wall`, `memory`, or `output`.
+  // name: `cpu`, `wall`, or `memory`. (`config.limits.output` truncates
+  // the output and sets `truncated`; it never stops a run.)
   string limit = 2;
 
   // What happened, in a sentence.
@@ -15398,7 +15419,8 @@ message RunSessionResponse {
   // The command's exit status. Unset when the run was stopped.
   optional int32 exit = 4;
 
-  // The command's stdout and stderr, together at most `run.output` bytes.
+  // The command's stdout and stderr, together at most `run.output` bytes
+  // (`config.limits.output` for a run in an isolate).
   bytes stdout = 5;
   bytes stderr = 6;
 
@@ -15407,6 +15429,9 @@ message RunSessionResponse {
 
   // The contents of `result.json` in the run directory, when the command
   // wrote one that parses as JSON and fits `run.output`. Empty otherwise.
+  // A run in an isolate whose guest exports `legion:isolate/runner`
+  // (the language images do) reports the JSON result the runner returned,
+  // and falls back to `result.json` when it returned none.
   string result = 8;
 
   // The files named in `get`, in request order.
@@ -15455,8 +15480,10 @@ message RunSessionResponse {
   // code hash never pay for the same wrong guess twice, on any node.
   string next_tier = 18;
 
-  // Isolate tasks only: for a run that went to a VM, the time from the
-  // decision to a VM ready to execute, in milliseconds. 0 otherwise.
+  // Isolate tasks only: for a run that went to a VM, what the VM cost on
+  // top of the command, in milliseconds: the whole VM run (starting the
+  // session, staging files, collecting output, ending it) minus the
+  // command's own `wall_ms`. 0 otherwise.
   uint64 vm_ms = 19;
 
   // CPU and wall-clock time in microseconds, where the runtime measures

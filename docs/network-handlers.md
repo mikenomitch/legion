@@ -1453,6 +1453,29 @@ Requirements and limits:
 - No raw UDP and no ICMP.
 - No inbound traffic except through the datapath's ingress listeners (below).
 
+### Isolates
+
+An [`isolate`](task-runtime-isolate.md) task has no network of its own: its
+isolates run in a host process with no network at all. The task's
+`network.ports`, egress policy, and `connect` upstreams are bound for its
+**envelope allocation**, always gated, and the worker's isolate supervisor
+serves and dials those listeners on the isolates' behalf over Unix sockets
+in the envelope's directory:
+
+- **Ingress.** Each declared port's ingress listener (TLS, the ingress
+  chain) delivers HTTP/1.1 requests to the task's isolates.
+- **Egress.** An isolate's outbound request (`wasi:http/outgoing-handler`)
+  goes to the upstream whose key is the URL's host (`http://<key>/` or
+  `http://<key>.svc.legion/`), with its handlers and credential injection,
+  or else through the envelope's egress proxy under the task's policy and
+  the host guard. The worker originates TLS for `https://` URLs.
+- **Attribution.** Denials, access logs, and the identity string name the
+  isolate task, not `<task>-envelope`, and not the isolate or tenant.
+
+Bodies are buffered whole, up to the worker's `isolate.maxBodyBytes`. See
+[Outbound HTTP](task-runtime-isolate.md#outbound-http) and
+[HTTP handlers](task-runtime-isolate.md#http-handlers).
+
 ## The host guard
 
 The host guard is a fixed set of destinations no allocation may reach

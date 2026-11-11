@@ -19,7 +19,10 @@ without it the same thing is `legion instance create`, a wait, a way to copy
 files in, `legion exec`, and a stop that has to happen on every failure path.
 
 Runs work on session tasks of the `exec`, `container`, and `sandbox`
-runtimes. A run writes nothing to the replicated store.
+runtimes, which declare a `run` block, and on session tasks of the
+[`isolate`](task-runtime-isolate.md) runtime, which take runs natively
+([Runs on isolate tasks](#runs-on-isolate-tasks)). A run writes nothing to
+the replicated store.
 
 ## Declaring that a task takes runs
 
@@ -127,7 +130,10 @@ command reaches itself.
 ### Single-use, always
 
 A run's session is never reused for another run, because the next run may be
-another tenant's code. Every run pays a session start.
+another tenant's code. Every run pays a session start. (On an isolate task,
+`config.lifetime = "tenant"` or `"session"` reuses an isolate on purpose,
+per tenant key or session id; see
+[Lifetimes](task-runtime-isolate.md#lifetimes).)
 
 ## The reply: a stopped run is data
 
@@ -144,6 +150,10 @@ another tenant's code. Every run pays a session start.
 | `wall` | The command was still running at `run.wall` and was killed. `limit` is the wall as written. |
 | `memory` | The kernel killed the command for exceeding the session's memory limit. Reported where the node governs the session with a cgroup ([resource enforcement](resource-enforcement.md) on, `exec` and `container`); elsewhere the same event shows as exit status 137 or as `session_ended`. |
 | `session_ended` | The session ended under the run: an operator stopped it, a drain took it, or its runtime exited. |
+
+A run in an isolate has its own reasons: `limits` (with `limit` = `cpu`,
+`wall`, or `memory`), `unsupported`, `trap`, and `ended`
+([When a run stops](task-runtime-isolate.md#when-a-run-stops)).
 
 So an agent can tell "my code failed" (a non-zero `exit`), "my code hit a
 limit" (`stopped`), and "Legion could not run it" (an error) from the
@@ -162,6 +172,44 @@ Without `-j`, `legion session run` prints the command's stdout and stderr on
 its own stdout and stderr and exits with the command's status, so scripts
 keep working. A run stopped by `run.wall` exits 124, and a run stopped for
 any other reason exits 125.
+
+## Runs on isolate tasks
+
+A session task of the `isolate` runtime takes runs without a `run` block:
+the node runs the run's `main.<ext>` (else its first file) in a WebAssembly
+isolate under the task's `config.limits`, or, with a VM task, in a fresh
+single-use session of that sandbox task. Nothing else about the call
+changes: the same files, input, `--get`, run directory (`/legion/run`),
+idempotency, and reply.
+
+```console
+$ legion session run code-runner --file main.py --input '{"n": 3}' -j
+{"ok":true,"data":{"task":"run", ... "exit":0,"stdout":"3\n", ... "wallMs":2.914,"cpuMs":2.47,
+ "stopped":null,"deduplicated":false,"tier":"isolate",
+ "tierReason":"auto: no imports outside the image","nextTier":null,"isolateStart":"fresh"}}
+```
+
+| Request field (CLI flag) | Meaning |
+| --- | --- |
+| `tier` (`--tier auto\|isolate\|vm`) | Where the run happens. `auto`, the default, decides before anything runs. |
+| `tenant` (`--tenant KEY`) | Who the run is for: keys a `tenant` isolate's warm instance and the node's per-tenant fairness. 1 to 128 printable ASCII bytes. |
+| `session_id` (`--session ID`) | Run in an existing session isolate, on the node its id names. |
+| `args` (`--arg ARG`, repeatable) | Arguments for the code. At most 64, 64 KiB together. Need only `job:write`. |
+
+All four are refused (`INVALID_ARGUMENT`) on a task of another runtime, and
+`command` is refused on an isolate task. The reply adds, for isolate tasks
+only: `tier` and `tierReason` (where it ran and why), `nextTier` (where to run
+this code next time), `vmMs` (a VM run's start time), `isolateStart`
+(`fresh`, `warm`, `paged`, `hibernated`), and microsecond `cpuMicros` and
+`wallMicros`; in CLI JSON an isolate run's `cpuMs` and `wallMs` have
+fractions. A dry run adds `tier`, `tierReason`, `imports`, and
+`missingImports`. `--fallback vm` (CLI and MCP only) sends a stopped run a
+second time with `--tier vm`, and the reply then says `ranTwice`.
+
+A run on an isolate task is not a session of its own and does not appear in
+`legion instance list`. The full rules, including what decides the tier and
+how a stop sets `nextTier`, are in
+[Task Runtime: isolate](task-runtime-isolate.md#runs).
 
 ## Who may run what
 
@@ -261,7 +309,8 @@ replace it.
   starts a session.
 - **Session tasks only.** Keyed and service tasks do not take runs.
 - **Every run starts a session.** Sandbox runs pay a VM boot each time;
-  there is no pool of prepared VMs.
+  there is no pool of prepared VMs. Runs in an isolate task's isolate tier
+  start no session.
 - **A worker restart ends runs in flight.** The restarted worker ends any
   run session its predecessor left, within a few seconds, and the caller
   sees `UNAVAILABLE`. With an idempotency key the retry runs again, because

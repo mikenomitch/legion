@@ -12,6 +12,7 @@ use legion::content_store::{ContentStore, ContentStoreConfig};
 use legion::prelude::*;
 use legion::structs::isolate::{ConfineMode, WorkerIsolateConfigFull};
 use legion::structs::{RunFile, RunSessionRequest, TaskConfig};
+use legion::structs::manager_server::Manager as _;
 use legion::worker::isolates::binary::{self, ImageCatalog, ImageEntry, IsolateBinary};
 use legion::worker::isolates::host::ProcessLauncher;
 use legion::worker::isolates::modules::{Compiler, ModuleSource, ModuleWant};
@@ -421,4 +422,760 @@ async fn a_best_effort_confined_host_answers_hello() {
     assert_eq!(reply.exit, Some(0));
     let (_, hosts) = node.supervisor.stats("", "").await;
     assert!(!hosts[0].confinement.is_empty(), "{hosts:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Through the whole stack: a manager on raft, a real worker (task manager,
+// worker service on the mTLS worker plane, isolate supervisor), and real
+// `legion-isolate` hosts. The manager's `RunSession` is the entry, as the
+// CLI's `legion session run`.
+// ---------------------------------------------------------------------------
+
+pub(crate) mod cluster {
+    use super::*;
+    use legion::cluster_tls::{
+        certified_key, server_config, tls_incoming, ClusterClientVerifier, SwappableIdentity,
+        SwappableRoots,
+    };
+    use legion::manager::eval::EvalExt;
+    use legion::manager::server::ManagerDaemonService;
+    use legion::mesh_ca::{generate_csr, sign_csr, CsrSubject};
+    use legion::prelude::{Context, Value, R};
+    use legion::storage::store::Store;
+    use legion::structs::config::{ManagerConfigFull, PersistenceType};
+    use legion::structs::job::JobConfig;
+    use legion::structs::manager_server::Manager;
+    use legion::structs::worker_server::WorkerServer;
+    use legion::structs::{
+        GetAllocationLogsRequest, Node, NodeMsg, RunSessionResponse, Submission,
+    };
+    use legion::worker::server::WorkerDaemonService;
+    use legion::worker::state::WorkerStateStore;
+    use legion::worker::task_manager::WorkerTaskManager;
+    use std::sync::Mutex;
+    use tonic::{Request, Status};
+
+    pub const JOB: &str = "code-runner";
+    pub const NODE: &str = "w-iso";
+
+    /// Where the node's isolate images come from.
+    pub enum Images {
+        /// A catalog whose `python` image is this test fixture.
+        Fixture(&'static str),
+        /// A built images directory (`crates/isolate/images/build.sh`).
+        Built(PathBuf),
+    }
+
+    pub struct Cluster {
+        pub svc: ManagerDaemonService,
+        pub task_manager: Arc<Mutex<WorkerTaskManager>>,
+        pub supervisor: Arc<IsolateSupervisor>,
+        pub dir: tempfile::TempDir,
+    }
+
+    fn fixture_images(dir: &Path, name: &str) -> PathBuf {
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::copy(fixture(name), images.join("python.wasm")).unwrap();
+        let manifest = json!({ "images": { "python": {
+            "file": "python.wasm",
+            "sha256": sha256_of(&images.join("python.wasm")),
+            "extensions": [".py"],
+            "modules": ["json", "re", "math"],
+            "vmEntry": "main.py",
+        } } });
+        std::fs::write(images.join("manifest.json"), manifest.to_string()).unwrap();
+        images
+    }
+
+    impl Cluster {
+        /// One manager, one worker running isolates, and job [`JOB`] with
+        /// these tasks placed (its envelopes running on the worker).
+        pub async fn start(images: Images, tasks: Value) -> R<Self> {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter("legion_worker::worker::isolates=debug")
+                .with_test_writer()
+                .try_init();
+            let dir = tempfile::tempdir()?;
+            let images = match images {
+                Images::Fixture(name) => fixture_images(dir.path(), name),
+                Images::Built(path) => path,
+            };
+            let mut config = ManagerConfigFull {
+                store_path: dir.path().join("store").to_str().context("utf-8")?.into(),
+                scheduling_policy: "bin_pack".to_string(),
+                scheduler_settings: Some(json!({ "nodes_considered": "100%" })),
+                ..Default::default()
+            };
+            config.persistence.r#type = PersistenceType::Raft;
+            config.persistence.raft.bootstrap = true;
+            config.persistence.raft.node_id = "mgr-iso".into();
+            config.persistence.raft.data_dir =
+                dir.path().join("raft").to_str().context("utf-8")?.into();
+            let store = tokio::task::block_in_place(|| Store::start_storage(&config))?;
+            let svc = ManagerDaemonService::new(store);
+
+            let mut manager = WorkerTaskManager::with_state_store(WorkerStateStore::new(
+                dir.path().join("worker").join("worker_state.json"),
+            ));
+            manager.load_builtin_plugins();
+            let task_manager = Arc::new(Mutex::new(manager));
+            let isolate_config = WorkerIsolateConfigFull {
+                binary: Some(isolate_binary().display().to_string()),
+                images: Some(images.display().to_string()),
+                confine: ConfineMode::BestEffort,
+                max_memory: "512MiB".into(),
+                ..Default::default()
+            };
+            let enforcement = legion::structs::WorkerResourceEnforcementConfig {
+                enabled: false,
+                ..Default::default()
+            };
+            let supervisor = legion::worker::isolates::supervisor_setup::start(
+                &task_manager,
+                NODE,
+                isolate_config.clone(),
+                Duration::from_secs(1),
+                &enforcement,
+            )
+            .await
+            .context("the isolate supervisor did not start")?;
+            let launch_pool = Arc::new(legion::worker::launch_pool::LaunchPool::new(
+                8,
+                Duration::from_secs(1),
+            ));
+            let child_vms = Arc::new(legion::worker::isolates::vm::ChildVms::new(
+                task_manager.clone(),
+                NODE,
+                launch_pool.clone(),
+                16 << 20,
+            ));
+            supervisor.set_vm_backend(child_vms);
+            let service = WorkerDaemonService {
+                node_id: NODE.into(),
+                task_manager: task_manager.clone(),
+                identity: None,
+                edge_boot: None,
+                direct_exec: None,
+                launch_pool,
+                node_identity: None,
+                netd: None,
+            };
+
+            let ca = svc.store.ensure_mesh_ca()?;
+            let roots = SwappableRoots::from_pem(&ca.cert_pem)?;
+            let (key, csr) = generate_csr(NODE)?;
+            let (cert, _) = sign_csr(
+                &ca.cert_pem,
+                &ca.key_pem,
+                &csr,
+                &CsrSubject::Node(NODE.to_string()),
+            )?;
+            let identity = SwappableIdentity::new();
+            identity.set(certified_key(&cert, &key)?);
+            let tls = server_config(identity, Some(ClusterClientVerifier::new(roots)), false)?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let served = WorkerServer::new(service);
+            tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(served)
+                    .serve_with_incoming(tls_incoming(listener, tls))
+                    .await;
+            });
+            svc.store.insert_node(NodeMsg::from(Node {
+                id: NODE.to_string(),
+                pool: "default".into(),
+                status: "ready".into(),
+                availability: "available".into(),
+                last_heartbeat: "2023-01-01T00:00:00Z".into(),
+                heartbeat_source: String::new(),
+                config_attrs: json!({
+                    "node_id": NODE,
+                    "maxAllocations": 50,
+                    "resources": { "memory": 65536, "cpu": 40000 },
+                    "workerAddress": format!("https://{address}"),
+                }),
+                fingerprint_attrs: json!({
+                    "memory_total": "68719476736",
+                    "cpus": { "cpu-1": { "frequency": 2000.0 } },
+                }),
+                dynamic_attrs: json!({
+                    "capabilities": ["sessions", "isolates"],
+                    "protocolVersion": 3,
+                }),
+                health_checks: json!({}),
+            }))?;
+            let cluster = Cluster {
+                svc,
+                task_manager,
+                supervisor,
+                dir,
+            };
+            cluster.submit(tasks)?;
+            Ok(cluster)
+        }
+
+        pub fn store(&self) -> &Store {
+            &self.svc.store
+        }
+
+        /// Store the job and place it. Straight into the store: a test that
+        /// needs a job the `JobSubmit` RPC would refuse (an `exec` VM task
+        /// standing in for a sandbox) says so where it builds it.
+        pub fn submit(&self, tasks: Value) -> R<()> {
+            let config: JobConfig =
+                serde_json::from_value(json!({ "name": JOB, "tasks": tasks }))?;
+            tokio::task::block_in_place(|| -> R<()> {
+                self.store().handle_job_submit(
+                    &config,
+                    &[Submission {
+                        path: format!("{JOB}.json"),
+                        content: "{}".to_string(),
+                        is_primary: true,
+                    }],
+                )?;
+                let config_id = self.store().get_job_config(JOB)?.id();
+                self.store().enqueue_eval(
+                    "job_reschedule",
+                    Some(JOB),
+                    Some(&config_id),
+                    None,
+                    None,
+                )?;
+                while let Some(eval) = self.store().claim_eval()? {
+                    eval.handle(self.store())?;
+                    self.store().complete_eval(&eval.id, true)?;
+                }
+                Ok(())
+            })
+        }
+
+        /// Wait until the worker runs `task`'s envelope (and, for an isolate
+        /// task, the supervisor has prepared it).
+        pub async fn wait_for(&self, task: &str, isolate: bool) -> R<()> {
+            for _ in 0..400 {
+                let envelope = self
+                    .task_manager
+                    .lock()
+                    .expect("task manager")
+                    .session_spec(JOB, task)
+                    .is_some();
+                if envelope && (!isolate || {
+                    self.supervisor.sync_from_task_manager();
+                    self.supervisor.has_task(JOB, task)
+                }) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            anyhow::bail!("the worker never ran the envelope of {JOB}/{task}")
+        }
+
+        pub async fn run(&self, request: RunSessionRequest) -> Result<RunSessionResponse, Status> {
+            self.svc
+                .run_session(Request::new(RunSessionRequest {
+                    job_id: JOB.into(),
+                    wait_timeout_seconds: request.wait_timeout_seconds.or(Some(120)),
+                    ..request
+                }))
+                .await
+                .map(|reply| reply.into_inner())
+        }
+
+        /// The job's task logs as `legion job logs` reads them: the
+        /// manager's `GetAllocationLogs`, forwarded to the worker.
+        pub async fn logs(&self, stream: &str) -> R<Vec<(String, String)>> {
+            let reply = self
+                .svc
+                .get_allocation_logs(Request::new(GetAllocationLogsRequest {
+                    job: JOB.into(),
+                    stream: stream.into(),
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner();
+            Ok(reply
+                .allocations
+                .into_iter()
+                .flat_map(|alloc| {
+                    let task = alloc.task_name.clone();
+                    alloc
+                        .streams
+                        .into_iter()
+                        .map(move |s| (format!("{task}:{}", s.stream), s.content))
+                })
+                .collect())
+        }
+
+        /// Start a session isolate of `task` through the manager
+        /// (`CreateInstance`, as `legion instance create`); its id.
+        pub async fn start_session_isolate(&self, task: &str) -> R<String> {
+            Ok(self
+                .svc
+                .create_instance(Request::new(legion::structs::CreateInstanceRequest {
+                    job_id: JOB.into(),
+                    task: Some(task.into()),
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner()
+                .instance_id)
+        }
+
+        /// Session ids the worker's task manager holds (VM sessions; never
+        /// isolates).
+        pub fn sessions(&self) -> Vec<String> {
+            self.task_manager
+                .lock()
+                .expect("task manager")
+                .session_statuses()
+                .into_iter()
+                .map(|status| status.session_id)
+                .collect()
+        }
+    }
+
+    impl Drop for Cluster {
+        fn drop(&mut self) {
+            if let Ok(mut manager) = self.task_manager.lock() {
+                for claim in manager.claims_snapshot() {
+                    manager.kill_claim(&claim.claim_id, "test over");
+                }
+            }
+        }
+    }
+
+    /// An isolate task `run` of the `python` image.
+    pub fn isolate_task(config: Value) -> Value {
+        json!({
+            "name": "run",
+            "runtime": "isolate",
+            "config": config,
+            "resources": { "cpu": 10, "memory": 16, "memoryMax": 128 },
+            "stateful": {
+                "mode": "session",
+                "envelope": { "resources": { "cpu": 1000, "memory": 1024 } },
+            },
+        })
+    }
+
+    pub fn main_py(content: &str) -> RunFile {
+        RunFile {
+            path: "main.py".into(),
+            content: content.as_bytes().to_vec(),
+            executable: false,
+        }
+    }
+}
+
+use cluster::{isolate_task, main_py, Cluster, Images, JOB};
+
+/// A run through the manager: routed to the worker, executed by a real
+/// host, the isolate reply shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_through_the_manager_reaches_a_real_host() -> legion::prelude::R<()> {
+    let cluster = Cluster::start(
+        Images::Fixture("runner.wasm"),
+        json!([isolate_task(json!({ "image": "python", "lifetime": "request" }))]),
+    )
+    .await?;
+    cluster.wait_for("run", true).await?;
+    let reply = cluster
+        .run(RunSessionRequest {
+            task_name: "run".into(),
+            args: vec!["entry".into()],
+            files: vec![main_py("print('hi')\n")],
+            input: Some("{\"n\":1}".into()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(reply.tier, "isolate", "{reply:?}");
+    assert_eq!(reply.tier_reason, "auto: no imports outside the image");
+    assert_eq!(reply.exit, Some(0));
+    assert_eq!(reply.task_name, "run");
+    assert_eq!(reply.node_id, cluster::NODE);
+    let result: Value = serde_json::from_str(&reply.result)?;
+    assert_eq!(result["body"], "print('hi')\n", "{result}");
+    assert_eq!(result["input"], "{\"n\":1}", "{result}");
+    assert!(reply.cpu_micros > 0 && reply.wall_micros > 0, "{reply:?}");
+    assert!(cluster.sessions().is_empty(), "an isolate run takes no session");
+    // A request isolate's output is in its reply, never in the task log.
+    assert!(String::from_utf8_lossy(&reply.stdout).contains("ran entry"));
+    let logs = cluster.logs("stdout").await?;
+    assert!(
+        logs.iter().all(|(_, content)| !content.contains("[isolate")),
+        "{logs:?}"
+    );
+    Ok(())
+}
+
+/// Plan §6.9: a session isolate's output is in the task's log stream,
+/// where `legion job logs` finds it, each line naming its isolate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_isolates_output_is_in_the_job_logs() -> legion::prelude::R<()> {
+    let cluster = Cluster::start(
+        Images::Fixture("runner.wasm"),
+        json!([isolate_task(json!({ "image": "python", "lifetime": "session" }))]),
+    )
+    .await?;
+    cluster.wait_for("run", true).await?;
+    let started = cluster
+        .svc
+        .create_instance(tonic::Request::new(legion::structs::CreateInstanceRequest {
+            job_id: JOB.into(),
+            task: Some("run".into()),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    let id = started.instance_id.clone();
+    for mode in ["count", "nope"] {
+        cluster
+            .run(RunSessionRequest {
+                task_name: "run".into(),
+                session_id: id.clone(),
+                args: vec![mode.into()],
+                files: vec![main_py("")],
+                ..Default::default()
+            })
+            .await?;
+    }
+    // The host forwards the lines after the invocation; the worker appends.
+    let want_out = format!("[isolate {id}] ran count\n");
+    let want_err = format!("[isolate {id}] unknown mode nope\n");
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        seen = cluster.logs("").await?;
+        let has = |stream: &str, want: &str| {
+            seen.iter()
+                .any(|(name, content)| name.ends_with(stream) && content.contains(want))
+        };
+        if has(":stdout", &want_out) && has(":stderr", &want_err) {
+            // Both in the envelope allocation's streams.
+            assert!(
+                seen.iter()
+                    .filter(|(_, content)| content.contains("[isolate "))
+                    .all(|(name, _)| name.starts_with("run-envelope:")),
+                "{seen:?}"
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the session isolate's output never reached the job logs: {seen:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The VM tier (plan §6.12). A VM task must be a sandbox session task, and
+// `JobSubmit` refuses anything else. This container has no /dev/kvm, and
+// the sandbox runtime's Linux dev backend runs no guest agent, so it takes
+// no exec and therefore no session runs (`SandboxPlugin::exec`: "sandbox
+// exec is not supported on ...: the Linux dev path runs no guest agent").
+// The tests below that need a real sandbox are `#[ignore]`d for that
+// reason; the ones that run here store the job straight into the store
+// with an `exec` session task as the VM task (the RPC's rule is not
+// changed), so the supervisor's VM path, the session-run machinery and
+// child ownership all run for real.
+// ---------------------------------------------------------------------------
+
+/// Why the sandbox variants cannot run in this container.
+const NO_SANDBOX_RUNS: &str = "needs /dev/kvm: a sandbox session run needs exec, which the Linux \
+                               dev backend does not take (no guest agent)";
+
+/// A session task `machine` the isolate task's VM runs go to: `exec`
+/// standing in for a sandbox, or a real `sandbox`.
+fn machine(runtime: &str) -> Value {
+    let config = match runtime {
+        "exec" => json!({ "command": ["sleep", "600"] }),
+        _ => json!({ "image": "busybox:1.36", "command": ["sleep", "600"] }),
+    };
+    json!({
+        "name": "machine",
+        "runtime": runtime,
+        "config": config,
+        "resources": { "cpu": 100, "memory": 64 },
+        "stateful": {
+            "mode": "session",
+            "envelope": { "resources": { "cpu": 400, "memory": 512 } },
+        },
+        // The entry (staged as main.py) and the run's args.
+        "run": {
+            "command": ["sh", "-c", "echo entry=$(cat main.py); echo args=$*", "sh"],
+            "wall": "30s",
+        },
+        "children": { "max": 4, "orphanAfter": "5m" },
+    })
+}
+
+/// The isolate task with `config.vm` naming `machine`.
+fn vm_isolate(lifetime: &str, children_max: Option<u32>) -> Value {
+    let mut task = isolate_task(json!({
+        "image": "python",
+        "lifetime": lifetime,
+        "limits": { "cpu": "200ms", "wall": "5s" },
+        "vm": { "task": "machine", "memoFor": "10m" },
+    }));
+    task["children"] = json!({ "tasks": ["machine"] });
+    if let Some(max) = children_max {
+        task["children"]["max"] = json!(max);
+    }
+    task
+}
+
+async fn vm_cluster(runtime: &str, lifetime: &str, children_max: Option<u32>) -> Cluster {
+    let cluster = Cluster::start(
+        Images::Fixture("runner.wasm"),
+        json!([vm_isolate(lifetime, children_max), machine(runtime)]),
+    )
+    .await
+    .expect("cluster");
+    cluster.wait_for("run", true).await.expect("isolate task");
+    cluster.wait_for("machine", false).await.expect("VM task");
+    cluster
+}
+
+async fn invocations(cluster: &Cluster) -> u64 {
+    let (tasks, _) = cluster.supervisor.stats(JOB, "run").await;
+    tasks.iter().map(|t| t.invocations).sum()
+}
+
+async fn vm_runs(cluster: &Cluster) -> u64 {
+    let (tasks, _) = cluster.supervisor.stats(JOB, "run").await;
+    tasks.iter().map(|t| t.vm_runs).sum()
+}
+
+fn vm_run_request(tier: &str, args: &[&str], source: &str) -> RunSessionRequest {
+    RunSessionRequest {
+        task_name: "run".into(),
+        tier: tier.into(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        files: vec![main_py(source)],
+        ..Default::default()
+    }
+}
+
+/// `tier = "vm"`: the run executes in a fresh session of the VM task, with
+/// the isolate reply's shape, its args appended to the VM task's command,
+/// and the session gone afterwards (never reused).
+async fn check_vm_tier_runs(cluster: &Cluster) {
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let reply = cluster
+            .run(vm_run_request("vm", &["a", "b c"], "print(1)"))
+            .await
+            .expect("vm run");
+        assert_eq!(reply.tier, "vm", "{reply:?}");
+        assert_eq!(reply.tier_reason, "requested");
+        assert_eq!(reply.next_tier, "vm");
+        assert_eq!(reply.task_name, "machine");
+        assert!(reply.vm_ms > 0, "{reply:?}");
+        assert_eq!(reply.exit, Some(0), "{reply:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&reply.stdout),
+            "entry=print(1)\nargs=a b c\n",
+            "the entry staged as main.py, the args appended to run.command"
+        );
+        assert!(reply.wall_micros > 0 && reply.isolate_start.is_empty());
+        sessions.push(reply.session_id.clone());
+        assert!(cluster.sessions().is_empty(), "the VM session ended");
+    }
+    assert_ne!(sessions[0], sessions[1], "a VM session is never reused");
+    assert_eq!(vm_runs(cluster).await, 2);
+    assert_eq!(invocations(cluster).await, 0, "nothing ran in an isolate");
+}
+
+/// `auto` with the isolate runtime disabled for the job goes to the VM.
+async fn check_disabled_runtime_goes_to_the_vm(cluster: &Cluster) {
+    use legion::structs::runtime_state::{RuntimeDisable, RuntimeDisableSet};
+    let gate = cluster
+        .task_manager
+        .lock()
+        .unwrap()
+        .runtime_gate();
+    gate.replace(RuntimeDisableSet::new(vec![RuntimeDisable {
+        runtime: "isolate".into(),
+        reason: "CVE-2026-0001".into(),
+        ..Default::default()
+    }]));
+    let reply = cluster
+        .run(vm_run_request("auto", &[], "print(2)"))
+        .await
+        .expect("auto run");
+    assert_eq!(reply.tier, "vm", "{reply:?}");
+    assert_eq!(reply.tier_reason, "auto: the isolate runtime is disabled");
+    gate.replace(RuntimeDisableSet::new(vec![]));
+}
+
+/// A stopped isolate run says where to go next and is not rerun; the next
+/// `auto` run of the same source goes straight to the VM.
+async fn check_stops_set_next_tier_and_the_memo(cluster: &Cluster) {
+    for (mode, reason, source) in [
+        ("unsupported", "unsupported", "x = 1  # unsupported"),
+        ("spin", "limits", "while True: pass"),
+    ] {
+        let before = (invocations(cluster).await, vm_runs(cluster).await);
+        let reply = cluster
+            .run(vm_run_request("auto", &[mode], source))
+            .await
+            .expect("stopped run");
+        assert_eq!(reply.tier, "isolate", "{reply:?}");
+        let stopped = reply.stopped.clone().expect("stopped");
+        assert_eq!(stopped.reason, reason, "{reply:?}");
+        assert_eq!(reply.next_tier, "vm", "{reply:?}");
+        assert_eq!(
+            (invocations(cluster).await, vm_runs(cluster).await),
+            (before.0 + 1, before.1),
+            "exactly one invocation, and no VM"
+        );
+        assert!(cluster.sessions().is_empty(), "no VM session was created");
+        let again = cluster
+            .run(vm_run_request("auto", &[mode], source))
+            .await
+            .expect("memo run");
+        assert_eq!(again.tier, "vm", "{again:?}");
+        assert!(
+            again.tier_reason.starts_with("auto: this code"),
+            "the memo reason: {again:?}"
+        );
+        assert_eq!(invocations(cluster).await, before.0 + 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_vm_tier_runs_in_a_fresh_vm_session() {
+    let cluster = vm_cluster("exec", "request", None).await;
+    check_vm_tier_runs(&cluster).await;
+    check_disabled_runtime_goes_to_the_vm(&cluster).await;
+    check_stops_set_next_tier_and_the_memo(&cluster).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs /dev/kvm: a sandbox session run needs exec, which the Linux dev backend does not take (no guest agent)"]
+async fn the_vm_tier_runs_in_a_fresh_sandbox_session() {
+    let _ = NO_SANDBOX_RUNS;
+    let cluster = vm_cluster("sandbox", "request", None).await;
+    check_vm_tier_runs(&cluster).await;
+    check_disabled_runtime_goes_to_the_vm(&cluster).await;
+    check_stops_set_next_tier_and_the_memo(&cluster).await;
+}
+
+/// The child VMs the task manager holds that an owner of this kind and id
+/// owns.
+fn children_of(cluster: &Cluster, kind: &str, id: &str) -> Vec<String> {
+    cluster
+        .task_manager
+        .lock()
+        .unwrap()
+        .session_statuses()
+        .into_iter()
+        .filter(|status| {
+            status
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.kind == kind && owner.id == id)
+        })
+        .map(|status| status.session_id)
+        .collect()
+}
+
+async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{what} never happened");
+}
+
+/// Child VMs from isolates (plan §6.12): the runner's `vm` mode acquires a
+/// child of the VM task and execs `echo hi` in it. A request isolate's
+/// child ends with the request.
+async fn check_request_child_vm(cluster: &Cluster) {
+    let reply = cluster
+        .run(vm_run_request("isolate", &["vm"], ""))
+        .await
+        .expect("vm mode");
+    assert_eq!(reply.exit, Some(0), "{reply:?}");
+    let result: Value = serde_json::from_str(&reply.result).expect("result");
+    assert_eq!(result["stdout"], "hi\n", "{result}");
+    let child = result["id"].as_str().unwrap().to_string();
+    eventually("the request isolate's child ends", || {
+        !cluster.sessions().contains(&child)
+    })
+    .await;
+}
+
+/// A session isolate keeps its child across hibernation, `GetIsolate`
+/// lists it, and stopping the isolate ends the child.
+async fn check_session_child_vm(cluster: &Cluster) {
+    let started = cluster
+        .start_session_isolate("run")
+        .await
+        .expect("session isolate");
+    let id = started;
+    let mut request = vm_run_request("isolate", &["vm"], "");
+    request.session_id = id.clone();
+    let reply = cluster.run(request.clone()).await.expect("vm in session");
+    assert_eq!(reply.exit, Some(0), "{reply:?}");
+    let result: Value = serde_json::from_str(&reply.result).expect("result");
+    let child = result["id"].as_str().unwrap().to_string();
+    assert_eq!(children_of(cluster, "session", &id), vec![child.clone()]);
+    let isolate = cluster.supervisor.get_isolate(&id).await.expect("isolate");
+    assert!(
+        isolate.children.iter().any(|c| c.session_id == child),
+        "GetIsolate lists the child: {isolate:?}"
+    );
+    cluster.supervisor.hibernate(&id).await.expect("hibernate");
+    assert_eq!(
+        children_of(cluster, "session", &id),
+        vec![child.clone()],
+        "the child outlives hibernation"
+    );
+    assert!(cluster.supervisor.stop_session(&id, "test").await);
+    eventually("the session isolate's child ends", || {
+        !cluster.sessions().contains(&child)
+    })
+    .await;
+}
+
+/// `children.max` on the isolate task bounds one isolate's children.
+async fn check_children_max(cluster: &Cluster) {
+    let mut request = vm_run_request("isolate", &["vm"], "");
+    let started = cluster
+        .start_session_isolate("run")
+        .await
+        .expect("session isolate");
+    request.session_id = started.clone();
+    let first = cluster.run(request.clone()).await.expect("first child");
+    assert_eq!(first.exit, Some(0), "{first:?}");
+    let second = cluster.run(request).await.expect("second acquire");
+    assert_eq!(second.exit, Some(3), "the acquire is refused: {second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("acquire"),
+        "{second:?}"
+    );
+    cluster.supervisor.stop_session(&started, "test").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolates_own_child_vms() {
+    let cluster = vm_cluster("exec", "request", None).await;
+    check_request_child_vm(&cluster).await;
+    drop(cluster);
+    let cluster = vm_cluster("exec", "session", Some(1)).await;
+    check_session_child_vm(&cluster).await;
+    check_children_max(&cluster).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs /dev/kvm: a sandbox session run needs exec, which the Linux dev backend does not take (no guest agent)"]
+async fn isolates_own_sandbox_child_vms() {
+    let cluster = vm_cluster("sandbox", "request", None).await;
+    check_request_child_vm(&cluster).await;
+    drop(cluster);
+    let cluster = vm_cluster("sandbox", "session", Some(1)).await;
+    check_session_child_vm(&cluster).await;
+    check_children_max(&cluster).await;
 }

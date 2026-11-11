@@ -406,6 +406,8 @@ type Killer = Arc<dyn Fn() + Send + Sync>;
 struct FakeLauncher {
     next_pid: AtomicU32,
     hosts: Mutex<Vec<(HostSpawn, FakeHost, Killer)>>,
+    /// When set, each host gets a stand-in cgroup directory here.
+    cgroup_root: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl FakeLauncher {
@@ -477,12 +479,20 @@ impl HostLauncher for FakeLauncher {
             .lock()
             .unwrap()
             .push((spawn.clone(), host, kill.clone()));
+        let cgroup = self.cgroup_root.lock().unwrap().clone().map(|root| {
+            let leaf = root.join(format!("{}-{}", spawn.cordon, spawn.replica));
+            std::fs::create_dir_all(&leaf).unwrap();
+            if let Some(max) = spawn.memory_max_bytes {
+                std::fs::write(leaf.join("memory.max"), max.to_string()).unwrap();
+            }
+            leaf
+        });
         Ok(Launched {
             client,
             pid,
             exited,
             kill: Box::new(move || kill()),
-            cgroup: None,
+            cgroup,
         })
     }
 }
@@ -1452,4 +1462,40 @@ async fn a_drain_hibernates_only_the_covered_jobs_session_isolates() {
         .reclaim(ReclaimLevel::ReclaimHibernate, 0, Duration::ZERO, None, "")
         .await;
     assert!(!host_resident(&h, "run-b.1"), "pressure hibernates every idle session");
+}
+
+#[tokio::test]
+async fn the_host_cgroup_follows_envelope_resizes() {
+    let h = harness();
+    let root = h._dir.path().join("cgroups");
+    *h.launcher.cgroup_root.lock().unwrap() = Some(root.clone());
+    let task = || isolate_task("run", module_config("request"));
+    h.supervisor.sync(vec![envelope("ns/app", task(), 1024.0)]);
+    h.supervisor
+        .run(run_call("ns/app", "run", &[("main.wasm", "x")]), None)
+        .await
+        .unwrap();
+    let max = || std::fs::read_to_string(root.join("ns-0/memory.max")).unwrap();
+    assert_eq!(max(), (1024u64 << 20).to_string());
+    // The envelope grows: memory.max follows.
+    h.supervisor.sync(vec![envelope("ns/app", task(), 2048.0)]);
+    for _ in 0..100 {
+        if max() == (2048u64 << 20).to_string() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(max(), (2048u64 << 20).to_string());
+    // A second task in the cordon adds its envelope.
+    let mut other = envelope("ns/two", task(), 512.0);
+    other.allocation_id = 8;
+    h.supervisor
+        .sync(vec![envelope("ns/app", task(), 2048.0), other]);
+    for _ in 0..100 {
+        if max() == (2560u64 << 20).to_string() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(max(), (2560u64 << 20).to_string());
 }

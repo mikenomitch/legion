@@ -24,7 +24,12 @@
 Public doc: [docs/child-sessions.md](../../docs/child-sessions.md).
 
 Not built, and why: the isolate host's start path (§6.3, first row), which
-belongs to the isolate runtime and does not exist without it. No
+belongs to the isolate runtime and does not exist without it. *Update
+2026-11-11:* built with the [isolate runtime](isolate-runtime-plan.md):
+`vm.acquire()` starts a child of the VM task on the isolate's node, a
+session isolate owns it as `session`, and a request or tenant isolate
+under a new owner kind, `isolate`, that managers leave to the node
+([isolate calls entry 36](../calls/isolate-runtime-plan_calls.md#36-child-vms-of-an-isolate-are-owned-per-isolate-and-judged-by-its-node)). No
 throughput benchmark was run for Phase 4; the handoff uses the datapath's
 own copy, whose numbers are the datapath plan's.
 

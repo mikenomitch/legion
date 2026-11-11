@@ -128,7 +128,10 @@ sandboxes.
 - **Any isolation level.** Run plain processes with
   [`exec`](docs/task-runtime-exec.md), OCI images with
   [`container`](docs/task-runtime-container.md), or untrusted code in
-  microVMs with [`sandbox`](docs/task-runtime-sandbox.md). Need something
+  microVMs with [`sandbox`](docs/task-runtime-sandbox.md). Short snippets
+  and handlers run as WebAssembly isolates, many to a process, with
+  [`isolate`](docs/task-runtime-isolate.md), which sends the code that needs
+  a real machine to a microVM. Need something
   else? A [custom runtime](docs/task-runtime-plugins.md) is a Rust
   crate that implements one trait, and the
   [`noop` example](plugins/tasks/noop/src/lib.rs) is under 100 lines.
@@ -465,6 +468,7 @@ start:
   [Resource Enforcement](docs/resource-enforcement.md) ·
   [Devices and GPUs](docs/devices.md)
 - **Sandboxes:** [Sandbox Runtime](docs/task-runtime-sandbox.md) ·
+  [Isolate Runtime](docs/task-runtime-isolate.md) ·
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
   [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
   [Session Mode](docs/session-mode.md) ·

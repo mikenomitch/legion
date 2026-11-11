@@ -197,8 +197,9 @@ mod guest_logs_test {
         // The active file plus two generations, each at most one batch over
         // the cap.
         assert!(total < 3 * (4096 + MAX_LINE_BYTES as u64 + 128), "{total}");
-        let read = crate::worker::logs::read_allocation_logs(&logs.dir(7), "stdout", 0, 0, true)
-            .unwrap();
-        assert!(read[0].content.contains("[line cut at 16384 bytes]"));
+        // Every batch passed the cap, so each was rotated out at once.
+        let rotated = std::fs::read_to_string(logs.dir(7).join("stdout.log.1")).unwrap();
+        assert!(rotated.starts_with("[isolate inv-999] xxx"), "{}", &rotated[..40]);
+        assert!(rotated.ends_with(" [line cut at 16384 bytes]\n"));
     }
 }

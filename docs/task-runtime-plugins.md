@@ -24,7 +24,7 @@ tasks = {
 
 `runtime` is required on every task. The worker resolves it against its
 task-plugin registry. The value is either a built-in (`exec`, `container`,
-`sandbox`) or the directory name of a dynamic plugin under
+`sandbox`, `isolate`) or the directory name of a dynamic plugin under
 `plugins/tasks/<runtime>/` (such as the bundled `noop`). The
 `config` object is runtime-specific and is validated against that runtime's
 schema. `legion job schema` emits the live per-runtime schemas under
@@ -358,7 +358,7 @@ fn resize(
 `TaskPluginRegistry` behavior:
 
 - Caches plugins per `runtime`.
-- Loads built-ins for `exec`, `container`, and `sandbox` directly.
+- Loads built-ins for `exec`, `container`, `sandbox`, and `isolate` directly.
 - Loads other runtimes dynamically from plugin dir.
 
 Dynamic plugin requirements:
@@ -371,7 +371,7 @@ Dynamic plugin requirements:
 
 Worker task manager flow:
 
-1. Load built-ins at startup (`exec`, `container`, `sandbox`), and the
+1. Load built-ins at startup (`exec`, `container`, `sandbox`, `isolate`), and the
    bundled `noop` dylib if it is present.
 2. On allocation start:
    - resolve plugin by `task.runtime`
@@ -405,7 +405,14 @@ classes:
 | `exec` | Env only (no device cgroup) | — |
 | `container` | Device nodes, cgroup allow rules, mounts, hooks, env (Linux) | ✅ `config.runtimeClass` (Linux) |
 | `sandbox` | Refused at submit (no VFIO passthrough yet) | — |
+| `isolate` | Refused at submit (an isolate cannot use a device) | — |
 | `noop` and dylib runtimes | Env in `extra_env`; edits in `TaskInstance.devices` to apply or ignore | — |
+
+The `isolate` plugin only validates and normalizes its tasks: an isolate task
+is a session task whose units are never allocations, so its `start` and
+`stop` refuse. The worker's isolate supervisor runs its isolates against the
+task's envelope in a separate `legion-isolate` host process
+([isolate](task-runtime-isolate.md)).
 
 A dylib task runtime is **not** panic-contained yet (see
 [docs/plugin-system.md](plugin-system.md#panics-and-quarantine)): a panic in
@@ -416,4 +423,5 @@ See per-runtime docs:
 - `docs/task-runtime-exec.md`
 - `docs/task-runtime-container.md`
 - `docs/task-runtime-sandbox.md`
+- `docs/task-runtime-isolate.md`
 - `docs/task-runtime-noop.md`

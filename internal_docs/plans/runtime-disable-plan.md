@@ -22,7 +22,11 @@ What was built, and where it differs from the text below:
   written, nodes drain their sessions from the record (calls entry 4).
 - **§6.5 (a runtime reacting to its own disable) is not built**: it is the
   isolate runtime's behavior, and that runtime does not exist. The state it
-  needs is delivered: a worker's `RuntimeGate` holds the set.
+  needs is delivered: a worker's `RuntimeGate` holds the set. *Update
+  2026-11-11:* built with the [isolate runtime](isolate-runtime-plan.md)
+  ([isolate calls entry 31](../calls/isolate-runtime-plan_calls.md#31-disabling-the-isolate-runtime-the-node-decides-when-a-vm-can-take-the-run-and-a-drain-hibernates-only-what-it-covers)),
+  which also fixed the session-task match in the eval loop and
+  `RuntimeRunning`.
 - **§10's version-skew report is built** as `unawareNodes` in `status`.
 - **The public doc is its own page**, `docs/runtime-disable.md`, not a
   section of `docs/task-supervision.md`.
@@ -195,7 +199,7 @@ A runtime may react to a disable before refusing. The isolate runtime does:
 a `tier = "auto"` run of an isolate task with a VM task runs in the VM when
 the `isolate` runtime is disabled, decided before it starts like any tier
 choice. That is the runtime's own behavior, documented on its page; this
-plan only delivers the state.
+plan only delivers the state. (Built 2026-11-11.)
 
 ## 7. Proto, struct, config, and persistence changes
 

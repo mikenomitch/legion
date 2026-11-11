@@ -253,7 +253,10 @@ resources = { cpu = 500, memory = 512 },
 - `requireId`, `initialInstances`, `stateful.storage`, and `volumes`.
 - Ports, a `service`, `connect` upstreams, a network policy, or gated
   networking. The node's datapath serves allocations, and an unnamed
-  session has none. Give a sandbox its own `config.network`.
+  session has none. Give a sandbox its own `config.network`. An `isolate`
+  task is the exception: its ports, network policy, and `connect` are
+  bound for its envelope allocation, always gated, and only `service` is
+  refused ([isolate sessions](#isolate-sessions)).
 - `identities`. Workload identity for unnamed sessions is not available.
 - `speculativeStart`: a session already starts without a raft write.
 - `suspend` with a `reserve`: a session's room is its envelope share, and
@@ -996,12 +999,42 @@ and treat `complete = false` on a listing as "some sessions may be
 missing", not as "these are all of them". See
 [agent readiness](agent-readiness.md).
 
+## Isolate sessions
+
+A task of the [`isolate`](task-runtime-isolate.md) runtime is always a
+session task, and its units are WebAssembly isolates in the node's isolate
+host rather than session processes. Most of this page applies to its
+envelopes; what differs:
+
+- **Never indexed.** No isolate is in a manager's session index: `legion
+  instance list` does not show them, `complete` and `sessionCount` do not
+  count them, and starting one writes nothing. `legion isolate stats` shows
+  the per-node aggregates.
+- **Only `config.lifetime = "session"` tasks start sessions.** Their ids
+  carry the node tag, so `instance get`, `stop`, `suspend`, `start`,
+  `resize`, and `legion session run --session` reach them through the
+  [routing by id](#routing-by-id). An id derived from an idempotency key
+  has no tag and is found only with `--on-node` (`session run`, `isolate
+  get`). A start on a task of another lifetime is `FAILED_PRECONDITION`.
+- **No promotion,** and no `instance create --id`.
+- **The datapath rides the envelope.** An isolate task may declare
+  `network.ports`, an egress policy, and `connect` upstreams, which are
+  bound for its envelope allocation, gated; `network.mode` other than
+  `gated`/`auto`, `connect.templates`, and `service` are refused.
+- **`suspend`** applies to `lifetime = "session"` only, and an isolate
+  hibernates to its own checkpoint (its `state` map): `checkpoint`,
+  `checkpointEvery`, `archive`, `park`, `onResume`, and `wake` are refused,
+  and so is `durability = "store"`.
+- **The router reserves nothing** for an isolate run or start; the node
+  admits it against the envelope.
+
 ## Running code once
 
 A session task that declares a `run` block also takes **runs**: `legion
 session run` starts a fresh session, stages the caller's files, executes the
 task's command once, returns its output, and ends the session, in one call
-and with no raft write. See [Session Runs](session-runs.md).
+and with no raft write. An `isolate` task takes runs without a `run` block.
+See [Session Runs](session-runs.md).
 
 ## Sessions that own sessions
 

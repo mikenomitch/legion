@@ -600,6 +600,7 @@ purpose:
 | `pools.default` | The pool a task whose permit names none lands in, or a list of pools it may land in (`["legion-system", "default"]`, rendered as a `pool matches ^(…)$` permit). Each must be within `allowed`, and a pool name, not a glob |
 | `runtimes` | Allowed task runtimes, names or globs |
 | `hostVolumes` | Allowed host volumes (`driver = "host"`, by `params.name`), names or globs |
+| `isolateCordons` | The [isolate cordon](task-runtime-isolate.md#cordons-who-shares-a-process) kinds jobs may use: `"namespace"`, `"job"`, `"shared"` (exact names, no globs). Unset allows `namespace` and `job`; `shared`, which puts several namespaces' isolates in one host process, needs at least one governing policy that lists it |
 | `autoscale` | Autoscaling defaults for every task in the matching namespaces: the jobspec `autoscale` record without `checks`, overriding the cluster's scaling defaults field by field, and live ([autoscaling.md](autoscaling.md#overriding-the-defaults)). Its `min` must be a multiple of `count` of at least `"1x"` |
 
 For `pools.allowed`, `runtimes` and `hostVolumes`, **unset allows
@@ -623,7 +624,7 @@ work that was already admitted:
 
 | Moment | Checks |
 | --- | --- |
-| `job run`, `job plan`, `RunJobTemplate` | job rules, runtimes, pools, host volumes, quota (devices included), `maxJobs` |
+| `job run`, `job plan`, `RunJobTemplate` | job rules, runtimes, pools, host volumes, isolate cordons, quota (devices included), `maxJobs` |
 | `job validate` | job rules, when the caller can read the policies (`acl:read`); otherwise it warns that they were not checked |
 | `job scale` out | quota (scale-in is never refused) |
 | `instance create` (keyed, named sessions) | quota, for the new instances |

@@ -20,6 +20,12 @@
   exist either. The kinds and the `confined` flag are defined, and a
   confined recipe is refused by the in-process builder until Phase 2 brings
   one (calls entry 9).
+- **Update (2026-11-11):** the isolate runtime built the `cwasm` kind, with
+  a confined recipe run by `legion-isolate compile` and keyed by the
+  binary's `compatKey`
+  ([isolate calls entry 13](../calls/isolate-runtime-plan_calls.md#13-code-is-compiled-by-a-node-local-compiler-process-with-cranelift-only-x86-64-first-user-cwasm-is-never-loaded)).
+  `preinit-image` and `preinit-entry` still have no builder (isolate calls
+  entry 29), and `vm-base` still waits for prepared VMs.
 - **Where the build differs from the text below:** the root disk tests took
   five mechanical line edits rather than none (calls entry 12); the cache
   needs the content store to be enabled (calls entry 7); §6.5's "existing

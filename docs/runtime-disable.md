@@ -193,6 +193,27 @@ Tasks of one group place together on one node, so a task that shares a
 [group](jobs-tasks-and-scheduling.md) with a task on a disabled runtime
 waits with it. Tasks of a job share one group unless they set `group`.
 
+### The `isolate` runtime
+
+Disabling `isolate` is the response to an engine advisory
+([isolate](task-runtime-isolate.md#engine-pinning-and-the-cve-response)).
+An isolate task's envelope is not placed on the `isolate` runtime, so it
+keeps placing; what stops is the isolates:
+
+| Path | Effect |
+| --- | --- |
+| A run with `tier = "auto"` (the default) on a task with a VM task | Runs in the VM instead, with `tierReason` `auto: the isolate runtime is disabled` |
+| A run with `tier = "isolate"`, or any run on a task without a VM task | Refused, `UNAVAILABLE` / `RUNTIME_DISABLED` (by the manager when it can tell up front) |
+| A run with `tier = "vm"` | Runs as usual |
+| Starting a session isolate | Refused by the manager |
+| HTTP requests to an isolate task's ports | `503` |
+| `--drain` | Hibernates the covered jobs' session isolates; they keep their `state` and wake on their next call once the runtime is enabled. Request and tenant isolates are not touched |
+
+`operator runtime status` counts no sessions for `isolate`, since no
+manager records isolates; `legion isolate stats` has the numbers. A submit
+of a job with an isolate task still warns `[runtime-disabled]`, even when its
+`auto` runs go to the VM.
+
 ## How workers learn
 
 Managers send the whole set of disables on every heartbeat reply, and push

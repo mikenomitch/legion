@@ -56,6 +56,11 @@ Plans, roadmaps, to-do lists, and development notes live in
   layer ownership, stdio, and the per-node image cache.
 - [Task Runtime: sandbox](task-runtime-sandbox.md): OCI images in microVMs for
   untrusted code and agent workspaces.
+- [Task Runtime: isolate](task-runtime-isolate.md): WebAssembly isolates
+  (Python, JavaScript, or your own component) in a confined, multi-tenant
+  host process per cordon, with a microVM tier for code that needs a real
+  machine: lifetimes, runs and tiers, the guest's world, the security model,
+  and operating the host.
 - [Task Runtime: noop](task-runtime-noop.md)
 - [Resource Enforcement](resource-enforcement.md): enforcing declared `memory`,
   `cores`, and `cpu` on Linux with hard memory limits, exclusive pinned

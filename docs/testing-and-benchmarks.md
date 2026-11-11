@@ -145,6 +145,41 @@ holds `crate::support::DYNAMIC_PORT_GATE`.
     failover. They are here, not beside the worker code, because the worker
     crate cannot see the manager.
 
+### The isolate runtime's tests
+
+The [isolate runtime](task-runtime-isolate.md) has tests in three places:
+
+- **`crates/isolate/tests/`**, the `legion-isolate` crate's own:
+  `run.rs`, `lifetimes.rs`, `admission.rs`, and `http.rs` drive an
+  in-process host with a fake worker; `scratch.rs` runs a real wasi-libc
+  guest against the in-memory filesystem; `binary.rs` starts the real
+  binary on socketpairs as a worker would; `escape_corpus.rs` is the
+  guest-escape regression corpus, run against every memory layout the
+  machine supports and meant to be rerun on every engine upgrade.
+  The guests are Rust crates under `tests/guests/` (not workspace members,
+  built for `wasm32-wasip2` by `tests/guests/build.sh`), and the built
+  components are checked in as `tests/fixtures/*.wasm`, since CI has no wasm
+  target. Rebuild them after changing a guest.
+- **Confinement** tests in `binary.rs` need the binary built with a
+  test-only hook: `cargo test -p legion-isolate --features
+  confinement-test`. Without the feature they are ignored.
+- **Image tests** (`crates/isolate/tests/images.rs`) need the built images
+  and are all ignored, since CI does not build them:
+  `crates/isolate/images/build.sh`, then `cargo test -p legion-isolate
+  --test images -- --ignored`. `LEGION_ISOLATE_IMAGES` names another images
+  directory.
+- **`tests/integration/`**: `isolate::` (the worker's supervisor driving the
+  real binary; it takes `LEGION_ISOLATE_BINARY`, else builds it with
+  `cargo build -p legion-isolate`, and fails rather than skips without it;
+  its VM-tier tests need `/dev/kvm` and are ignored),
+  `isolate_control::` (the manager's half against fake nodes), and
+  `isolate_images::` (the images through the whole stack; ignored, needs
+  the built images).
+
+`cargo bench -p legion-isolate --bench isolate_bench` measures a fresh
+instance per call, a call on a warm runner, and a call whose guest awaits
+the worker.
+
 ## Running Tests
 
 Primary command:

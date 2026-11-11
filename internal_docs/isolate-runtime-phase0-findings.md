@@ -4,7 +4,10 @@
 > **Status:** partial. These are measurements from a 4-vCPU Firecracker guest,
 > not from the AWS rig the plan names. The AWS run (nested and metal instance
 > types, 16 vCPU / 64 GiB, 4-level and 5-level paging) is still open, and §4 and
-> §10 of the plan have not been rewritten from these numbers.
+> §10 of the plan have not been rewritten from these numbers. *2026-11-11:* the
+> runtime was built on these findings (items 7, 8, 12 and 13 changed the design:
+> [calls entries 7, 9, 21, 22](calls/isolate-runtime-plan_calls.md)); §4 and §10
+> now carry these and the shipped images' container numbers beside the targets.
 
 ## Environment
 

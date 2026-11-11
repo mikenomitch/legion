@@ -211,6 +211,15 @@ message Confinement {
   bool seccomp = 5;
   // Human-readable notes for layers that did not apply (best-effort mode).
   repeated string notes = 6;
+  // The process runs in its own mount namespace with a root that holds
+  // only the read-only artifact directories.
+  bool mount_root = 7;
+  // The host is PID 1 of its own PID namespace: no process outside it can
+  // be named.
+  bool pid_namespace = 8;
+  // Landlock scopes signals and abstract Unix sockets to the host's own
+  // domain (kernels with Landlock ABI 6 or later).
+  bool landlock_scopes = 9;
 }
 
 message LoadModuleRequest {

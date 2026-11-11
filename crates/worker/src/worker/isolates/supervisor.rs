@@ -379,6 +379,9 @@ impl IsolateSupervisor {
         let mut prepare = Vec::new();
         let mut reconfigure = Vec::new();
         let mut removed = Vec::new();
+        // Cordons whose envelopes grew or shrank: their hosts' cgroup
+        // `memory.max` follows (a new or departed task changes it too).
+        let mut resized: Vec<String> = Vec::new();
         {
             let mut state = lock(&self.state);
             let mut seen = std::collections::HashSet::new();
@@ -391,6 +394,11 @@ impl IsolateSupervisor {
                 let envelope_memory_mib = envelope.room.get("memory").copied().unwrap_or(0.0);
                 if let Some(entry) = state.tasks.get_mut(&key) {
                     entry.envelope_allocation_id = envelope.allocation_id;
+                    if entry.envelope_memory_mib != envelope_memory_mib
+                        && !resized.contains(&entry.cordon)
+                    {
+                        resized.push(entry.cordon.clone());
+                    }
                     entry.envelope_memory_mib = envelope_memory_mib;
                     if entry.fingerprint != fingerprint {
                         match build_entry(&envelope.job_id, task, room, &self.images) {
@@ -465,6 +473,9 @@ impl IsolateSupervisor {
                     }
                 };
                 let failed = matches!(&*entry.readiness.borrow(), Readiness::Failed(_));
+                if !resized.contains(&entry.cordon) {
+                    resized.push(entry.cordon.clone());
+                }
                 state.tasks.insert(key.clone(), entry);
                 if !failed {
                     prepare.push(key);
@@ -478,11 +489,15 @@ impl IsolateSupervisor {
                 .collect();
             for key in gone {
                 if let Some(entry) = state.tasks.remove(&key) {
+                    if !resized.contains(&entry.cordon) {
+                        resized.push(entry.cordon.clone());
+                    }
                     removed.push((key, entry.cordon));
                 }
             }
         }
-        if prepare.is_empty() && reconfigure.is_empty() && removed.is_empty() {
+        if prepare.is_empty() && reconfigure.is_empty() && removed.is_empty() && resized.is_empty()
+        {
             return;
         }
         let me = self.arc();
@@ -497,6 +512,9 @@ impl IsolateSupervisor {
             }
             for (key, cordon) in removed {
                 me.remove_task(key, &cordon).await;
+            }
+            for cordon in resized {
+                me.resize_cordon_cgroups(&cordon).await;
             }
         });
         if !spawned {
@@ -763,6 +781,34 @@ impl IsolateSupervisor {
         // does, and memory.max is a ceiling, not a reservation.
         let _ = replicas;
         (mib > 0.0).then_some((mib * 1024.0 * 1024.0) as u64)
+    }
+
+    /// Set each live replica's cgroup `memory.max` to the cordon's envelope
+    /// sum now (an envelope grew or shrank, a task came or went). Hosts
+    /// without a cgroup (enforcement off) are skipped; a failed write is
+    /// logged and the old ceiling stays.
+    async fn resize_cordon_cgroups(&self, cordon: &str) {
+        let Some(bytes) = self.cordon_memory_bytes(cordon) else {
+            return;
+        };
+        for replica in self.replicas(cordon) {
+            let Some(cgroup) = replica.conn().and_then(|conn| conn.cgroup.clone()) else {
+                continue;
+            };
+            let path = cgroup.join("memory.max");
+            let written =
+                tokio::task::spawn_blocking(move || std::fs::write(&path, bytes.to_string()))
+                    .await;
+            match written {
+                Ok(Ok(())) => {
+                    debug!(%cordon, replica = replica.index, bytes, "Isolate host memory.max follows its envelopes")
+                }
+                Ok(Err(err)) => {
+                    warn!(%cordon, replica = replica.index, error = %err, "Could not resize the isolate host's cgroup")
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Start one replica's host process and handshake with it.

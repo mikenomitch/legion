@@ -2,13 +2,75 @@
 
 > **Judgement calls:** [isolate-runtime-plan_calls.md](../calls/isolate-runtime-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-28; burst redesigned the same day
-after review: each run happens in one place, chosen before it starts; a
+**Status: IN EXECUTION** (written 2026-10-28; burst redesigned the same
+day after review: each run happens in one place, chosen before it starts; a
 session's address is always its isolate; the VM is a declared sibling task
 reached as a child session; isolates use `memory`/`memoryMax` like every
-runtime. See calls entries 5 to 7 and 17. On 2026-11-07, everything that was
-not isolate-specific moved into shared plans, calls entry 8). Nothing here
-is built.
+runtime. See calls entries 6, 12, 23 and 17. On 2026-11-07, everything that
+was not isolate-specific moved into shared plans, calls entry 18. Phases 1
+to 5 built 2026-11-11.) Public page:
+[docs/task-runtime-isolate.md](../../docs/task-runtime-isolate.md). Phase 0
+findings: [isolate-runtime-phase0-findings.md](../isolate-runtime-phase0-findings.md).
+
+What is built, by phase (each difference from the text below is a calls
+entry, and the affected section carries a dated **As built** note):
+
+- **Phase 0: container measurements only.** A spike on a 4-vCPU Firecracker
+  guest measured start, idle memory, slots per layout, epoch and fuel
+  overhead, fiber against stackless waits, binary size, and compile times.
+  The AWS run (nested and metal, 16 vCPU / 64 GiB, 5-level paging) has not
+  happened; §4 and §10 keep their targets, with the container numbers beside
+  them.
+- **Phases 1 to 5: built, with deviations.** `legion-isolate` (`host`,
+  `compile`, `engine-info`); one host per cordon replica per node with
+  shards, the pooling allocator, epoch preemption, limits, admission, and
+  self-confinement (all five layers); request, tenant, and session
+  lifetimes; the `js` and `python` images; session runs on isolate tasks
+  with `tier`, the pre-flight check, the memo, `nextTier`, and
+  `--fallback vm`; HTTP ingress and egress through the envelope's
+  datapath; child VMs through `legion:isolate/vm`; hibernation and
+  page-out; guest output in the task's log stream; `legion isolate stats` and `get`; the runtime-disable
+  reaction; session-isolate resize. The deviations: fibers for every guest
+  and no WASI 0.3 world (calls 7); hibernation keeps the `state` map, not
+  memory (calls 9); paging is kernel reclaim on the host's cgroup (calls
+  21); Legion's own in-memory `wasi:filesystem` (calls 22); a gRPC host
+  protocol with an `Origin` per request instead of PROXY v2 (calls 10);
+  a supervisor instead of per-session claims (calls 5); the envelope
+  allocation carries the datapath (calls 19); `limits.output` truncates
+  (calls 46); reuse needs the `runner` export (calls 28); new `args`,
+  `tenant`, `session_id` fields (calls 27); `entry` is not pre-initialized
+  (calls 29); a JS entry is a script (calls 35).
+- **Phase 6: mostly not built.** The `mpk` and `small` slot layouts exist as
+  worker config (`isolate.layout`) and were measured for slot counts only;
+  nothing else in Phase 6 is built (`cordonBoundary = "vm"` is refused at
+  worker start).
+- **Phases 7 and 8: untouched.**
+
+Deferred, deliberately not built in this round:
+
+- the AWS Phase 0 run and the density campaign (§12);
+- memory-image hibernation (no engine API; calls 9) and the stackless
+  WASI 0.3 world (the engine keeps a stack per store; calls 7);
+- `suspend.durability = "store"` for session isolates (calls 44), so no
+  durable named isolate (calls 24); host-held connections and WebSockets
+  across hibernation (calls 20); gateway wake for session isolates;
+- connection handoff from an isolate (calls 23); the VM task sharing a
+  `connect` block, which needs a gated datapath for sandbox sessions
+  (calls 50); prepared VMs (sandbox-scaling Phase 8);
+- stage-time pre-initialization of `entry` (calls 29); dynamic Wasm
+  modules sent as runs; ES modules in `js` (calls 35); Python packages
+  beyond the standard library and curated images (calls 33); `js-small`
+  (QuickJS, measured 5× smaller idle, calls 32); streaming HTTP bodies
+  (calls 38);
+- `cordonBoundary = "vm"`, MPK as a soaked default, SELinux `execmem`,
+  perf-counter quarantine, Spectre-mode knobs, 5-level paging (Phase 6);
+- replica rebalancing and shrinking, shard rebalancing (calls 26, 39);
+  the host cgroup following envelope resizes, and `cpu.weight` (calls 21);
+- per-job metric labels (calls 55); invocation-level idempotency in the
+  host (calls 53);
+- fuzz targets (§12); KVM runs of the VM-tier tests; aarch64; shipping
+  `legion-isolate` and the images in a release, and reproducible image
+  builds (calls 59).
 
 This plan adds a second, much lighter tier to Legion's sandboxing. Code runs
 first as an **isolate**: a WebAssembly instance inside a shared,
@@ -35,7 +97,7 @@ measured trigger), moving a running isolate's continuation into a VM
 (child-sessions plan, Phase 3), envelopes shared by many small jobs,
 isolates in the managers' session index, wasm threads, and GPU access from
 either tier. Dropped on review: Legion re-running a stopped run in a VM on
-its own (calls entry 5).
+its own (calls entry 6).
 
 Companion plans: what this runtime needs that is not isolate-specific is
 planned as shared primitives, and §6.14 shows how they compose:
@@ -57,7 +119,7 @@ Relationship to other plans: this executes, and replaces the shape of,
 2, many sessions per VM", a seam with no runtime behind it), and it is the
 plan the open TODO item "A **WASM** runtime" asks for. It keeps
 [mesh-interfaces-plan_calls.md entry 22](../calls/mesh-interfaces-plan_calls.md#22-the-plugin-engine-is-wasmi-an-interpreter-not-wasmtime)
-(network plugins stay on wasmi) and explains in its own calls entry 4 why
+(network plugins stay on wasmi) and explains in its own calls entry 3 why
 the isolate host is the case that entry said would overturn it, and why the
 worker binary still does not grow.
 
@@ -437,13 +499,35 @@ not individually inspectable in the UI, in this plan).
 All numbers above are targets that Phase 0 replaces with measurements. A
 target Phase 0 shows to be wrong is rewritten here with a calls entry.
 
+**As built (2026-11-11): container measurements beside the targets.** The
+AWS run that would replace these targets has not happened, so they stand.
+What a 4-vCPU Firecracker guest container measured (noisy, shared;
+[findings](../isolate-runtime-phase0-findings.md) and
+`crates/isolate/images/README.md`), labelled as such:
+
+| Target | Container measurement | Verdict here |
+| --- | --- | --- |
+| G1: component instantiate ≤ 20 µs p50, ≤ 100 µs p99 | 5.0 / 9.8 µs from `InstancePre`; full store cycle 8.1 / 22.7 µs | met |
+| G1: JS pre-initialized script ≤ 300 µs | not measured: `entry` is not pre-initialized (calls 29); a fresh `js` hello world is 1.14 ms p50 (2.00 ms p99), warm 107 µs | open |
+| G1: JS dynamic 10 KB ≤ 1 ms p50 | 2.86 ms for a ~12 KB snippet in the shipped image (1.75 ms for 10 KB in the spike) | missed |
+| G1: Python small snippet ≤ 5 ms p50 | hello world 2.55 ms (5.99 ms p99), warm 171 µs; a ~12 KB snippet 12.0 ms | met for small snippets only |
+| G2: ≥ 4,000 small / ≥ 500 JS isolates per GiB idle | Rust component 33.8 KiB idle (~31,000 per GiB); `js` 767 KiB (~1,300 per GiB); `python` 1,519 KiB (~690 per GiB) | met for RAM; slots and stacks bind first |
+| G2: ≥ 10^5 resident per 64 GiB host, ≥ 10^6 hibernated | 21,870 guard-page slots per process (so ≥ 5 hosts per node), 328,842 with MPK and a raised `vm.max_map_count`; no density campaign | not measured |
+| G3: waiting holds no stack; switch ≤ 1 µs | fiber suspend/resume 480 ns; a store keeps a stack after any async call on either ABI (calls 7) | switch met; "no stack" not achievable on wasmtime 50 |
+| G5: VM run ≤ 250 ms cold | not measured (no `/dev/kvm`) | open |
+| G6: no network, no writable filesystem, no new code | network namespace with a down loopback; in-memory scratch only; anonymous `PROT_EXEC` not denied without an LSM (calls 14) | met except "no new code" |
+| G7, G8, G9 | as designed | met |
+
+End-to-end timings through the manager are not in this table: they had not
+been measured when it was written.
+
 ### Non-goals
 
 - **Running arbitrary Linux binaries in an isolate.** That is what the
   VM tier is for. Isolates run Wasm.
 - **Legion re-running a run, or moving one between tiers, on its own.** A
   caller may rerun; Legion reports what happened and which tier to use next
-  (calls entry 5).
+  (calls entry 6).
 - **POSIX compatibility in the isolate tier.** No `fork`, no processes, no
   raw sockets, no persistent filesystem. WASIX-style POSIX emulation is
   rejected (§6.9).
@@ -457,7 +541,7 @@ target Phase 0 shows to be wrong is rewritten here with a calls entry.
   answer for their own isolates; the UI shows aggregates.
 - **Promoting an isolate session to a keyed instance.** A keyed instance is
   an allocation each; durable named isolates use derived ids and
-  `durability = "store"` instead (§8, calls entry 10).
+  `durability = "store"` instead (§8, calls entry 24).
 - **Wasm threads and shared memory.** They are a high-resolution timer and
   a scheduling hazard (§6.10).
 - **GPU access** from either tier.
@@ -680,6 +764,15 @@ real packages. Legion's target (≤ 5 ms) holds only for the standard
 library plus small snippets; anything heavy is routed to a VM by the
 pre-flight check, and the public doc says so.
 
+**As built (2026-11-11).** `js` is StarlingMonkey via componentize-js
+0.23.0 without weval (calls entry 32); `python` is CPython 3.14 via
+componentize-py 0.25.1 with the whole standard library in a compressed
+blob and no packages (calls entries 33, 34). Rule 2 is built for both
+images (calls entries 35, 51). Rule 1 is half built: the image manifest
+pins each built artifact's sha256 and a job can pin `name@sha256:<hex>`,
+but builds are not reproducible and no release ships images yet (calls
+entry 59).
+
 ### 6.3 Process and thread model
 
 Three questions: whether isolates run in the worker process, how tenants
@@ -739,6 +832,12 @@ a shard (it is a different process, §6.5), and the first touch of a newly
 mapped compiled module is prefetched off the shard before the module is
 marked ready.
 
+**As built (2026-11-11).** Option C with pinned shards, but without the
+rebalancers: holders stay on the shard they started on and the shard count
+is fixed at host start (calls entry 26), and a cordon's replicas only grow,
+with each task's budget split evenly between them (calls entry 39). The
+worker clamps a host's slots to what `vm.max_map_count` allows.
+
 ### 6.4 Memory layout
 
 Each isolate's linear memory is a slot in wasmtime's pooling allocator.
@@ -779,6 +878,14 @@ mean a module's initial memory, including a pre-initialized JS heap, is
 mapped from the compiled artifact and shared by every instance until
 written. An idle isolate's cost is its *private* pages: what it wrote.
 
+**As built (2026-11-11).** Guard pages are the default; `mpk` and `small`
+exist as the worker-wide `isolate.layout`, not per cordon, and are not
+soaked (calls entry 15). Measured in a container: 21,870 guard-page slots
+per process, 328,842 with MPK (`vm.max_map_count` raised), 702,500 small
+reservations; live instances cost about 8 mappings each, so the default
+`vm.max_map_count` allows about 8,000 per process, and the worker clamps
+`slotsPerHost` (default 10,000) to it (calls entry 39).
+
 ### 6.5 The start path and compilation
 
 What happens between "run this" and the guest's first instruction,
@@ -813,6 +920,14 @@ twice:
    and the shared restore-hygiene test (§12) holds it to the same rule as
    VM forks and prepared VMs.
 
+**As built (2026-11-11):** only step 1 exists. `entry` arrives through the
+task's `artifacts` and is staged into the run directory and executed on
+every fresh instance; nothing is pre-initialized at stage time, because
+re-snapshotting an image needs its componentize toolchain on the node
+(calls entry 29). Dynamic source is sent as a run's files (`main.<ext>`,
+else the first file), not a `source` field. The images reseed what their
+snapshot froze on each instance's first run (calls entry 48).
+
 **Where compilation runs.** wasmtime splits cleanly: a runtime-only build
 that loads precompiled `.cwasm` artifacts adds 1.2 to 2.1 MB; Cranelift is
 the rest of the default 19 MB
@@ -839,6 +954,14 @@ arbitrary code execution, so the artifact is a trust boundary.
 The two critical aarch64 escapes of April 2026 and the maintainers' note
 that OSS-Fuzz has no aarch64 runners make x86-64 the first supported host
 architecture; aarch64 follows when continuous fuzzing covers it (§6.10).
+
+**As built (2026-11-11):** the compiler process is built as the first row
+of the table, with Cranelift only, x86-64 Linux only, and artifacts as
+derived content of kind `cwasm` keyed by the module digest and the
+binary's `compatKey`; it refuses core modules and unprovided imports by
+name (calls entry 13). Measured compiles: StarlingMonkey 12 MB in 3.3 s
+and CPython 18 MB in 2.5 s on 4 threads; Cranelift adds 13.7 MiB to the
+binary, not ~19 MB.
 
 ### 6.6 Waiting without holding anything
 
@@ -879,6 +1002,17 @@ uninterruptible stretch.
 **Fairness across tenants** is deficit round robin per shard, keyed by
 (job, tenant key), weighted by the job's envelope CPU, so one tenant with
 10,000 runnable isolates gets the same share as one with ten.
+
+**As built (2026-11-11): fibers for every guest, no stackless world.**
+Phase 0 measured that on wasmtime 50.0.1 every `Store` that has run an
+async call keeps a fiber stack until it is dropped, on the callback ABI
+too, and that an await costs 1.8 µs on the callback ABI against 0.48 µs on
+a fiber. So the "take as the target" row above buys nothing on this engine:
+the host runs every guest with `call_async` on 128 KiB fibers, built
+without `concurrency_support`, and the guest world is WASI 0.2 only
+(calls entry 7, reversing entry 8). A waiting isolate holds a stack and its
+slot, and hibernates only between calls. Epochs measured +14 to +25% on
+call-heavy code, not ~10% (calls entry 25).
 
 ### 6.7 Ceding memory: four resident tiers
 
@@ -926,6 +1060,20 @@ how long the isolate has been idle (or waiting):
   zram, or swap, `MADV_PAGEOUT` does nothing for anonymous pages and the
   paged-out tier collapses into hot. The public doc says so and the worker
   reports it.
+
+**As built (2026-11-11).** The tiers exist with different mechanisms.
+*Hibernated* is a state checkpoint: the isolate's `legion:isolate/state`
+map and session metadata, not its pages; it wakes into a fresh instance
+with `control.info().resumed = true`, because the engine's only way to read
+a component's memories (`guest_debug`) costs 320 µs per instantiation and
+2× run time (calls entry 9). *Paged out* is the worker asking the host which
+idle instances are cold and then asking the kernel to reclaim that many
+bytes from the host's cgroup (`memory.reclaim`, cgroup v2 with swap or
+zswap); the host does no `madvise`, and the worker logs once where the node
+cannot page (calls entry 21). Hibernation happens only with no call in
+flight (calls entry 7). Not built: host-held connections across
+hibernation, `durability = "store"` (calls entry 44), and gateway wake.
+Park is the guest's `control.park()`, not the `suspend.park` block.
 
 ### 6.8 Instance lifetime
 
@@ -975,6 +1123,21 @@ cannot reach a destination its job's policy does not allow.
 isolates, and every syscall it emulates is host attack surface and a
 reason an isolate never bursts when it should. Code that needs POSIX gets a
 VM, which already is POSIX.
+
+**As built (2026-11-11).** The worker does egress as taken, but the hop is
+not PROXY v2 over HTTP/2: the host speaks gRPC (`proto/isolate_host.proto`)
+over two inherited socketpairs, and every request carries an `Origin` the
+worker checks against the host's cordon; per-isolate attribution is in
+debug log fields, and denials name the task (calls entry 10). The worker
+dials the envelope allocation's own datapath sockets for egress and
+originates TLS (calls entries 19, 37). The in-memory filesystem is Legion's
+own `wasi:filesystem` (wasmtime-wasi 50 has none; calls entry 22).
+Guest stdout/stderr from handler and session isolates go to the envelope
+allocation's task log, one batch per invocation when it ends, each line
+prefixed with the isolate id and tenant (the log format has no fields;
+calls entry 54). Inbound HTTP
+goes through a node-local Unix socket per port, bodies buffered (calls
+entry 38).
 
 ### 6.10 Security model and defense in depth
 
@@ -1054,6 +1217,15 @@ reaches only data in that cordon, never a credential, and that an
 operator decides who shares a cordon. The public doc must say this in
 those words.
 
+**As built (2026-11-11).** Layers 1 to 7 are built, layer 7 as the host
+confining itself before any thread (`isolate.confine = "enforce"` by
+default; calls entry 14); its network namespace holds an unconfigured
+loopback that is down, not nothing. Layer 8's "no compiler in the host" is
+built; denying anonymous executable memory (SELinux `execmem`) is not.
+Layers 9 (`cordonBoundary = "vm"`, refused at worker start) and 10
+(quarantine) are not built. Layer 11's engine is pinned (`=50.0.1`) in its
+own binary.
+
 ### 6.11 Limits and accounting
 
 **Memory is the same two numbers as every other runtime.** An isolate does
@@ -1079,7 +1251,7 @@ not get a parallel pair of fields (calls entry 17):
 - **Per invocation, time and output:** `config.limits.cpu` (turn CPU summed,
   checked at every yield), `limits.wall`, and `limits.output`. These are
   budgets, not reservations, so they live in `config`. `cpu` and `wall`
-  are required (calls entry 21). A run stopped by one is reported in its
+  are required (calls entry 45). A run stopped by one is reported in its
   reply (`stopped.reason = "limits"`, naming the limit), with
   `nextTier = "vm"` when the task has a VM task.
 - **Per job on a node:** the envelope. `resources.cpu` is the isolate's
@@ -1093,6 +1265,17 @@ not get a parallel pair of fields (calls entry 17):
 - **Resizing a running isolate** is [resize](resize-plan.md)'s Phase 1: a
   session isolate's reservation is re-admitted against its envelope and its
   ceiling is a limiter change, up to the cordon's slot size. No raft.
+
+**As built (2026-11-11).** `limits.output` truncates (the reply says
+`truncated`) rather than stopping the run, as `run.output` does for session
+runs; `cpu`, `wall`, and memory stop it (calls entry 46). `memoryMax` caps
+linear memory plus scratch file bytes (calls entry 22). `max_active` is the
+envelope's CPU over the task's CPU weight and `max_resident` its memory over
+the reservation, enforced by the host per invocation (calls entry 40). A
+session resize changes `memory` and `memoryMax` live; `cpu` answers
+`not_supported` (it is the task's weight). The host cgroup's `memory.max`
+is set once and does not follow envelope resizes, and no `cpu.weight` is
+set (calls entry 21).
 
 **Accounting at burst: nothing changes size, a second unit appears.**
 Because a VM, whether a VM run's or an isolate's child, is a session of its
@@ -1119,7 +1302,7 @@ a running invocation between tiers and never runs one twice on its own.
 
 The first draft of this plan had Legion replay a failed run in a VM when
 the run had not yet made an outbound request. Review found it confusing,
-and it was dropped (calls entry 5): whether a snippet burst or failed
+and it was dropped (calls entry 6): whether a snippet burst or failed
 depended on the order of two lines, one call could run in two different
 Pythons, and the invocation's size changed mid-flight.
 
@@ -1248,6 +1431,19 @@ In three steps that each ship alone:
 - **VM runs are slow until warm starts exist:** a cold boot per run until
   scaling Phase 8 lands.
 
+**As built (2026-11-11).** Both paths are built as described, decided
+node-side (calls entry 6). Differences: the VM tier exists only when the
+task has a `config.vm` block (`vm = {}` takes the default task; calls
+entry 12); a run's `args` are appended to the VM task's `run.command`
+(calls entry 27); `--fallback vm` is refused with `--session` and
+`--dry-run`; and a request or tenant isolate owns its children under a new
+owner kind, `isolate` (calls entry 36). The shared `connect` binding does
+not validate yet, because sandbox session tasks still refuse `connect`
+(calls entry 50), and a suspended child is not resumed through its handle
+(calls entry 52). Nothing here has run against a real VM: the container it
+was built in has no `/dev/kvm`, and connection handoff from an isolate and
+prepared VMs are not built.
+
 ### 6.13 Observability
 
 Per task, never per isolate, on the existing metric families' pattern:
@@ -1259,6 +1455,11 @@ Per task, never per isolate, on the existing metric families' pattern:
 and per cordon `legion_isolate_host_rss_bytes` and slot occupancy. One
 log line per VM run and per stopped run; none per invocation by
 default.
+
+**As built (2026-11-11):** the families exist on the worker without `job`
+or `task` labels (per-task numbers are on the heartbeat and in `legion
+isolate stats`), the CPU counter is `legion_isolate_cpu_microseconds_total`,
+and slot occupancy is `legion_isolate_slots` (calls entry 55).
 
 ### 6.14 What composes
 
@@ -1401,6 +1602,26 @@ without a TCP hop:
 network = { ports = [{ name = "http" }] },
 ```
 
+**As built (2026-11-11).** The jobspec is as above with these differences
+(the working example is `configs/jobs/isolate.ncl`, every field is in
+`configs/jobs/maximal.ncl`):
+
+- `entry` names a file delivered by the task's `artifacts`
+  (`${artifact.<name>}` or a relative path) and is not pre-initialized
+  (calls entry 29); a JS entry is a script, not an ES module (calls entry
+  35).
+- The VM tier needs an explicit `vm` block; `vm.task` defaults to the only
+  entry of `children.tasks` inside it (calls entry 12).
+- `config.env` exists; unknown fields are refused (calls entry 58).
+- `connect = net` on the `machine` task does not validate: sandbox session
+  tasks still refuse `connect`, so the demo VM tasks use `network = { mode =
+  "none" }` (calls entry 50). The isolate task's own `connect` and
+  `network.ports` ride its envelope; `service` is refused (calls entry 19).
+- `suspend` applies only with `lifetime = "session"`, and
+  `durability = "store"` is refused at submit (calls entry 44).
+- `memory` defaults to 1 MiB for `js` and modules and 2 MiB for `python`;
+  `cpu` to 10 (calls entry 17).
+
 ### 7.2 The CLI
 
 Runs use the [session-runs plan](session-runs-plan.md)'s verb; the isolate
@@ -1450,6 +1671,16 @@ client's second request, never the server's. Child VMs are sessions of the
 VM task, so `legion session get <isolate session>` lists them and `legion
 session exec <child>` reaches one.
 
+**As built (2026-11-11).** `legion session run` gained `--tier
+auto|isolate|vm`, `--tenant KEY`, `--session ID`, `--arg ARG` (repeatable),
+and `--fallback vm` (calls entries 6, 27); its JSON adds `tier`,
+`tierReason`, `nextTier`, `vmMs`, `isolateStart`, and `ranTwice` only on
+isolate replies, with fractional `cpuMs`/`wallMs`, and it exits 124 for a
+wall stop and 125 for any other stop (calls entry 57). `legion isolate
+stats <JOB> [--task T]` and `legion isolate get <SESSION_ID> [--on-node N]`
+exist (calls entries 30, 56); child VMs of a session isolate are listed by
+`isolate get`.
+
 ### 7.3 The RPCs
 
 - **`Manager.RunSession` and `Worker.RunSession`** from the
@@ -1462,6 +1693,16 @@ session exec <child>` reaches one.
 - The kill switch is the [runtime-disable plan](runtime-disable-plan.md)'s
   `legion operator runtime disable isolate`; an isolate task reacts to it as
   §13 describes.
+
+**As built (2026-11-11).** `RunSessionRequest` also gained `tenant`,
+`session_id`, and `args` (calls entry 27), and the reply `cpu_micros`,
+`wall_micros`, and `isolate_start`; `RunStop` reasons `limits`,
+`unsupported`, `trap`, and `ended`, with `limit` `cpu|wall|memory|output`;
+`RunDryRun` gained `tier`, `tier_reason`, `imports`, and `missing_imports`.
+The stats are `Manager.GetIsolateStats` and `Worker.GetIsolateStats`, and
+`Manager.GetIsolate` / `Worker.GetIsolate` answer `legion isolate get`;
+the heartbeat carries `isolate_tasks` and `isolate_hosts`. The node-local
+worker↔host protocol is `proto/isolate_host.proto` (calls entry 10).
 
 ### 7.4 The guest's world
 
@@ -1513,6 +1754,18 @@ world handler {
 The same world exists in its WASI 0.3 form (async functions on the
 stackless ABI) once the toolchains it needs support it (§6.6).
 
+**As built (2026-11-11).** The contract is
+`crates/isolate/wit/legion-isolate.wit` (`legion:isolate@0.1.0`): imports
+`control` (`info()` with `resumed`, `park()`, `unsupported()`), `state`,
+and `vm` as above (with `fetch` taking Legion's own request and response
+records); an export `runner`, which a component
+needs to be reused under `tenant` or `session` lifetimes and to report
+exact exit codes (`wasi:cli/run` is single-shot and reports 0 or 1; calls
+entry 28); worlds `image` and `imports`. The host links WASI 0.2 up to
+0.2.12 (sockets linked but denying everything) and refuses an import it
+does not provide at compile. There is no WASI 0.3 form (calls entry 7) and
+no wasm threads.
+
 ### 7.5 Agents
 
 - Runs are the session-runs plan's MCP tool `session_run`, with the
@@ -1522,6 +1775,11 @@ stackless ABI) once the toolchains it needs support it (§6.6).
   come from their plans.
 - `docs/agent-readiness.md` gains the isolate fields, including `nextTier`
   as the hint an agent should carry forward.
+
+**As built (2026-11-11):** `legion_session_run` takes `tier`, `tenant`,
+`session_id`, `args`, and `fallback` (refused with `session_id` or a dry
+run); read-only tools `legion_isolate_stats` and `legion_isolate_get`;
+catalog entries `isolate.stats` and `isolate.get`.
 
 ## 8. The control plane (kept small on purpose)
 
@@ -1571,6 +1829,16 @@ Isolates add no placement model. An `isolate` task is a session task:
 What the managers never see: an isolate's start, end, invocation,
 page-out, or hibernation.
 
+**As built (2026-11-11).** Items 2, 3, 4, and 6 are built as written
+(the router reserves nothing for an isolate run, calls entry 41; session
+isolates are found by their id's node tag, calls entry 30). Differences:
+item 1's replica split only grows (no moving room between replicas), and
+the host cgroup's `memory.max` is the sum of the envelopes with no
+`cpu.weight` and no resize (calls entries 21, 39); item 4's reporting
+level is not a declared runtime property, the supervisor simply never
+reports isolates to the index (calls entry 5); item 5 holds for `local`
+only, because `durability = "store"` is not built (calls entry 44).
+
 ## 9. Proto, struct, config, and persistence changes
 
 - **Proto.** The isolate's fields on `RunSessionRequest` (`tier`) and
@@ -1598,6 +1866,21 @@ page-out, or hibernation.
 - **Struct.** `IsolateTaskConfig`, `IsolateLimits`, `IsolateVmConfig`,
   `IsolateStats` in `src/structs/`.
 
+**As built (2026-11-11).** Proto as §7.3's note: more fields than listed
+here, plus `GetIsolate` on both services, and a second, node-local proto,
+`proto/isolate_host.proto`. Job config adds `config.env`. The structs live
+in `crates/common/src/structs/isolate.rs`. The worker block is `isolate =
+{ binary, maxMemory, slotsPerHost, shards, epoch, slice, pageOutAfter,
+cordonBoundary, layout, confine, images, maxBodyBytes }`
+(`configs/workers/default.ncl`); `cordonBoundary = "vm"` is refused, the
+binary is looked up as `isolate.binary`, then beside the worker, then
+`LEGION_ISOLATE_BINARY`, and images as `isolate.images`, then
+`isolate-images` beside the binary, then `LEGION_ISOLATE_IMAGES` (calls
+entry 49). On the node: compiled modules as derived content `cwasm`
+(pre-initialized kinds have no builder), checkpoints in the content
+store's `snapshots` class, and the session book in
+`<state dir>/isolates/sessions.json`.
+
 ## 10. Target numbers per phase
 
 Targets assume a 16-vCPU, 64 GiB x86-64 node with 4-level paging and
@@ -1612,6 +1895,23 @@ MPK, and are replaced by Phase 0's measurements.
 | 4: sessions and memory tiers | wake from page-out ≤ 200 µs, from hibernation ≤ 2 ms | ≥ 10^5 resident, ≥ 10^6 hibernated | no stack for stackless guests | none |
 | 5: burst | unchanged | unchanged | unchanged | a VM run or child VM ≤ 250 ms cold; ≤ 50 ms from a warm snapshot (scaling Phase 8); ≤ 10 ms p50 on metal from a prepared VM |
 | 6: density and hardening | unchanged | ≥ 2×10^5 resident (MPK striping) | unchanged | unchanged |
+
+**As built (2026-11-11): container measurements, not the AWS rig.** The
+targets above stand until the AWS run; beside them, a 4-vCPU Firecracker
+guest container measured:
+
+| Phase | Start p50 (container) | Resident (container) | Waiting cost (container) | Burst |
+| --- | --- | --- | --- | --- |
+| 0 | component 5.0 µs; `js` hello 1.14 ms fresh, 107 µs warm; `python` hello 2.55 ms fresh, 171 µs warm | idle per instance: component 33.8 KiB, `js` 767 KiB, `python` 1,519 KiB | fiber 480 ns per await; callback ABI 1.8 µs; a stack held per store either way | not measured (no KVM) |
+| 1 | as Phase 0 | 21,870 guard-page slots per process (the worker defaults to 10,000) | one fiber per store that has made an async call | none |
+| 3 | `js` 12 KB snippet 2.86 ms; `python` 12 KB snippet 12.0 ms | `js` ~1,300 per GiB | | |
+| 4 | not measured (no swap for page-out; hibernation wakes a fresh instance) | no density campaign | stack held while waiting (calls entry 7) | |
+| 6 | | MPK 328,842 slots per process with `vm.max_map_count` raised; small reservations 702,500 | | |
+
+The JS dynamic target is missed and the Python target holds only for small
+snippets; neither target has been rewritten, because the numbers come from
+the wrong machine. End-to-end timings through the manager are not in this
+table.
 
 ## 11. Implementation phases
 
@@ -1676,6 +1976,17 @@ Each phase ships on its own and is useful on its own.
   isolate inside a VM-hosted `legion-isolate` with the full filesystem and
   process capabilities (§6.12, model D).
 
+**As built (2026-11-11).** Phase 0 ran in a container only (the status
+block at the top lists what). Phases 1 to 5 were built together rather
+than shipped one by one; the cordon model of Phase 2 replaced Phase 1's
+"one host per job" from the start (`cordon = "job"` is that shape). Not
+built from these phases: stage-time pre-initialization of `entry` and
+compiled dynamic Wasm (Phase 3); the stackless world, host-held
+connections, gateway wake, and `durability = "store"` (Phase 4);
+`machine.resize` is built, prepared VMs are not (Phase 5); a compile
+prefetch before a host upgrade (§13). Phase 6 has only the layouts as
+config.
+
 ## 12. Testing plan
 
 - **Unit (Phase 1+).** Limits arithmetic and trap classification
@@ -1726,6 +2037,36 @@ Each phase ships on its own and is useful on its own.
   `child_gone` after the child is stopped; promoting an owner with a
   child is refused until child sessions Phase 2.
 
+**As built (2026-11-11).** What exists, and where it differs:
+
+- **Unit and host tests** are in `crates/isolate/tests/` (`run`,
+  `admission`, `lifetimes`, `http`, `scratch`, `binary`, `escape_corpus`)
+  against the real host library and checked-in guest fixtures, and in
+  `crates/worker/src/worker/isolates/` (supervisor with a fake host,
+  egress, ingress, child VMs). Fair scheduling is a shard unit test.
+  Invocation-id idempotency in the host is not built (calls entry 53).
+- **Integration** is `tests/integration/isolate.rs` (the supervisor
+  against the real `legion-isolate` binary; its real-sandbox VM-tier tests
+  are ignored for `/dev/kvm`, and an `exec` task stands in for the VM task
+  in the rest), `tests/integration/isolate_images.rs` (the built images
+  through manager, worker, and host; ignored unless the images are built),
+  and
+  `tests/integration/isolate_control.rs` (manager, routing, ACLs,
+  promote refusal, runtime disable, child owners, credentials), plus the
+  ACL table entries.
+- **Restore hygiene** is tested in `crates/isolate` (`tests/run.rs` and
+  the image tests), not in a shared `tests/integration/restore_hygiene.rs`,
+  which does not exist (calls entry 48).
+- **Confinement** tests need `--features confinement-test`; the
+  anonymous `PROT_EXEC` case only reports that it is not denied.
+- **The escape corpus** exists; **fuzz targets do not**.
+- **Benchmarks** are `crates/isolate/benches/isolate_bench.rs`, not
+  `benchmarks/micro/`.
+- **Language images** are tested by `crates/isolate/tests/images.rs`,
+  ignored unless the images are built.
+- **The density campaign** and **the KVM burst tests** have not run (no
+  AWS run, no `/dev/kvm`).
+
 ## 13. Rollout and backward compatibility
 
 - **New surface only.** No existing job, runtime, or default changes.
@@ -1750,6 +2091,20 @@ Each phase ships on its own and is useful on its own.
   and image digest; a mismatch wakes the isolate fresh with an `onResume`
   notice rather than restoring incompatible memory.
 - **Breaking changes.** None; there is no installed base of isolates.
+
+**As built (2026-11-11).** The capability is named `isolates`, and the
+binary is looked up as the worker's `isolate.binary`, then
+`legion-isolate` beside the worker, then `LEGION_ISOLATE_BINARY`; images
+as `isolate.images`, then `isolate-images` beside the binary (with its
+`manifest.json`), then `LEGION_ISOLATE_IMAGES` (calls entry 49). Neither
+ships in a release yet. The kill switch's `auto` reaction is built, and
+`--drain` hibernates only the covered jobs' session isolates (calls entry
+31). Engine upgrades: the `compatKey` keys the cache as planned, but the
+prefetch is not built, and a checkpoint from another engine or module
+version is restored at the state level, not refused (calls entry 9). One
+small break outside isolates: the idempotency fingerprint of every session
+run now includes `tier`, `tenant`, `session_id`, and `args` (calls entry
+27).
 
 ## 14. Open questions
 
@@ -1800,6 +2155,28 @@ Each phase ships on its own and is useful on its own.
     It would let `auto` pick a node that has VM room for code that needs a
     VM. Lean: node first (the image module lists are there); revisit if
     VM-tier runs are often refused for room on the node the router picked.
+
+**As built (2026-11-11): what the work answered.**
+
+- **Q1:** StarlingMonkey stays the `js` image (without weval AOT, calls
+  entry 32). QuickJS measured 5.1× smaller idle (127.6 against 651.2 KiB)
+  and faster on dynamic snippets, which meets the stated condition, but
+  `js-small` was not shipped; it is an open item.
+- **Q3:** gRPC over two inherited socketpairs (calls entry 10). No
+  measurement of the worker's CPU per egress request yet, so no ring.
+- **Q4:** no curated images; the `python` image is the standard library
+  only (calls entry 33).
+- **Q5:** no; session isolates are not in the index (calls entries 4, 30).
+- **Q7:** accepted as leaned: per-job memory in a shared host is the
+  host's accounting, and the cordon cgroup is the backstop (calls entry
+  21).
+- **Q8:** x86-64 Linux only.
+- **Q9:** a VM run is never reused (single-use session runs).
+- **Q10:** the lean holds, but the Nickel binding it relies on does not
+  validate yet (calls entry 50).
+- **Q11:** node first, as leaned.
+- Q2 and Q6 are untouched.
+
 ## 15. Acceptance criteria
 
 - **Phase 0:** a findings doc with the measurements listed in §11, and §4
@@ -1833,3 +2210,27 @@ Each phase ships on its own and is useful on its own.
 - **Phase 6:** slots per host with MPK striping at least 5× the guard-page
   layout's, measured; `cordonBoundary = "vm"` runs a cordon host inside a
   microVM end to end.
+
+**As built (2026-11-11): where each criterion stands.**
+
+- **Phase 0:** a findings doc exists, from a container, not the AWS rig;
+  §4 and §10 carry the container numbers beside the targets instead of
+  being rewritten.
+- **Phase 1:** `docs/task-runtime-isolate.md` exists; every limit produces
+  its reply (`output` truncates instead, calls entry 46); `isolate_bench`
+  exists. The 2 ms end-to-end run through the manager and the injected
+  credential through the real datapath with the real host had not been
+  measured or run end to end when this was written.
+- **Phase 2:** cordons share a host per namespace and confinement kills
+  on forbidden syscalls in the binary tests (`--features
+  confinement-test`); the disable refuses isolate runs and sends `auto`
+  runs of a task with a VM task to the VM.
+- **Phase 3:** the JS start target is missed and the Python one met only
+  for small snippets (container numbers); dynamic Wasm modules as runs are
+  not built.
+- **Phase 4:** not met as written: no density campaign, and an isolate
+  awaiting an upstream holds a stack (calls entry 7).
+- **Phase 5:** built but not run against a real VM (no `/dev/kvm`); the
+  shared-`connect` criterion fails by construction today (calls entry 50).
+- **Phase 6:** MPK slots measured at 15× guard pages in the container
+  (with `vm.max_map_count` raised); `cordonBoundary = "vm"` is not built.

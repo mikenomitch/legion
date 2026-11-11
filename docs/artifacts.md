@@ -633,9 +633,14 @@ What is kept there today:
 | Kind | Built from | Used by |
 | --- | --- | --- |
 | `rootfs` | an image's layers, the guest binary, and the task's `rootfs_headroom_mib` | [sandbox starts](task-runtime-sandbox.md#the-root-disk-cache) |
+| `cwasm` | a WebAssembly component's digest and the `legion-isolate` engine's compatibility key, compiled by a `legion-isolate compile` child process | [isolate tasks](task-runtime-isolate.md#compilation): every host process on the node maps it read-only |
 
-The class also defines the kinds `cwasm`, `preinit-image`, `preinit-entry`,
-and `vm-base`. Nothing builds them yet.
+The class also defines the kinds `preinit-image`, `preinit-entry`, and
+`vm-base`. Nothing builds them yet.
+
+When the class cannot keep a `cwasm` entry (its budget is `"0"`, or there
+is no room), the worker compiles into an `isolates/cwasm/` directory beside
+its state file instead, which the isolate hosts can also read.
 
 How it behaves:
 
