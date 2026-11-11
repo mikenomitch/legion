@@ -361,10 +361,17 @@ impl IsolateHost for FakeHost {
                     part: Some(checkpoint_chunk::Part::Data(body)),
                 },
             ];
-            self.worker
+            // As the real host does: a checkpoint the worker refuses leaves
+            // the instance resident, and the reclaim goes on.
+            if self
+                .worker
                 .clone()
                 .save_checkpoint(futures::stream::iter(chunks))
-                .await?;
+                .await
+                .is_err()
+            {
+                continue;
+            }
             self.state.lock().unwrap().sessions.insert(id, (0, false));
             hibernated += 1;
         }
@@ -1384,6 +1391,40 @@ fn host_reclaims(h: &Harness) -> Vec<ReclaimRequest> {
         .iter()
         .flat_map(|(_, host)| host.state.lock().unwrap().reclaims.clone())
         .collect()
+}
+
+/// A suspend that could not hibernate because this worker refused the
+/// checkpoint says so, rather than calling the session busy.
+#[tokio::test]
+async fn a_refused_checkpoint_is_reported_as_the_reason_a_suspend_failed() {
+    let h = harness();
+    h.supervisor.sync(vec![envelope(
+        "ns/app",
+        isolate_task("run", module_config("session")),
+        1024.0,
+    )]);
+    h.supervisor
+        .start_session("ns/app", "run", "run-a.1", "", "manager", "", "")
+        .await
+        .unwrap();
+    let mut call = run_call("ns/app", "run", &[("main.wasm", "count")]);
+    call.request.session_id = "run-a.1".into();
+    h.supervisor.run(call, None).await.unwrap();
+    // The checkpoint directory cannot be created: every save is refused.
+    std::fs::write(h._dir.path().join("checkpoints"), b"not a directory").unwrap();
+    let err = h.supervisor.hibernate("run-a.1").await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+    assert!(
+        err.message()
+            .contains("was not hibernated: could not keep the checkpoint"),
+        "{err:?}"
+    );
+    assert!(!err.message().contains("busy"), "{err:?}");
+    assert!(host_resident(&h, "run-a.1"), "the session is still running");
+    // Once checkpoints can be kept again, the same suspend works.
+    std::fs::remove_file(h._dir.path().join("checkpoints")).unwrap();
+    h.supervisor.hibernate("run-a.1").await.unwrap();
+    assert!(!host_resident(&h, "run-a.1"));
 }
 
 #[tokio::test]

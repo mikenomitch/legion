@@ -120,14 +120,25 @@ fn engine_info_speaks_this_workers_protocol() {
     assert!(!found.compat_key.is_empty());
 }
 
+/// A content store that never refuses for the machine's own free disk: the
+/// default `minFreeDisk` is 5 GiB, which a test machine filled by its own
+/// build can fall below mid-suite, and then compiled modules and
+/// checkpoints are not kept and these tests fail for a reason that has
+/// nothing to do with what they check.
+fn test_store_config() -> ContentStoreConfig {
+    ContentStoreConfig {
+        min_free_disk: 0,
+        ..ContentStoreConfig::default()
+    }
+}
+
 #[test]
 fn a_component_compiles_once_into_derived_content() {
     let dir = tempfile::tempdir().unwrap();
     let images = dir.path().join("images");
     std::fs::create_dir_all(&images).unwrap();
     let store = Arc::new(
-        ContentStore::open(dir.path().join("content"), ContentStoreConfig::default())
-            .expect("content store"),
+        ContentStore::open(dir.path().join("content"), test_store_config()).expect("content store"),
     );
     let compiler = Compiler {
         binary: probed(),
@@ -208,9 +219,8 @@ fn node_confined(image_fixture: &str, confine: ConfineMode) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let images = dir.path().join("images");
     std::fs::create_dir_all(&images).unwrap();
-    let store = Arc::new(
-        ContentStore::open(dir.path().join("content"), ContentStoreConfig::default()).unwrap(),
-    );
+    let store =
+        Arc::new(ContentStore::open(dir.path().join("content"), test_store_config()).unwrap());
     let found = probed();
     let fallback = dir.path().join("cwasm");
     std::fs::create_dir_all(&fallback).unwrap();

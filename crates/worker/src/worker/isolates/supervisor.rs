@@ -2281,6 +2281,9 @@ impl IsolateSupervisor {
             .map(|task| task.cordon.clone())
             .ok_or_else(|| Status::unavailable("its task left this node"))?;
         let (_, conn) = self.pick_replica(&cordon, "", Some(record.replica))?;
+        if let Some(record) = lock(&self.sessions).get_mut(session_id) {
+            record.last_save_error = None;
+        }
         let mut client = conn.client.clone();
         client
             .reclaim(host::ReclaimRequest {
@@ -2304,6 +2307,15 @@ impl IsolateSupervisor {
                 after.generation,
                 false,
             )),
+            // The host asked this worker to keep a checkpoint and the worker
+            // could not: the session stays resident, for that reason.
+            Some(after) if after.last_save_error.is_some() => {
+                Err(Status::resource_exhausted(format!(
+                    "session isolate {session_id} was not hibernated: {}; it is still \
+                     running",
+                    after.last_save_error.unwrap_or_default()
+                )))
+            }
             Some(_) => Err(Status::failed_precondition(format!(
                 "session isolate {session_id} is busy (a call is running in it); suspend it \
                  again once it is idle"
@@ -2335,13 +2347,18 @@ impl IsolateSupervisor {
         let store = self.checkpoints.clone();
         let id = session_id.clone();
         let now = crate::util::now_unix_ms();
-        let mut stored =
-            tokio::task::spawn_blocking(move || store.put(&id, generation, &body, now))
-                .await
-                .map_err(|err| Status::internal(format!("storing the checkpoint panicked: {err}")))?
-                .map_err(|err| {
-                    Status::resource_exhausted(format!("could not keep the checkpoint: {err:#}"))
-                })?;
+        let stored = tokio::task::spawn_blocking(move || store.put(&id, generation, &body, now))
+            .await
+            .map_err(|err| Status::internal(format!("storing the checkpoint panicked: {err}")))?
+            .map_err(|err| {
+                Status::resource_exhausted(format!("could not keep the checkpoint: {err:#}"))
+            });
+        // Remember the outcome on the session, so a suspend that asked for
+        // this checkpoint can report a refusal as what it was.
+        if let Some(record) = lock(&self.sessions).get_mut(&session_id) {
+            record.last_save_error = stored.as_ref().err().map(|s| s.message().to_string());
+        }
+        let mut stored = stored?;
         stored.engine_version = header.engine_version.clone();
         stored.module_id = header.module_id.clone();
         let replaced = {

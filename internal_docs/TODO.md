@@ -641,11 +641,6 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
       `config.entry` no longer follows links
       ([calls 17](calls/isolate-runtime-plan_calls.md#17-configentry-is-read-beneath-its-staging-directory-with-a-no-symlink-walk-on-every-kernel-not-openat2)),
       but other readers of a staged tree must not either.
-- [ ] **A flaky host test.** `crates/isolate/tests/http.rs`
-      `a_warm_instance_cannot_leave_a_request_running_after_its_call_test`
-      failed 2 of 4 runs in the second hardening round (the request had not
-      reached the fake worker when the invocation ended); the test races,
-      the code under test was not changed.
 - [ ] **Fuzz targets** for host-function argument decoding and the WIT
       boundary, run nightly; the escape corpus exists, fuzzing does not
       ([plan §12](plans/isolate-runtime-plan.md#12-testing-plan)).
@@ -1291,6 +1286,12 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
       alone: `raft_durability::leader_loss_mid_burst`,
       `raft_write_path::every_log_purge_fsyncs_the_state_db_first` and
       `proxy_hand_offs_cross_nodes_only_over_the_mesh_test`.
+      `worker::task_manager::tests::a_restarted_worker_keeps_its_owner_references_test`
+      fails about 1 run in 8 under CPU load and never alone (2026-11-11, 30/30
+      alone, 35/40 with six busy loops): the restarted worker finds no owner
+      link for the child, so a launch thread's late session-log write likely
+      lands after the test's own sync. Neither the test nor the session log
+      changed in the isolate work.
 - [ ] **Crate split follow-ups** ([plan § 8](plans/workspace-crate-split-plan.md#8-implementation-phases)):
   - [ ] **The store out of `legion-manager`.** It is the largest compile
         (3.8 GB, 4.5 GB with tests). `storage` has 28 references into

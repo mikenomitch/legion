@@ -75,6 +75,12 @@ pub struct SessionRecord {
     /// `manager` or `edge`.
     #[serde(default)]
     pub origin: String,
+    /// Why the last checkpoint this worker was asked to keep for the
+    /// session was refused (the content store had no room, say), until the
+    /// next one is kept. Lets a suspend that did not hibernate say why
+    /// instead of guessing. Not persisted.
+    #[serde(skip)]
+    pub last_save_error: Option<String>,
 }
 
 /// Every session isolate on the node, persisted as one JSON file.
