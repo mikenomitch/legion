@@ -557,6 +557,7 @@ struct Ctx {
     scratch: Scratch,
     table: ResourceTable,
     account: Arc<MemoryAccount>,
+    now: Datetime,
 }
 
 impl Ctx {
@@ -568,6 +569,7 @@ impl Ctx {
             scratch,
             table: ResourceTable::new(),
             account,
+            now: T1,
         }
     }
 
@@ -576,7 +578,7 @@ impl Ctx {
             scratch: &mut self.scratch,
             table: &mut self.table,
             cwd: RUN_DIR,
-            now: T1,
+            now: self.now,
         }
     }
 }
@@ -925,17 +927,8 @@ fn guest_calls_stamp_with_the_context_clock_test() {
     assert_eq!(times(&v.stat(borrow(&f)).unwrap()), [pair(T1); 3]);
 
     // The next call carries a later turn's time.
-    v.now = T2;
-    let mut v = {
-        let ScratchCtx { scratch, .. } = v;
-        scratch.set_now(T2);
-        ScratchCtx {
-            scratch,
-            table: &mut c.table,
-            cwd: RUN_DIR,
-            now: T2,
-        }
-    };
+    c.now = T2;
+    let mut v = super::scratch_ctx(&mut c);
     v.set_times(borrow(&f), NewTimestamp::Now, NewTimestamp::NoChange)
         .unwrap();
     assert_eq!(
