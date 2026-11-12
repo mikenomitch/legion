@@ -1302,12 +1302,6 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
       ([development.md](development.md#keeping-builds-and-test-runs-small)); fold the
       raft-ops tests into `tests/integration/` ([calls 1](calls/test-build-footprint_calls.md)).
 
-## Long term
-
-- [ ] A **speed** scheduler; needs a plan first.
-- [ ] A **VM** runtime beyond the microVM sandbox.
-- [ ] **Windows support pass**, including artifact staging ([plan](plans/artifact-system-plan.md)).
-
 ## Verify
 
 Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS rig. The code for each is in; these confirm it.
