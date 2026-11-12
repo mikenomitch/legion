@@ -297,14 +297,9 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 
 [liveness plan](plans/liveness-off-the-raft-path-plan.md) ·
 [cadence plan](plans/heartbeat-cadence-at-scale-plan.md) ·
+[ping plan](plans/liveness-ping-split-plan.md) ·
 [docs](../docs/heartbeat-cadence-and-scale.md)
 
-- [ ] **Tighten failure detection at large fleets.** 20k nodes get 21s beats, so
-      loss detection takes ~105s vs 10s on small fleets. Raise the default
-      `targetRatePerSecond` (rerun 20k at 5,000 and 10,000), then split a cheap
-      liveness ping from desired-state sync (wire change; needs a plan).
-- [ ] **Per-pool heartbeat freshness.** `legion_heartbeat_freshness_ratio` is
-      fleet-wide and blends fast and slow pools.
 - [ ] **`heartbeat = { adaptive = false }` never settled onto its fixed 2s** at
       5k nodes on the AWS rig (freshness 0.46), so the fixed-cadence ablation
       row understates its cost. Find why the fixed cadence isn't held

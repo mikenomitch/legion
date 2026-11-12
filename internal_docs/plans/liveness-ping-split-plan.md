@@ -11,7 +11,7 @@ page is [`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cadence-and
 - **The AWS rig rerun.** The ping and heartbeat costs are measured in-process
   and over loopback (§9); the fleet-level claim (a 20,000-node fleet gets a
   25s window for about a third of a core of pings at most) is argued from
-  those numbers, not measured on the rig. Filed under Verify in `internal_docs/TODO.md`.
+  those numbers, not measured on the rig. Filed in the rig plan's "Campaign runs still owed" ([aws-comparative-benchmark-plan.md](aws-comparative-benchmark-plan.md)).
 - **Raising `targetRatePerSecond`.** The TODO item this plan closes proposed
   rerunning 20k nodes at 5,000 and 10,000 and raising the default. With
   detection split off, the full-heartbeat rate governs report latency and

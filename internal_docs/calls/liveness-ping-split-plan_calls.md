@@ -119,7 +119,7 @@ third of a core spread over the managers workers dial, and still cuts the
 20k-node window from 105s to 25s and holds 10s to 10,000 nodes. Report latency
 is the "start reports wait for a heartbeat" TODO's problem, better solved by
 moving reports onto the stream than by heartbeating harder. The rig rerun is
-filed under Verify; it, or pings on `StreamWork` (#1), can raise either rate.
+filed in the AWS rig plan's campaign runs; it, or pings on `StreamWork` (#1), can raise either rate.
 
 ## 5. A ping recovers a lost node and asks for a full heartbeat (`sync_now`)
 
