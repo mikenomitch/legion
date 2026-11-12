@@ -1219,6 +1219,12 @@ pub struct WorkerTaskManager {
     /// off-lock teardown is on, for the supervisor to take with the next
     /// [`Self::take_reapable`] (see [`Self::enable_off_lock_teardown`]).
     pending_reaps: Vec<Reap>,
+    /// The state file's record of each teardown in `reaping`, as a stop in
+    /// progress: the reap owns the instance, so without this the next
+    /// snapshot would drop a process that is still running, and a worker
+    /// that died mid-reap would leave it orphaned. Removed by
+    /// [`Self::finish_reap`].
+    reaping_records: HashMap<i64, PersistedAllocation>,
     /// Set by the daemon, which runs a supervisor to take
     /// [`Self::pending_reaps`]; woken whenever one is queued. `None` (tests,
     /// tools) tears down inline under the lock, as before.
@@ -1433,6 +1439,7 @@ impl WorkerTaskManager {
             ratified_unseen: HashMap::new(),
             reaping: std::collections::HashSet::new(),
             pending_reaps: Vec::new(),
+            reaping_records: HashMap::new(),
             teardown_wake: None,
             next_launch_generation: 0,
             checkpoints: Default::default(),
@@ -3776,6 +3783,23 @@ impl WorkerTaskManager {
                 Ok(()) => {
                     if let Some(reap) = self.pending_reaps.last_mut() {
                         reap.signal = Some(PendingSignal { preemptor });
+                        let entry = TerminatingAllocation {
+                            allocation: reap.entry.allocation.clone(),
+                            task: reap.entry.task.clone(),
+                            instance: TaskInstance {
+                                pid: reap.entry.instance.pid,
+                                resource_assignment: reap
+                                    .entry
+                                    .instance
+                                    .resource_assignment
+                                    .clone(),
+                                ..TaskInstance::default()
+                            },
+                            cause,
+                            deadline: std::time::Instant::now(),
+                            remove_dirs,
+                        };
+                        self.record_reaping(allocation_id, &entry, false);
                     }
                     return;
                 }
@@ -3925,6 +3949,7 @@ impl WorkerTaskManager {
             return Err(entry);
         };
         self.reaping.insert(allocation_id);
+        self.record_reaping(allocation_id, &entry, true);
         self.pending_reaps.push(Reap {
             allocation_id,
             entry,
@@ -3935,6 +3960,47 @@ impl WorkerTaskManager {
         });
         wake.notify_one();
         Ok(())
+    }
+
+    /// Keep `entry` in the state file as a stop in progress while it is
+    /// reaped (see `reaping_records`). `signalled`: past its signal, so a
+    /// restarted worker kills it at once; otherwise it signals it again.
+    fn record_reaping(
+        &mut self,
+        allocation_id: i64,
+        entry: &TerminatingAllocation,
+        signalled: bool,
+    ) {
+        let Some(pid) = entry.instance.pid else {
+            return;
+        };
+        if !self.persists(allocation_id) {
+            return;
+        }
+        let record = PersistedAllocation {
+            allocation: entry.allocation.clone(),
+            task: entry.task.clone(),
+            pid: Some(pid),
+            pid_start_time: self.cached_pid_start_time(allocation_id, pid),
+            resource_assignment: entry.instance.resource_assignment.clone(),
+            self_terminate_after_secs: None,
+            volumes: self
+                .volume_specs
+                .get(&allocation_id)
+                .cloned()
+                .unwrap_or_default(),
+            external_id: None,
+            in_envelope: false,
+            stopping: Some(PersistedStop {
+                cause: entry.cause,
+                remove_dirs: entry.remove_dirs,
+                kill_deadline_unix: signalled.then(|| unix_from_instant(entry.deadline)),
+            }),
+            terminal: None,
+        };
+        // No write here: the file already lists the process (running, or
+        // stopping), and the next snapshot carries this record instead.
+        self.reaping_records.insert(allocation_id, record);
     }
 
     /// Run the runtime's `destroy`, then release storage and directories.
@@ -4030,6 +4096,7 @@ impl WorkerTaskManager {
         }
         for reap in std::mem::take(&mut self.pending_reaps) {
             self.reaping.remove(&reap.allocation_id);
+            self.reaping_records.remove(&reap.allocation_id);
             tasks.push((reap.entry.allocation, reap.entry.task, reap.entry.instance));
         }
         tasks
@@ -4119,6 +4186,7 @@ impl WorkerTaskManager {
             if defer && entry.remove_dirs {
                 if let Some(plugin) = self.registry.plugin_handle(&entry.task.runtime) {
                     self.reaping.insert(*allocation_id);
+                    self.record_reaping(*allocation_id, &entry, true);
                     deferred.push(Reap {
                         allocation_id: *allocation_id,
                         entry,
@@ -4148,6 +4216,7 @@ impl WorkerTaskManager {
     /// and directories, in [`Self::finish_teardown`]'s order.
     pub fn finish_reap(&mut self, reap: Reap) {
         self.reaping.remove(&reap.allocation_id);
+        self.reaping_records.remove(&reap.allocation_id);
         // A signalled stop waits out its grace window in the terminating
         // set, like one signalled under the lock.
         if reap.signalled {
@@ -7348,6 +7417,8 @@ impl WorkerTaskManager {
             });
         }
 
+        // Teardowns being reaped off the lock (see `reaping_records`).
+        records.extend(self.reaping_records.values().cloned());
         {
             let mut cache = self
                 .pid_start_times
@@ -11567,6 +11638,20 @@ mod tests {
         // A second failure for it while it is torn down is not reported.
         manager.record_failure(alloc().id, "again");
         assert!(manager.drain_failures().is_empty());
+        // Another start's snapshot still lists it, as a stop in progress, so
+        // a worker that died now would stop it on restart.
+        let other = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("other", "exec")
+        };
+        manager.run_allocation(&Allocation { id: 6, ..alloc() }, &other)?;
+        let persisted = manager.state_store().load()?;
+        let record = persisted
+            .iter()
+            .find(|record| record.allocation.id == alloc().id)
+            .expect("the process stays in the state file while it is reaped");
+        assert_eq!(record.pid, Some(pid));
+        assert!(record.stopping.is_some());
 
         let (_, reaps) = manager.take_reapable(true);
         for mut reap in reaps {
@@ -11579,6 +11664,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!pid_is_running(pid));
+        assert!(manager
+            .state_store()
+            .load()?
+            .iter()
+            .all(|record| record.allocation.id != alloc().id));
+        let _ = manager.reconcile_allocations(&[]);
         Ok(())
     }
 
