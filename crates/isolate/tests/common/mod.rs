@@ -76,6 +76,10 @@ pub struct FakeWorker {
     pub vm_seen: Mutex<Vec<VmRequest>>,
     pub checkpoints: Mutex<HashMap<String, (CheckpointHeader, Vec<u8>)>>,
     pub saves: Mutex<u64>,
+    /// Checkpoint saves started (counted before `save_delay`), and how long
+    /// each waits before it is kept (when set).
+    pub saves_started: std::sync::atomic::AtomicUsize,
+    pub save_delay: Mutex<Option<Duration>>,
     pub logs: Mutex<Vec<LogBatch>>,
     /// Egress waits this long before answering (when set).
     pub egress_delay: Mutex<Option<Duration>>,
@@ -155,6 +159,12 @@ impl WorkerApi for FakeWorker {
         header: CheckpointHeader,
         body: Vec<u8>,
     ) -> Result<SaveCheckpointReply, Status> {
+        self.saves_started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = *self.save_delay.lock().unwrap();
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
         let id = header.origin.as_ref().unwrap().isolate_id.clone();
         self.checkpoints.lock().unwrap().insert(id, (header, body));
         let mut n = self.saves.lock().unwrap();

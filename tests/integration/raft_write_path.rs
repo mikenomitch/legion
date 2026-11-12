@@ -174,10 +174,24 @@ fn every_log_purge_fsyncs_the_state_db_first() -> R<()> {
         store.put_kv(&format!("purge/{i}"), "v", KvValueType::String, None, None)?;
     }
     let log_db = dir.path().join("raft").join("control").join("log.sqlite");
+    let mut filler = 0;
     wait_for(
         Duration::from_secs(60),
         "the retention task to purge behind a snapshot",
         || {
+            // openraft decides to snapshot only when an entry commits, and
+            // skips the decision while a build is running: if every write
+            // above committed during one slow build (a loaded machine), no
+            // later snapshot would ever cover them. Keep committing so the
+            // policy is asked again.
+            filler += 1;
+            let _ = store.put_kv(
+                "purge/filler",
+                &filler.to_string(),
+                KvValueType::String,
+                None,
+                None,
+            );
             let Ok(conn) = read_only(&log_db) else {
                 return false;
             };
