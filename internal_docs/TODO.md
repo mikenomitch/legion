@@ -261,16 +261,6 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       exist only for blocked evals (`blocked.rs`).
 - [ ] **Usage-aware placement and a descheduler** (review SCH7).
 
-### Preemption
-
-[plan](plans/preemption-and-eviction-plan.md) · [docs](../docs/preemption-and-eviction.md)
-
-- [ ] **Should the per-pool preemption toggle be ACL-adjacent?**
-      `disabledPools` lives in `schedulerSettings`, so a pool-scoped operator
-      can't exempt their own pool (plan, Open Questions 6).
-- [ ] **A fresh multi-task group preempts only for its first member**; if a
-      later member can't fit, the whole plan fails.
-
 ### Gang scheduling
 
 [plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md)
@@ -1316,6 +1306,8 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **Read-model refresh applies the changeset delta** — `cache_apply_allocation_delta` with fallback and round-robin scrub ([findings](aws-phase4-findings.md) · [calls](calls/eval-path-raft-cost-plan_calls.md))
 - **Plan-apply conflict reduction** — two-pass bind (epoch as ranking hint), candidate lists restored, rejected plans no longer partially commit ([plan](plans/plan-apply-conflict-reduction-plan.md) · [calls](calls/plan-apply-conflict-reduction-plan_calls.md))
 - **Priorities and preemption** — six priority bands, plan-atomic preemption, stop causes, graceful `stop { signal, killAfter }`, `bands` ACL selector, pool toggle, UI history; fair-share stays a non-goal ([plan](plans/preemption-and-eviction-plan.md) · [calls](calls/preemption-and-eviction-plan_calls.md) · [docs](../docs/preemption-and-eviction.md) · [graceful stop](../docs/graceful-stop.md))
+- **A fresh multi-task group picks its node, and preempts, for all its members** — the first member's placement uses the group's combined ask, and a group's tasks place back to back; before, a later member that did not fit failed the whole plan, with or without preemption ([calls 16](calls/preemption-and-eviction-plan_calls.md) · [docs](../docs/preemption-and-eviction.md#multi-task-groups))
+- **The per-pool preemption toggle stays in manager config** — decided, not ACL-scoped: a pool-scoped token cannot exempt its pool (plan Open Question 6 · [calls 17](calls/preemption-and-eviction-plan_calls.md) · [docs](../docs/preemption-and-eviction.md#operator-controls))
 - **Plugin ABI version symbol** — `declare_task_plugin_abi!()` makes stale dylibs fail at load ([docs](../docs/task-runtime-plugins.md))
 - **Declarable scheduling indexes** — `partition_by` × `dims` indexes, nearest-fit candidates, shadow mode, default `fit` index ([plan](plans/scheduling-index-plan.md) · [docs](../docs/scheduling-indexes.md))
 - **Late-binding plan apply (phases 0–3)** — ranked candidates per placement, conflict-exhausted evals requeue with backoff, `plan_candidates` ([plan](plans/late-binding-plan-apply-plan.md) · [docs](../docs/late-binding-plan-apply.md))

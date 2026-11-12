@@ -29,6 +29,11 @@ descheduler-style rebalancing, network/device-aware victim selection, and a
 preemption plugin seam (each is a named non-goal below, and each is restated
 in the public doc's Known limitations).
 
+Closed after shipping: a fresh multi-task group used to pick its node (and
+run preemption) for its first member alone, so a later member that did not
+fit failed the whole plan. The group now picks its node with every member's
+combined ask, and its members place back to back (judgement call 16).
+
 **Phase 1 was split during implementation.** The original Phase 1 bundled the
 stop *cause* with the stop *ladder*. Two findings forced them apart:
 
@@ -976,12 +981,15 @@ Regression:
    onto them the moment anyone asked for per-team rather than per-namespace
    scoping.
 
-6. **Still open. Should the per-pool preemption toggle be ACL-adjacent rather
-   than manager config?** `disabledPools` lives in `schedulerSettings`, so a
-   pool-scoped operator cannot exempt their own pool without cluster-config
-   access — even though `pools` already exists as an ACL selector. Lean:
-   config for v1, named here so the asymmetry is a decision rather than an
-   oversight.
+6. ~~**Should the per-pool preemption toggle be ACL-adjacent rather than
+   manager config?**~~ **Resolved: it stays in manager config.**
+   `disabledPools` suspends the band guarantee for every job in a pool, so it
+   belongs to whoever owns the cluster's bands, not to one pool's tenant; a
+   pool-scoped token cannot change it, and the public doc says so. The need
+   behind the question (protect long-running work) is met per workload by
+   `disruption.minAvailable` and the band. A per-node flag writable with
+   pool-scoped `node:write`, like drain, was considered and not taken; see
+   judgement call 17.
 
 ## Acceptance Criteria
 

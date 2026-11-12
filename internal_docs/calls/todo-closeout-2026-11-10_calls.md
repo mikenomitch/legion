@@ -204,7 +204,7 @@ limitation already decided and written down, or a question answered here:
 | `authz` webhooks and the worker's own calls are not judged by the host guard | [worker-plane-auth calls 23](worker-plane-auth-plan_calls.md) |
 | An agent-less guest loses unflushed writes on stop | [sandbox-clean-stop calls 1](sandbox-clean-stop_calls.md) |
 | `SIGINT`/`SIGQUIT` reach a sandbox command ignored | [sandbox-clean-stop calls 3](sandbox-clean-stop_calls.md), [task-runtime-sandbox.md](../../docs/task-runtime-sandbox.md) |
-| Victim metadata is a store query inside planning | [preemption calls 18](preemption-and-eviction-plan_calls.md) |
+| Victim metadata is a store query inside planning | [preemption calls 20](preemption-and-eviction-plan_calls.md) |
 | Drain rate limiting, fair share beyond bands | [preemption calls 10](preemption-and-eviction-plan_calls.md) |
 | A typed error for `edge_boot::classify` | [edge-boot calls 17](edge-boot-plan_calls.md) |
 | `sd_notify`, watchdog pings, socket activation for `exec` | [host-process-supervision plan §8](../plans/host-process-supervision-plan.md) |
