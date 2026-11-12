@@ -210,7 +210,7 @@ cron = "0.15.0"
 # src/autoscaler/schedule.rs), so a business-hours floor follows DST. The
 # zone table is pre-generated (phf only): no build script, no new C code.
 chrono-tz = "0.10.4"
-reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }
 url = "2.5.4"
 tempfile = "3"
 libc = "0.2"

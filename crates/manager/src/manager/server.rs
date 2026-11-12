@@ -2084,6 +2084,9 @@ pub struct ManagerDaemonService {
     pub auth: Arc<Authenticator>,
     /// Externally reachable manager address embedded in join tokens.
     pub advertise_addr: String,
+    /// [`Self::worker_manager_addresses`]'s last answer and when it was
+    /// computed.
+    worker_manager_addresses: Arc<Mutex<Option<(std::time::Instant, Vec<String>)>>>,
     /// Set when `advertise_addr` is a loopback address derived from a
     /// wildcard bind, so remote workers cannot use the join tokens it mints
     /// (`ServerConfigFull::loopback_join_address_warning`). Returned with
@@ -2229,6 +2232,7 @@ impl ManagerDaemonService {
             store,
             auth,
             advertise_addr: DEF_MANAGER_ADDRESS.to_string(),
+            worker_manager_addresses: Arc::default(),
             join_address_warning: None,
             manager_id: String::new(),
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
@@ -2441,21 +2445,47 @@ impl ManagerDaemonService {
     }
 
     /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
-    /// `WorkerRegisterReply.manager_addresses`): the replicated raft
-    /// membership's advertised listeners, with this manager's own API scheme
-    /// (`https` when `server.tls` is on). Empty outside raft mode, which
-    /// leaves a worker's known set unchanged.
+    /// `WorkerRegisterReply.manager_addresses`): for each member of the
+    /// replicated raft membership, its `server.advertiseAddr` when its
+    /// published config row sets one (the address its join tokens carry,
+    /// which workers can reach), else its raft listener with this manager's
+    /// own API scheme (`https` when `server.tls` is on). Empty outside raft
+    /// mode, which leaves a worker's known set unchanged.
+    ///
+    /// Served on every heartbeat reply, so the config rows are read at most
+    /// once per [`WORKER_MANAGER_ADDRESSES_TTL`].
     fn worker_manager_addresses(&self) -> Vec<String> {
+        {
+            let cached = self
+                .worker_manager_addresses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((at, addresses)) = cached.as_ref() {
+                if at.elapsed() < WORKER_MANAGER_ADDRESSES_TTL {
+                    return addresses.clone();
+                }
+            }
+        }
         let scheme = if self.advertise_addr.starts_with("https://") {
             "https"
         } else {
             "http"
         };
-        self.store
-            .raft_member_addresses()
-            .into_iter()
-            .map(|host_port| format!("{scheme}://{host_port}"))
-            .collect()
+        let members = self.store.raft_members();
+        let rows = if members.is_empty() {
+            Vec::new()
+        } else {
+            self.store.get_manager_configs().unwrap_or_default()
+        };
+        let mut addresses = worker_addresses_for_members(members, &rows, scheme);
+        addresses.sort();
+        addresses.dedup();
+        *self
+            .worker_manager_addresses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some((std::time::Instant::now(), addresses.clone()));
+        addresses
     }
 
     /// Job scope for read/lifecycle endpoints, carrying the job's stored
@@ -14001,6 +14031,50 @@ fn request_fingerprint(request: &impl serde::Serialize) -> String {
         .collect()
 }
 
+/// The worker-facing address of each raft member `(name, host:port)`: its
+/// published `server.advertiseAddr` (a config row keyed by its name or its
+/// raft address), given `scheme` when it names none, else `scheme://` its
+/// raft address. Sorted and deduplicated.
+fn worker_addresses_for_members(
+    members: Vec<(String, String)>,
+    rows: &[crate::structs::ManagerNodeConfig],
+    scheme: &str,
+) -> Vec<String> {
+    let advertised: HashMap<&str, String> = rows
+        .iter()
+        .filter_map(|row| {
+            let config: Value = serde_json::from_str(&row.config_json).ok()?;
+            let addr = config
+                .get("server")?
+                .get("advertiseAddr")?
+                .as_str()?
+                .trim()
+                .to_string();
+            (!addr.is_empty()).then_some((row.node_id.as_str(), addr))
+        })
+        .collect();
+    let mut addresses: Vec<String> = members
+        .into_iter()
+        .map(|(name, host_port)| {
+            match advertised
+                .get(name.as_str())
+                .or_else(|| advertised.get(host_port.as_str()))
+            {
+                Some(addr) if addr.contains("://") => addr.clone(),
+                Some(addr) => format!("{scheme}://{addr}"),
+                None => format!("{scheme}://{host_port}"),
+            }
+        })
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+/// How long [`ManagerDaemonService::worker_manager_addresses`] reuses its
+/// answer.
+const WORKER_MANAGER_ADDRESSES_TTL: Duration = Duration::from_secs(30);
+
 /// Which nodes' own guards refuse a `TestNetPolicy` target.
 #[derive(Debug, Default)]
 struct NodeGuardRefusals {
@@ -16849,6 +16923,36 @@ mod tests {
         store.set_sandbox_gated_default(true);
         assert_eq!(test("agents").await?.source, "gated-default");
         Ok(())
+    }
+
+    /// Workers fail over to each manager's `server.advertiseAddr` (what its
+    /// join tokens carry) when its config row sets one, and to its raft
+    /// listener otherwise.
+    #[test]
+    fn workers_are_given_each_managers_advertise_address_test() {
+        let row = |node_id: &str, advertise: Option<&str>| crate::structs::ManagerNodeConfig {
+            node_id: node_id.into(),
+            config_json: json!({ "server": { "advertiseAddr": advertise } }).to_string(),
+            updated_at: String::new(),
+        };
+        let members = vec![
+            ("mgr-a".to_string(), "10.9.0.1:4747".to_string()),
+            ("mgr-b".to_string(), "10.9.0.2:4747".to_string()),
+            ("mgr-c".to_string(), "10.9.0.3:4747".to_string()),
+        ];
+        let rows = vec![
+            row("mgr-a", Some("https://api-a.example:4747")),
+            row("mgr-b", Some("192.0.2.2:4747")),
+            row("mgr-c", None),
+        ];
+        assert_eq!(
+            worker_addresses_for_members(members, &rows, "https"),
+            vec![
+                "https://10.9.0.3:4747".to_string(),
+                "https://192.0.2.2:4747".to_string(),
+                "https://api-a.example:4747".to_string(),
+            ]
+        );
     }
 
     /// `net policy test` judges a node's own addresses and its `hostGuard`

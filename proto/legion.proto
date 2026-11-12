@@ -11321,9 +11321,12 @@ message HeartbeatReply {
   //
   // The list is a snapshot, not a delta: the worker replaces its copy
   // wholesale whenever it changes, and always keeps the address from its
-  // join token as a last resort. Addresses must be reachable from workers;
-  // when managers advertise a raft address workers cannot reach, the worker
-  // tries each one in turn and keeps the ones that answer.
+  // join token as a last resort. Each manager is listed by its
+  // `server.advertiseAddr` (the address its join tokens carry) when its
+  // published config sets one, else by its raft advertise address with the
+  // answering manager's scheme; managers whose raft peers on a network
+  // workers cannot reach should set `server.advertiseAddr`. The list is
+  // recomputed at most every 30 seconds.
   //
   // Default: empty on a manager that does not run `persistence.type = "raft"`
   // (there is no other manager to fail over to) or that predates this
