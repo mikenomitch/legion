@@ -430,6 +430,7 @@ fn streaming_open_options(conditional_put: bool) -> OpenOptions {
         // cluster's backups as the node's instance role
         // (manager-workload-identity calls #5).
         ambient_fallthrough: false,
+        proxy_url: None,
     }
 }
 

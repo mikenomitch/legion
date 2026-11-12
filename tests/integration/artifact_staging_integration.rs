@@ -743,6 +743,82 @@ async fn pin_lookups_at_submit_are_held_to_the_host_guard() -> R<()> {
     Ok(())
 }
 
+/// The manager's `artifacts.hostGuard.allow` opens one `ip:port` for its
+/// pin lookups, as a worker's `hostGuard.allow` does for its fetches: a dev
+/// registry on the manager's own host pins at submit once it is listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn manager_host_guard_allow_opens_a_pin_lookup() -> R<()> {
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let served = digest.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\n\
+                 Docker-Content-Digest: {served}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+
+    let source = format!("oci://127.0.0.1:{port}/team/tool:latest?protocol=http");
+    let submit = |manager: ManagerDaemonService, name: &'static str| {
+        let jobspec = json!({
+            "name": name,
+            "tasks": [{
+                "name": "tool",
+                "runtime": "exec",
+                "artifacts": [{"source": source.clone(), "name": "tool", "resolve": "pin"}],
+                "config": {"command": ["true"]},
+            }],
+        })
+        .to_string();
+        async move {
+            manager
+                .run_job(Request::new(run_request(jobspec, name)))
+                .await
+        }
+    };
+
+    let store = setup_store()?;
+    insert_node(&store, "node-a")?;
+    let status = submit(ManagerDaemonService::new(store.clone()), "unopened")
+        .await
+        .expect_err("loopback is guarded without an allow entry");
+    assert!(
+        status.message().contains("artifacts.hostGuard.allow"),
+        "the refusal names the manager's setting: {}",
+        status.message()
+    );
+
+    let cluster = ManagerConfigFull {
+        artifacts: ArtifactsManagerConfigFull {
+            host_guard: legion::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{port}")],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let manager = ManagerDaemonService::with_manager_config(store.clone(), &cluster);
+    submit(manager, "opened")
+        .await
+        .map_err(|status| anyhow::anyhow!("pin with an allow entry: {status}"))?;
+    let job_config_id = store.get_job_config("opened")?.id();
+    let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+    assert!(
+        tasks[0].1.artifacts[0].source.contains(&digest),
+        "{}",
+        tasks[0].1.artifacts[0].source
+    );
+    Ok(())
+}
+
 /// `resolve: "always"` keeps the mutable reference for staging-time
 /// resolution.
 #[tokio::test]

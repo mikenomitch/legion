@@ -1845,6 +1845,13 @@ pub struct ArtifactsManagerConfig {
     /// cache this would re-download images per allocation and regress
     /// runtimes that cache images themselves).
     pub container_image_desugar: Option<bool>,
+    /// The host guard the manager judges its own `resolve = "pin"` lookups
+    /// with, at submit (docs/artifacts.md, "What the host guard checks").
+    /// The built-in classes and the manager's own addresses are refused
+    /// whatever this says; `allow` opens one `ip:port` each (a dev registry
+    /// on the manager's host), `deny` adds destinations. `counterInterval`
+    /// is a worker setting and is refused here.
+    pub host_guard: Option<crate::structs::host_guard::HostGuardConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1853,6 +1860,8 @@ pub struct ArtifactsManagerConfigFull {
     pub allowed_schemes: Vec<String>,
     pub auth: Vec<ArtifactAuthMatcher>,
     pub container_image_desugar: bool,
+    #[serde(default)]
+    pub host_guard: crate::structs::host_guard::HostGuardConfig,
 }
 
 impl Default for ArtifactsManagerConfigFull {
@@ -1864,6 +1873,7 @@ impl Default for ArtifactsManagerConfigFull {
                 .collect(),
             auth: Vec::new(),
             container_image_desugar: false,
+            host_guard: Default::default(),
         }
     }
 }
@@ -1894,6 +1904,7 @@ impl ArtifactsManagerConfig {
             container_image_desugar: self
                 .container_image_desugar
                 .unwrap_or(d.container_image_desugar),
+            host_guard: self.host_guard.clone().unwrap_or(d.host_guard),
         }
     }
 }
@@ -1934,6 +1945,7 @@ impl From<ArtifactsManagerConfigFull> for ArtifactsManagerConfig {
             allowed_schemes: Some(val.allowed_schemes),
             auth: Some(val.auth),
             container_image_desugar: Some(val.container_image_desugar),
+            host_guard: Some(val.host_guard),
         }
     }
 }

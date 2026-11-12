@@ -15,6 +15,9 @@ use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest, Oci
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
+use crate::artifacts::guard_proxy::{self, GuardProxy};
+use crate::structs::host_guard::HostGuard;
+
 use crate::artifacts::fetcher::{
     ArtifactFetcher, Credential, FetchRequest, FetchedArtifact, FetchedPayload, ResolvedIdentity,
 };
@@ -69,12 +72,12 @@ fn parse_reference(req: &FetchRequest<'_>) -> R<(Reference, ClientProtocol)> {
 /// node's own addresses, or at the cloud metadata service is refused unless
 /// the worker's `hostGuard.allow` opens it, as for an `http(s)` artifact.
 ///
-/// The `http(s)` fetcher also pins its connection to the judged addresses;
-/// oci-client builds its own HTTP client with no resolver to pin, and
-/// follows redirects (a blob's CDN, the token `realm`) on its own, so those
-/// are not judged. Every blob is verified against the manifest's digest, so
-/// what a redirect returns cannot land in the task directory unless it is
-/// the content the manifest names.
+/// This is the early refusal with the clear message. The pin is the
+/// [`GuardProxy`](crate::artifacts::guard_proxy::GuardProxy): oci-client
+/// builds its own HTTP client with no resolver hook and follows redirects (a
+/// blob's CDN, the token `realm`) on its own, so every connection it opens,
+/// the registry's and each redirect's, goes through the proxy, which
+/// resolves, judges, and dials only judged addresses.
 fn judge_registry(
     req: &FetchRequest<'_>,
     reference: &Reference,
@@ -155,42 +158,83 @@ fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
 /// The credential is part of the key because the client caches tokens by
 /// registry and repository, not by who asked: a token minted for one job's
 /// credential must never serve another job's pull.
-fn oci_client(protocol: ClientProtocol, for_image: bool, auth: &RegistryAuth) -> Client {
+///
+/// On a guarded worker the client sends through the worker's
+/// [`GuardProxy`](crate::artifacts::guard_proxy::GuardProxy), under a proxy
+/// user of its own, which the second value names so a failed fetch can read
+/// back the proxy's refusals ([`guard_proxy::explain`]). A worker whose
+/// environment names its own HTTP proxy keeps it, and is judged by name only
+/// ([`judge_registry`]).
+fn oci_client(
+    protocol: ClientProtocol,
+    for_image: bool,
+    auth: &RegistryAuth,
+    guard: Option<&Arc<HostGuard>>,
+) -> R<(Client, Option<ProxyUser>)> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     /// Bounds the cache for a node whose jobs use many credentials; clients
     /// past it are built per call, as before.
     const MAX_CLIENTS: usize = 64;
-    /// (plain http, platform selection, credential fingerprint).
-    type ClientKey = (bool, bool, [u8; 32]);
-    static CLIENTS: OnceLock<Mutex<HashMap<ClientKey, Client>>> = OnceLock::new();
+    /// (plain http, platform selection, credential fingerprint, guarded
+    /// proxy address).
+    type ClientKey = (bool, bool, [u8; 32], Option<std::net::SocketAddr>);
+    static CLIENTS: OnceLock<Mutex<HashMap<ClientKey, (Client, Option<ProxyUser>)>>> =
+        OnceLock::new();
 
+    let proxy = match guard {
+        Some(guard) if !guard_proxy::system_proxy_configured() => {
+            Some(GuardProxy::for_guard(guard)?)
+        }
+        _ => None,
+    };
     let key = (
         protocol == ClientProtocol::Http,
         for_image,
         credential_fingerprint(auth),
+        proxy.as_ref().map(|proxy| proxy.addr()),
     );
     let mut clients = CLIENTS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if let Some(client) = clients.get(&key) {
-        return client.clone();
+    if let Some(entry) = clients.get(&key) {
+        return Ok(entry.clone());
     }
     let mut config = ClientConfig {
         protocol,
         connect_timeout: Some(std::time::Duration::from_secs(30)),
+        // A registry that stops sending mid-pull fails the pull rather than
+        // holding every other start of the image behind it
+        // ([`ImagePullClaim`]). The timeout is per read, so a slow but
+        // moving pull of a large layer is not cut off.
+        read_timeout: Some(REGISTRY_READ_TIMEOUT),
         ..ClientConfig::default()
     };
     if for_image {
         config.platform_resolver = Some(Box::new(linux_platform_resolver));
     }
+    let proxy_user = proxy.map(|proxy| {
+        let user = format!("oci-{:016x}", rand::random::<u64>());
+        let url = proxy.url(&user);
+        config.https_proxy = Some(url.clone());
+        config.http_proxy = Some(url);
+        (proxy, user)
+    });
     let client = Client::new(config);
+    let entry = (client, proxy_user);
     if clients.len() < MAX_CLIENTS {
-        clients.insert(key, client.clone());
+        clients.insert(key, entry.clone());
     }
-    client
+    Ok(entry)
 }
+
+/// How long a registry connection may go without sending a byte before the
+/// pull fails.
+pub(crate) const REGISTRY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A guarded proxy and the user one client connects to it as.
+type ProxyUser = (Arc<GuardProxy>, String);
 
 /// A digest of a registry credential, for the keys of [`oci_client`]'s
 /// clients and of shared tag resolutions. The credential itself is never
@@ -303,10 +347,13 @@ impl ArtifactFetcher for OciFetcher {
         // Pinning HEADs the reference itself, so no platform is selected: a
         // multi-platform tag pins to its index digest, which is what the
         // per-node fetch then resolves a platform manifest out of.
-        let client = oci_client(protocol.clone(), false, &auth);
+        let (client, proxy) =
+            oci_client(protocol.clone(), false, &auth, req.limits.egress.as_ref())?;
         let runtime = blocking_runtime()?;
+        let started = std::time::Instant::now();
         let digest = runtime
             .block_on(client.fetch_manifest_digest(&reference, &auth))
+            .map_err(|err| guard_proxy::explain(err.into(), proxy.as_ref(), started))
             .with_context(|| format!("resolve manifest digest for {}", req.redacted_source))?;
 
         let pinned_reference = reference.clone_with_digest(digest.clone());
@@ -324,28 +371,48 @@ impl ArtifactFetcher for OciFetcher {
         let (reference, protocol) = parse_reference(req)?;
         judge_registry(req, &reference, &protocol)?;
         let auth = registry_auth(req)?;
-        let client = oci_client(protocol, req.media_type.is_none(), &auth);
+        let (client, proxy) = oci_client(
+            protocol,
+            req.media_type.is_none(),
+            &auth,
+            req.limits.egress.as_ref(),
+        )?;
         let runtime = blocking_runtime()?;
+        let started = std::time::Instant::now();
+        self.fetch_with(req, sink, runtime, &client, &reference, &auth)
+            .map_err(|err| guard_proxy::explain(err, proxy.as_ref(), started))
+    }
+}
 
+impl OciFetcher {
+    fn fetch_with(
+        &self,
+        req: &FetchRequest<'_>,
+        sink: &mut ArtifactSink,
+        runtime: &tokio::runtime::Runtime,
+        client: &Client,
+        reference: &Reference,
+        auth: &RegistryAuth,
+    ) -> R<FetchedArtifact> {
         match req.media_type {
             Some(media_type) => {
                 // Resolve (possibly via an image index) to one platform manifest.
                 let (manifest, manifest_digest) = runtime
-                    .block_on(client.pull_image_manifest(&reference, &auth))
+                    .block_on(client.pull_image_manifest(reference, auth))
                     .with_context(|| format!("pull manifest for {}", req.redacted_source))?;
                 self.fetch_oras_layers(
                     req,
                     sink,
                     runtime,
-                    &client,
-                    &reference,
-                    &auth,
+                    client,
+                    reference,
+                    auth,
                     manifest,
                     manifest_digest,
                     media_type,
                 )
             }
-            None => self.fetch_image_layout(req, sink, runtime, &client, &reference, &auth),
+            None => self.fetch_image_layout(req, sink, runtime, client, reference, auth),
         }
     }
 }
@@ -1504,6 +1571,14 @@ mod tests {
                         thread_routes.lock().unwrap().get(&path).cloned()
                     };
                     let response = match found {
+                        // A route served as `redirect` answers `307` to the
+                        // URL its body names, as a registry's blob CDN does.
+                        Some((content_type, body)) if content_type == "redirect" => format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n",
+                            String::from_utf8_lossy(&body)
+                        )
+                        .into_bytes(),
                         Some((content_type, body)) => {
                             let digest = ContentDigest::of_bytes(&body);
                             let mut head = format!(
@@ -1980,6 +2055,55 @@ mod tests {
             ..HostGuardConfig::default()
         })?)?;
         assert!(!registry.take_log().is_empty());
+        Ok(())
+    }
+
+    /// A registry the guard opens cannot send a pull somewhere the guard
+    /// refuses: the blob redirect goes through the guarded proxy, which
+    /// judges its target on its own and refuses it before any request.
+    #[test]
+    fn a_registry_redirect_is_judged_by_the_proxy_test() -> R<()> {
+        use crate::structs::host_guard::{HostGuard, HostGuardConfig};
+        if crate::artifacts::guard_proxy::system_proxy_configured() {
+            // The worker keeps an operator's proxy, so there is no pin to test.
+            return Ok(());
+        }
+        let registry = FakeRegistry::start();
+        let elsewhere = FakeRegistry::start();
+        let layer = b"redirected layer".as_slice();
+        registry.publish("v1", br#"{"config":{}}"#, &[layer]);
+        elsewhere.publish("v1", br#"{"config":{}}"#, &[layer]);
+        let blob = format!(
+            "/v2/lib/img/blobs/{}",
+            ContentDigest::of_bytes(layer).as_str()
+        );
+        registry.serve(
+            blob.clone(),
+            "redirect",
+            format!("http://127.0.0.1:{}{blob}", elsewhere.port).into_bytes(),
+        );
+        let source = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
+        let dir = tempfile::tempdir()?;
+        let parsed = parse_artifact_source(&source)?;
+        let limits = FetchLimits {
+            egress: Some(Arc::new(HostGuard::new(&HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{}", registry.port)],
+                ..HostGuardConfig::default()
+            })?)),
+            ..FetchLimits::default()
+        };
+        let mut sink = ArtifactSink::new(dir.path().join("img"), limits.max_bytes)?;
+        let err = OciFetcher::new()
+            .fetch(&request(&parsed, &limits, &source), &mut sink)
+            .expect_err("the redirect's target is guarded");
+        assert!(
+            registry.take_log().iter().any(|line| line.ends_with(&blob)),
+            "the allowed registry was asked for the blob"
+        );
+        assert!(
+            elsewhere.take_log().is_empty(),
+            "nothing reached the redirect's target: {err:#}"
+        );
         Ok(())
     }
 

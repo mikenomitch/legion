@@ -410,7 +410,7 @@ pub enum RegionDefault {
 }
 
 /// What differs between the consumers of one store type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenOptions {
     /// Send `If-None-Match` / `If-Match` on conditional puts. The lease and
     /// session manifests need it: without it `object_store` answers
@@ -432,6 +432,13 @@ pub struct OpenOptions {
     /// that behavior; streaming persistence turns it off and refuses, so a
     /// backup never silently signs as a broader principal.
     pub ambient_fallthrough: bool,
+    /// Send every request through this HTTP proxy: an artifact fetch's
+    /// [`GuardProxy`](crate::artifacts::guard_proxy::GuardProxy), which
+    /// judges each connection (redirects included) with the worker's host
+    /// guard. The instance-metadata and container-credential endpoints are
+    /// left off it, so an ambient principal still finds its keys; they are
+    /// fixed by the node's environment, not by a job.
+    pub proxy_url: Option<String>,
 }
 
 impl Default for OpenOptions {
@@ -444,6 +451,7 @@ impl Default for OpenOptions {
             region_default: RegionDefault::Environment,
             aws_env_settings: true,
             ambient_fallthrough: true,
+            proxy_url: None,
         }
     }
 }

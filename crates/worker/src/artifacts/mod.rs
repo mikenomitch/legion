@@ -20,6 +20,7 @@ use crate::structs::parse_artifact_source;
 pub mod auth;
 pub mod fetcher;
 pub mod fetchers;
+pub mod guard_proxy;
 pub mod stage;
 pub mod status;
 

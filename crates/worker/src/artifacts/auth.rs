@@ -96,6 +96,14 @@ pub fn validate_artifacts_against_cluster(
     cluster: &ArtifactsManagerConfigFull,
     node_identity_names: &[String],
 ) -> R<()> {
+    crate::structs::host_guard::HostGuard::new(&cluster.host_guard)
+        .context("invalid artifacts.hostGuard")?;
+    if cluster.host_guard.counter_interval.is_some() {
+        bail!(
+            "artifacts.hostGuard.counterInterval is a worker setting; the manager's guard \
+             judges submit-time pin lookups and keeps no counters"
+        );
+    }
     for artifact in artifacts {
         let parsed = parse_artifact_source(&artifact.source)
             .with_context(|| format!("task {task_name} artifact source"))?;

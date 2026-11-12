@@ -307,6 +307,8 @@ pub(crate) struct S3Plan {
     pub principal: Principal,
     /// The non-credential `AWS_*` settings imported from the environment.
     pub env_settings: Vec<(AmazonS3ConfigKey, String)>,
+    /// [`OpenOptions::proxy_url`].
+    pub proxy_url: Option<String>,
 }
 
 /// Decide how to build the client for `location`, signing as `principal`.
@@ -358,6 +360,7 @@ pub(crate) fn plan(
         conditional_put: options.conditional_put,
         principal,
         env_settings,
+        proxy_url: options.proxy_url.clone(),
     })
 }
 
@@ -405,6 +408,12 @@ pub(crate) fn process_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The node-fixed credential endpoints a proxied store reaches directly:
+/// EC2 instance metadata (IPv4 and IPv6) and the ECS container-credential
+/// endpoint. object_store's credential client shares the store's proxy
+/// settings, and a guarded proxy would refuse these link-local addresses.
+const CREDENTIAL_ENDPOINTS: &str = "169.254.169.254,169.254.170.2,fd00:ec2::254";
+
 /// Build the client a [`plan`] describes.
 pub(crate) fn build(plan: S3Plan) -> R<AmazonS3> {
     let mut builder = AmazonS3Builder::new();
@@ -425,6 +434,11 @@ pub(crate) fn build(plan: S3Plan) -> R<AmazonS3> {
         builder = builder
             .with_endpoint(endpoint)
             .with_allow_http(plan.allow_http);
+    }
+    if let Some(proxy_url) = &plan.proxy_url {
+        builder = builder
+            .with_proxy_url(proxy_url)
+            .with_proxy_excludes(CREDENTIAL_ENDPOINTS);
     }
     builder = match &plan.principal {
         Principal::Anonymous => builder.with_skip_signature(true),

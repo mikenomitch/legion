@@ -11,6 +11,7 @@ use futures::StreamExt;
 use object_store::{path::Path as ObjectPath, ObjectStore};
 
 use crate::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};
+use crate::artifacts::guard_proxy::{self, GuardProxy};
 use crate::artifacts::stage::ArtifactSink;
 use crate::objects::{
     self, ObjectCredential, OpenOptions, RegionDefault, StoreUrl, FALLBACK_REGION,
@@ -28,6 +29,8 @@ impl S3Fetcher {
 
 struct S3Target {
     store: Arc<dyn ObjectStore>,
+    /// The guarded proxy the store sends through, and its user.
+    proxy: Option<(Arc<GuardProxy>, String)>,
     key: ObjectPath,
     file_name: String,
 }
@@ -97,6 +100,20 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
             )?;
         }
     }
+    // Every connection the client opens, the endpoint's and any redirect's,
+    // goes through the worker's guarded proxy, which judges and pins it.
+    // An operator's own proxy (`HTTPS_PROXY`, `AWS_PROXY_URL`) is kept, and
+    // the fetch is then judged by its endpoint name only.
+    let proxy = match req.limits.egress.as_ref() {
+        Some(guard)
+            if !guard_proxy::system_proxy_configured()
+                && std::env::var("AWS_PROXY_URL").map_or(true, |v| v.trim().is_empty()) =>
+        {
+            let user = format!("s3-{:016x}", rand::random::<u64>());
+            Some((GuardProxy::for_guard(guard)?, user))
+        }
+        _ => None,
+    };
     let url = StoreUrl::from_url(req.url.clone())
         .with_context(|| format!("invalid s3 source {}", req.redacted_source))?;
     let key = url.key("")?;
@@ -121,6 +138,7 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
             ObjectCredential::Ambient => RegionDefault::Environment,
             _ => RegionDefault::Fixed(FALLBACK_REGION),
         },
+        proxy_url: proxy.as_ref().map(|(proxy, user)| proxy.url(user)),
         ..OpenOptions::default()
     };
 
@@ -135,6 +153,7 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
     Ok(S3Target {
         store: objects::open(&url, &credential, &options)
             .with_context(|| format!("build s3 client for {}", req.redacted_source))?,
+        proxy,
         key,
         file_name,
     })
@@ -165,6 +184,7 @@ impl ArtifactFetcher for S3Fetcher {
             .context("build s3 fetch runtime")?;
 
         let mut writer = sink.file_writer(&target.file_name)?;
+        let started = std::time::Instant::now();
         let total = runtime.block_on(async {
             let result = target
                 .store
@@ -183,7 +203,9 @@ impl ArtifactFetcher for S3Fetcher {
                 written += chunk.len() as u64;
             }
             Ok::<(u64, u64), anyhow::Error>((size, written))
-        })?;
+        });
+        let total =
+            total.map_err(|err| guard_proxy::explain(err, target.proxy.as_ref(), started))?;
         let _ = total;
         let (path, digest, bytes) = writer.finish()?;
         Ok(FetchedArtifact {

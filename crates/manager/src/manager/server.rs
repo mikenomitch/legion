@@ -2112,6 +2112,10 @@ pub struct ManagerDaemonService {
     /// Fetcher registry used to resolve `resolve: "pin"` references at
     /// submit (blocking; callers wrap in block_in_place).
     fetcher_registry: Arc<Mutex<crate::artifacts::FetcherRegistry>>,
+    /// The host guard `resolve: "pin"` lookups are judged with, built from
+    /// `artifacts.hostGuard` on first use and shared after, so its guarded
+    /// proxy and the registry clients behind it are reused across submits.
+    pin_guard: Arc<std::sync::OnceLock<Arc<crate::structs::host_guard::HostGuard>>>,
     /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
     /// true). When false the endpoint rejects with FailedPrecondition.
     exec_enabled: bool,
@@ -2239,6 +2243,7 @@ impl ManagerDaemonService {
             fetcher_registry: Arc::new(Mutex::new(
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
+            pin_guard: Arc::default(),
             exec_enabled: true,
             exec_tickets: crate::structs::ExecTicketsConfigFull::default(),
             exec_keys: Arc::new(Mutex::new(None)),
@@ -4408,7 +4413,22 @@ impl ManagerDaemonService {
     /// checks"): the fetcher resolves the host once, refuses loopback, the
     /// unspecified address, link-local and cloud metadata, and the manager's
     /// own addresses, and holds the connection to the addresses it judged.
-    /// The manager has no `hostGuard.allow`, so nothing opens those.
+    /// The manager's `artifacts.hostGuard` opens one `ip:port` at a time
+    /// and adds `deny` ranges, as a worker's `hostGuard` does. The OCI and
+    /// S3 clients send through the guard's proxy, so their own resolution
+    /// and redirects are judged too.
+    /// The guard [`Self::resolve_pin`] judges with (`artifacts.hostGuard`).
+    fn pin_guard(&self) -> R<Arc<crate::structs::host_guard::HostGuard>> {
+        if let Some(guard) = self.pin_guard.get() {
+            return Ok(guard.clone());
+        }
+        let guard = Arc::new(
+            crate::structs::host_guard::HostGuard::new(&self.artifacts_config.host_guard)
+                .context("invalid artifacts.hostGuard")?,
+        );
+        Ok(self.pin_guard.get_or_init(|| guard).clone())
+    }
+
     fn resolve_pin(
         &self,
         spec: &crate::structs::ArtifactSpec,
@@ -4439,8 +4459,10 @@ impl ManagerDaemonService {
             .lock()
             .expect("fetcher registry")
             .fetcher(&parsed.scheme)?;
+        let guard = self.pin_guard()?;
+        guard.set_node_addrs(crate::structs::host_guard::interface_addresses());
         let limits = FetchLimits {
-            egress: Some(Arc::new(manager_pin_guard())),
+            egress: Some(guard),
             ..FetchLimits::default()
         };
         let redacted = spec.redacted_source();
@@ -4454,15 +4476,17 @@ impl ManagerDaemonService {
             limits: &limits,
         };
         let resolved = fetcher.resolve(&request).map_err(|err| {
-            // The fetcher's refusal names the worker's `hostGuard.allow`,
-            // which does not apply here.
-            if format!("{err:#}").contains("the host guard refuses") {
+            // The fetcher's refusal names the worker's `hostGuard.allow`;
+            // here it is the manager's `artifacts.hostGuard.allow`.
+            let text = format!("{err:#}");
+            if text.contains("the host guard refuses") || text.contains("the host guard refused") {
                 err.context(format!(
                     "the manager will not look up {redacted} at submit: its host guard \
                      refuses loopback, link-local and cloud metadata addresses, and the \
-                     manager's own, and no setting opens them for a pin lookup. Pin the \
-                     digest or commit yourself, or set resolve: \"always\" so the worker \
-                     resolves it, where hostGuard.allow applies"
+                     manager's own. Open one ip:port with the manager's \
+                     artifacts.hostGuard.allow, pin the digest or commit yourself, or set \
+                     resolve: \"always\" so the worker resolves it, where its own \
+                     hostGuard.allow applies"
                 ))
             } else {
                 err
@@ -13951,16 +13975,6 @@ fn request_fingerprint(request: &impl serde::Serialize) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// The host guard the manager judges its own `resolve = "pin"` lookups with:
-/// the guard's built-in classes (loopback, unspecified, link-local, cloud
-/// metadata) and this manager's interface addresses, with no `allow` or
-/// `deny` entries (those are worker settings).
-fn manager_pin_guard() -> crate::structs::host_guard::HostGuard {
-    let guard = crate::structs::host_guard::HostGuard::default();
-    guard.set_node_addrs(crate::structs::host_guard::interface_addresses());
-    guard
 }
 
 /// The reply a keyed `CreateInstance` replays from its idempotency record:
