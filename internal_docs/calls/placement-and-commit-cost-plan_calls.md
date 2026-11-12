@@ -193,6 +193,10 @@ the rest fit there. Trying domains whole gives the gang's all-or-nothing
 rule a domain-sized unit, and best fit (Kueue's default) keeps large domains
 whole for large gangs, the same argument as SCH4's `bin_pack`.
 
+**Amended 2026-11-12.** The bound is now sixteen domains across every
+`topology.keys` level, and only domains whose estimate, counting what
+preemption could reclaim, reaches the quorum are tried (gang calls 30).
+
 ## 6. The claim's pending count is capped at the fair share's saturation point; the queue-depth gauge is rate-limited
 
 **Call.** A claim counts pending rows only up to `workers × max + held`
@@ -251,6 +255,9 @@ later than it could have.
 (worker and plugin), and a checkpoint story; none exists, and a half-built
 version would be a jobspec promise without a mechanism. The existing
 member-loss path already gives the correct end state.
+
+**Resolved 2026-11-12** by
+[spot-interruption-plan.md](../plans/spot-interruption-plan.md).
 
 ## 9. Per-plan and per-claim logs move to `debug`; one `info` line for a plan slower than a second
 

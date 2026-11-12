@@ -277,6 +277,35 @@ fn a_waiting_gang_holds_nothing_and_takes_freed_capacity_whole() -> R<()> {
     Ok(())
 }
 
+/// Gang-aware wake: freed room for one member does not wake a gang that is
+/// two short of its quorum (no re-plan for nothing); room for both does.
+#[test]
+fn a_blocked_gang_wakes_only_when_its_shortfall_could_fit() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3"])?;
+    cluster.submit(&job("filler-a", 1, None))?;
+    cluster.submit(&job("filler-b", 1, None))?;
+    cluster.settle()?;
+    cluster.submit(&job("trainer", 3, gang()))?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 0, "one free node of three");
+
+    let skipped = || legion::telemetry::metrics().gang_wakes_skipped_total.get();
+    let before = skipped();
+    cluster.store().remove_allocs_for_job("filler-a")?;
+    assert_eq!(
+        cluster.settle()?,
+        0,
+        "two free nodes cannot hold three: the gang keeps waiting, unplanned"
+    );
+    assert!(skipped() > before, "the skipped wake is counted");
+    assert_eq!(cluster.store().blocked_evals()?.len(), 1);
+
+    cluster.store().remove_allocs_for_job("filler-b")?;
+    assert_eq!(cluster.settle()?, 1, "room for all three wakes it");
+    assert_eq!(cluster.running("trainer")?, 3);
+    Ok(())
+}
+
 fn gang_on_loss(policy: MemberLossPolicy) -> Option<GangConfig> {
     Some(GangConfig {
         on_member_loss: policy,
@@ -625,7 +654,7 @@ fn failure_driven_restarts_spend_the_move_budget() -> R<()> {
             )?
             .context("removed")?;
         let exhausted = matches!(removal.verdict, MoveVerdict::Exhausted { .. });
-        store.gang_member_lost(&removal.allocation, StopCause::Unknown, exhausted)?;
+        store.gang_member_lost(&removal.allocation, StopCause::Unknown.as_str(), exhausted)?;
         Ok(removal.verdict)
     };
     let reschedule = || -> R<()> {
@@ -780,7 +809,7 @@ fn a_required_topology_gang_waits_for_one_domain_and_starts_inside_it() -> R<()>
         2,
         Some(GangConfig {
             topology: Some(GangTopology {
-                key: "rack".into(),
+                keys: vec!["rack".into()],
                 mode: TopologyMode::Required,
             }),
             ..GangConfig::default()
@@ -842,5 +871,77 @@ fn a_restarted_gang_is_ranked_afresh() -> R<()> {
     assert_eq!(after.keys().copied().collect::<Vec<_>>(), [0, 1, 2]);
     let old: std::collections::HashSet<i64> = before.values().map(|(id, _)| *id).collect();
     assert!(after.values().all(|(id, _)| !old.contains(id)));
+    Ok(())
+}
+
+impl Cluster {
+    /// One worker heartbeat from `node`, reporting `restarts`.
+    fn heartbeat(
+        &self,
+        node: &str,
+        restarts: Vec<legion::structs::GangMemberRestart>,
+    ) -> R<legion::structs::HeartbeatReply> {
+        let allocation_ids = self
+            .store()
+            .allocs_for_node(node)?
+            .iter()
+            .map(|allocation| allocation.id)
+            .collect();
+        Ok(self
+            .runtime
+            .block_on(
+                self.svc
+                    .heartbeat(Request::new(legion::structs::HeartbeatRequest {
+                        id: node.to_string(),
+                        allocation_ids,
+                        gang_restarts: restarts,
+                        ..Default::default()
+                    })),
+            )?
+            .into_inner())
+    }
+}
+
+/// The heartbeat path end to end: every reply carries the view of the gang
+/// members on the node, and a member the worker restarted in place, under
+/// `onMemberLoss = "restartInPlace"`, raises the whole gang's epoch, which
+/// every node's next reply carries (docs/gang-scheduling.md, "Local
+/// restarts").
+#[test]
+fn a_reported_local_restart_restarts_the_gang_in_place() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3"])?;
+    cluster.submit(&job(
+        "trainer",
+        3,
+        gang_on_loss(MemberLossPolicy::RestartInPlace),
+    ))?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 3);
+
+    let reply = cluster.heartbeat("n-1", Vec::new())?;
+    let view = reply.gang_members.first().context("n-1 runs a member")?;
+    assert_eq!((view.size, view.min, view.epoch), (3, 3, 0));
+    let member = view.allocation_id;
+
+    cluster.heartbeat(
+        "n-1",
+        vec![legion::structs::GangMemberRestart {
+            allocation_id: member,
+            reason: "exited 1; restarting".into(),
+        }],
+    )?;
+    for node in ["n-1", "n-2", "n-3"] {
+        let reply = cluster.heartbeat(node, Vec::new())?;
+        let view = reply.gang_members.first().context("a member")?;
+        assert_eq!(view.epoch, 1, "{node} restarts its member in place");
+    }
+    assert_eq!(cluster.running("trainer")?, 3, "nothing was re-placed");
+    let events = gang_events(&cluster)?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["cause"] == "local_restart" && event["action"] == "restartInPlace"),
+        "{events:?}"
+    );
     Ok(())
 }

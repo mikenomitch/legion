@@ -175,35 +175,6 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       exist only for blocked evals (`blocked.rs`).
 - [ ] **Usage-aware placement and a descheduler** (review SCH7).
 
-### Gang scheduling
-
-[plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md)
-
-- [ ] **Gang variables go stale after a scale or a moved leader**: members keep
-      the `LEGION_GANG_SIZE` / `LEGION_GANG_LEADER_ADDR` they were placed with.
-      Restart the gang on scale, or deliver them as a re-read file (calls 9).
-- [ ] **Readiness timeout** (Kueue's `waitForPodsReady`): `placementTimeout`
-      covers placement only, not a placed member that hangs before running.
-- [ ] **In-place gang restart** (JobSet `InPlaceRestart`).
-- [ ] **Local restarts as gang losses**: a worker restarting a crashed member in
-      place is invisible to the manager; a worker report would let
-      `onMemberLoss` apply (calls 5).
-- [ ] **Phase 4**: an integration test for the `createFirst` blue-green gang
-      update, and the autoscaler consuming a blocked gang's shortfall.
-- [ ] **Gang-aware wake**: a blocked gang re-plans on any capacity on its class.
-      Wake only when `min - running - placeable` could fit, once measured (calls 2).
-- [ ] **Whole-gang preemption victims**: a `gang = true` job is never
-      preemptible because preemption won't go below quorum (calls 7).
-- [ ] **Reservation / backfill for starving gangs.** Watch
-      `legion_gang_blocked_jobs` first; needs its own plan.
-- [ ] **Gangs ignore spot-interruption notices** (review AI7;
-      [calls #8](calls/placement-and-commit-cost-plan_calls.md)). Wants an
-      "interruption pending" node condition from IMDS or the `aws-asg` plugin.
-      Needs its own plan.
-- [ ] **Multi-level gang topology** (`keys = ["rack", "zone"]`); also at most
-      eight domains are tried per plan ([plan §11](plans/placement-and-commit-cost-plan.md) ·
-      [calls #5](calls/placement-and-commit-cost-plan_calls.md)).
-
 ### Edge boot
 
 [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) · [calls](calls/edge-boot-plan_calls.md)
@@ -1172,6 +1143,9 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **Placement quality and commit cost** — bounded `plan_submission`, O(batch) claims, `bin_pack`/`spread` scored against capacity with count-scaled anti-affinity, in-memory plan apply, debug-level plan logs, topology-aware gang placement (review SCH2/3/4/5a/8, AI7a) ([plan](plans/placement-and-commit-cost-plan.md) · [calls](calls/placement-and-commit-cost-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md))
 - **Gang scheduling, Phase 1** — `gang = true | { min }`, all-or-nothing quorum placement, preemption floor, one-step rollout, `gang_reports` ([plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md))
 - **Gang scheduling, Revision 2** — `gang.placementTimeout`, `gang.onMemberLoss = restart|replace|fail`, `LEGION_GANG_RANK/SIZE/MIN/LEADER_ADDR` ([plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) · [docs](../docs/gang-scheduling.md#placement-timeout))
+- **Gang scheduling, Revision 3** — gang views that follow a `job scale` or a moved rank 0 (members restart in place under `LEGION_GANG_EPOCH`), `gang.readyTimeout`, `onMemberLoss = "restartInPlace"`, local restarts as losses (`gang.onLocalRestart`), gang-aware wake, whole-gang preemption victims, multi-level topology (`topology.keys`, preemption-aware domain filter, 16 trials), and the Phase 4 tests (`createFirst` blue-green update, the autoscaler consuming a blocked gang's shortfall) ([plan](plans/gang-scheduling-plan.md#revision-3-the-follow-ups-2026-11-12) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md))
+- **Gang reservations** — a gang waiting past `schedulerSettings.gangReservation.after` reserves room on the nodes it needs for one `hold`; work of its band or below backfills only what is beyond it ([plan](plans/gang-reservation-plan.md) · [calls](calls/gang-reservation-plan_calls.md) · [docs](../docs/gang-scheduling.md#reservations))
+- **Spot interruption** — the worker's EC2 `spotInterruption` watcher and `legion node interrupt` record a node's pending interruption; gangs keep off the node and its gang members move first (stop cause `interruption`) ([plan](plans/spot-interruption-plan.md) · [calls](calls/spot-interruption-plan_calls.md) · [docs](../docs/spot-interruption.md))
 - **Elastic session envelopes, Phase 1** — `stateful.envelope.max`/`shrinkAfter` grow and shrink a node's envelope ([plan](plans/elastic-session-envelopes-plan.md) · [calls](calls/elastic-session-envelopes-plan_calls.md) · [docs](../docs/session-mode.md#elastic-envelopes))
 - **Submit/update/scale-out evals settle with their plans** — fused settle saves one entry each ([plan](plans/multi-eval-plans-plan.md) · [calls](calls/multi-eval-plans-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md))
 - **Index truncation samples a tied cell uniformly** — fixes the planner seeing only the lowest-id slice at rig scale ([findings](aws-phase5-findings.md#open-in-priority-order) · [calls](calls/scheduling-index-plan_calls.md) · [docs](../docs/scheduling-indexes.md))

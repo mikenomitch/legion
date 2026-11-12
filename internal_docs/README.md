@@ -127,7 +127,8 @@ When one is required and what goes in it:
 | [edge-admission-control-plan.md](plans/edge-admission-control-plan.md) | in execution (Phase 1 built: the per-node claim window that sheds edge starts `OVERLOADED` before boot when ratification is slow, and enforces `maxProvisionalPerNode`. Manager-side speculation shedding and deadline-aware ratification planned) |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
 | [edge-ratify-throughput-plan.md](plans/edge-ratify-throughput-plan.md) | in execution (Phase 1 shipped 2026-10-14: in-process ratify load harness, ratifications fenced by committed state instead of epochs, create decided inside the entry, ratify off the async runtime. Per-node RPC batching deferred on data, networked load test planned) |
-| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | in execution (Phases 1–3 shipped; rank/world size, readiness timeout, and Phase 4 open) |
+| [gang-reservation-plan.md](plans/gang-reservation-plan.md) | shipped (2026-11-12: a long-waiting gang reserves room on the nodes it needs; backfill by room, not time) |
+| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | shipped (Phases 1–4 and Revision 3, 2026-11-12: views that follow a scale, readiness timeout, in-place restarts, local restarts as losses, gang-aware wake, whole-gang preemption, multi-level topology; cross-job and named cross-task gangs, a start barrier, and the UI badge not built) |
 | [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 5 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs, ingress into gated and TAP sandboxes, and upstreams in gated sandboxes; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
@@ -163,7 +164,7 @@ When one is required and what goes in it:
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
 | [scheduler-sharding-strategies-proposal.md](plans/scheduler-sharding-strategies-proposal.md) | proposal, revision 3 (sharding the scheduler across more raft groups; extends multi-raft Phase 8; recommends pool-keyed shards that are raft group **plus** own state file, co-located first, spread later, with plan shipping (M3) as the peer lever for planner-bound large fleets; Phase 0 attributes the October campaigns' wall per fleet-size regime before anything graduates) |
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
-| [placement-and-commit-cost-plan.md](plans/placement-and-commit-cost-plan.md) | shipped (2026-11-08: review SCH2/SCH3/SCH4/SCH8, the SCH5 plan round trip, and gang topology (AI7); the SCH5 node-row half followed 2026-11-12; spot-interruption handling and multi-level topology deferred) |
+| [placement-and-commit-cost-plan.md](plans/placement-and-commit-cost-plan.md) | shipped (2026-11-08: review SCH2/SCH3/SCH4/SCH8, the SCH5 plan round trip, and gang topology (AI7); the SCH5 node-row half followed 2026-11-12; spot interruption and multi-level topology shipped 2026-11-12 with the gang follow-ups) |
 | [plan-path-fleet-scaling-plan.md](plans/plan-path-fleet-scaling-plan.md) | in execution (per-eval cost that grows with node count, from the 2026-10-09 campaign: 99 ms/eval at 10k vs 36 at 5k; Phases 1-3 done; Phase 4 removed the per-eval node lookup and O(jobs) SQL scans and instruments the whole eval, AWS re-run pending) |
 | [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md); the throughput half of that cell is retracted by [aws-phase4-findings.md](aws-phase4-findings.md), which found the rig measuring its own submission rate) |
 | [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue + eval-loop batching landed; phase 5 — in-memory reprojection memo + audit hardening — landed 2026-08-06; the AWS re-measurement is not run) |
@@ -191,6 +192,7 @@ When one is required and what goes in it:
 | [service-discovery-mesh-and-config.md](plans/service-discovery-mesh-and-config.md) | superseded (cookbook + mesh extensions) |
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
 | [session-snapshot-start-plan.md](plans/session-snapshot-start-plan.md) | planned (2026-11-12): opt-in session starts from a per-node memory snapshot of a template guest, restored as a fork, falling back to a boot |
+| [spot-interruption-plan.md](plans/spot-interruption-plan.md) | shipped (2026-11-12: the worker's EC2 spot watcher and `legion node interrupt`; gangs keep off and move off interrupted nodes; other clouds via a handler) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [task-start-critical-path-plan.md](plans/task-start-critical-path-plan.md) | shipped (phases 1–3: start stage timings, startup probing for health checks, gated namespaces before their listeners; phases 4–5, 2026-11-12: health transitions reported on `StreamWork` between heartbeats, a streamed placement's policy assignment on its delta; follow-up: the worker state file written off the lock, TAP devices without `ip`, the rest of the worker's blocking work off the task-manager lock) |
@@ -285,6 +287,8 @@ by project impact. The full template and a worked example:
 - [checkpoints-on-stream-plan_calls.md](calls/checkpoints-on-stream-plan_calls.md)
 - [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
+- [gang-reservation-plan_calls.md](calls/gang-reservation-plan_calls.md)
+- [spot-interruption-plan_calls.md](calls/spot-interruption-plan_calls.md)
 - [heartbeat-cadence-at-scale-plan_calls.md](calls/heartbeat-cadence-at-scale-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)

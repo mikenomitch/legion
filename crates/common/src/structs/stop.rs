@@ -80,6 +80,10 @@ pub enum StopCause {
     /// the managers removed it, and nothing replaces it until the runtime is
     /// enabled again.
     RuntimeDisabled,
+    /// The node has a pending interruption (a spot reclaim notice, or
+    /// `legion node interrupt`; docs/spot-interruption.md), and this gang
+    /// member was moved off it before the node goes.
+    Interruption,
     /// No cause was recorded for this stop.
     ///
     /// This is a legitimate steady-state value, not only a bug: stop causes
@@ -109,6 +113,7 @@ impl StopCause {
             StopCause::Gang => "gang",
             StopCause::Failed => "failed",
             StopCause::RuntimeDisabled => "runtime_disabled",
+            StopCause::Interruption => "interruption",
             StopCause::Unknown => "unknown",
         }
     }
@@ -133,6 +138,7 @@ impl StopCause {
             "gang" => StopCause::Gang,
             "failed" => StopCause::Failed,
             "runtime_disabled" => StopCause::RuntimeDisabled,
+            "interruption" => StopCause::Interruption,
             _ => StopCause::Unknown,
         }
     }
@@ -255,6 +261,7 @@ mod stop_cause_test {
             StopCause::Preempted,
             StopCause::NodePressure,
             StopCause::RuntimeDisabled,
+            StopCause::Interruption,
             StopCause::Unknown,
         ] {
             assert_eq!(StopCause::from_wire(cause.as_str()), cause);

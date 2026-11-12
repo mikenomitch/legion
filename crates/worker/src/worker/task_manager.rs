@@ -1067,6 +1067,11 @@ pub struct WorkerTaskManager {
     /// missing ([`NET_CAPTURE_UNAVAILABLE`]), put back when capture recovers.
     net_capture_masked: HashMap<i64, AllocationHealth>,
     failed: Vec<FailedAllocationReport>,
+    /// Gang members restarted in place under their task's `restart` policy
+    /// since the last acknowledged heartbeat, by local key, with why
+    /// (`HeartbeatRequest.gang_restarts`; docs/gang-scheduling.md, "Local
+    /// restarts").
+    gang_restarts: Vec<(i64, String)>,
     /// Terminal (non-failure) outcomes owed to the manager on the next
     /// heartbeat.
     terminated_reports: Vec<TerminatedAllocationReport>,
@@ -1389,6 +1394,7 @@ impl WorkerTaskManager {
             allocation_health: HashMap::new(),
             net_capture_masked: HashMap::new(),
             failed: Vec::new(),
+            gang_restarts: Vec::new(),
             terminated_reports: Vec::new(),
             terminated: HashMap::new(),
             terminal_outcomes: HashMap::new(),
@@ -2779,6 +2785,93 @@ impl WorkerTaskManager {
             .entry(allocation_id)
             .or_default()
             .push(std::time::Instant::now());
+        // A gang member's local restart is the manager's business: the rest
+        // of its gang may need to restart with it.
+        if self
+            .task_configs
+            .get(&allocation_id)
+            .is_some_and(|task| gang_env(task, "LEGION_GANG_RANK").is_some())
+        {
+            let reason = self
+                .allocation_health
+                .get(&allocation_id)
+                .map(|health| health.status.clone())
+                .filter(|status| !status.is_empty())
+                .unwrap_or_else(|| "restarted in place".to_string());
+            self.gang_restarts.push((allocation_id, reason));
+        }
+    }
+
+    /// Gang members restarted in place since the last call, by the id the
+    /// manager knows them by.
+    pub fn drain_gang_restarts(&mut self) -> Vec<crate::structs::GangMemberRestart> {
+        let restarts = std::mem::take(&mut self.gang_restarts);
+        restarts
+            .into_iter()
+            .filter_map(|(local, reason)| {
+                Some(crate::structs::GangMemberRestart {
+                    allocation_id: self.external_id(local)?,
+                    reason,
+                })
+            })
+            .collect()
+    }
+
+    /// Put back gang restart reports a failed heartbeat did not deliver.
+    pub fn requeue_gang_restarts(&mut self, restarts: Vec<crate::structs::GangMemberRestart>) {
+        let mut restored: Vec<(i64, String)> = restarts
+            .into_iter()
+            .map(|restart| (self.local_key(restart.allocation_id), restart.reason))
+            .collect();
+        restored.append(&mut self.gang_restarts);
+        self.gang_restarts = restored;
+    }
+
+    /// Apply the manager's current view of a gang member this node runs
+    /// (`HeartbeatReply.gang_members`; docs/gang-scheduling.md, "Starting
+    /// together"). When the view's epoch is newer than the one the member's
+    /// process started under, its `LEGION_GANG_*` variables are rewritten
+    /// in the payload this node keeps and the local key is returned: the
+    /// caller restarts it in place. A member not running here, or already
+    /// at this epoch or a newer one, is left alone.
+    pub fn apply_gang_view(&mut self, view: &crate::structs::GangMemberView) -> Option<i64> {
+        let local = self.local_key(view.allocation_id);
+        if !self.instances.contains_key(&local)
+            || self.terminating.contains_key(&local)
+            || self.draining.contains_key(&local)
+        {
+            return None;
+        }
+        let task = self.task_configs.get_mut(&local)?;
+        let current: u64 = gang_env(task, "LEGION_GANG_EPOCH")
+            .and_then(|epoch| epoch.parse().ok())
+            .unwrap_or(0);
+        if view.epoch <= current || gang_env(task, "LEGION_GANG_RANK").is_none() {
+            return None;
+        }
+        let env = task
+            .config
+            .as_object_mut()?
+            .entry("env")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()))
+            .as_object_mut()?;
+        for (key, value) in [
+            ("LEGION_GANG_RANK", view.rank.to_string()),
+            ("LEGION_GANG_SIZE", view.size.to_string()),
+            ("LEGION_GANG_MIN", view.min.to_string()),
+            ("LEGION_GANG_EPOCH", view.epoch.to_string()),
+        ] {
+            env.insert(key.to_string(), serde_json::Value::String(value));
+        }
+        if view.leader_address.is_empty() {
+            env.remove("LEGION_GANG_LEADER_ADDR");
+        } else {
+            env.insert(
+                "LEGION_GANG_LEADER_ADDR".to_string(),
+                serde_json::Value::String(view.leader_address.clone()),
+            );
+        }
+        Some(local)
     }
 
     /// Queue a terminal (non-failure) outcome for the next heartbeat and mark
@@ -8512,6 +8605,12 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
     Ok((alloc, task))
 }
 
+/// A `LEGION_GANG_*` variable from a task's payload env, if it is a gang
+/// member (the manager injects them; docs/gang-scheduling.md).
+fn gang_env<'a>(task: &'a TaskConfig, name: &str) -> Option<&'a str> {
+    task.config.get("env")?.get(name)?.as_str()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12505,6 +12604,84 @@ mod tests {
         manager
             .task_configs
             .insert(allocation.id, TaskConfig::new("noop-task", "noop"));
+    }
+
+    /// A gang member's payload, as the manager injects it.
+    fn gang_member_task(epoch: u64) -> TaskConfig {
+        let mut task = TaskConfig::new("worker", "noop");
+        task.config = serde_json::json!({ "env": {
+            "LEGION_GANG_RANK": "1",
+            "LEGION_GANG_SIZE": "2",
+            "LEGION_GANG_MIN": "2",
+            "LEGION_GANG_EPOCH": epoch.to_string(),
+            "LEGION_GANG_LEADER_ADDR": "10.0.0.1",
+        }});
+        task
+    }
+
+    /// A newer gang epoch rewrites the member's `LEGION_GANG_*` values and
+    /// asks for an in-place restart; the same or an older one does nothing.
+    #[test]
+    fn a_newer_gang_view_rewrites_the_member_and_restarts_it() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        let allocation = alloc();
+        seed_running_allocation(&mut manager, &allocation);
+        manager
+            .task_configs
+            .insert(allocation.id, gang_member_task(0));
+        let view = |epoch: u64| crate::structs::GangMemberView {
+            allocation_id: allocation.id,
+            rank: 1,
+            size: 3,
+            min: 3,
+            leader_address: "10.0.0.9".into(),
+            epoch,
+        };
+        assert_eq!(manager.apply_gang_view(&view(0)), None, "same epoch");
+        assert_eq!(manager.apply_gang_view(&view(1)), Some(allocation.id));
+        let env = &manager.task_configs[&allocation.id].config["env"];
+        assert_eq!(env["LEGION_GANG_SIZE"], "3");
+        assert_eq!(env["LEGION_GANG_EPOCH"], "1");
+        assert_eq!(env["LEGION_GANG_LEADER_ADDR"], "10.0.0.9");
+        assert_eq!(manager.apply_gang_view(&view(1)), None, "applied once");
+
+        // Not a gang member: nothing.
+        manager
+            .task_configs
+            .insert(allocation.id, TaskConfig::new("noop-task", "noop"));
+        assert_eq!(manager.apply_gang_view(&view(5)), None);
+        Ok(())
+    }
+
+    /// A gang member's local restart is reported once, with its reason; a
+    /// task that is not a gang member is not reported.
+    #[test]
+    fn a_gang_members_local_restart_is_reported() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        let member = alloc();
+        seed_running_allocation(&mut manager, &member);
+        manager.task_configs.insert(member.id, gang_member_task(0));
+        manager.set_allocation_health(member.id, false, "exited 1; restarting");
+        manager.record_restart_attempt(member.id);
+        let other = Allocation {
+            id: member.id + 1,
+            ..alloc()
+        };
+        seed_running_allocation(&mut manager, &other);
+        manager.record_restart_attempt(other.id);
+
+        let reports = manager.drain_gang_restarts();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].allocation_id, member.id);
+        assert_eq!(reports[0].reason, "exited 1; restarting");
+        assert!(manager.drain_gang_restarts().is_empty(), "drained");
+        manager.requeue_gang_restarts(reports);
+        assert_eq!(manager.drain_gang_restarts().len(), 1, "put back");
+        Ok(())
     }
 
     #[test]

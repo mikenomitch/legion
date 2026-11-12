@@ -217,6 +217,12 @@ documents each):
 | Operator | `legion_raft_status`, `legion_raft_history`, `legion_manager_configs`, `legion_observability`, **`legion_raft_command`**, **`legion_raft_join_token`**, **`legion_keyring_rewrap_kv`**, **`legion_node_restart_worker`**, **`legion_node_update_dynamic`** |
 | Networking, state, snapshots, join tokens | `legion_net_policy_get`, `legion_state_saved_query_list`, `legion_join_token_list`, **`legion_net_policy_delete`**, **`legion_net_plugin_delete`**, **`legion_state_saved_query_upsert`**, **`legion_state_saved_query_delete`**, **`legion_snapshot_alias_delete`**, **`legion_join_token_create`**, **`legion_join_token_delete`** |
 
+`legion_node_update_dynamic` is also how an agent records a node's pending
+interruption (a spot reclaim it learned of): set the dynamic attribute
+`legion.interruption` to `{ deadline, source, detail }`, or `null` to clear
+it, exactly what `legion node interrupt` does. Gangs then keep off the node
+and its gang members are moved first ([spot-interruption.md](spot-interruption.md)).
+
 Tool errors come back in-band (`result.isError = true`, with the error
 envelope as `structuredContent` on 2025-06-18), following MCP convention.
 Transport and protocol errors use JSON-RPC `error`.
@@ -1262,7 +1268,10 @@ token can act. See [Namespaces](namespaces.md).
      adds `topologyKey`, `topologyMode`, `topologyDomain` (the domain it
      would use, or the closest one when it would wait), and
      `topologyDomains`; `topologyDomains: 0` means no eligible node reports
-     the attribute ([Topology](gang-scheduling.md#topology)).
+     the attribute ([Topology](gang-scheduling.md#topology)). On a blocked
+     job, `legion_job_info`'s `blocked.gang` also carries `reservedMembers`,
+     `reservedNodes`, and `reservationExpires` once a long-waiting gang has
+     [reserved](gang-scheduling.md#reservations) room.
 
    `preemptionMode` tells you whether that list is empty because nothing would
    be displaced or because preemption is off. Ask for confirmation when

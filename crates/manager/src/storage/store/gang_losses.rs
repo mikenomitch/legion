@@ -8,6 +8,9 @@
 //!
 //! - `restart` stops the survivors (stop cause `gang`) so the whole gang is
 //!   placed again as one unit;
+//! - `restartInPlace` keeps the survivors on their nodes and raises the
+//!   gang's epoch, so each worker restarts its members in place
+//!   (`store/gang_members.rs`), and the missing members place together;
 //! - `replace` keeps them, and the missing members place together once they
 //!   fit;
 //! - `fail` marks the job failed, then stops every allocation of it.
@@ -15,8 +18,10 @@
 //! A member whose move budget ran out fails the job whatever the policy: the
 //! gang cannot be whole again.
 //!
-//! The losses are a member failing (a worker's report, or a memory-pressure
-//! eviction) and its node being lost or drained. Every caller runs
+//! The losses are a member failing (a worker's report, a memory-pressure
+//! eviction, a local restart reported as a failure, or a member not ready
+//! within `gang.readyTimeout`), its node being lost or drained, and its node
+//! about to be interrupted (docs/spot-interruption.md). Every caller runs
 //! [`Store::gang_member_lost`] after the lost row is gone and before it
 //! queues the replacement, so no plan can top the gang up before the
 //! decision. Worker reports land on whichever manager the worker dials, so
@@ -44,6 +49,8 @@ pub struct GangLoss {
     /// Allocations the action stopped (the survivors of a restart, every
     /// allocation of the job for a fail).
     pub stopped: usize,
+    /// Survivors told to restart in place (`restartInPlace`).
+    pub restarted_in_place: usize,
     /// For a restart: the survivors' stop grace (`stop.killAfter`), which a
     /// caller that queues the re-placement itself waits out first, so new
     /// members never start beside old ones still shutting down.
@@ -52,14 +59,15 @@ pub struct GangLoss {
 
 impl Store {
     /// Apply the gang policy of `lost`'s task, if it is a gang
-    /// (module docs). `cause` is why the member went (for the event);
-    /// `exhausted` says its move budget ran out. Returns what happened, or
-    /// `None` when the task is not a gang or its job no longer wants it.
+    /// (module docs). `cause` is why the member went, as the event names it
+    /// (a [`StopCause`] string, or `ready_timeout`); `exhausted` says its
+    /// move budget ran out. Returns what happened, or `None` when the task
+    /// is not a gang or its job no longer wants it.
     #[instrument(err, skip_all, fields(allocation_id = lost.id, job_id = %lost.job_id))]
     pub fn gang_member_lost(
         &self,
         lost: &Allocation,
-        cause: StopCause,
+        cause: &str,
         exhausted: bool,
     ) -> R<Option<GangLoss>> {
         // Free for every task that is not a gang: one read-model lookup.
@@ -105,10 +113,148 @@ impl Store {
             running = loss.running,
             min = loss.min,
             stopped = loss.stopped,
-            cause = cause.as_str(),
+            restarted_in_place = loss.restarted_in_place,
+            cause,
             "Gang member lost"
         );
         Ok(Some(loss))
+    }
+
+    /// A gang member its worker restarted in place under the task's
+    /// `restart` policy (`HeartbeatRequest.gang_restarts`;
+    /// docs/gang-scheduling.md, "Local restarts"). What it means for the
+    /// gang, which the caller acts on:
+    ///
+    /// - `None`: nothing. The task is not a gang, its `onLocalRestart` is
+    ///   `ignore`, its job no longer wants it, the gang still runs its
+    ///   quorum without the restarted member, or its policy is `replace`
+    ///   (the member is already back).
+    /// - `Some(Restart | Fail)`: the restart is a member failure; the caller
+    ///   reports it through the failure path, which removes the member,
+    ///   spends the move budget, and applies the policy.
+    /// - `Some(RestartInPlace)`: done here: every member's epoch went up, so
+    ///   each restarts in place (the restarted member once more, so the
+    ///   whole gang shares one epoch).
+    #[instrument(err, skip_all, fields(allocation_id = restarted.id, job_id = %restarted.job_id))]
+    pub fn gang_member_restarted(
+        &self,
+        restarted: &Allocation,
+        reason: &str,
+    ) -> R<Option<MemberLossPolicy>> {
+        let Some(task) = self
+            .shared_task_configs_for_job_config(&restarted.job_config_id)?
+            .iter()
+            .find(|(id, _)| *id == restarted.task_config_id)
+            .map(|(_, task)| task.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(gang) = task.gang.as_ref() else {
+            return Ok(None);
+        };
+        if gang.on_local_restart == crate::structs::LocalRestartPolicy::Ignore
+            || self
+                .job_config_unwanted_reason(&restarted.job_config_id)?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let members = self
+            .allocs_for_job_config(&restarted.job_config_id)?
+            .into_iter()
+            .filter(|allocation| allocation.task_config_id == restarted.task_config_id)
+            .count() as u32;
+        let desired =
+            self.effective_task_count(&restarted.job_id, &task.group, &task.name, task.count.num)?;
+        let min = gang.quorum(desired);
+        // The restarted member was down: the others are what ran.
+        let running = members.saturating_sub(1);
+        if running >= min {
+            return Ok(None);
+        }
+        match gang.on_member_loss {
+            MemberLossPolicy::Replace => Ok(None),
+            MemberLossPolicy::Restart | MemberLossPolicy::Fail => Ok(Some(gang.on_member_loss)),
+            MemberLossPolicy::RestartInPlace => {
+                let task_config_id = restarted.task_config_id;
+                let restarted_in_place =
+                    self.replicated(Lane::Scheduler, "gang_restart_in_place", move |s| {
+                        let conn = s.write_connection()?;
+                        Self::bump_gang_epoch_tx(&conn, task_config_id)
+                    })?;
+                let loss = GangLoss {
+                    job_id: restarted.job_id.clone(),
+                    job_config_id: restarted.job_config_id.clone(),
+                    task_name: task.name.clone(),
+                    action: MemberLossPolicy::RestartInPlace,
+                    running,
+                    min,
+                    stopped: 0,
+                    restarted_in_place,
+                    grace_secs: 0,
+                };
+                self.events()
+                    .job_gang_member_lost(restarted, "local_restart", &loss);
+                crate::telemetry::metrics()
+                    .gang_outcomes_total
+                    .inc(&[loss.action.as_str()]);
+                info!(
+                    job_id = %loss.job_id,
+                    task = %loss.task_name,
+                    restarted_in_place,
+                    reason,
+                    "Gang member restarted in place; the gang restarts in place"
+                );
+                Ok(Some(MemberLossPolicy::RestartInPlace))
+            }
+        }
+    }
+
+    /// Move every gang member off `node_id`, which has a pending
+    /// interruption (docs/spot-interruption.md): each is removed (stop cause
+    /// `interruption`) and its gang's `onMemberLoss` applies, as for a lost
+    /// node but before the node goes, so a `restart` re-places the gang
+    /// elsewhere (gangs never place on an interrupted node) and a `replace`
+    /// moves just the member. Infrastructure, so no move budget is spent.
+    /// Work that is not a gang stays: a drain moves it. Returns how many
+    /// members moved.
+    pub fn move_gangs_off_interrupted_node(&self, node_id: &str) -> R<usize> {
+        let mut members: Vec<Allocation> = Vec::new();
+        for allocation in self.allocs_for_node(node_id)? {
+            let is_gang = self
+                .shared_task_configs_for_job_config(&allocation.job_config_id)?
+                .iter()
+                .any(|(id, task)| *id == allocation.task_config_id && task.gang.is_some());
+            if is_gang {
+                members.push(allocation);
+            }
+        }
+        if members.is_empty() {
+            return Ok(0);
+        }
+        let configs = self.remove_allocations(&members, StopCause::Interruption)?;
+        let reconcile = self.gang_members_lost_on_node(&members, StopCause::Interruption, configs);
+        for job_config_id in reconcile {
+            let Some(member) = members
+                .iter()
+                .find(|member| member.job_config_id == job_config_id)
+            else {
+                continue;
+            };
+            self.enqueue_eval(
+                "job_reschedule",
+                Some(&member.job_id),
+                Some(&job_config_id),
+                Some(node_id),
+                None,
+            )?;
+        }
+        warn!(
+            node_id,
+            moved = members.len(),
+            "Moved gang members off a node with a pending interruption"
+        );
+        Ok(members.len())
     }
 
     /// The gang half of a node-scoped removal (a lost or drained node):
@@ -129,7 +275,7 @@ impl Store {
             if !seen.insert((allocation.job_config_id.clone(), allocation.task_config_id)) {
                 continue;
             }
-            let loss = match self.gang_member_lost(allocation, cause, false) {
+            let loss = match self.gang_member_lost(allocation, cause.as_str(), false) {
                 Ok(Some(loss)) => loss,
                 Ok(None) => continue,
                 Err(err) => {
@@ -143,7 +289,7 @@ impl Store {
                 }
             };
             match loss.action {
-                MemberLossPolicy::Replace => {}
+                MemberLossPolicy::Replace | MemberLossPolicy::RestartInPlace => {}
                 MemberLossPolicy::Fail => {
                     reconcile.remove(&allocation.job_config_id);
                 }
@@ -264,12 +410,17 @@ impl Store {
             running,
             min,
             stopped: 0,
+            restarted_in_place: 0,
             grace_secs: 0,
         };
         if action == MemberLossPolicy::Restart && !survivors.is_empty() {
             self.remove_allocations(&survivors, StopCause::Gang)?;
             loss.stopped = survivors.len();
             loss.grace_secs = task.stop.clone().unwrap_or_default().kill_after.as_secs();
+        }
+        if action == MemberLossPolicy::RestartInPlace && !survivors.is_empty() {
+            let conn = self.write_connection()?;
+            loss.restarted_in_place = Self::bump_gang_epoch_tx(&conn, task_config_id)?;
         }
         Ok(Some(loss))
     }
@@ -291,6 +442,7 @@ impl Store {
             running: 0,
             min: 0,
             stopped: allocations.len(),
+            restarted_in_place: 0,
             grace_secs: 0,
         }))
     }

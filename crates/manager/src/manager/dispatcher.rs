@@ -614,13 +614,15 @@ pub fn attach_resize_override(
 
 /// Add a gang member's identity to its payload's env
 /// (docs/gang-scheduling.md, "Starting together"): `LEGION_GANG_RANK`,
-/// `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, and `LEGION_GANG_LEADER_ADDR` when
-/// rank 0's address is known. They come from the member's `gang_member` row,
-/// fixed when it was placed, so every copy of the payload (a push, the
-/// heartbeat's desired set, the work stream, a ratification) carries the same
-/// values, and a running member is never updated, which would restart it.
-/// Like the variables above, they win over user-declared keys. Free for a
-/// task that is not a gang.
+/// `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, `LEGION_GANG_EPOCH`, and
+/// `LEGION_GANG_LEADER_ADDR` when rank 0's address is known. They come from
+/// the member's `gang_member` row, so every copy of the payload (a push, the
+/// heartbeat's desired set, the work stream, a ratification) carries the
+/// gang's current view. A running member learns of a change through the
+/// heartbeat's `gang_members` feed instead, whose newer epoch makes its
+/// worker restart it in place with the same values this payload now
+/// carries. Like the variables above, they win over user-declared keys. Free
+/// for a task that is not a gang.
 pub fn attach_gang_env(
     store: &Store,
     task: &TaskConfig,

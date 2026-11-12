@@ -209,6 +209,11 @@ pub struct VictimCandidate {
     /// evicting it frees nothing and costs a restart.
     pub node_pinned: bool,
     pub kill_after_secs: u64,
+    /// A gang member whose only floor is its gang's quorum (no
+    /// `disruption.minAvailable` of its own): at its floor it cannot be
+    /// taken alone, but its whole gang can be (docs/gang-scheduling.md,
+    /// "Preemption").
+    pub whole_gang: bool,
 }
 
 impl VictimCandidate {
@@ -550,6 +555,7 @@ mod preemption_test {
             task_running: 4,
             node_pinned: false,
             kill_after_secs: 30,
+            whole_gang: false,
         }
     }
 

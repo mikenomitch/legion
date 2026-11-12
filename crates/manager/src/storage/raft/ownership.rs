@@ -297,6 +297,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // destroy's scheduler cleanup: all scheduler-lane ops, like `allocation`.
     // NOT commutative (ranks are assigned from the live set).
     ("gang_member", Owner::Lane(Lane::Scheduler)),
+    // `gang_reservation` holds the capacity a long-waiting gang reserves
+    // (docs/gang-scheduling.md, "Reservations"). Written by the scheduler
+    // leader's gang sweep and read by every plan: scheduler lane.
+    ("gang_reservation", Owner::Lane(Lane::Scheduler)),
     // `node_alloc_usage` caches the aggregated allocation usage of a node
     // for the plan-apply capacity recheck, next to a fingerprint of the rows
     // it was derived from (see the migration that creates it). Written by

@@ -2,21 +2,22 @@
 
 > **Judgement calls:** [`calls/gang-scheduling-plan_calls.md`](../calls/gang-scheduling-plan_calls.md)
 
-**Status: IN EXECUTION.** Phases 1–3 are built, as revised in
-[Revision: 2026-10-17](#revision-2026-10-17-what-changed-before-execution)
-and
-[Revision 2](#revision-2-placement-timeout-and-member-loss-2026-10-17)
-below, which win over the original design text wherever they disagree.
-Phase 1 pulled `gang.min` forward from Phase 2 and a minimal gang-as-victim
-rule forward from the deferrals; Revision 2 built `placementTimeout` (Phase
-2) and member-loss recovery (Phase 3, as `onMemberLoss` rather than
-`recovery`), and gives each member its rank, the world size, and rank 0's
-address. Still deferred: a readiness timeout, in-place gang restarts, the
-Phase 4 items, capacity reservation / backfill anti-starvation, gang-grained
-preemption beyond "never below quorum" (coordinated with the
-[preemption plan](preemption-and-eviction-plan.md)), cross-job gangs, named
-cross-task gangs, topology-aware placement (same rack/zone), and autoscaler
-integration (each is a named non-goal, open question, or phase below).
+**Status: SHIPPED.** Phases 1–4 are built, as revised in
+[Revision: 2026-10-17](#revision-2026-10-17-what-changed-before-execution),
+[Revision 2](#revision-2-placement-timeout-and-member-loss-2026-10-17), and
+[Revision 3](#revision-3-the-follow-ups-2026-11-12) below, which win over the
+original design text wherever they disagree. Phase 1 pulled `gang.min`
+forward from Phase 2 and a minimal gang-as-victim rule forward from the
+deferrals; Revision 2 built `placementTimeout` (Phase 2) and member-loss
+recovery (Phase 3, as `onMemberLoss` rather than `recovery`), and gives each
+member its rank, the world size, and rank 0's address; Revision 3 closed the
+follow-ups: views that follow a scale or a moved leader, a readiness timeout,
+in-place gang restarts, local restarts as losses, gang-aware wake, whole-gang
+preemption, multi-level topology, the Phase 4 tests, and two features with
+plans of their own, [gang reservations](gang-reservation-plan.md) and [spot
+interruption](spot-interruption-plan.md). Still not built, by choice (named
+non-goals and open questions below): cross-job gangs, named cross-task gangs,
+a start barrier, and the UI gang badge.
 Public doc: [`docs/gang-scheduling.md`](../../docs/gang-scheduling.md).
 
 ## Revision: 2026-10-17 (what changed before execution)
@@ -40,7 +41,7 @@ build:
   other. The `attempts`/`blocked_reason` eval columns,
   `Store::block_eval_for_capacity`, the 5s-to-2m backoff, and the
   `node_join` clause in `reschedule_allocations_for_new_node` are dropped.
-  Judgement call 25 (blocked semantics gang-opt-in) is moot, and call 24
+  Judgement call 33 (blocked semantics gang-opt-in) is moot, and call 32
   (`node_join` + capped backoff) is superseded by new call 2.
 - **Partial placement shipped for every job**
   (`docs/scheduler-and-eval-loop.md`, "Partial placement"). A plan now places
@@ -267,6 +268,127 @@ at `stage`, since a provisional start predates its rank.
   failure.
 - An `ignore` policy (Volcano `SyncJob`): a Legion service member that is
   lost must be replaced.
+
+## Revision 3: the follow-ups (2026-11-12)
+
+Everything Revisions 1 and 2 left open in `TODO.md`'s "Gang scheduling"
+group, built in one change. Two items were large enough for plans of their
+own: [gang reservations](gang-reservation-plan.md) (anti-starvation) and
+[spot interruption](spot-interruption-plan.md).
+
+### Prior art (surveyed for this revision)
+
+| Need | Prior art | Taken |
+| --- | --- | --- |
+| Members learn a new world size / leader | torchrun re-rendezvous on membership change; JobSet restarts the set; LWS `RecreateGroupOnPodRestart` | Restart in place with the new values (no re-placement), driven by an epoch |
+| Readiness bound | Kueue `waitForPodsReady.timeout` (evict + requeue with backoff) | Per member, from placement; a late member is a failed member (move budget = backoff + limit) |
+| In-place restart | JobSet `InPlaceRestart` (restart containers, keep pods/nodes) | `onMemberLoss = "restartInPlace"` |
+| Local restarts | JobSet: a container restart is not a pod failure unless `restartPolicy: Never`; MPI Operator: any restart breaks the job | Reported by the worker, a loss by default, `onLocalRestart = "ignore"` to opt out |
+| Whole-gang victims | Volcano gang preemption (evict the job's whole PodGroup, cost by size) | Same, after ordinary victims fail, all or nothing |
+| Multi-level topology | Kueue TAS `podset-preferred-topology` levels; Slurm `--switches` | `keys = [inner, outer]`, tried in order |
+
+### Jobs to be done
+
+- **ML engineer:** "When I scale my training job from 8 to 16 workers, every
+  worker must agree on the world size, without me tearing the job down." /
+  "If one worker's image never finishes pulling, don't leave the other seven
+  idle forever." / "When a worker crashes and its worker restarts it, my
+  NCCL collective is broken: restart everyone, cheaply."
+- **Platform operator:** "A big gang waiting for hours behind a stream of
+  small jobs is a support ticket; make it eventually win." / "Spot nodes go
+  away with two minutes' notice: don't let a gang find out by stalling." /
+  "A `critical` job must be able to displace a `low` training gang, whole."
+- **Agent:** "Tell me whether a waiting gang holds room, and until when."
+
+### Design, as built
+
+1. **Views that stay current.** `gang_member` gains `epoch`. A placement that
+   changes the members' view (size, quorum, ranks, leader address) rewrites
+   every live row and raises the epoch (`Store::sync_gang_view_tx`, in the
+   insert transaction); the scheduler leader's **gang sweep** (once a second,
+   beside the placement-timeout pass) does the same for changes no insert
+   sees (a scale-in, a scale-out that waits). Every heartbeat reply carries
+   `gang_members` (the view of each gang member on the node); a worker whose
+   member started under an older epoch rewrites its `LEGION_GANG_*` env and
+   restarts it in place. `LEGION_GANG_EPOCH` is new. A plain `replace` of a
+   non-leader changes nothing for the rest.
+2. **`gang.readyTimeout`.** `gang_member` gains `placed_unix` and `ready`. The
+   sweep marks a member ready on its first healthy report and hands back
+   members past the timeout, which are removed as failed (move budget,
+   `allocation.failed`, `onMemberLoss`, cause `ready_timeout`).
+3. **`onMemberLoss = "restartInPlace"`.** Survivors keep their nodes; the
+   decision op raises the epoch (`Store::bump_gang_epoch_tx`); the lost
+   members place as a `replace` top-up.
+4. **Local restarts** (`gang.onLocalRestart = "loss" | "ignore"`, default
+   `loss`). The worker reports each in-place restart of a gang member
+   (`HeartbeatRequest.gang_restarts`, only from the supervisor's restart
+   paths, never for manager-asked restarts). Below the quorum: `restart`/`fail`
+   go through the failure path (removal, move budget, policy), `restartInPlace`
+   raises the epoch, `replace` does nothing.
+5. **Gang-aware wake.** The wake pass skips a blocked gang whose class's free
+   capacity (plus lower-band usage when it can preempt) cannot hold `min -
+   running` members; `legion_gang_wakes_skipped_total` counts the skips.
+6. **Whole-gang preemption.** `VictimCandidate.whole_gang` marks members only
+   their quorum protects. When no ordinary victim set fits, the pass tries
+   each such lower-band gang with members on a candidate node: all members
+   (other nodes too, as `collateral`) plus ordinary victims; cheapest by the
+   usual cost. All or nothing (age, node-local storage, band).
+7. **Multi-level topology.** `topology.keys` (innermost first, at most four;
+   `key` is the one-level form). Domains whose estimate cannot reach the
+   quorum even counting preemptible capacity are skipped, so the trial bound
+   (raised to 16, across levels) never skips a domain where preemption would
+   have made room.
+8. **Phase 4.** Integration tests for the `createFirst` blue-green gang
+   update (both gangs side by side, never a partial new gang, never less than
+   a whole gang running; and the wait when there is room for one) and for the
+   autoscaler consuming a blocked gang's shortfall (demand for the whole
+   quorum; the nodes it names let the gang place).
+
+### Surface
+
+```nickel
+gang = {
+  min = 6,
+  placementTimeout = "30m",
+  readyTimeout = "10m",                 # new
+  onMemberLoss = "restartInPlace",      # new value
+  onLocalRestart = "loss",              # new; or "ignore"
+  topology = { keys = ["rack", "zone"], mode = "required" },   # `keys` new
+},
+```
+
+`LEGION_GANG_EPOCH` (new env); `HeartbeatRequest.gang_restarts`,
+`HeartbeatReply.gang_members` (new wire fields); `GangReport.reserved_*`
+(fields 17–19); metrics `legion_gang_wakes_skipped_total`,
+`legion_gang_reservations`; outcome `restartInPlace`; event causes
+`local_restart`, `ready_timeout`, `interruption`.
+
+### Phases
+
+All shipped together, each separable: views and epoch (1, 3 depend on it), 2,
+4, 5, 6, 7, 8, then the two plans of their own.
+
+### Testing
+
+Unit: topology levels, preemption-aware trial order, view sync on scale,
+`restartInPlace` epoch, local-restart decisions per policy, readiness sweep,
+whole-gang preemption (taken whole; kept by `disruption.minAvailable`; elastic
+members one at a time), interruption filter and move, reservation sweep and
+withholding, worker view application and restart reporting, the IMDS
+watcher against a fake. Integration: `gang_scheduling::` (gang-aware wake),
+`rollout_integration::` (blue-green), `capacity_demand::` (blocked gang as
+demand).
+
+### Rollout
+
+No compatibility shims. Changed defaults: a gang's local restarts now restart
+the gang (`onLocalRestart = "loss"`); a `low` gang can now be preempted
+whole; a scale restarts members in place; gangs reserve room after five
+minutes. Workers that predate the feed never restart for a new epoch, and a
+manager that predates `gang_restarts` ignores them (version skew per
+`docs/upgrades.md`).
+
+**Judgement calls.** New: 24–31 (the superseded 24 and 25 are now 32 and 33).
 
 ## Problem Statement
 
@@ -730,7 +852,7 @@ When the plan defers, the eval does not complete and does not fail — it
   capacity-blocked eval get their eval's `ready_at` pulled to *now* on
   `node_join`. Allocation-removal wake (a big job freeing half the cluster
   mid-backoff) is Phase 2; until then the backoff cap bounds that latency
-  at 2 minutes. (Ranked judgement call #24, superseded by #2.)
+  at 2 minutes. (Ranked judgement call #32, superseded by #2.)
 - **The terminal-failure contract is unchanged for everything else.**
   Non-gang placement failures still fail terminally in v1. Extending
   blocked semantics to all capacity failures is the standing open question

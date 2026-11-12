@@ -3167,6 +3167,73 @@ pub struct WorkerConfigAlt {
     /// ([`WorkerArtifactsPayload::isolate`]).
     #[serde(default)]
     pub isolate: Option<crate::structs::isolate::WorkerIsolateConfig>,
+    /// Watch the cloud's spot interruption notice and report it to the
+    /// managers (docs/spot-interruption.md). Absent means no watcher.
+    /// Carried to the worker in the artifacts payload
+    /// ([`WorkerArtifactsPayload::spot_interruption`]).
+    #[serde(default)]
+    pub spot_interruption: Option<WorkerSpotInterruptionConfig>,
+}
+
+/// A worker type's `spotInterruption` block (docs/spot-interruption.md):
+/// where the node learns that its cloud provider is about to reclaim it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerSpotInterruptionConfig {
+    /// `aws`: the EC2 instance metadata service's
+    /// `spot/instance-action` (IMDSv2, falling back to v1). The only
+    /// provider today.
+    pub provider: String,
+    /// The metadata service's base URL. Default
+    /// `http://169.254.169.254`; set it to point a test at a fake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// How often to look, as a duration. Default `5s`, at least `1s`. AWS
+    /// gives two minutes' notice, so anything well under that works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_every: Option<String>,
+}
+
+/// The default `spotInterruption.endpoint` (the EC2 metadata service).
+pub const DEFAULT_SPOT_METADATA_ENDPOINT: &str = "http://169.254.169.254";
+
+/// The default `spotInterruption.pollEvery`.
+pub const DEFAULT_SPOT_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl WorkerSpotInterruptionConfig {
+    /// Check the block at manager startup.
+    pub fn validate(&self) -> R<()> {
+        if self.provider != "aws" {
+            bail!(
+                "spotInterruption.provider {:?} is not supported; the only provider is \"aws\"",
+                self.provider
+            );
+        }
+        self.poll_every()?;
+        Ok(())
+    }
+
+    /// `pollEvery`, or its default.
+    pub fn poll_every(&self) -> R<std::time::Duration> {
+        let every = match self.poll_every.as_deref() {
+            None => DEFAULT_SPOT_POLL_EVERY,
+            Some(raw) => humantime::parse_duration(raw)
+                .with_context(|| format!("spotInterruption.pollEvery {raw:?} is not a duration"))?,
+        };
+        if every < std::time::Duration::from_secs(1) {
+            bail!("spotInterruption.pollEvery must be at least 1s");
+        }
+        Ok(every)
+    }
+
+    /// `endpoint`, or its default, without a trailing slash.
+    pub fn endpoint(&self) -> String {
+        self.endpoint
+            .as_deref()
+            .unwrap_or(DEFAULT_SPOT_METADATA_ENDPOINT)
+            .trim_end_matches('/')
+            .to_string()
+    }
 }
 
 /// Worker-type `container` block. Carried to the worker as JSON in
@@ -3779,6 +3846,10 @@ pub struct WorkerArtifactsPayload {
     /// [`crate::structs::isolate::WorkerIsolateConfigFull::default`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolate: Option<crate::structs::isolate::WorkerIsolateConfigFull>,
+    /// The top-level `spotInterruption` block, riding the same payload for
+    /// the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_interruption: Option<WorkerSpotInterruptionConfig>,
 }
 
 /// A worker's `sessions` block (docs/session-mode.md, "No split brain").
@@ -4585,5 +4656,35 @@ mod tests {
             !full.container_image_desugar,
             "desugar off until cache plan"
         );
+    }
+}
+
+#[cfg(test)]
+mod spot_interruption_config_test {
+    use super::*;
+
+    #[test]
+    fn the_spot_interruption_block_parses_and_validates() -> R<()> {
+        let config: WorkerSpotInterruptionConfig =
+            serde_json::from_value(serde_json::json!({ "provider": "aws" }))?;
+        config.validate()?;
+        assert_eq!(config.endpoint(), DEFAULT_SPOT_METADATA_ENDPOINT);
+        assert_eq!(config.poll_every()?, DEFAULT_SPOT_POLL_EVERY);
+        let tuned: WorkerSpotInterruptionConfig = serde_json::from_value(serde_json::json!({
+            "provider": "aws", "endpoint": "http://127.0.0.1:9/", "pollEvery": "2s"
+        }))?;
+        assert_eq!(tuned.endpoint(), "http://127.0.0.1:9");
+        assert_eq!(tuned.poll_every()?, Duration::from_secs(2));
+        let gcp: WorkerSpotInterruptionConfig =
+            serde_json::from_value(serde_json::json!({ "provider": "gcp" }))?;
+        assert!(gcp.validate().is_err());
+        let fast: WorkerSpotInterruptionConfig =
+            serde_json::from_value(serde_json::json!({ "provider": "aws", "pollEvery": "10ms" }))?;
+        assert!(fast.validate().is_err());
+        assert!(serde_json::from_value::<WorkerSpotInterruptionConfig>(
+            serde_json::json!({ "provider": "aws", "interval": "5s" })
+        )
+        .is_err());
+        Ok(())
     }
 }

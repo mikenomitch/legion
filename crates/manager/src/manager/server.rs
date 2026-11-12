@@ -9434,6 +9434,8 @@ impl Manager for ManagerDaemonService {
             let health = std::mem::take(&mut req.allocation_health);
             let volume_reports = std::mem::take(&mut req.volume_reports);
             let pressure_actions = std::mem::take(&mut req.pressure_actions);
+            let gang_restarts = std::mem::take(&mut req.gang_restarts);
+            let interruption = req.interruption.take();
             tokio::task::spawn_blocking(move || -> R<(Vec<i64>, Vec<i64>)> {
                 snapshot_rpcs::apply_snapshot_reports(&store, &node_id, &snapshot_reports);
                 store.update_node_heartbeat(node_id.clone())?;
@@ -9457,6 +9459,23 @@ impl Manager for ManagerDaemonService {
                     handle_pressure_actions(&store, &failures, &node_id, &pressure_actions)
                 {
                     error!(node_id = %node_id, error = ?err, "Error handling pressure actions");
+                }
+                // Gang members the worker restarted in place, and the node's
+                // own interruption notice (docs/gang-scheduling.md,
+                // docs/spot-interruption.md).
+                let mut retry_failed = retry_failed;
+                retry_failed.extend(handle_gang_restarts(
+                    &store,
+                    &failures,
+                    &node_id,
+                    &gang_restarts,
+                ));
+                if let Err(err) = apply_reported_interruption(&store, &node_id, interruption) {
+                    warn!(
+                        node_id = %node_id,
+                        error = %format!("{err:#}"),
+                        "Error recording the node's interruption notice"
+                    );
                 }
                 Ok((retry_failed, retry_terminated))
             })
@@ -9729,7 +9748,16 @@ impl Manager for ManagerDaemonService {
             self.store.note_runtime_refusals(&refusals);
         }
 
+        // The gang view of every gang member on the node: a newer epoch
+        // restarts the member in place (docs/gang-scheduling.md). Never
+        // fails the heartbeat.
+        let gang_members = self.store.gang_views_for_node(&id).unwrap_or_else(|err| {
+            warn!(node_id = %id, error = %format!("{err:#}"), "Error reading gang views");
+            Vec::new()
+        });
+
         let reply = HeartbeatReply {
+            gang_members,
             owner_notices,
             net_policies,
             message: "ack".into(),
@@ -10662,6 +10690,16 @@ impl Manager for ManagerDaemonService {
             .store
             .update_node_dyamic(&id, &dd_as_map)
             .map_err(|e| map_store_error("Error updating node", e))?;
+        // A pending interruption (`legion node interrupt`,
+        // docs/spot-interruption.md) moves the node's gang members now.
+        if node.pending_interruption().is_some()
+            && dd_as_map.contains_key(crate::structs::INTERRUPTION_ATTR)
+        {
+            let store = self.store.clone();
+            let node_id = id.clone();
+            run_blocking(move || store.move_gangs_off_interrupted_node(&node_id))
+                .map_err(|e| map_store_error("Error moving gang members off the node", e))?;
+        }
         let allocs = self
             .store
             .allocs_for_node(&id)
@@ -14690,6 +14728,193 @@ fn update_allocation_health_snapshots(
     store.upsert_allocation_health_snapshots(node_id, snapshots)
 }
 
+/// Members the gang sweep found past their gang's `readyTimeout`
+/// (`Store::gang_sweep`; docs/gang-scheduling.md, "Readiness timeout"):
+/// each is removed as a failed allocation (spending the move budget), its
+/// gang's `onMemberLoss` applies, and the move verdict queues the
+/// replacement or fails the job, exactly as for a failure report.
+pub(crate) fn fail_unready_gang_members(store: &Store, members: &[crate::structs::Allocation]) {
+    for member in members {
+        let Some(task) = store
+            .cached_task_configs_for_job_config(&member.job_config_id)
+            .ok()
+            .and_then(|tasks| {
+                tasks
+                    .into_iter()
+                    .find(|(id, _)| *id == member.task_config_id)
+                    .map(|(_, task)| task)
+            })
+        else {
+            continue;
+        };
+        let timeout = task
+            .gang
+            .as_ref()
+            .and_then(|gang| gang.ready_timeout)
+            .unwrap_or_default();
+        let reason = format!(
+            "Not ready within gang.readyTimeout {}: placed on node {}, but it never reported \
+             healthy (still starting: an image pull, an artifact, or a check that never \
+             passed)",
+            humantime::format_duration(timeout),
+            member.node_id
+        );
+        let removal = store.remove_failed_allocation(
+            member.id,
+            StopCause::Failed,
+            Some(crate::storage::store::StopExplanation {
+                detail: reason.clone(),
+                hint: "Raise gang.readyTimeout, or pre-pull the image".to_string(),
+            }),
+            FailedMove {
+                policy: (&task.on_unhealthy).into(),
+                reason: reason.clone(),
+            },
+        );
+        let removal = match removal {
+            Ok(Some(removal)) => removal,
+            Ok(None) => continue,
+            Err(err) => {
+                warn!(
+                    allocation_id = member.id,
+                    error = %format!("{err:#}"),
+                    "Failed to remove a gang member past its readyTimeout"
+                );
+                continue;
+            }
+        };
+        store.events().allocation_failed(
+            member.id,
+            &member.node_id,
+            &member.job_id,
+            &member.job_config_id,
+            member.task_config_id,
+            &reason,
+        );
+        warn!(
+            allocation_id = member.id,
+            job_id = %member.job_id,
+            node_id = %member.node_id,
+            "Gang member not ready within its readyTimeout"
+        );
+        let gang = match store.gang_member_lost(
+            &removal.allocation,
+            "ready_timeout",
+            matches!(removal.verdict, MoveVerdict::Exhausted { .. }),
+        ) {
+            Ok(loss) => loss,
+            Err(err) => {
+                warn!(
+                    allocation_id = member.id,
+                    error = %format!("{err:#}"),
+                    "Gang member-loss policy failed; replacing the member"
+                );
+                None
+            }
+        };
+        apply_move_verdict(store, &removal, &member.node_id, gang.as_ref());
+    }
+    if !members.is_empty() {
+        store.request_capacity_reconcile_if_waiting();
+    }
+}
+
+/// Gang members a worker restarted in place under their task's `restart`
+/// policy (`HeartbeatRequest.gang_restarts`; docs/gang-scheduling.md, "Local
+/// restarts"). A gang that counts the restart as a loss and would restart
+/// or fail sees it as a member failure, through the same path as a failure
+/// report (the member is removed, the move budget is spent, the policy
+/// applies); `restartInPlace` is applied by the store. Returns the reports
+/// to retry, like [`handle_failed_allocations`].
+fn handle_gang_restarts(
+    store: &Store,
+    failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
+    node_id: &str,
+    restarts: &[crate::structs::GangMemberRestart],
+) -> Vec<i64> {
+    let mut failed: Vec<FailedAllocation> = Vec::new();
+    for restart in restarts {
+        let allocation = match store.get_allocation_by_id(restart.allocation_id) {
+            Ok(Some(allocation)) if allocation.node_id == node_id => allocation,
+            Ok(_) => continue,
+            Err(err) => {
+                warn!(
+                    allocation_id = restart.allocation_id,
+                    error = %format!("{err:#}"),
+                    "Error reading a restarted gang member"
+                );
+                continue;
+            }
+        };
+        match store.gang_member_restarted(&allocation, &restart.reason) {
+            Ok(Some(
+                crate::structs::MemberLossPolicy::Restart | crate::structs::MemberLossPolicy::Fail,
+            )) => failed.push(FailedAllocation {
+                allocation_id: allocation.id,
+                reason: format!(
+                    "Restarted in place by its worker, which its gang counts as a lost member \
+                     (gang.onLocalRestart = \"loss\"): {}",
+                    restart.reason
+                ),
+                artifact_states: None,
+            }),
+            Ok(_) => {}
+            Err(err) => warn!(
+                allocation_id = allocation.id,
+                job_id = %allocation.job_id,
+                error = %format!("{err:#}"),
+                "Gang local-restart policy failed"
+            ),
+        }
+    }
+    if failed.is_empty() {
+        return Vec::new();
+    }
+    handle_failed_allocations(store, failure_tracker, node_id, &failed)
+}
+
+/// Record the interruption notice a worker's spot watcher reported, or its
+/// withdrawal (docs/spot-interruption.md), on the node's
+/// `legion.interruption` dynamic attribute, and move the node's gang
+/// members when a new notice lands. A notice an operator set (`legion node
+/// interrupt`, source `operator`) is not withdrawn by a worker that reports
+/// none. Writes only when something changed.
+fn apply_reported_interruption(
+    store: &Store,
+    node_id: &str,
+    reported: Option<crate::structs::NodeInterruptionNotice>,
+) -> R<()> {
+    let node = match store.cached_node(node_id)? {
+        Some(node) => node,
+        None => return Ok(()),
+    };
+    let current = node.pending_interruption().cloned();
+    let desired = reported.map(|notice| {
+        serde_json::json!({
+            "deadline": notice.deadline_unix,
+            "source": notice.source,
+            "detail": notice.detail,
+        })
+    });
+    match (current, desired) {
+        (current, Some(desired)) if current.as_ref() != Some(&desired) => {
+            let mut diff = Map::new();
+            diff.insert(crate::structs::INTERRUPTION_ATTR.to_string(), desired);
+            store.update_node_dyamic(node_id, &diff)?;
+            store.move_gangs_off_interrupted_node(node_id)?;
+        }
+        (Some(current), None)
+            if current.get("source").and_then(Value::as_str) != Some("operator") =>
+        {
+            let mut diff = Map::new();
+            diff.insert(crate::structs::INTERRUPTION_ATTR.to_string(), Value::Null);
+            store.update_node_dyamic(node_id, &diff)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Apply a lost member's gang policy ([`Store::gang_member_lost`]). A
 /// decision that cannot be made is logged, and the member is then replaced
 /// like any task's: the report it came from is already acted on.
@@ -14699,7 +14924,7 @@ fn gang_member_lost(
     cause: StopCause,
     exhausted: bool,
 ) -> Option<crate::storage::store::GangLoss> {
-    match store.gang_member_lost(lost, cause, exhausted) {
+    match store.gang_member_lost(lost, cause.as_str(), exhausted) {
         Ok(loss) => loss,
         Err(err) => {
             warn!(

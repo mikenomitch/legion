@@ -304,6 +304,22 @@
     # Off by default: with it on, any client that can reach port 4848 and
     # holds a ticket for this node can open the session the ticket names.
     # exec = { direct = true },
+    # Spot interruption notices (docs/spot-interruption.md): watch the cloud
+    # metadata service for the reclaim notice a spot instance gets ahead of
+    # time, and report it on every heartbeat while it stands. The managers
+    # then keep gangs off this node and move the gang members it runs
+    # before it goes. Absent: no watcher (`legion node interrupt` still
+    # records a notice by hand).
+    # spotInterruption = {
+    #     # "aws": EC2's spot/instance-action (IMDSv2, else v1). The only
+    #     # provider.
+    #     provider = "aws",
+    #     # The metadata service. Default:
+    #     endpoint = "http://169.254.169.254",
+    #     # How often to look. Default "5s", at least "1s"; AWS gives two
+    #     # minutes' notice.
+    #     pollEvery = "5s",
+    # },
     # Devices (docs/devices.md): GPUs and other whole devices a task can ask
     # for with resources.devices. Absent: this node has no devices.
     # devices = {

@@ -1576,11 +1576,23 @@
                 # the first time the gang came up short, not per retry.
                 # Unset: wait indefinitely. At least 1s.
                 placementTimeout = "30m",
-                # What a lost member (failed, node lost, drained, evicted)
-                # does to the rest when it leaves fewer than `min` running:
+                # How long each placed member may take to become ready (its
+                # first healthy report: running, and passing its checks if
+                # it has any) before it counts as a lost member, so a member
+                # stuck pulling its image cannot hold the rest at their
+                # rendezvous forever. Charged to the move budget like a
+                # failure. Unset: no bound. At least 1s.
+                readyTimeout = "10m",
+                # What a lost member (failed, not ready in time, node lost,
+                # drained, evicted, its node about to be interrupted) does to
+                # the rest when it leaves fewer than `min` running:
                 #   "restart" (default) stops the survivors and places the
                 #             whole gang again, together, once their stop
                 #             grace has passed;
+                #   "restartInPlace" keeps the survivors on their nodes and
+                #             restarts their processes there under a new
+                #             LEGION_GANG_EPOCH; the missing members place
+                #             together once they fit;
                 #   "replace" keeps the survivors and places the missing
                 #             members together once they fit;
                 #   "fail"    fails the job and stops every member.
@@ -1588,24 +1600,34 @@
                 # alone. Restarts after a failure spend onUnhealthy's move
                 # budget; once it is spent the job fails.
                 onMemberLoss = "restart",
+                # A member the worker restarts in place under the task's
+                # `restart` policy: "loss" (default) counts it as a lost
+                # member, so onMemberLoss applies; "ignore" lets it rejoin
+                # on its own while the rest keep running.
+                onLocalRestart = "loss",
                 # Keep the members inside one value of a node attribute: one
                 # rack, one NVLink domain (docs/gang-scheduling.md,
-                # "Topology"). `key` names the attribute the way count.per
-                # and `distinct` do. `mode`:
-                #   "required" (default) every member in one domain, or the
-                #              gang waits, holding nothing, until one domain
-                #              has room; a top-up stays in its domain;
+                # "Topology"). `keys` names the attributes the way count.per
+                # and `distinct` do, innermost level first: one rack, else
+                # one zone. `key = "rack"` is the one-level form. `mode`:
+                #   "required" (default) every member in one domain of some
+                #              level, or the gang waits, holding nothing,
+                #              until one has room; a top-up stays in its
+                #              domain;
                 #   "preferred" one domain when one fits, else the fewest
-                #              domains that hold the quorum, else anywhere.
-                # Nodes without the attribute are in no domain. `job plan`
-                # reports the domain chosen, or the best one and how many
-                # members it fits.
-                topology = { key = "rack", mode = "preferred" },
+                #              outermost domains that hold the quorum, else
+                #              anywhere.
+                # Nodes without an attribute are in no domain of that level.
+                # `job plan` reports the level and domain chosen, or the
+                # best one and how many members it fits.
+                topology = { keys = ["rack", "zone"], mode = "preferred" },
             },
             # Every member starts with LEGION_GANG_RANK (0..count-1),
-            # LEGION_GANG_SIZE, LEGION_GANG_MIN, and LEGION_GANG_LEADER_ADDR
-            # (rank 0's node), fixed when it is placed: what a rendezvous
-            # such as torchrun needs. Members start as their workers get
+            # LEGION_GANG_SIZE, LEGION_GANG_MIN, LEGION_GANG_LEADER_ADDR
+            # (rank 0's node), and LEGION_GANG_EPOCH: what a rendezvous such
+            # as torchrun needs. When they change (a `job scale`, rank 0
+            # replaced elsewhere, a restartInPlace) every member restarts in
+            # place with the new values. Members start as their workers get
             # them; the rendezvous is where they meet. A gang's
             # speculativeStart is capped at `stage`.
             config = {

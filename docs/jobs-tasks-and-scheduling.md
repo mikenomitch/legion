@@ -224,13 +224,14 @@ Important `TaskConfig` fields:
 - `count`:
   - integer count
   - or `{ num, per }` for per-attribute placement
-- `gang`: `true` or `{ min, placementTimeout, onMemberLoss }`. The task's
-  replicas place all together (or at least `min` of them together) or not at
-  all, and a gang that does not fit waits, blocked and holding nothing,
-  instead of placing what fits. `placementTimeout` fails the job if the wait
-  runs too long, and a lost member restarts the whole gang (or, with
-  `onMemberLoss`, is replaced alone or fails the job). See
-  [Gang Scheduling](gang-scheduling.md).
+- `gang`: `true` or `{ min, placementTimeout, readyTimeout, onMemberLoss,
+  onLocalRestart, topology }`. The task's replicas place all together (or at
+  least `min` of them together) or not at all, and a gang that does not fit
+  waits, blocked and holding nothing, instead of placing what fits.
+  `placementTimeout` fails the job if the wait runs too long, `readyTimeout`
+  replaces a member that never comes up, and a lost member restarts the whole
+  gang (or, with `onMemberLoss`, restarts it in place, is replaced alone, or
+  fails the job). See [Gang Scheduling](gang-scheduling.md).
 - `indexHint`: the scheduling index the task's candidates come from, or
   `"scan"` for the full scan. Advisory: an unknown or unusable hint falls back
   to automatic selection and `job plan` says why. See

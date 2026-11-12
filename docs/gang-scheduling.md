@@ -35,8 +35,10 @@ loses a member is restarted whole.
 | `gang = true` | Every replica places in one plan, or none does. A lost member restarts the whole gang. |
 | `gang = { min = 6 }` | Place once at least 6 fit together. The rest place as room appears. `min` must be between 1 and `count`. |
 | `gang = { placementTimeout = "30m" }` | Fail the job if the gang has waited 30 minutes without reaching its quorum ([Placement timeout](#placement-timeout)). |
-| `gang = { onMemberLoss = "replace" }` | What a lost member does to the rest: `restart` (default), `replace`, or `fail` ([When a member is lost](#when-a-member-is-lost)). |
-| `gang = { topology = { key = "rack" } }` | Place every member within one value of a node attribute: one rack, one NVLink domain ([Topology](#topology)). |
+| `gang = { readyTimeout = "10m" }` | A placed member that has not come up within 10 minutes is a lost member ([Readiness timeout](#readiness-timeout)). |
+| `gang = { onMemberLoss = "replace" }` | What a lost member does to the rest: `restart` (default), `restartInPlace`, `replace`, or `fail` ([When a member is lost](#when-a-member-is-lost)). |
+| `gang = { onLocalRestart = "ignore" }` | Whether a member its worker restarts in place is a lost member: `loss` (default) or `ignore` ([Local restarts](#local-restarts)). |
+| `gang = { topology = { key = "rack" } }` | Place every member within one value of a node attribute: one rack, one NVLink domain ([Topology](#topology)). `keys = ["rack", "zone"]` falls back level by level. |
 | `gang = false`, or no `gang` | Replicas place independently (the default). |
 
 The fields combine: `gang = { min = 6, placementTimeout = "30m", onMemberLoss
@@ -46,13 +48,15 @@ The fields combine: `gang = { min = 6, placementTimeout = "30m", onMemberLoss
 | --- | --- | --- |
 | `min` | `count` | The gang's **quorum**: the replicas that must run together. If `legion job scale` lowers the count below `min`, the quorum drops with it. |
 | `placementTimeout` | unset (wait indefinitely) | How long the gang may wait for its quorum before its job fails. A duration (`"30m"`, `"2h"`) or a number of seconds; at least `1s`. |
+| `readyTimeout` | unset (no bound) | How long each placed member may take to report healthy once before it counts as lost. A duration or seconds; at least `1s`. |
 | `onMemberLoss` | `"restart"` | What a loss that leaves fewer than `min` running does to the survivors. |
-| `topology` | unset (any nodes) | `{ key = "<node attribute>", mode = "required" \| "preferred" }`. `mode` defaults to `"required"`. |
+| `onLocalRestart` | `"loss"` | Whether a member's in-place restart by its worker is a loss. |
+| `topology` | unset (any nodes) | `{ key = "<node attribute>" }` or `{ keys = ["<inner>", "<outer>", ...] }`, with `mode = "required" \| "preferred"`. `mode` defaults to `"required"`. |
 
 Unknown fields are rejected, not parsed and ignored:
 
 ```console
-error: unknown field `recovery` in gang, expected one of `min`, `placementTimeout`, `onMemberLoss`, `topology` (see docs/gang-scheduling.md)
+error: unknown field `recovery` in gang, expected one of `min`, `placementTimeout`, `readyTimeout`, `onMemberLoss`, `onLocalRestart`, `topology` (see docs/gang-scheduling.md)
 ```
 
 `legion job schema` and `configs/jobs/maximal.ncl` describe the field too.
@@ -88,11 +92,21 @@ registering or being uncordoned, a node's attributes changing, or allocations
 leaving a node. Then the plan runs again, and places the whole gang if it now
 fits.
 
-Nothing is reserved while the gang waits: no partial placements and no held
-capacity. Any number of waiting gangs cost the cluster nothing, and
-two waiting gangs can never deadlock each other, because neither holds
-anything the other needs. The flip side is in [Limitations](#limitations):
-smaller jobs can keep taking the capacity a large gang is waiting for.
+Nothing is placed while the gang waits: no partial placements, and no
+capacity held for its first few minutes. Two waiting gangs can never
+deadlock each other, because neither holds anything the other needs. A gang
+that keeps waiting while smaller jobs take the capacity it needs as it frees
+gets a [reservation](#reservations) after five minutes.
+
+**Waking.** A blocked gang is not re-planned for every capacity event on its
+class. When an event comes, the scheduler estimates how many members the
+nodes that could take the task now hold (free capacity over the task's
+request, per node, summed; for a gang whose band can preempt, plus the usage
+of work in lower bands), and wakes the gang only when that reaches the
+members its quorum still needs (`min - running`). The estimate is an upper
+bound (it ignores ports, `distinct`, and anti-affinity, which the plan still
+checks), so it never keeps back a gang that would have placed. Each event it
+skips is counted in `legion_gang_wakes_skipped_total`.
 
 Both "the nodes are full" and "no node matches the task's constraints" wait.
 A constraint no node satisfies today can be satisfied by a node that joins
@@ -149,6 +163,33 @@ a good value depends on the workload. Set it when a late gang is worse than
 no gang, for example a training run with a deadline, or when an agent should
 get a definite failure instead of an open-ended wait.
 
+### Readiness timeout
+
+`placementTimeout` covers placing the gang. A placed member can still fail to
+come up: an image pull that never finishes, an artifact that hangs, a health
+check that never passes. Its peers then sit at their rendezvous until the
+member's own failure, which may never come. `readyTimeout` bounds that:
+
+```nickel
+gang = { readyTimeout = "10m" },
+```
+
+A member is **ready** once it has reported healthy: running, and passing its
+checks if it has any (a task without checks is healthy as soon as it runs).
+Each member has its own clock, from when it was placed. A member still not
+ready `readyTimeout` after its placement is a **lost member**: it is removed as
+a failed allocation (`allocation.failed`, with the reason `Not ready within
+gang.readyTimeout 10m: ...`), its gang's `onMemberLoss` applies (`restart` by
+default), and like any failure it spends the task's move budget, so a member
+that never comes up eventually fails the job rather than restarting the gang
+forever. A member that was ready once is never timed out again; staying healthy
+after that is `onUnhealthy`'s job.
+
+The clock is checked by the scheduler leader once a second, in whole seconds:
+a member is timed out within about two seconds after its deadline, never
+before. There is no default: how long a member may take to start depends on
+its image and its node.
+
 ### When a member is lost
 
 A gang is **broken** when fewer than its quorum still run. A member loss that
@@ -159,10 +200,20 @@ running. A loss that breaks the gang applies `onMemberLoss`:
 | `onMemberLoss` | The survivors | Then |
 | --- | --- | --- |
 | `"restart"` (default) | Stop, with their normal graceful stop and stop notice (cause `gang`). | The whole gang places again, together, as one unit. |
+| `"restartInPlace"` | Stay on their nodes; each worker restarts their processes there, under a new `LEGION_GANG_EPOCH`. | The missing members place together once they all fit. |
 | `"replace"` | Keep running. | The missing members place together once they all fit. |
 | `"fail"` | Stop, with every other allocation of the job. | The job is `failed` and places nothing until `legion job run` restarts it. |
 
 With `gang = true` every loss breaks the gang.
+
+`restartInPlace` is `restart` without the re-placement: nothing is stopped
+or moved but the members that were lost, which is much faster for a large
+gang with heavy images, and the gang keeps its nodes (and its topology
+domain). It suits frameworks that need every process restarted but not new
+nodes. The survivors restart in place with the same stop and start a local
+restart uses, so their graceful stop applies; each worker does it as soon as
+its next heartbeat says so, so the survivors restart within a heartbeat of
+each other, not at once.
 
 `restart` is the default because the gang's contract is "these replicas run
 together", and most frameworks that need a gang (PyTorch distributed, MPI,
@@ -176,7 +227,12 @@ A **loss** is one of:
 
 - a member **failing**: its process exits and the worker gives up restarting
   it, or `onUnhealthy` moves it for being unhealthy;
-- its node being **lost** or **drained**;
+- a member **restarting in place** under the task's `restart` policy
+  ([Local restarts](#local-restarts));
+- a member **not ready** within `readyTimeout`;
+- its node being **lost** or **drained**, or having a pending
+  **interruption** (a spot reclaim notice; [spot
+  interruption](spot-interruption.md));
 - a **memory-pressure** eviction.
 
 A job stop, a scale-in, a rollout replacing the gang, preemption (which never
@@ -194,23 +250,42 @@ can never leave the gang split.
 
 **The budget.** Restarts and replacements caused by a member failing spend
 the task's existing move budget, `onUnhealthy.moveCount` moves per
-`movePeriod`. When it runs out the job fails, survivors included, whatever
-`onMemberLoss` says: the gang cannot be whole again without help. Node loss,
-drain, and eviction spend nothing; they are the infrastructure's failures, not
-the workload's.
+`movePeriod`, and so do local restarts that `restart` or `fail` the gang and
+members past their `readyTimeout`. When it runs out the job fails, survivors
+included, whatever `onMemberLoss` says: the gang cannot be whole again without
+help. Node loss, drain, interruption, and eviction spend nothing; they are the
+infrastructure's failures, not the workload's.
 
 Each loss is recorded as a `job.gang_member_lost` event naming the member,
-the cause, the members still running, and the action taken:
+the cause (`failed`, `local_restart`, `ready_timeout`, `node_lost`, `drain`,
+`interruption`, `node_pressure`), the members still running, and the action
+taken:
 
 ```text
 Gang worker of job trainer lost allocation 812 on node gpu-07 (node_lost): 7 run, below its quorum of 8; restarting the whole gang (7 stopped)
 ```
 
-**Local restarts are not losses.** A worker restarting a crashed process in
-place, under the task's `restart` policy, is invisible to the manager, and
-the rest of the gang keeps running beside the restarted member. For a
-framework that cannot take a member back mid-run, set `restart = { policy =
-"never" }` so a crash becomes a member failure and `onMemberLoss` applies.
+### Local restarts
+
+A worker restarts a crashed or unhealthy member in place under the task's
+`restart` policy (and `onUnhealthy`'s restart budget). For a gang that is a
+member gone and back: its peers, blocked in a collective, rarely take it
+back. So by default (`onLocalRestart = "loss"`) the worker reports each local
+restart of a gang member on its next heartbeat, and the manager treats it as a
+lost member:
+
+| `onMemberLoss` | A local restart that leaves fewer than `min` running |
+| --- | --- |
+| `"restart"` | Is a member failure: the member is removed (spending the move budget) and the whole gang stops and places again. |
+| `"restartInPlace"` | Restarts every member in place under a new epoch (the restarted one too, so the whole gang shares one). |
+| `"replace"` | Changes nothing: the member is back already. |
+| `"fail"` | Is a member failure: the job fails. |
+
+The restarted member counts as down for the quorum check, so an elastic gang
+whose other members still make the quorum carries on untouched.
+`onLocalRestart = "ignore"` opts out: the member rejoins on its own, as for
+any task. Restarts the manager asks for (a `restartInPlace`, a refreshed
+view) are never reported back.
 
 ### Topology
 
@@ -234,24 +309,39 @@ dynamic attributes. Give nodes the attribute in the worker config (`attrs = {
 rack = "r12" }`) or let a fingerprint report it. Nodes that do not have it are
 in no domain.
 
+**Levels.** `keys` names several attributes, innermost first:
+
+```nickel
+gang = { topology = { keys = ["rack", "zone"] } },
+```
+
+The gang is tried in one rack first; only when no rack can hold its quorum is
+it tried in one zone. `required` then means "inside one domain of some level"
+(one rack, else one zone, never across zones). At most four levels; `key =
+"rack"` is the one-level form.
+
 | `mode` | Places | When no domain fits the quorum |
 | --- | --- | --- |
 | `"required"` (default) | Every member in one domain. | The gang waits, holding nothing, like any gang short of its quorum. |
-| `"preferred"` | Every member in one domain when one fits. | The fewest domains that together hold the quorum, then any eligible nodes. It never waits for topology. |
+| `"preferred"` | Every member in one domain when one fits. | The fewest domains of the outermost level that together hold the quorum, then any eligible nodes. It never waits for topology. |
 
 **Which domain.** The scheduler estimates how many members fit in each domain
 (free capacity on each eligible node over the task's request, summed), then
 places the gang inside one domain at a time: first the domains that fit every
 member, smallest first, so large domains stay whole for large gangs (best
-fit); then the domains that fit the quorum, largest first. A domain the
-estimate admits can still fail (anti-affinity, a static port, `distinct`), in
+fit); then the domains that fit the quorum, largest first; then, for a gang
+whose band can preempt, the domains that would fit the quorum once the work
+in lower bands is preempted, largest first. A domain that cannot hold the
+quorum even then is never tried. A domain the estimate admits can still fail
+(anti-affinity, a static port, `distinct`, a victim too young to take), in
 which case its placement is discarded and the next domain is tried. At most
-eight domains are tried per gang per plan.
+sixteen domains are tried per gang per plan, across all its levels.
 
-**Top-ups stay put.** A running gang that tops up (`onMemberLoss = "replace"`,
-or members above `min` placing later) places in the domain its running
-members occupy: only there under `required`, there first under `preferred`.
-A `restart` re-places the whole gang and may choose a different domain.
+**Top-ups stay put.** A running gang that tops up (`onMemberLoss = "replace"`
+or `"restartInPlace"`, or members above `min` placing later) places in the
+domain its running members occupy, level by level: under `required`, in their
+rack, else in their zone; under `preferred`, there first. A `restart`
+re-places the whole gang and may choose a different domain.
 
 **Seeing it.** `legion job plan` names the domain, or the best domain and how
 far it got:
@@ -270,15 +360,56 @@ Gang:
 A `preferred` gang that spans racks prints `across more than one rack: none of
 the 6 with eligible nodes fits it alone (topology preferred)`.
 
-With `-j`, each gang report carries `topologyKey`, `topologyMode`,
-`topologyDomain` (the domain chosen, or the best one tried), and
-`topologyDomains` (how many domains have eligible nodes). The blocked job's
-`gang` report has the same fields.
+With `-j`, each gang report carries `topologyKey` (the level the domain
+belongs to), `topologyMode`, `topologyDomain` (the domain chosen, or the best
+one tried), and `topologyDomains` (how many domains of that level have eligible
+nodes). The blocked job's `gang` report has the same fields. A gang with
+several levels that does not place says so with every level: `No single rack
+or zone fits the 8 member(s) the gang needs together ...; the closest,
+zone=east, fits 6`.
 
 `topology` changes nothing else: the quorum, the timeout, member-loss
 handling, preemption floors, and the rendezvous variables are as for any gang.
 Preemption runs inside the domain being tried, so a gang that can only fit by
 preempting does so within one domain.
+
+## Reservations
+
+A waiting gang holds nothing, and that is what keeps waiting cheap and
+deadlock-free. Its cost is starvation: a stream of small jobs can take freed
+capacity a node at a time, so a large gang never sees enough of it at once.
+So a gang that has waited long enough reserves room:
+
+```nickel
+# manager config
+schedulerSettings = {
+  gangReservation = { after = "5m", hold = "30m" },   # the defaults; `false` turns it off
+},
+```
+
+When a gang has been short of its quorum for `after` (counted from its first
+block, like `placementTimeout`), the scheduler leader picks nodes for the
+members its quorum still needs: among the nodes that could take its task
+(not interrupted, inside its topology domain when it has one), the ones with
+the most free room for it first, each reserving as many members as its
+capacity holds less other gangs' reservations. From then on, every plan for a
+job of the gang's band or below sees each reserved node's free capacity less
+the reserved members' requests. Work beyond the reservation still places
+there (backfill); work in a higher band ignores it; the gang's own plan uses
+it. As the work on those nodes finishes or moves, the room accumulates for the
+gang instead of going to the next small job, and the gang places once it is
+all there.
+
+A reservation ends when the gang places, its wait ends (a stop, a restart, an
+update, a timeout), or `hold` passes. A wait gets one reservation: a gang that
+did not place within `hold` waits on, holding nothing, so one gang cannot
+fence capacity forever. A gang that can never fit on the eligible nodes, even
+empty, reserves nothing.
+
+`legion job info` shows the reservation under the blocked gang (`Reserved room
+for 8 member(s) on 2 node(s) until ...`), and `-j` carries `reservedMembers`,
+`reservedNodes`, and `reservationExpires` in the `gang` report.
+`legion_gang_reservations` counts the gangs holding one.
 
 ## Starting together
 
@@ -306,6 +437,7 @@ Every member of a gang starts with:
 | `LEGION_GANG_SIZE` | The world size: the gang's count (after `legion job scale`). |
 | `LEGION_GANG_MIN` | The quorum: `gang.min`, else the count. For an elastic rendezvous, `min:size` is the range of members it may start with. |
 | `LEGION_GANG_LEADER_ADDR` | The address of the node running rank 0: the address service discovery reports for its allocation. Unset if that node advertises none. |
+| `LEGION_GANG_EPOCH` | The gang's incarnation: `0` for a fresh gang, one higher each time the gang's view changes or it restarts in place, and higher again after a `restart`. Every member of one incarnation shares it; a rendezvous can use it as its run id (torchrun's `--rdzv-id`). |
 
 They are set like `LEGION_ALLOC_ID`: in the task's runtime `env`, at process
 start, winning over a jobspec key of the same name
@@ -339,12 +471,17 @@ Each member gets the lowest rank no running member holds, so with
 and the survivors keep theirs. With `min` below `count`, members placed later
 take the ranks above the quorum's.
 
-**Fixed for the member's lifetime.** The values are decided when the member
-is placed and never change while it runs: a change would be a payload update,
-which restarts the member. So members placed before a `legion job scale` keep
-the old `LEGION_GANG_SIZE`, and with `replace`, survivors keep the old
-`LEGION_GANG_LEADER_ADDR` when rank 0 itself was replaced on another node.
-The default `restart` re-places every member, so the whole gang always agrees.
+**Kept current.** A member's process cannot see new environment variables,
+so the values cannot change under it. When the gang's view changes (a `legion
+job scale` changes the size and quorum, rank 0 is replaced on another node, a
+scale-in leaves a rank at or above the new size and the members are re-ranked)
+the gang's epoch goes up, and every member restarts **in place**, on its node,
+with the new values: the manager sends each node the current view of its gang
+members on every heartbeat, and a worker whose member started under an older
+epoch restarts it. A `replace` of any member but rank 0 changes nothing for
+the others, so they keep running. A scale-out that has to wait for room
+refreshes the running members at once; the new members join the same epoch
+when they place.
 
 A slot-mode stateful gang also gets `LEGION_INSTANCE_SLOT`, the stable ordinal
 of its instance. It usually matches the rank but is not guaranteed to; use
@@ -398,6 +535,7 @@ $ legion job plan trainer.ncl -j
 | `topologyDomain` | The attribute value the gang places in, or for a gang that does not place, the domain that came closest. Empty without `topology`, or when a `preferred` gang spans domains. |
 | `topologyDomains` | How many domains have at least one eligible node. |
 | `waitingSince` / `deadline` | `job info` only (0 in a dry run): when the wait started, and when it times out, as Unix seconds. `deadline` is 0 without a timeout. |
+| `reservedMembers` / `reservedNodes` / `reservationExpires` | `job info` only: the gang's [reservation](#reservations), if it holds one. 0 otherwise. |
 
 A job without `gang` still fails its dry run when a replica does not fit, as
 before. The MCP tool `legion_job_plan` returns the same reply.
@@ -446,8 +584,10 @@ Other surfaces:
   its quorum, and `legion_blocked_wait_seconds` records how long blocked evals
   wait ([metrics](metrics.md)). A gauge that stays up while the cluster churns
   is the starvation signal. `legion_gang_outcomes_total{outcome}` counts
-  member losses by what they led to (`replace`, `restart`, `fail`) and
-  placement timeouts (`timeout`).
+  member losses by what they led to (`replace`, `restart`, `restartInPlace`,
+  `fail`) and placement timeouts (`timeout`). `legion_gang_reservations`
+  counts gangs holding a reservation, and `legion_gang_wakes_skipped_total`
+  the capacity events too small to wake a blocked gang.
 
 ## Validation
 
@@ -508,13 +648,25 @@ evicting lower-band work evicts what every one of its replicas needs, in the
 same transaction that places them. If the whole gang cannot fit even with
 the victims it is allowed to take, nothing is evicted.
 
-A gang is **never preempted below its quorum**. Taking one member would idle
-the rest, so the quorum works like a
-[`disruption.minAvailable`](preemption-and-eviction.md) floor, and the
-stricter of the two binds. With `gang = true` no member can be preempted at
-all. With `min` below `count`, the members above the quorum can be. A
-preemptor that finds only gang members to take reports the floor in its
-placement error (`disruption.minAvailable`).
+A gang is **never preempted below its quorum**, only **whole**. Taking one
+member would idle the rest, so on its own a member at the gang's quorum is
+not a victim; the quorum works like a
+[`disruption.minAvailable`](preemption-and-eviction.md) floor. With `min`
+below `count`, the members above the quorum can be taken one at a time, like
+any task's.
+
+When no victim set within every floor makes room, a higher-band preemptor may
+take a **whole lower-band gang**: every member, on every node, in the same
+transaction as its own placement (Volcano's shape). The members on the node
+it places on free the room; the rest go with them, and their room is free for
+the rest of the plan. The whole gang's size is its cost, so a gang is only
+taken when nothing cheaper fits. A gang is taken all or nothing: if any
+member is too young (`victimExemptAge`), holds node-local storage, or is not
+in a lower band, none is. The evicted gang's job then waits, holding nothing,
+and places whole again when there is room, like any gang. A gang that also
+sets its own `disruption.minAvailable` keeps that floor: it is never taken
+below it, whole or not, and a preemptor that finds nothing else reports the
+floor in its placement error (`disruption.minAvailable`).
 
 Drain, node loss, and `job stop` are not preemption. They take members
 regardless: drain and node loss are [member losses](#when-a-member-is-lost),
@@ -550,10 +702,11 @@ finish while the gang waits for it.
 `legion job scale` changes a gang's count. Scaling out places the new
 replicas together (with `gang = true`, the quorum is the new count). Scaling
 in removes replicas and lowers the quorum to the new count if it falls below
-`min`. Neither restarts the running members, so they keep the
-`LEGION_GANG_SIZE` they were placed with, and a scale-in can leave gaps in
-the ranks. A workload with a fixed world size should be stopped and re-run at
-the new size instead.
+`min`. Either way the running members restart in place with the new
+`LEGION_GANG_SIZE` and `LEGION_GANG_MIN` under a new epoch, and a scale-in
+re-ranks members so the ranks stay `0..size-1`. A gang that cannot take a
+world-size change mid-run sees one restart, not a gang that disagrees about
+its size.
 
 ## Failure modes and diagnostics
 
@@ -565,62 +718,51 @@ the new size instead.
 | `status: failed`, eval message `did not reach its quorum within placementTimeout` | The gang waited past its `placementTimeout`. A `job.gang_timeout` event has the details. | Add capacity or lower `count`/`min`, then `legion job run`. Raise or remove `placementTimeout` if the wait was expected. |
 | Every member stopped with cause `gang`, then the gang placed again | A member was lost and `onMemberLoss = "restart"` restarted the gang. `job.gang_member_lost` names the member and the cause. | Nothing, if losses are rare. A member that keeps failing spends the move budget and fails the job; look at its logs. |
 | `status: failed` after `job.gang_member_lost` with `action: fail` | `onMemberLoss = "fail"`, or the task's move budget ran out. | Fix the failing member, then `legion job run`. |
-| Members start minutes apart and the workload's rendezvous times out | Members start independently ([Starting together](#starting-together)): a large image or artifact on one node delays its member. | Raise the rendezvous timeout in the workload, or pre-pull the image. |
+| Members start minutes apart and the workload's rendezvous times out | Members start independently ([Starting together](#starting-together)): a large image or artifact on one node delays its member. | Raise the rendezvous timeout in the workload, or pre-pull the image. Set `readyTimeout` so a member that never comes up is replaced. |
+| `allocation.failed` with `Not ready within gang.readyTimeout` | A member did not report healthy in time, and its gang's `onMemberLoss` applied. | Raise `readyTimeout`, pre-pull the image, or check the member's health checks. |
+| Every member restarted in place at once (`LEGION_GANG_EPOCH` went up) | The gang's view changed (a scale, a new rank 0) or `restartInPlace` applied. `job.gang_member_lost` names the loss, if there was one. | Nothing: that is how members learn the new values. |
+| The whole gang restarted after one member crashed and came back | `onLocalRestart = "loss"` (the default) counts a local restart as a lost member. | Expected for frameworks that cannot take a member back. Set `onLocalRestart = "ignore"` if yours can. |
 | `LEGION_GANG_LEADER_ADDR` is unset | Rank 0's node advertises no `workerAddress` (and its allocation has no network address). | Set the worker's advertised address, or find rank 0 through service discovery. |
-| Members disagree on `LEGION_GANG_SIZE` after `legion job scale` | Running members keep the size they were placed with. | Stop and re-run the job to resize a gang. |
-| `legion_gang_blocked_jobs` stays above zero while jobs keep placing | Smaller jobs take capacity as it frees, and the gang never sees enough at once. | Fence capacity for the gang with a node pool and `permit` ([Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md)), or stop competing work. See [Limitations](#limitations). |
-| A higher-band job fails to place, naming `disruption.minAvailable` | Every candidate victim is a gang member at its quorum. | Expected. Stop the gang, or give it `min` below `count`. |
+| `legion_gang_blocked_jobs` stays above zero while jobs keep placing | Smaller jobs take capacity as it frees, and the gang never sees enough at once. | A [reservation](#reservations) starts after `gangReservation.after`; lower it, or fence capacity with a node pool and `permit` ([Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md)). |
+| A small job blocks though a node shows free room | The room is a waiting gang's [reservation](#reservations) (`legion job info` on the gang shows it). | Wait for the gang, raise the small job's band, or turn `gangReservation` off. |
+| A whole gang stopped with cause `preempted` | A higher-band job could only fit by taking the whole lower-band gang ([Preemption](#preemption)). | Expected. Raise the gang's band, or give it a `disruption.minAvailable` floor. |
+| A higher-band job fails to place, naming `disruption.minAvailable` | Every candidate victim is protected by a floor the user set. | Expected. |
+| Gang members stopped with cause `interruption` | Their node has a pending interruption ([spot interruption](spot-interruption.md)). | Nothing: the gang's `onMemberLoss` moved them before the node went. |
 | `job validate` rejects the gang | One of the [validation](#validation) rules. | The error names the fix. |
 | `status: blocked`, the reason says `No single <key> fits` | A `required` topology gang: the eligible nodes have room, but no one domain holds the quorum. `topologyDomain` is the closest. | Free room in one domain, lower `count`/`min`, or switch to `mode = "preferred"`. |
 | `topologyDomains: 0` | No eligible node has the topology attribute. | Check the key's spelling and that the nodes report it (`legion node info`). |
 
 ## Limitations
 
-- **No reservation or backfill.** A waiting gang holds nothing, so a stream of
-  small jobs can keep taking freed capacity before a large gang sees enough of
-  it at once. Legion does not yet reserve freed capacity for the oldest
-  waiting gang. Pools and permits are the way to fence capacity for gangs
-  today, `legion_gang_blocked_jobs` shows when it matters, and
-  `placementTimeout` turns an endless wait into a failure.
+- **Reservations are coarse.** A reservation holds room per node, sized to
+  each node's capacity, for at most `hold`; it does not predict when the work
+  on those nodes will leave (Legion has no runtime estimates), so it can hold
+  room that frees late while other nodes free early. There is no backfill by
+  expected finish time: work beyond the reservation places, work inside it
+  does not.
 - **No start barrier.** Members start as their workers get them, and the
   workload's rendezvous is where they meet
   ([Starting together](#starting-together)). The rendezvous port is the
   workload's to fix: Legion gives the leader's address, not a port.
-- **Gang variables do not follow a scale or a replaced leader.** A running
-  member keeps the `LEGION_GANG_SIZE` and `LEGION_GANG_LEADER_ADDR` it was
-  placed with. Scaling a gang does not restart it, and with `replace` a new
-  rank 0 on another node is not announced to the survivors. Stop and re-run a
-  gang to resize it.
-- **No readiness timeout.** `placementTimeout` covers placing the gang, not
-  starting it. A member that is placed but hangs before it runs (an image pull
-  that never finishes) holds the others at their rendezvous until the worker
-  reports its start failed.
-- **Restarts are full re-placements.** A `restart` stops every survivor and
-  places the gang again, possibly on other nodes. There is no in-place
-  restart that keeps the gang's nodes and restarts only its processes.
-- **Local restarts are not losses.** A member the worker restarts in place
-  under the task's `restart` policy does not restart the gang. Set `restart =
-  { policy = "never" }` for frameworks that need it to.
-- **Every capacity event re-plans a waiting gang.** A gang is woken by any
-  capacity on a node of its class, even one free replica's worth, and re-plans
-  in full (gang tasks use the full node list, never a truncated
-  [scheduling index](scheduling-indexes.md) candidate list, so "it does not
-  fit" is always a real answer). The re-plan is read-only and places nothing,
-  but on a large, busy cluster many waiting gangs cost planning time.
+- **A changed view restarts every member.** Members cannot be told a new
+  size or leader without restarting them, so a scale or a replaced rank 0
+  restarts the gang in place. A workload that could take a new world size
+  live has no way to ask for it.
+- **In-place restarts are not simultaneous.** Under `restartInPlace` each
+  worker restarts its members on its own next heartbeat, so the survivors
+  restart within a heartbeat interval of each other.
 - **The whole job waits.** Other tasks of a job with a waiting gang do not
   place either, and a gang `restart` or `fail` stops only the gang task's
   allocations (`fail` stops the whole job). Split unrelated tasks into
   separate jobs.
 - **One job per gang.** Two jobs cannot be gang-scheduled together.
-- **One level of topology.** `topology` names one attribute. There is no
-  "one rack, else one zone" fallback: a `preferred` gang that fits no single
-  rack spans the fewest racks that hold it, with no preference for racks in
-  the same zone. At most eight domains are tried per plan, so on a cluster
-  with many domains a gang that fits only by preemption may not try the one
-  where it would have.
-- **No spot-interruption handling.** A spot reclaim reaches a gang as a node
-  loss or drain after the fact, and `onMemberLoss` applies then (`restart` by
-  default). Nothing reacts to the two-minute notice ahead of the loss, and a
-  fresh gang can be placed onto a node that has one.
+- **Topology levels are tried in order, not combined.** `keys = ["rack",
+  "zone"]` prefers any one rack over a zone, without preferring racks in the
+  same zone when it has to fall back, and at most sixteen domains are tried
+  per plan across the levels.
+- **Interruption notices come from AWS or an operator.** The worker's watcher
+  reads EC2's spot notice only; other clouds' notices need an external
+  handler that runs `legion node interrupt` ([spot
+  interruption](spot-interruption.md)).
 - **Older managers ignore `gang`.** A manager that predates the field accepts
   a jobspec with `gang` and schedules it without gang semantics.
