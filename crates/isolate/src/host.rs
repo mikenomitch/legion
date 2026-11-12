@@ -228,14 +228,44 @@ struct HolderMeta {
     hibernations: u64,
     /// The next instance is made from a checkpoint (`control.info().resumed`).
     resumed: bool,
+    /// Calls that resolved this session's holder and have not finished:
+    /// hibernation does not start while any are pending, because a call
+    /// that already holds the holder would otherwise wait out the
+    /// hibernation and then run on an empty instance.
+    pending: u32,
+    /// A hibernation has started (its checkpoint is being kept) or has
+    /// finished (the host let the holder go). A lookup that finds it set
+    /// waits for the hibernation and looks again.
+    hibernating: bool,
     /// The invocation running in it now, to cut it.
     running: Option<Arc<Running>>,
 }
 
+/// A call's claim on its session's holder, from lookup until the call
+/// ends: while any claim is held, the session does not hibernate.
+struct PendingCall(Arc<Holder>);
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        let mut m = self.0.meta.lock().unwrap();
+        m.pending = m.pending.saturating_sub(1);
+    }
+}
+
 impl Holder {
+    /// Claim this holder for a call, unless a hibernation has started.
+    fn claim(self: &Arc<Self>) -> Option<PendingCall> {
+        let mut m = self.meta.lock().unwrap();
+        if m.hibernating {
+            return None;
+        }
+        m.pending += 1;
+        Some(PendingCall(self.clone()))
+    }
+
     fn idle_for(&self) -> Option<Duration> {
         let m = self.meta.lock().unwrap();
-        if m.active || !m.has_instance {
+        if m.active || m.pending > 0 || !m.has_instance {
             return None;
         }
         m.last_active.map(|t| t.elapsed())
@@ -680,6 +710,7 @@ impl Host {
                 }
             }
         }
+        let mut claim = None;
         let holder = match life {
             Lifetime::Request => None,
             Lifetime::Tenant => Some(self.tenant_holder(&task, &req.tenant)),
@@ -689,7 +720,10 @@ impl Host {
                         "a session isolate's invocation needs a session_id",
                     ));
                 }
-                Some(self.session_holder(&req, &task).await?)
+                let c = self.session_holder(&req, &task).await?;
+                let h = c.0.clone();
+                claim = Some(c);
+                Some(h)
             }
         };
         let shard = match &holder {
@@ -745,6 +779,7 @@ impl Host {
             spec,
             module,
             holder,
+            _claim: claim,
             call,
             inv: inv.clone(),
             t0,
@@ -820,21 +855,71 @@ impl Host {
     }
 
     /// The session's holder, restored from the worker's checkpoint when the
-    /// host does not hold it.
+    /// host does not hold it, claimed for one call. A session caught
+    /// hibernating is waited for (its checkpoint is being kept), then looked
+    /// up again, so the call wakes it from that checkpoint.
     async fn session_holder(
         &self,
         req: &InvokeRequest,
         task: &Arc<TaskEntry>,
-    ) -> Result<Arc<Holder>, Status> {
-        if let Some(h) = self.0.sessions.lock().unwrap().get(&req.session_id) {
-            if h.job != req.job_id || h.task != req.task_name {
-                return Err(Status::not_found(format!(
-                    "session {} belongs to another task",
-                    req.session_id
-                )));
-            }
-            return Ok(h.clone());
+    ) -> Result<PendingCall, Status> {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(task.spec().queue_timeout_millis as u64);
+        loop {
+            let held = self
+                .0
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&req.session_id)
+                .cloned();
+            let hibernating = match held {
+                Some(h) => {
+                    if h.job != req.job_id || h.task != req.task_name {
+                        return Err(Status::not_found(format!(
+                            "session {} belongs to another task",
+                            req.session_id
+                        )));
+                    }
+                    match h.claim() {
+                        Some(c) => return Ok(c),
+                        None => h,
+                    }
+                }
+                None => {
+                    let h = self.restore_session(req, task).await?;
+                    let mut s = self.0.sessions.lock().unwrap();
+                    let h = s.entry(req.session_id.clone()).or_insert(h).clone();
+                    drop(s);
+                    match h.claim() {
+                        Some(c) => return Ok(c),
+                        None => h,
+                    }
+                }
+            };
+            // Hibernation holds the instance until it has kept the
+            // checkpoint and let the holder go (or failed and kept it).
+            drop(
+                tokio::time::timeout_at(deadline, hibernating.inst.lock())
+                    .await
+                    .map_err(|_| {
+                        task.counters.refusals.fetch_add(1, Ordering::Relaxed);
+                        Status::resource_exhausted(format!(
+                            "session {} was still hibernating past the queue timeout",
+                            req.session_id
+                        ))
+                    })?,
+            );
         }
+    }
+
+    /// A holder for a session the host does not hold, from the worker's
+    /// checkpoint.
+    async fn restore_session(
+        &self,
+        req: &InvokeRequest,
+        task: &Arc<TaskEntry>,
+    ) -> Result<Arc<Holder>, Status> {
         let origin = Origin {
             job_id: req.job_id.clone(),
             task_name: req.task_name.clone(),
@@ -865,9 +950,7 @@ impl Host {
         meta.session_id = req.session_id.clone();
         meta.job_id = req.job_id.clone();
         meta.task_name = req.task_name.clone();
-        let h = self.new_session(meta, StateMap::from_map(cp.state), true);
-        let mut s = self.0.sessions.lock().unwrap();
-        Ok(s.entry(req.session_id.clone()).or_insert(h).clone())
+        Ok(self.new_session(meta, StateMap::from_map(cp.state), true))
     }
 
     // -- sessions -----------------------------------------------------------
@@ -1093,8 +1176,14 @@ impl Host {
     }
 
     /// Hibernate one idle session isolate: checkpoint its state through the
-    /// worker, then drop it. `Ok(None)` when it is busy (only between
-    /// calls) or has no instance.
+    /// worker, then drop it. `Ok(None)` when it is busy (a call holds or has
+    /// claimed it), has no instance, or is no longer the host's.
+    ///
+    /// The instance stays locked from the claim check until the holder is
+    /// let go, and a lookup that finds the session hibernating waits on that
+    /// lock and looks again: so no call can end up on the dropped holder,
+    /// which would run on an empty instance while the checkpoint holds the
+    /// session's state.
     async fn hibernate(&self, h: &Arc<Holder>) -> Result<Option<u64>, Status> {
         let Ok(mut guard) = h.inst.try_lock() else {
             return Ok(None);
@@ -1109,6 +1198,18 @@ impl Host {
                 return Ok(None);
             }
         };
+        {
+            let s = self.0.sessions.lock().unwrap();
+            if !s.get(&h.key).is_some_and(|held| Arc::ptr_eq(held, h)) {
+                // Closed, or its task removed, since it was picked.
+                return Ok(None);
+            }
+            let mut m = h.meta.lock().unwrap();
+            if m.pending > 0 {
+                return Ok(None);
+            }
+            m.hibernating = true;
+        }
         let task = self.task(&h.job, &h.task).ok();
         let module_id = task
             .as_ref()
@@ -1145,13 +1246,21 @@ impl Host {
             bytes: body.len() as u64,
             freed_bytes: freed,
         };
-        self.0.worker.save_checkpoint(header, body).await.inspect_err(|s| {
+        if let Err(s) = self.0.worker.save_checkpoint(header, body).await {
             warn!(session_id = %h.key, error = %s.message(), "checkpoint not saved; keeping the instance");
-        })?;
-        // The checkpoint holds the session now: forget it here.
+            h.meta.lock().unwrap().hibernating = false;
+            return Err(s);
+        }
+        // The checkpoint holds the session now: forget it here, before the
+        // instance is unlocked for whoever waited on it.
         *guard = None;
+        {
+            let mut s = self.0.sessions.lock().unwrap();
+            if s.get(&h.key).is_some_and(|held| Arc::ptr_eq(held, h)) {
+                s.remove(&h.key);
+            }
+        }
         drop(guard);
-        self.0.sessions.lock().unwrap().remove(&h.key);
         if let Some(t) = task {
             t.counters.hibernations.fetch_add(1, Ordering::Relaxed);
         }
@@ -1407,6 +1516,8 @@ struct Job {
     spec: Arc<TaskSpec>,
     module: Arc<LoadedModule>,
     holder: Option<Arc<Holder>>,
+    /// A session call's claim on `holder`, held until the call ends.
+    _claim: Option<PendingCall>,
     call: invoke_request::Call,
     inv: Arc<Invocation>,
     t0: Instant,

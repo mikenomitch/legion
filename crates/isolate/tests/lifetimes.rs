@@ -255,6 +255,37 @@ async fn an_idle_session_hibernates_after_its_idle_time_test() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_during_hibernation_wakes_from_the_checkpoint_test() {
+    use std::sync::atomic::Ordering;
+    let mut s = runner_spec("s", Lifetime::Session);
+    s.hibernate_after_millis = 100;
+    let h = host_with(s);
+    // The checkpoint takes a while to keep, so the call below lands while
+    // the session is between "checkpoint asked for" and "let go".
+    *h.worker.save_delay.lock().unwrap() = Some(Duration::from_millis(500));
+    open(&h, "s", "sess-mid").await;
+    call(&h, "s", "acme", "sess-mid", &["set", "a", "1"]).await;
+    assert_eq!(
+        wait_for(|| h.worker.saves_started.load(Ordering::SeqCst), |n| *n > 0).await,
+        1
+    );
+    assert!(!h
+        .worker
+        .checkpoints
+        .lock()
+        .unwrap()
+        .contains_key("sess-mid"));
+    // The call waits for the hibernation, then wakes the session from its
+    // checkpoint: its state is there, not a fresh instance's.
+    let r = call(&h, "s", "acme", "sess-mid", &["get", "a"]).await;
+    assert_eq!(
+        (result(&r).as_str(), r.start.as_str()),
+        ("\"1\"", "hibernated")
+    );
+    assert_eq!(h.host.stats().tasks[0].hibernations, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_hibernates_sessions_and_drops_tenants_coldest_first_test() {
     let mut c = config();
     c.shards = 2;
