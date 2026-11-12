@@ -19745,12 +19745,21 @@ export class StreamWorkRequest extends Message<StreamWorkRequest> {
     case: "open";
   } | {
     /**
-     * Every later frame: the highest message the worker has applied.
+     * A later frame: the highest message the worker has applied.
      *
      * @generated from field: legion.StreamWorkAck ack = 2;
      */
     value: StreamWorkAck;
     case: "ack";
+  } | {
+    /**
+     * A later frame: something the worker reports at once rather than on
+     * its next heartbeat.
+     *
+     * @generated from field: legion.StreamWorkReport report = 3;
+     */
+    value: StreamWorkReport;
+    case: "report";
   } | { case: undefined; value?: undefined } = { case: undefined };
 
   constructor(data?: PartialMessage<StreamWorkRequest>) {
@@ -19763,6 +19772,7 @@ export class StreamWorkRequest extends Message<StreamWorkRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "open", kind: "message", T: StreamWorkOpen, oneof: "frame" },
     { no: 2, name: "ack", kind: "message", T: StreamWorkAck, oneof: "frame" },
+    { no: 3, name: "report", kind: "message", T: StreamWorkReport, oneof: "frame" },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkRequest {
@@ -19779,6 +19789,65 @@ export class StreamWorkRequest extends Message<StreamWorkRequest> {
 
   static equals(a: StreamWorkRequest | PlainMessage<StreamWorkRequest> | undefined, b: StreamWorkRequest | PlainMessage<StreamWorkRequest> | undefined): boolean {
     return proto3.util.equals(StreamWorkRequest, a, b);
+  }
+}
+
+/**
+ * What a streaming worker reports between heartbeats (docs/
+ * architecture-managers-workers.md, "Reports between heartbeats").
+ *
+ * A start used to reach the manager on the worker's next heartbeat: about a
+ * second on average at the default two-second cadence, and up to the
+ * adaptive cadence (21 seconds on a 20,000-node fleet), so rollouts and
+ * service discovery waited that long for work that was already serving. A
+ * streaming worker now sends each health transition the moment it happens.
+ *
+ * A hint, like the manager's pushes: the heartbeat's `allocation_health`
+ * still carries every allocation's health on every beat and stays the
+ * record. A report lost with its stream costs one heartbeat interval. A
+ * heartbeat whose snapshot was taken just before a transition can arrive
+ * after the transition's report and set the older health back until the
+ * next beat. The manager applies a report as it applies a heartbeat's
+ * health, under the node the stream's `open` was authenticated for.
+ *
+ * @generated from message legion.StreamWorkReport
+ */
+export class StreamWorkReport extends Message<StreamWorkReport> {
+  /**
+   * Allocations whose health changed (`healthy` flipped, or the first
+   * report of a new start), by the manager's allocation ids, in the form
+   * `HeartbeatRequest.allocation_health` uses. Unratified edge and session
+   * starts are not included: the manager has no allocation for them.
+   *
+   * @generated from field: repeated legion.AllocationHealth allocation_health = 1;
+   */
+  allocationHealth: AllocationHealth[] = [];
+
+  constructor(data?: PartialMessage<StreamWorkReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StreamWorkReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_health", kind: "message", T: AllocationHealth, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkReport {
+    return new StreamWorkReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StreamWorkReport {
+    return new StreamWorkReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StreamWorkReport {
+    return new StreamWorkReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StreamWorkReport | PlainMessage<StreamWorkReport> | undefined, b: StreamWorkReport | PlainMessage<StreamWorkReport> | undefined): boolean {
+    return proto3.util.equals(StreamWorkReport, a, b);
   }
 }
 
@@ -20058,6 +20127,22 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
    */
   ownerNotices: OwnerNotice[] = [];
 
+  /**
+   * The network policy each allocation in `upserts` runs under, as content
+   * hashes, in the form `HeartbeatReply.net_policies` uses (an allocation
+   * absent from the list has no policy). A gated allocation pushed on the
+   * stream opens its datapath from this assignment the moment it launches,
+   * fetching a body it has not seen with `FetchDatapathMaterial`, instead of
+   * failing closed until the next heartbeat brings the assignment.
+   *
+   * A hint, like `endpoint_feed`: unset on a replayed message, and not
+   * counted in `digest`. The heartbeat's `net_policies` stays the record
+   * and replaces whatever this set.
+   *
+   * @generated from field: repeated legion.AllocNetPolicy net_policies = 12;
+   */
+  netPolicies: AllocNetPolicy[] = [];
+
   constructor(data?: PartialMessage<StreamWorkReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20079,6 +20164,7 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
     { no: 20, name: "revision", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 21, name: "resumed_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "owner_notices", kind: "message", T: OwnerNotice, repeated: true },
+    { no: 12, name: "net_policies", kind: "message", T: AllocNetPolicy, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkReply {

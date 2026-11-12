@@ -284,49 +284,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 ### Start path and node throughput
 
-- [ ] **Sandbox boot throughput, what is still open**
-      ([plan](plans/sandbox-boot-throughput-plan.md) ·
-      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
-      [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
-  - [ ] **A large node is bound by its root disks** (calls 13). Reflinked
-        clones plus `debugfs` writes contend in XFS locks (~150–200 boots/s on
-        96 vCPU). Write per-sandbox files without touching shared extents, or
-        spread clones over several base copies, then re-measure.
-  - [ ] **Parallel branches not stacked** (calls 1): `sandbox-warm-pool`,
-        `edge-prewarm`, `elastic-session-envelopes`, `edge-admission-backpressure`,
-        `edge-ratify-throughput`, `chunked-checkpoints`, `checkpoints-on-stream`,
-        `multi-eval-plans`, `scheduler-lane-entry-cost`, `flat-commit-cost`,
-        `web-fleet-throughput`; each needs its own measured case.
-  - [ ] **A memory-snapshot start for sessions**: restore from a per-node
-        template snapshot instead of booting (opt-in, falls back to a boot).
-- [ ] **Start reports wait for a heartbeat.** A health transition reaches the
-      manager on the next full heartbeat (~1 s, up to 21 s on adaptive cadence;
-      liveness pings carry no reports), so rollouts and discovery wait. Carry it on a `StreamWork` report frame
-      ([plan](plans/task-start-critical-path-plan.md) phases 4–5,
-      [calls 4](calls/task-start-critical-path-plan_calls.md)).
-- [ ] **A pushed gated task's policy and ingress wait for the heartbeat.** Its
-      namespace, proxy, resolver, and upstreams bind at launch (2026-11-08) but
-      fail closed until the heartbeat delivers the policy, and ingress listeners
-      bind on the heartbeat. Carry the policy assignment on the delta
-      ([docs](../docs/network-handlers.md)).
-- [ ] **The worker state file is rewritten whole on every start.**
-      `persist_state` serializes every allocation, reads `/proc`, and fsyncs
-      under the task-manager lock, so a burst on a dense node is quadratic.
-      Group-commit off the lock or keep a record per allocation
-      (`legion_task_start_stage_seconds{stage="register"}`).
-- [ ] **TAP sandboxes shell out to `ip` on the start path**
-      (`sandbox_checkpoint::HostTaps`, `sandbox::set_tap_link`). Use the
-      ioctls instead, if the `network` stage shows up on a real KVM node.
-- [ ] **Finish moving worker blocking work off the task-manager lock (audit
-      W3).** Still under it: `reap_terminating`, `record_failure`/self-fence,
-      `prepare`/`start` for `ratify_claim`, `restart_allocation`, edge-boot
-      starts, snapshot restores (an `eager` restore holds it for the whole
-      read), and `container stop` on reconcile. `heartbeat_tick` locks a std
-      mutex from async; teardown needs a "tearing down" state
-      ([calls #11](calls/architecture-audit-2026-10-09_calls.md)). Also under
-      it: a start's filesystem work (`prepare_instance`, log dir and sink), a
-      stop's fsync of the worker state file, and the runtime's memory
-      `checkpoint`.
+- [ ] **A memory-snapshot start for sessions**: restore from a per-node
+      template snapshot instead of booting (opt-in, falls back to a boot)
+      ([plan](plans/session-snapshot-start-plan.md) ·
+      [calls](calls/session-snapshot-start-plan_calls.md), PLANNED).
 
 ### Host runtimes (`exec`, `container`, new runtimes)
 

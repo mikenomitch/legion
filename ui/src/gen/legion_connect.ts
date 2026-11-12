@@ -2593,7 +2593,9 @@ export const Manager = {
      * The worker opens this stream once and keeps it open. Its first frame is
      * `StreamWorkRequest.open`, naming its node and the last position it
      * applied (`last_epoch`, `last_seq`); every later frame is an `ack` of the
-     * highest `seq` it applied. The manager sends `StreamWorkReply` messages:
+     * highest `seq` it applied, or a `report` of health transitions the
+     * manager applies at once instead of waiting for the next heartbeat
+     * (`StreamWorkReport`). The manager sends `StreamWorkReply` messages:
      *
      * - **Deltas.** Each committed change to an allocation on the node (placed,
      *   updated, stopped, removed) becomes the next message on the node's
