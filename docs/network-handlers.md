@@ -1134,10 +1134,18 @@ starts the task. An allocation the manager pushes straight to the worker can
 start before any heartbeat lists it (at once, or as soon as its artifacts are
 staged). For such a start the worker creates the namespace before the
 launch, and binds the egress proxy, the resolver, and the upstream listeners
-inside it from the allocation the push carried. It also triggers a heartbeat
-at once, which brings the allocation's policy and its ingress listeners.
-Until that policy lands, the egress proxy and the upstreams fail closed:
-each connection is refused, and none goes out unjudged. The start itself
+inside it from the allocation the push carried. A work-stream delta also
+carries the allocation's policy assignment (`StreamWorkReply.net_policies`),
+so the egress proxy and the upstreams judge by it from their first
+connection, and the ingress listeners bind at launch too. When the node has
+not seen that policy's body yet, it fetches it with `FetchDatapathMaterial`
+on a heartbeat it triggers at once; a `PostWork` push carries no assignment,
+so it triggers that heartbeat to bring the assignment and the ingress
+listeners. Until the policy is in place, the egress proxy and the upstreams
+fail closed: each connection is refused (`policy-pending`), and none goes
+out unjudged. The heartbeat's `net_policies` stays the record and replaces
+whatever a delta set, so a heartbeat built just before a delta landed can
+leave the new allocation `policy-pending` for one beat. The start itself
 also creates the namespace when it is missing, and every creation is
 serialized and idempotent. A worker that cannot
 create namespaces (no `CAP_SYS_ADMIN`, or not Linux) fails the start with

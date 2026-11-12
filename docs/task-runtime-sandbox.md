@@ -319,6 +319,18 @@ How it behaves:
   `rootfs_headroom_mib`, and the Legion version that built it. A new guest
   binary, a task with different headroom, or a new Legion release gets its
   own base.
+- **A large node spreads its clones over copies of a base.** On a reflink
+  filesystem every clone of one base shares its extents, so on a node
+  starting hundreds of sandboxes a second their writes meet in the same
+  filesystem locks (the base's inode and its refcount records). A node keeps
+  one full copy of each base per 16 vCPUs, from 1 to 8 (a 96-vCPU node keeps
+  6), and starts take them in turn. A copy is made in the background from
+  the first, the first time a start would have used it, and a start never
+  waits for one: until it lands, that start clones the first copy. Each copy
+  takes the base's full size from the same budget, and is evicted like any
+  base. Nodes under 32 vCPUs, and filesystems without reflinks (where a
+  clone already shares nothing), keep one. The gain on the 96-vCPU node
+  this was found on has not been measured yet.
 - **Nothing per sandbox is in a base.** Env (which can hold secrets),
   hostname, instance id, and the generated init are written into each
   sandbox's own copy, after it is made. A base is read-only, and a copy

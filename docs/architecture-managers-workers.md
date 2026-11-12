@@ -714,6 +714,36 @@ whatever the heartbeat cadence:
   heartbeat's endpoint feed stays the record, so a lost push costs one
   heartbeat interval. See
   [How endpoints reach a node](service-discovery.md#how-endpoints-reach-a-node).
+- **Policy assignments.** A message's upserts come with the network policy
+  each runs under (`net_policies`, content hashes as the heartbeat carries
+  them), so a gated allocation started from a delta opens its datapath at
+  launch instead of failing closed until the next heartbeat. A hint like
+  the pushes above: unset on a replayed message, and the heartbeat's
+  assignment replaces it. See
+  [Gated networking](network-handlers.md).
+
+#### Reports between heartbeats
+
+The stream also carries frames the other way. Besides its acks, a worker
+sends a `report` frame (`StreamWorkReport`) for each health transition the
+moment it happens: an allocation that turned healthy (its first check
+passed, or it has none), or one that stopped being healthy. The manager
+writes it as it writes a heartbeat's `allocation_health`, under the node the
+stream was authenticated for, so rollouts and service discovery see a
+started task about a round trip after it serves rather than on the next
+beat (about a second at the default 2-second cadence, and up to the
+[adaptive cadence](heartbeat-cadence-and-scale.md), 21 seconds on a
+20,000-node fleet). Waking the heartbeat for each transition instead would
+have tied the fleet's heartbeat rate to its placement rate.
+
+A report is a hint, not the record. Every heartbeat still carries every
+allocation's health and replaces what a report wrote, so a report lost with
+its stream costs one heartbeat interval, and one queued while no stream was
+up is dropped when the stream reopens. A heartbeat whose snapshot was taken
+just before a transition can reach the manager after the transition's
+report and set the older health back until the next beat. Unratified edge
+and session starts are never reported this way: the manager has no
+allocation for them.
 
 A worker on the stream sends a heartbeat of a few dozen bytes and gets a
 reply of a few bytes, however many allocations it runs; the manager builds
