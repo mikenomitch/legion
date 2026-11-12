@@ -2,7 +2,7 @@
 
 Legion's running to-do list. Open work is at the top, by area; shipped work is in [Done](#done).
 
-- Each area links its plan in [`plans/`](plans/) and its page in [`docs/`](../docs/README.md); hardware and rig runs are under [Verify](#verify).
+- Each area links its plan in [`plans/`](plans/) and its page in [`docs/`](../docs/README.md).
 - Finish something here → check it off and move it to Done **in the same change**.
 - Keep items short: what is wrong, where in the code or plan, and a link. History belongs in the plan or calls doc.
 - Deferred work found along the way becomes a new open item in its area.
@@ -13,7 +13,6 @@ Worker-plane auth Phases 0–8 shipped ([plan](plans/worker-plane-auth-plan.md) 
 [calls](calls/worker-plane-auth-plan_calls.md)); the AWS spot-check fixes are in
 [launch-spot-check-findings.md](launch-spot-check-findings.md) and
 [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md).
-Their remaining real-hardware runs are under Verify.
 
 ### Worker plane and the host guard
 
@@ -93,7 +92,7 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 [raft-write-path](plans/raft-write-path-plan.md) ·
 [placement-and-commit-cost](plans/placement-and-commit-cost-plan.md) · docs:
 [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md),
-[benchmarks.md](../docs/benchmarks.md). Rig re-measurements are under Verify.
+[benchmarks.md](../docs/benchmarks.md).
 
 ### Plan, commit and write-path cost
 
@@ -162,7 +161,7 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       A `kind` label would want the same treatment.
 - [ ] **Adaptive scheduler concurrency, phases 4–5**
       ([plan](plans/adaptive-scheduler-concurrency-plan.md)). Everything waits on
-      the Phase 0 matrix (Verify):
+      the Phase 0 matrix (plan §11, §16):
   - [ ] Flip the default to `enforce` if the matrix shows it beats the best
         static `evalThreads`; then make the `evalThreads` guidance unconditional.
   - [ ] The `pool` label on `legion_plan_apply_total` (deferred with Phase 0;
@@ -359,8 +358,7 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 
 ## Task runtimes
 
-Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md). Hardware and
-rig runs for everything below live in the verify list.
+Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 ### Start path and node throughput
 
@@ -454,7 +452,7 @@ rig runs for everything below live in the verify list.
 Phases 1–5 are built ([plan](plans/isolate-runtime-plan.md) ·
 [calls](calls/isolate-runtime-plan_calls.md) ·
 [docs](../docs/task-runtime-isolate.md)); what follows was deferred or
-knowingly left limited. Rig and KVM runs are under [Verify](#verify).
+knowingly left limited.
 
 - [ ] **Hibernation as a memory image.** A hibernated session isolate keeps
       only its `state` map; memory, globals and handles are lost. Blocked on
@@ -738,7 +736,7 @@ knowingly left limited. Rig and KVM runs are under [Verify](#verify).
       ([plan](plans/suspend-resume-and-oversubscription-plan.md) ·
       [calls](calls/suspend-resume-and-oversubscription-plan_calls.md) ·
       [docs](../docs/suspend-and-resume.md)). Phases 1–7 and Tracks 1–2
-      shipped; Linux/KVM checks are in the verify list. Still open:
+      shipped. Still open:
   - [ ] Node usage lives on the manager that got the heartbeat; another
         manager reports `usage_reported: false`.
   - [ ] Memory snapshots copy only the instance volume; refuse or snapshot
@@ -1287,101 +1285,6 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
       ([development.md](development.md#keeping-builds-and-test-runs-small)); fold the
       raft-ops tests into `tests/integration/` ([calls 1](calls/test-build-footprint_calls.md)).
 
-## Verify
-
-Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS rig. The code for each is in; these confirm it.
-
-### Launch blockers
-
-- [ ] Run a real gated container end to end on a Linux node (runc and crun, default mode): stock `nginx` reachable on its advertised port, `curl` through the proxy refused with `gated-default`, then allowed after `network.egress.allow` ([worker-plane-auth plan](plans/worker-plane-auth-plan.md) §6.12).
-- [ ] Run the kernel host guard on a cgroup v2 node as root: `sudo -E cargo test --lib kernel_guard_loads -- --ignored --nocapture` (a dial to `169.254.169.254` fails with `EPERM`, counter reports it) ([plan §6.13](plans/worker-plane-auth-plan.md)).
-- [ ] Run the container privilege floor on crun: `LEGION_OCI_RUNTIME=crun cargo test --lib oci_runtime_security -- --ignored` ([calls 40](calls/worker-plane-auth-plan_calls.md)).
-- [ ] Re-run the three ignored runc tests (`oci_runtime_exec_runs_inside_the_container`, `…_sees_task_dir_files_and_their_rewrites`, `…_enforces_a_declared_memory_limit`) on a cgroup v2 host to tell environment from bug.
-- [ ] Re-run the AWS spot check without shims (`tests/spot-check/smoke.sh` + RUNBOOK human pass), including container/exec paths on the `0710` allocation-dir grant and edge-boot speculative dispatch ([launch-spot-check-fixes plan](plans/launch-spot-check-fixes-plan.md)).
-- [ ] Rerun `05-dag.ncl` on the 3-manager rig: a DAG advances past its first step ([launch-spot-check-findings.md](launch-spot-check-findings.md)).
-- [ ] Rerun `05-dag.ncl` twice with different `run` values: the resubmit's rollout progresses ([rollouts.md](../docs/rollouts.md#lifecycle-specific-behavior)).
-- [ ] Rerun the `durability = "store"` suspend and cross-node resume on the rig (contentStore auth on part fetch, node-independent `vmdev` links, gated-restore wait) ([suspend-and-resume.md](../docs/suspend-and-resume.md)).
-- [ ] Reproduce P1-5 on the rig: re-run `install.sh` over a worker with running tasks and confirm no orphans or second copies ([plan §8.4](plans/launch-spot-check-fixes-plan.md)).
-- [ ] Run the sandbox spot check (RUNBOOK §12, `tests/spot-check/smoke.sh sandboxes`; needs `legion-guest` and the §12.0 config), never run so far.
-- [ ] Verify the sandbox clean stop on the KVM rig, cloud-hypervisor and Firecracker: `09-sandboxes.ncl` task `ws`, write `/workspace/probe`, `instance stop` + `start`, plus the `sandbox-suspend` boots count ([calls](calls/sandbox-clean-stop_calls.md)).
-- [ ] Confirm on the rig whether the disk-fit fix explains sc-wkr-1's 2G refusal ([calls 74](calls/launch-spot-check-fixes-plan_calls.md)).
-- [ ] Confirm cgroup v2 resource enforcement turns on (P1-1), and measure worker-plane TLS dispatch cost at 1,000 nodes, on real hardware.
-
-### Scheduling & placement
-
-- [ ] Re-measure job intake with batching on, on 3 voters (5k nodes, `dense_fleet` at 200k allocations, 16 eval threads, 32 submitters): `raft_ops_total{op="enqueue_evals_isolated"}` and `{op="seed_task_statuses_batch"}` well below the submit rate ([eval-path-raft-cost plan](plans/eval-path-raft-cost-plan.md)).
-- [ ] Re-measure eval-loop claim/complete batching: rerun cells G/H from [aws-phase4-findings.md](aws-phase4-findings.md); `complete_evals_and_claim_next` rate ÷ `evals_processed_total` should exceed 1.
-- [ ] Re-measure the plan-apply conflict fix on AWS: the five-row table in [aws-phase2-findings.md](aws-phase2-findings.md), with `spread` as well as `bin_pack`; check `build_plan` stays flat above 5k and why `task_fetch` grew 33x ([plan-apply-conflict-reduction plan](plans/plan-apply-conflict-reduction-plan.md)).
-- [ ] Re-run the `dense_fleet` 50k/100k/200k fill ladder and the eval-thread sweep above 32 with `--submitter native`; trust only cells with `driver_bound: false` and `cross_check.agree` ([aws-phase4-findings.md](aws-phase4-findings.md)).
-- [ ] Re-measure a paced vs burst submission pair (600 nodes, 12,006 allocations) after the SCH3 claim fix, reading `legion_plan_apply_total{outcome}` ([placement-and-commit-cost plan](plans/placement-and-commit-cost-plan.md)).
-- [ ] Run adaptive concurrency's Phase 0 matrix: fixed `evalThreads ∈ {1..32}` at 1k and 5k nodes on a conflict-bound workload, into `benchmarks/scheduler/README.md` ([plan §11, §16](plans/adaptive-scheduler-concurrency-plan.md)).
-- [ ] Measure group commit on three voters and revisit the 64-op / 128 KiB batch bounds ([calls #4](calls/raft-write-path-plan_calls.md)).
-- [ ] Run edge boot's Phase 0 start-path matrix (submit → first byte, both persistence modes, cold/warm image, single/cross-region) on a real raft cluster and registry ([calls #18](calls/edge-boot-plan_calls.md)).
-- [ ] Re-measure the AWS campaign with heartbeats off raft: `heartbeat-commit-probe.sh` on gp3 at 250/1000/2500 nodes, `packing-density.sh`, all twelve `run-campaign.sh` cells, `storm.sh`, `soak-24h.sh`, `failover-drill.sh` with zero nodes lost, and the cadence phase-4 repro ([liveness plan §10.1](plans/liveness-off-the-raft-path-plan.md)).
-- [ ] Run the `heartbeat = { adaptive = false }` comparison at 10k and 20k nodes against the adaptive default ([cadence plan §13](plans/heartbeat-cadence-at-scale-plan.md)).
-- [ ] Re-run the ~3,000-node mass-loss storm: submissions keep landing while the reschedule backlog sits at priority 40; also confirm a job matching no node moves `evals_processed_total{kind="job_submit",status="error"}` by one ([node-loss-storm plan](plans/node-loss-storm-plan.md)).
-
-### Task runtimes
-
-- [ ] Run the new sandbox paths on KVM, both VMMs: the `#[ignore]`d tests for a session run with files in and `--get` out, balloon resize down and back up and `needs_restart` above boot size, `suspendWithOwner`, a `store` session's `--move`, and `runtime disable --drain` suspending a keyed sandbox ([session-runs](plans/session-runs-plan.md) · [resize](plans/resize-plan.md) · [child-sessions](plans/child-sessions-plan.md)).
-- [ ] Run the sandbox-boot cases on Firecracker and with TAP guests (~1 h, ~$1) to decide whether `auto` should prefer Firecracker ([docs](../docs/task-runtime-sandbox.md#choosing-a-vmm), [calls 15](calls/sandbox-boot-throughput-plan_calls.md)).
-- [ ] Measure root-disk-bound boot throughput on a node type with local NVMe ([results](../benchmarks/aws/sandbox-boot/RESULTS.md)).
-- [ ] Run the lazy-memory restore matrix (1/4/8 GiB, lazy vs eager, cloud-hypervisor v51–v53 and Firecracker, first read after resume, no-userfaultfd fallback, and once with `LEGION_SANDBOX_GATED_DEFAULT=1`) on a ≥32 GiB c5.metal; record numbers in the sandbox doc's "Restore time", RESULTS.md, and [plan §9](plans/lazy-memory-restore-plan.md#9-testing-plan).
-- [ ] Rootfs base cache: boot a cloned disk on Firecracker, and checkpoint and restore a cloned disk ([plan](plans/rootfs-base-cache-plan.md)).
-- [ ] Run the sandbox campaign on the AWS rig (`run-sandbox-campaign.sh`) and record ceiling, raft/CPU cost per lifecycle, and memory per sandbox in plan §14 ([calls](calls/sandbox-scaling-plan_calls.md) #20, #60).
-- [ ] Run the rig's keyed `ladder` cells with the `perf/multi-eval-plans` build vs main; merge only on a measured gain ([plan](plans/multi-eval-plans-plan.md) §12).
-- [ ] Run elastic envelopes on real workers, through a follower's forwarded write, and in a fleet-wide grow burst ([plan](plans/elastic-session-envelopes-plan.md) Phase 3).
-- [ ] Resume a real microVM behind the wake gateway on KVM ([plan](plans/wake-on-request-plan.md)).
-- [ ] Park and resume a real sandbox on KVM, gated and TAP, with memory and disk checkpoints ([plan](plans/park-plan.md)).
-- [ ] Sandbox exec Phase 0 at 1,000 and 10,000 concurrent sessions on the AWS rig with real workers (≤20/≤80 ms open latency); add a connection-reuse mode ([plan](plans/sandbox-exec-plan.md)).
-- [ ] Sandbox exec Phase 1 on KVM: `sandbox_exec_over_vsock`, then exec after a memory resume, a session across suspend, `none` sandbox exec, a shell keeping a sandbox awake, and a UI-terminal action ([plan](plans/sandbox-exec-plan.md)).
-- [ ] Delegated exec keys: a positive direct session into a `container` task on runc ([calls](calls/sandbox-exec-plan_calls.md)).
-- [ ] Gated Phase 0: boot a gated sandbox on a real VMM (`sandbox_gated_boots`, G0.1) and the G0.2 throughput numbers ([verification](suspend-resume-linux-verification.md#gated-sandboxes)).
-- [ ] Gated KVM checks G1.1–G1.5, G2.1, G3.1, G4.1, G5.1, G5.2, recorded in the verification doc ([plan](plans/gated-sandbox-checkpoints-plan.md)).
-- [ ] Run the supervision plan's root-only cgroup and hardening paths against a Linux worker ([plan](plans/host-process-supervision-plan.md)).
-- [ ] Suspend Phase 1 Linux checks on cgroup v2 ([§ Phase 1](suspend-resume-linux-verification.md#phase-1)).
-- [ ] Suspend Phase 2 Linux checks: `memory.low`/`memory.max`, oversubscribe ratio, two-bursting eviction, `memory.reclaim`, guest size ([§ Phase 2](suspend-resume-linux-verification.md#phase-2)).
-- [ ] Suspend Phase 3b KVM checks (`sandbox_memory_checkpoint_round_trip_*`), recording restore latency per VMM ([§ Phase 3b](suspend-resume-linux-verification.md#phase-3b)).
-- [ ] Suspend Phase 3c Linux checks: memory snapshot/restore acceptance on both VMMs, pins, paused volume snapshot, TAP recreation, restored VMM cgroup ([§ Phase 3c](suspend-resume-linux-verification.md#phase-3c)).
-- [ ] Suspend Phase 4 Linux checks: suspend <1.5 s / resume <300 ms for 1 GiB on both VMMs, identity refresh, RNG divergence, `container` disk suspend; publish latencies ([§ Phase 4](suspend-resume-linux-verification.md#phase-4)).
-- [ ] Suspend Phase 5 Linux checks: idle suspend, busy never suspends, pressure order, quiet connection, local suspension across lost heartbeat, balloon on both VMMs ([§ Phase 5](suspend-resume-linux-verification.md#phase-5)).
-- [ ] Confirm the pinned Firecracker accepts `free_page_reporting` (item 5.5), then turn it on.
-- [ ] Suspend Phase 6 Linux checks: three memory forks diverge, TAP on both VMMs, Firecracker page sharing, `container` disk fork, `sandbox_fork_divergence_*` ([§ Phase 6](suspend-resume-linux-verification.md#phase-6)).
-- [ ] Integration items 6.7 and 6.8: a spread fork of a TAP sandbox across two bridged KVM nodes, and the named TAP failures ([§ Phase 6](suspend-resume-linux-verification.md#phase-6)).
-- [ ] Suspend Phase 7b Linux checks: real MinIO publish of a memory checkpoint and resume on a second KVM node, with plaintext and sealed publish/fetch times ([§ Phase 7b](suspend-resume-linux-verification.md#phase-7b)).
-- [ ] Measure chunked publish/fetch against real MinIO and S3, and memory dirtiness on real Firecracker and cloud-hypervisor guests ([calls 4](calls/chunked-checkpoint-publish-plan_calls.md)).
-- [ ] Track 2 Linux checks: a make-room round with real sandbox captures and a `snapshots` budget filled by real checkpoints ([§ Track 2](suspend-resume-linux-verification.md#track-2)).
-- [ ] Track 1 KVM checks: per-instance TAPs on a bridge, TAP counters, in-place identity disk refresh, TAP sandbox forks ([§ Track 1](suspend-resume-linux-verification.md#track-1)).
-- [ ] Rerun `scheduler_speed`, `candidate_construction`, `snapshot_budget`, and the `locality` group before/after on a quiet host; the suspend plan's §9 numbers and the content-store budget numbers are noise-dominated ([plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)).
-- [ ] Isolate Phase 0 on the AWS rig (nested and metal, 16 vCPU / 64 GiB, a `la57` CPU for 5-level paging): the findings doc's measurements, then rewrite plan §4 and §10 from them; every number so far is from a 4-vCPU container ([findings](isolate-runtime-phase0-findings.md) · [plan §11](plans/isolate-runtime-plan.md#11-implementation-phases)).
-- [ ] Isolate density campaign (plan §12, Phases 4 and 6): fill a node with session isolates to its memory budget; report resident, paged-out and hibernated counts, wake latencies, and host RSS per isolate; include an MPK host with `vm.max_map_count` raised.
-- [ ] Isolate VM tier on KVM: a `tier = "vm"` run and an `auto` run that goes to the VM (reply shape, `vmMs`, a fresh VM per run, `args` on `run.command`), `--fallback vm`, and child VMs (`vm.acquire`/`exec`/`fetch`, `children.max`, a session isolate keeping its child across hibernation and re-attaching, the child ending with its owner, `child-gone`); nothing has run against a real VM. The tier logic and child ownership pass end to end with an `exec` session task standing in for the sandbox, and the two sandbox variants in `tests/integration/isolate.rs` are written and ignored ("needs /dev/kvm"); run them on a KVM node ([calls 66](calls/isolate-runtime-plan_calls.md#66-vm-tier-and-child-vm-tests-run-with-an-exec-session-task-standing-in-for-the-sandbox) · [plan §12 "Burst"](plans/isolate-runtime-plan.md#12-testing-plan)).
-- [ ] Isolate child re-attach by id after hibernation: a session isolate that hibernated calls `vm.attach(id)` on the child it started earlier and drives it. Not covered by any test (the test guest only calls `vm.acquire`); needs a runner fixture that calls `vm.attach`, then a run with the `exec` stand-in and on KVM ([calls 66](calls/isolate-runtime-plan_calls.md#66-vm-tier-and-child-vm-tests-run-with-an-exec-session-task-standing-in-for-the-sandbox)).
-- [ ] Isolate HTTP end to end on a real node: a request through netd's own TCP ingress listener (TLS and the ingress chain) to an isolate handler, and an upstream credential installed by the heartbeat's `FetchDatapathMaterial` path rather than set directly; the end-to-end test enters at the supervisor's ingress socket and installs the credential itself ([plan §12](plans/isolate-runtime-plan.md#12-testing-plan)).
-- [ ] Isolate page-out and the host cgroup on a cgroup v2 node with swap or zswap and resource enforcement on: `Reclaim{PAGE_OUT}` plus `memory.reclaim` actually moves pages, `pagedOut` counts them, the pressure response asks hosts before allocations, the forked host lands in its cgroup (placed before `exec`), `memory.max` follows envelope resizes, leaf names stay distinct for colliding cordon names, and each compile runs in its own `compile.<pid>.<n>` leaf ([calls 31](calls/isolate-runtime-plan_calls.md#31-paging-out-is-kernel-reclaim-on-the-hosts-cgroup-not-madvise-per-isolate)).
-- [ ] Isolate Phase 1 acceptance on a real node with **release builds**: `legion session run` on a Rust component task under 2 ms end to end. Measured so far only with debug builds of the worker and the host in a 4-vCPU container: 4.8 ms p50 (min 4.4 ms) for a Rust component, 17.6 ms p50 for a Python hello world (`isolate_images::hello_world_end_to_end_timing`), which does not meet the target; also `isolate_bench` (`cargo bench -p legion-isolate --bench isolate_bench`) against the Phase 0 targets on the rig ([plan §15](plans/isolate-runtime-plan.md#15-acceptance-criteria)).
-- [ ] Build the isolate images from a clean machine with the pinned toolchains (`pip install --require-hashes`, `npm ci` into `target/isolate-images-tools`); every build so far reused pre-installed toolchains ([images README](../crates/isolate/images/README.md)).
-
-### Networking, persistence, apps and the rest
-
-- [ ] Measure the manager-routed session start path across three managers with loadgen session mode, on the AWS rig (`benchmarks/aws/README.md`, [plan §8](plans/session-durability-and-routing-plan.md)).
-- [ ] Run Phase 5b `store` sessions against real S3 or MinIO (`crates/worker/src/session_manifest.rs` is tested only on `object_store`'s in-memory store).
-- [ ] Run Phase 5b with the `sandbox` runtime on KVM: publish and restore a session's sealed memory parts on another node ([plan](plans/session-durability-and-routing-plan.md)).
-- [ ] Measure splice pipe-page limits on a node with tens of thousands of concurrent bulk flows ([calls #6](calls/datapath-performance-plan_calls.md)).
-- [ ] macOS gated Phase 4: on a macOS 26 machine with a root worker, run the plan's three scenarios and settle its open questions ([plan §3](plans/macos-gated-plan.md)).
-- [ ] Run the system worker's per-worker host-guard naming as root ([calls 95](calls/legion-apps-plan_calls.md)).
-- [ ] Verify the system worker's `cpu.max` ceiling with a busy loop on a cgroup v2 host (plan §9 A1).
-- [ ] Run the `#[ignore]`d API-socket peer-cgroup refusal test as root on delegated cgroup v2 (`tests/integration/api_socket.rs`; [calls 31](calls/legion-apps-plan_calls.md)).
-- [ ] Run the cert manager against Let's Encrypt staging with Cloudflare DNS-01 and the HTTP-01 responder on a public node ([docs](../docs/cert-manager.md)).
-- [ ] Run the 10,000-policy autoscaler load test on the AWS rig with the app on a system worker and real workers (calls 101); also take release-profile numbers for the scaling-input rollup benchmark.
-- [ ] Run a GPU job end to end (exec and container, with/without `--cdi`, runc and crun) on a real NVIDIA node ([devices.md](../docs/devices.md#what-has-been-verified)).
-- [ ] Run Legion's bundles under gVisor (`runsc`) and Kata ([task-runtime-container.md](../docs/task-runtime-container.md#runtime-classes)).
-- [ ] Check jump-hint chords survive Safari and Firefox ([calls 1](calls/ui-jump-hints-plan_calls.md)).
-- [ ] Linux visual check of `/nodes/<id>` against `legion node usage <id>` with enforcement on, and the idle countdown reaching zero within one poll of the sweep ([plan](plans/suspend-resume-ui-plan.md)).
-- [ ] Browser check of the sessions UI against a live session cluster: Promote, End, paging, envelope and edge-nodes cards ([plan](plans/session-ui-plan.md)).
-- [ ] Re-verify on the rig: microVM clean stop (volume writes survive `instance stop`), image pulls after leader failover, two local managers with separate `~/.legion/tokens/` files, and `rig_install_cli_token` on a 3-manager rig ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
-
-
 ---
 
 # Done
@@ -1793,7 +1696,8 @@ judgement calls in [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-
   - **The installation guide's cloud-hypervisor and guest-kernel versions were checked upstream**: the kernel tag it named did not exist; it now names the pair the sandbox-boot rig ran, and the arm64 asset ([docs](../docs/installation.md)).
 - **Removed, already done**: the `proto-breaking-ok` label exists; the rig's driver no longer reports `0.0` for a cell shorter than its warmup; Linux containers have had their own network namespace since gated became the default; the guest agent has had a vsock exec channel and a static musl build since sandbox exec Phase 1.
 - **Removed, duplicates** (the surviving item carries the detail): the rig's `schedulingPolicy`, TAP and loopback-only sandboxes' upstreams, pressure re-landing on the evicting node, `exec` network namespaces and the overlay controller (both "Unplanned datapath"), wake on connect and diff snapshots, the session lifecycle rate, "prove Legion scales", the ingress's catalog polling, the https CA default, two task-manager-lock items (audit W3), and three Verify runs listed twice.
-- **Moved to the rig's plan**: the AWS comparative benchmark rig's own work (rig AMI, binary cache, sim node prefixes, competitor follower and harness gaps, the rest of the cross-system matrix, the streaming campaign, the operator-AMI bake check) now lives in [its plan's Open work](plans/aws-comparative-benchmark-plan.md#open-work). Legion bugs the rig finds stay here, by area; the plan-apply `spread` run is the Verify item that already covered it.
+- **Moved to the rig's plan**: the AWS comparative benchmark rig's own work (rig AMI, binary cache, sim node prefixes, competitor follower and harness gaps, the rest of the cross-system matrix, the streaming campaign, the operator-AMI bake check) now lives in [its plan's Open work](plans/aws-comparative-benchmark-plan.md#open-work). Legion bugs the rig finds stay here, by area.
+- **Removed, pending a full verify pass**: the Verify list (runs needing real hardware, KVM, macOS, root on cgroup v2, or the AWS rig); it is rebuilt from that pass rather than kept here.
 - **Removed, decided**: seventeen limitations and ideas, each with where its decision lives ([calls #10](calls/todo-closeout-2026-11-10_calls.md)).
 
 ## Spot checks, audits and security closures

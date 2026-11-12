@@ -319,10 +319,9 @@ fixes on first contact, so each starts with a `--smoke` cell.
 ## Open work
 
 The rig's own to-do list. It lives here rather than in
-[`TODO.md`](../TODO.md), which keeps only Legion bugs and Legion
-verification runs the rig turns up (for example the fixed-2s heartbeat
-ablation, under "Heartbeats and liveness", and the plan-apply re-measure
-with `spread` as well as `bin_pack`, under Verify).
+[`TODO.md`](../TODO.md), which keeps only the Legion bugs the rig turns
+up (for example the fixed-2s heartbeat ablation, under "Heartbeats and
+liveness").
 
 ### Campaign runs still owed
 
