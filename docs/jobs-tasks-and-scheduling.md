@@ -498,6 +498,12 @@ When a job group contains multiple tasks:
 
 - the planner builds group-level candidate sets from the combined constraints,
 - assignments may be pinned so tasks in the same group and token land on the same node,
+- a group with no node yet picks one with room for all of its tasks together
+  (each at its count), and only that room is enough to place it. Preemption, when
+  it runs, frees room for the whole group on one node
+  ([preemption-and-eviction.md](preemption-and-eviction.md#multi-task-groups)),
+- a group's tasks are placed one after another, so another group's task in the
+  same job cannot take room the group was given,
 - conflicting earlier placements in the same group are treated as errors.
 
 ## Node Add/Loss and Reconciliation

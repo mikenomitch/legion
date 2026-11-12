@@ -774,6 +774,24 @@ mod tests {
         ResourcePolicy::from_manager_config(&ManagerConfigFull::default()).expect("policy")
     }
 
+    #[test]
+    fn add_times_sums_amounts_and_unions_items() {
+        // Raw requests: normalization would add the policy's defaults.
+        let raw = |value: Value| ResourceRequest::from_value(&value).expect("request");
+        let mut total = ResourceRequest::default();
+        total.add_times(&raw(json!({ "memory": 256, "cpu": 100 })), 2);
+        total.add_times(&raw(json!({ "memory": 128, "gpu_ids": ["a"] })), 1);
+        total.add_times(&raw(json!({ "memory": 999, "gpu_ids": ["b"] })), 0);
+        assert_eq!(total.amount("memory"), Some(640.0));
+        assert_eq!(total.amount("cpu"), Some(200.0));
+        match total.values.get("gpu_ids") {
+            Some(ResourceValue::Items(items)) => {
+                assert_eq!(items.len(), 1, "a zero-times add contributes nothing");
+            }
+            other => panic!("expected an item set, got {other:?}"),
+        }
+    }
+
     fn request(resources: Value) -> ResourceRequest {
         let policy = usage_test_policy();
         let normalized = policy
@@ -1056,6 +1074,42 @@ impl ResourceRequest {
         }
 
         Ok(ResourceRequest { values, devices })
+    }
+
+    /// Fold `times` copies of `other` into this request: amounts add, item
+    /// sets union, and device demands repeat. The result is what several
+    /// placements bound for one node ask of it together, which is how a
+    /// multi-task group picks its node (and pays for any preemption) once,
+    /// for every member.
+    pub fn add_times(&mut self, other: &ResourceRequest, times: u32) {
+        if times == 0 {
+            return;
+        }
+        for (name, demand) in &other.values {
+            match demand {
+                ResourceValue::Amount(amount) => {
+                    let entry = self
+                        .values
+                        .entry(name.clone())
+                        .or_insert(ResourceValue::Amount(0.0));
+                    if let ResourceValue::Amount(total) = entry {
+                        *total += amount * f64::from(times);
+                    }
+                }
+                ResourceValue::Items(items) => {
+                    let entry = self
+                        .values
+                        .entry(name.clone())
+                        .or_insert_with(|| ResourceValue::Items(HashSet::new()));
+                    if let ResourceValue::Items(all) = entry {
+                        all.extend(items.iter().cloned());
+                    }
+                }
+            }
+        }
+        for _ in 0..times {
+            self.devices.extend(other.devices.iter().cloned());
+        }
     }
 }
 

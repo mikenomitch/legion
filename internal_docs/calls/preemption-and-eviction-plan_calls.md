@@ -5,9 +5,9 @@ Decisions made while writing and building
 (status SHIPPED — phases 1a, 1b, 2, 3 and the Phase 4 UI item are built).
 **Entries are ordered most-impactful first; the number is the rank.**
 Implementation-time calls are inserted at their rank, not appended: entries 3,
-5, 6 and 10 came out of building Phase 1a, and entries 5, 8, 13, 15, 16, 17
-and 18 out of building 1b/2/3. The design-time entries they displaced kept
-their relative order.
+5, 6 and 10 came out of building Phase 1a, entries 5, 8, 13, 15, 18, 19 and 20
+out of building 1b/2/3, and entries 16 and 17 out of closing the plan's last
+open items. The design-time entries they displaced kept their relative order.
 
 ## 1. Priority is a closed set of named bands, and preemption is strictly cross-band
 
@@ -468,7 +468,83 @@ not free capacity or destroys data — both indefensible. The rule follows
 the same principle as drain's held-stateful behavior: the platform never
 force-moves protected state; an operator who wants it moved acts explicitly.
 
-## 16. The worker orders stops before starts, and delays co-located starts until victims exit
+## 16. A fresh multi-task group picks its node, and pays for preemption, as one unit
+
+**Call.** A multi-task group with no node yet chooses that node with its first
+member's placement, using what every member still to place asks for together
+(each member's request times the allocations this plan places of it). Only
+nodes with room for all of it are eligible; when none has, the preemption pass
+runs with the combined ask, so the victims it picks free room for the whole
+group on one node. The planner also places a group's members back to back
+(the group takes the slot of its lowest task id), so a task of another group
+listed between two members cannot spend the room the group just secured.
+When no node fits the group even with preemption, the error says so:
+
+```text
+Failed to place task api: no available nodes matching constraints, permit, or
+resources; group app places its tasks on one node, and no node has room for all
+of them together. Preemption ran but found nothing to displace: …
+```
+
+**Alternatives.** (a) Leave it: preempt for the first member, fail the plan
+when a later one does not fit (the shipped v1 behavior, documented as a
+limitation). (b) Trial placement with rollback: place the group member by
+member on each candidate node in turn, the way topology gangs try one domain at
+a time, and keep the first node where every member lands. (c) Reserve the
+rest of the group's ask on the chosen node in the ledger and release it member
+by member, instead of reordering.
+
+**Trade-off.** The combined ask is an approximation for item-typed resources:
+item sets union, so two members asking for the same named item look like one
+demand, and the real per-member fit check can still fail afterwards (as
+before, the plan then fails whole, never partially). For a `count.per` group
+under a rollout's target, a later member's count is taken as
+`min(count.num, target)`, which can overstate what a second attribute value
+needs and so refuse a node, or take one more victim, than strictly necessary.
+And placement order changes for jobs whose groups are interleaved in the
+jobspec, which can move where their tasks land.
+
+**Why (simplicity and correctness).** The bug was not preemption-specific: the
+same first-member-only pick put a group on a node with room for one member
+while another node had room for all, and failed the plan without any
+preemption involved. One question, "where does the whole group fit?", fixes
+both, and it reuses the existing fit check and victim search unchanged, with
+one combined request. (b) costs a full trial placement per candidate node on
+every fresh group, the cost topology accepts only because domains are few.
+(c) adds a reservation the ledger has never had, for a hazard that ordering
+removes outright. Every task defaults to the group `default`, so this covers
+every multi-task job, not just those with explicit groups.
+
+## 17. The per-pool preemption brake stays in cluster config, not an ACL-scoped toggle
+
+**Call.** `schedulerSettings.preemption.disabledPools` stays where it is:
+manager config, set by whoever owns the cluster's config. A token whose ACL
+rules are scoped to one pool (`node` rules with `pools = ["gpu"]`) cannot
+exempt that pool from preemption. This closes the plan's Open Question 6.
+
+**Alternatives.** (a) A per-node preemption flag stored in raft, writable with
+`node:write` on the node's pool, the same way drain and eligibility are, with
+a `--pool` form that sets it on every node in a pool. (b) A first-class node
+pool object carrying the setting, gated by pool-scoped `node:write`.
+
+**Trade-off.** A pool owner who wants their pool exempt asks a cluster
+operator, and changing the list means editing manager config rather than one
+CLI call. The asymmetry with drain (pool-scoped) is real and is now stated in
+the public doc.
+
+**Why (simplicity).** Bands promise that a higher-band job can take room from
+lower-band work. A pool exemption suspends that promise for every job, whatever
+its band, so it belongs to whoever sets the cluster's bands and their
+governance, not to one pool's tenant. That is the same reasoning that keeps
+namespace policies apart from namespaces. The real need behind the question,
+"do not evict my long-running work", is a property of the workload and is
+already met per job: `disruption.minAvailable`, a lower or higher band (itself
+ACL-gated), and node-local storage, which is never a victim. (a) and (b) each
+add a stored setting, an RPC, a CLI verb, an MCP tool and ACL coverage to
+serve a request nobody has made yet; (b) also introduces an object Legion does
+not have, since a pool today is a string on a node.
+
+## 18. The worker orders stops before starts, and delays co-located starts until victims exit
 
 **Call.** `reconcile_allocations` applies removals first; a new allocation
 on a node with in-grace victims starts only after they exit (bounded by the
@@ -489,7 +565,7 @@ victim + preemptor beyond grace" is an invariant an operator can rely on.
 (call 2); this is the cheapest way to make the physical handover match it
 without new protocol between manager and worker.
 
-## 17. Observe mode journals at the point of decision, not on the way out of the plan
+## 19. Observe mode journals at the point of decision, not on the way out of the plan
 
 **Call.** In `observe` mode the `allocation.preempt_planned` event is emitted
 from inside the victim-selection pass, the moment the decision is made — not
@@ -512,7 +588,7 @@ whole mode would have been silent — the one thing it exists to not be. The
 dry-run flag is not incidental either: without it, repeatedly previewing a job
 would look, in the journal, like repeatedly nearly-preempting one.
 
-## 18. Victim metadata is loaded lazily, from the store, only after placement has already failed
+## 20. Victim metadata is loaded lazily, from the store, only after placement has already failed
 
 **Call.** The preemption pass builds its victim index by querying the store
 (one joined statement over `allocation`, `task_config` and `job_config` for
@@ -544,7 +620,7 @@ the scheduler. If preemption becomes common enough for the query to show up in
 the plan-phase histogram, (a) is the fix, and `legion_scheduler_plan_phase_seconds`
 is already the instrument that would say so.
 
-## 19. No preemption plugin seam in v1
+## 21. No preemption plugin seam in v1
 
 **Call.** Preemption is built into the planner. `SchedulingPolicy` keeps
 its ABI; there is no `PreemptionPolicy` plugin category yet.

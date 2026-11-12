@@ -168,6 +168,27 @@ victim's removal and the preemptor's placement arrive in the same heartbeat
 diff. The worker stops the victims with grace before it starts the
 preemptor.
 
+### Multi-task groups
+
+The tasks of one group run on one node, and every task is in the group
+`default` unless it names another. So a job with several tasks places them
+together unless you split them into groups.
+
+A group with no node yet picks one for all of its tasks at once. Only a node
+with room for every task in the group, at its count, is a candidate. When no
+node has that room, the preemption pass looks for victims that free enough of
+it on one node. The group never lands on a node where its first task fits but
+the rest cannot, and preemption never evicts work for a group that it then
+cannot place. A group's tasks are placed one after another, so a task of
+another group in the same job cannot use room the group was given.
+
+A group that already runs on a node (a reschedule replacing one of its tasks)
+stays on that node, and preemption looks only there.
+
+If no node can take the whole group even with preemption, the plan places
+none of it, and the error says so (see
+[When preemption still cannot place](#when-preemption-still-cannot-place)).
+
 ## Protecting a task: `disruption.minAvailable`
 
 ```nickel
@@ -248,6 +269,16 @@ Use `observe` to try preemption safely. The selection you see is the one
 `disabledPools` exempts a whole pool, whatever the bands say. Use it for a
 pool whose jobs each hold hours of un-checkpointed state.
 
+These settings are manager config, so changing them takes access to the
+cluster's config. ACL rules do not cover them: a token scoped to one pool (a
+`node` rule with `pools = ["gpu"]`) can drain that pool's nodes but cannot
+exempt the pool from preemption. That is deliberate. An exempt pool suspends
+the band guarantee for every job that could land there, so the decision
+belongs with whoever sets the cluster's bands. To protect one workload without
+it, give the task a `disruption.minAvailable` floor (see
+[Protecting a task](#protecting-a-task-disruptionminavailable)) or run it in
+a band that nothing likely to contend for its nodes outranks.
+
 `victimExemptAge` is a cheap guard against thrashing. Without it, one plan
 could undo the placement a previous plan made seconds earlier, and the
 follow-up eval could undo that. An allocation with no recorded placement time
@@ -315,6 +346,7 @@ Other endings you may see, each naming the limit that applied:
 | `Preemption is in observe mode: it identified N evictable allocation(s) but committed none…` | Switch to `enforce` to act on it. |
 | `every candidate node is in a pool where preemption is disabled…` | `disabledPools` covers every feasible node. |
 | `…3 holding node-local storage (never preemptible)` | A node full of node-pinned stateful work can't be preempted. |
+| `…group app places its tasks on one node, and no node has room for all of them together` | Each task of the group fits somewhere on its own, but no node fits the whole group, even after preemption. Add capacity, shrink the tasks, or split them into separate groups. |
 
 If a job's band can't displace anything, the submit also prints a warning:
 
@@ -434,10 +466,6 @@ be preempted. The placement error says so.
 - **No preemption plugin interface.** `SchedulingPolicy` keeps its ABI, and
   preemption is built in. Victim selection is written as a pure function so a
   plugin interface can be added later.
-- **Preemption for multi-task groups is limited.** A group already assigned to
-  a node can preempt on that node. A group being placed fresh preempts for its
-  first member. If a later member then cannot fit, the whole plan fails and
-  commits nothing. No partial group is ever left running.
 - **Preemption history is best-effort.** The event journal is bounded (about
   10k events), so treat `allocation.preempted` as an observability signal, not
   an audit log. Use the metrics for rates.

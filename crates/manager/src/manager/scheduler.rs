@@ -2729,7 +2729,7 @@ impl<'a> Scheduler<'a> {
         positional_job_id: Option<&str>,
         preemptor: PreemptorContext<'_>,
     ) -> R<BuiltPlan> {
-        tasks.sort_by_key(|a| a.0);
+        Self::order_for_placement(&mut tasks);
         let mut unplaced: Vec<UnplacedTask> = Vec::new();
         // Tasks whose runtime an operator disabled for this job's namespace
         // (docs/runtime-disable.md) place nothing: they leave the plan here
@@ -2919,6 +2919,14 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        let group_rest_asks = Self::group_rest_asks(
+            &tasks,
+            &required_counts,
+            task_targets.is_some(),
+            &group_sizes,
+            resource_policy,
+        )?;
+
         let mut group_candidates: HashMap<GroupKey, Vec<&Node>> = HashMap::new();
         for (group_name, filters) in &group_filters {
             if group_sizes.get(group_name).copied().unwrap_or(0) <= 1 {
@@ -3065,6 +3073,7 @@ impl<'a> Scheduler<'a> {
                         weights,
                         group_key.as_ref(),
                         &mut group_assignments,
+                        group_rest_asks.get(&task_id),
                         candidates_setting,
                         &mut preemption_pass,
                         &mut port_ledger,
@@ -3129,6 +3138,7 @@ impl<'a> Scheduler<'a> {
                             weights,
                             group_key.as_ref(),
                             &mut group_assignments,
+                            group_rest_asks.get(&task_id),
                             candidates_setting,
                             &mut preemption_pass,
                             &mut port_ledger,
@@ -3817,6 +3827,86 @@ impl<'a> Scheduler<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Sort a plan's tasks into placement order: by task id, except that a
+    /// group's members follow one another from its first member's slot.
+    ///
+    /// A multi-task group takes its node with its first member's placement
+    /// and holds room there for the members after it (see
+    /// [`Self::group_rest_asks`]). Placed in plain id order, a task of
+    /// another group listed between two members could spend that room, most
+    /// visibly capacity preemption had just freed for the group, and the
+    /// later member then failed the whole plan.
+    fn order_for_placement(tasks: &mut [(i64, TaskConfig, u32)]) {
+        let mut first_of_group: HashMap<String, i64> = HashMap::new();
+        for (task_id, task_config, _) in tasks.iter() {
+            first_of_group
+                .entry(task_config.group.clone())
+                .and_modify(|first| *first = (*first).min(*task_id))
+                .or_insert(*task_id);
+        }
+        tasks.sort_by_key(|(task_id, task_config, _)| {
+            (
+                first_of_group
+                    .get(&task_config.group)
+                    .copied()
+                    .unwrap_or(*task_id),
+                *task_id,
+            )
+        });
+    }
+
+    /// For each member of a multi-task group, what the members placed after
+    /// it in this plan ask for together: each one's normalized request times
+    /// the allocations this plan places of it. `tasks` must already be in
+    /// placement order ([`Self::order_for_placement`]); a member with no
+    /// later member placing anything has no entry.
+    ///
+    /// Used only while the group has no node yet, so the counts are a fresh
+    /// group's: `required_counts` for a task without `count.per`, and
+    /// `count.num` per attribute value for one with it (capped by the
+    /// target when a rollout stages placements).
+    fn group_rest_asks(
+        tasks: &[(i64, TaskConfig, u32)],
+        required_counts: &HashMap<i64, u32>,
+        targeted: bool,
+        group_sizes: &HashMap<String, usize>,
+        resource_policy: &ResourcePolicy,
+    ) -> R<HashMap<i64, ResourceRequest>> {
+        let mut after: HashMap<&str, ResourceRequest> = HashMap::new();
+        let mut rest = HashMap::new();
+        for (task_id, task_config, _) in tasks.iter().rev() {
+            if group_sizes.get(&task_config.group).copied().unwrap_or(0) <= 1 {
+                continue;
+            }
+            if let Some(ask) = after.get(task_config.group.as_str()) {
+                rest.insert(*task_id, ask.clone());
+            }
+            let required = required_counts.get(task_id).copied().unwrap_or(0);
+            let count = match task_config.count.per {
+                Some(_) if targeted => task_config.count.num.min(required),
+                Some(_) => task_config.count.num,
+                None => required,
+            };
+            if count == 0 {
+                continue;
+            }
+            let resources = resource_policy
+                .normalize_task_resources(&task_config.resources, true)
+                .with_context(|| {
+                    format!(
+                        "Failed to normalize resources for task {}",
+                        task_config.name
+                    )
+                })?;
+            let request = ResourceRequest::from_value(&resources)?;
+            after
+                .entry(task_config.group.as_str())
+                .or_default()
+                .add_times(&request, count);
+        }
+        Ok(rest)
+    }
+
     fn build_task_plan<'b>(
         &self,
         task_id: i64,
@@ -3958,6 +4048,7 @@ impl<'a> Scheduler<'a> {
         weights: SchedulerWeights,
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
+        group_rest: Option<&ResourceRequest>,
         candidates_setting: PlanCandidatesSetting,
         preemption: &mut PreemptionPass,
         port_ledger: &mut PortLedger,
@@ -4125,8 +4216,28 @@ impl<'a> Scheduler<'a> {
         // nodes its forks run on or were placed on in this plan. Loaded on
         // first use, so a plan with no spread fork never reads it.
         let mut spread_nodes: HashMap<String, HashSet<String>> = HashMap::new();
+        // A multi-task group not yet on a node picks that node here, with
+        // this member's first placement, and every later member follows it.
+        // So the pick is made with what the whole group asks for together:
+        // this member's placements plus every member still to place
+        // (`group_rest`). Picked on this member's request alone, the node
+        // (or the victims preemption freed on it) could hold this member and
+        // nothing after it, and the whole plan failed on a later member.
+        let group_ask: Option<ResourceRequest> = group_key
+            .filter(|key| !group_assignments.contains_key(*key))
+            .filter(|_| count > 1 || group_rest.is_some())
+            .map(|_| {
+                let mut ask = group_rest.cloned().unwrap_or_default();
+                ask.add_times(&plan.task_request, count);
+                ask
+            });
 
         for placement_index in 0..count {
+            // Only the placement that assigns the group's node uses the
+            // group's ask; the rest are pinned to that node.
+            let group_ask_now = group_ask
+                .as_ref()
+                .filter(|_| group_key.is_some_and(|key| !group_assignments.contains_key(key)));
             let mut eligible = Self::eligible_nodes(
                 &candidates,
                 plan.constraint_set(),
@@ -4202,6 +4313,19 @@ impl<'a> Scheduler<'a> {
                 });
             }
 
+            // A fresh multi-task group: keep only the nodes with room for
+            // every member. When that empties the list, preemption below
+            // makes room for all of them on one node, or the error says the
+            // group did not fit together.
+            let mut group_short: Option<&str> = None;
+            if let (Some(ask), Some(key)) = (group_ask_now, group_key) {
+                let before = eligible.len();
+                eligible.retain(|node| resource_ledger.can_fit(node.id.as_str(), ask));
+                if before > 0 && eligible.is_empty() {
+                    group_short = Some(key.name.as_str());
+                }
+            }
+
             // Preemption: the fleet has nodes this task is *allowed* on, they
             // are simply full. Ask whether displacing lower-band work would
             // open one. Runs only here — after normal feasibility has already
@@ -4227,7 +4351,7 @@ impl<'a> Scheduler<'a> {
                 if let Some(chosen) = self.plan_preemption_for_placement(
                     &full_but_allowed,
                     task_config,
-                    &plan.task_request,
+                    group_ask_now.unwrap_or(&plan.task_request),
                     resource_ledger,
                     group_key
                         .and_then(|key| group_assignments.get(key))
@@ -4328,16 +4452,31 @@ impl<'a> Scheduler<'a> {
                             )
                         )
                     }
-                    (None, _) => preemption.no_placement_error(
-                        task_config,
-                        namespace_restriction_note(
-                            node_lookup.as_slice(),
-                            &plan.filters.0,
-                            &plan.filters.1,
-                            &task_config.required_volume_drivers(),
+                    (None, _) => {
+                        let group_note = group_short.map(|group| {
+                            format!(
+                                "group {group} places its tasks on one node, and no node has \
+                                 room for all of them together"
+                            )
+                        });
+                        let note = [
+                            namespace_restriction_note(
+                                node_lookup.as_slice(),
+                                &plan.filters.0,
+                                &plan.filters.1,
+                                &task_config.required_volume_drivers(),
+                            ),
+                            group_note,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                        preemption.no_placement_error(
+                            task_config,
+                            (!note.is_empty()).then_some(note.as_str()),
                         )
-                        .as_deref(),
-                    ),
+                    }
                 };
                 let pinned_node = next_pin.map(|(_, node_id)| node_id.as_str());
                 let blocked = crate::manager::blocked::PlacementBlocked::for_task(
@@ -11885,6 +12024,206 @@ mod tests {
             outcome.evictions.is_empty(),
             "an unconstrained plan preempts nothing, whatever its band"
         );
+        Ok(())
+    }
+
+    /// A 256 MiB task in `group`.
+    fn group_member(name: &str, group: &str) -> TaskConfig {
+        TaskConfig {
+            group: group.into(),
+            resources: json!({ "memory": 256 }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    /// Submit a banded job of the given tasks (unplaced).
+    fn submit_banded_tasks(
+        store: &Store,
+        name: &str,
+        band: Band,
+        tasks: Vec<TaskConfig>,
+    ) -> R<String> {
+        let job = JobConfig {
+            priority: band,
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks,
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        Ok(store.get_job_config(name)?.id())
+    }
+
+    #[test]
+    fn a_fresh_group_preempts_for_every_member_not_just_the_first() -> R<()> {
+        // node-b is full of `low` work; node-a holds one `high` allocation
+        // and has room for one more 256 MiB task. A `high` group of two such
+        // tasks fits node-a only by half, and preemption cannot help there
+        // (the incumbent is a peer). It fits node-b once both `low`
+        // allocations go. Picking the group's node for its first member alone
+        // put it on node-a, where the second member could never fit, and the
+        // whole plan failed.
+        let store = setup_store()?;
+        let scheduler = Scheduler::new(&store)?;
+        small_node(&store, "node-b")?;
+        let batch = submit_banded(&store, "batch", Band::Low, 2, None)?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&batch, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            2
+        );
+        small_node(&store, "node-a")?;
+        let incumbent = submit_banded(&store, "incumbent", Band::High, 1, None)?;
+        let placed = scheduler.plan_and_apply(&incumbent, PlanMode::Fresh)?;
+        assert_eq!(placed.allocations[0].node_id, "node-a");
+        age_allocations(&store)?;
+
+        let app = submit_banded_tasks(
+            &store,
+            "app",
+            Band::High,
+            vec![group_member("api", "app"), group_member("cache", "app")],
+        )?;
+        let outcome = scheduler.plan_and_apply(&app, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2, "both members place");
+        assert!(
+            outcome
+                .allocations
+                .iter()
+                .all(|alloc| alloc.node_id == "node-b"),
+            "the group lands together on the node preemption can clear for all of it"
+        );
+        assert_eq!(outcome.evictions.len(), 2, "one victim per member");
+        assert!(outcome
+            .evictions
+            .iter()
+            .all(|victim| victim.job_id == "batch"));
+        assert_eq!(
+            store
+                .allocs_for_node("node-a")?
+                .iter()
+                .filter(|alloc| alloc.job_id == "incumbent")
+                .count(),
+            1,
+            "the peer was not touched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_group_takes_a_node_with_room_for_every_member() -> R<()> {
+        // The same mistake without preemption: node-a has room for one
+        // member, node-b for both. Bin packing prefers the fuller node-a for
+        // the first member; the group must still go where all of it fits.
+        let store = setup_store()?;
+        let scheduler = Scheduler::new(&store)?;
+        small_node(&store, "node-a")?;
+        let incumbent = submit_banded(&store, "incumbent", Band::Normal, 1, None)?;
+        scheduler.plan_and_apply(&incumbent, PlanMode::Fresh)?;
+        small_node(&store, "node-b")?;
+
+        let app = submit_banded_tasks(
+            &store,
+            "app",
+            Band::Normal,
+            vec![group_member("api", "app"), group_member("cache", "app")],
+        )?;
+        let outcome = scheduler.plan_and_apply(&app, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        assert!(outcome
+            .allocations
+            .iter()
+            .all(|alloc| alloc.node_id == "node-b"));
+        assert!(outcome.evictions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_listed_between_group_members_cannot_spend_the_group_room() -> R<()> {
+        // Two nodes full of `low` work. The `high` job lists a group member,
+        // a task of another group, then the second member. The group's
+        // preemption frees a whole node for both members; placed in listing
+        // order, the task in between took the second member's half of it.
+        let store = setup_store()?;
+        let scheduler = Scheduler::new(&store)?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let batch = submit_banded(&store, "batch", Band::Low, 4, None)?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&batch, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            4
+        );
+        age_allocations(&store)?;
+
+        let app = submit_banded_tasks(
+            &store,
+            "app",
+            Band::High,
+            vec![
+                group_member("api", "app"),
+                group_member("solo", "solo"),
+                group_member("cache", "app"),
+            ],
+        )?;
+        let outcome = scheduler.plan_and_apply(&app, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 3, "every task places");
+        assert_eq!(outcome.evictions.len(), 3, "one victim per placement");
+        let node_of = |task: &str| -> R<String> {
+            let task_id = task_id_for(&store, &app, task)?;
+            Ok(outcome
+                .allocations
+                .iter()
+                .find(|alloc| alloc.task_config_id == task_id)
+                .map(|alloc| alloc.node_id.clone())
+                .unwrap_or_default())
+        };
+        assert_eq!(
+            node_of("api")?,
+            node_of("cache")?,
+            "the group stays together"
+        );
+        assert_ne!(node_of("solo")?, node_of("api")?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_that_fits_nowhere_together_says_so() -> R<()> {
+        // node-a has room for one member and its other work is a peer, so
+        // nothing can make room for the second. The error names the group,
+        // rather than blaming the first member, which on its own fits.
+        let store = setup_store()?;
+        let scheduler = Scheduler::new(&store)?;
+        small_node(&store, "node-a")?;
+        let incumbent = submit_banded(&store, "incumbent", Band::High, 1, None)?;
+        scheduler.plan_and_apply(&incumbent, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let app = submit_banded_tasks(
+            &store,
+            "app",
+            Band::High,
+            vec![group_member("api", "app"), group_member("cache", "app")],
+        )?;
+        let err = scheduler
+            .plan_and_apply(&app, PlanMode::Fresh)
+            .expect_err("the group cannot fit together");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("group app places its tasks on one node"),
+            "the error names the group: {message}"
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 1, "nothing changed");
         Ok(())
     }
 
