@@ -159,6 +159,14 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         ));
     }
 
+    // Nothing to push (every node streams, or none can be dialed): no task
+    // to spawn, and no runtime to build when there is none to spawn on. A
+    // runtime per eval was what made the 50k-node `eval_cycle` bench's
+    // `dispatch` phase look like it grew with the fleet.
+    if pending.is_empty() {
+        return Ok(());
+    }
+
     // The sends leave the eval's critical path entirely. Dispatch is
     // best-effort BY DESIGN — the heartbeat reply carries the full desired
     // set, so a lost push costs at most one heartbeat interval — and the

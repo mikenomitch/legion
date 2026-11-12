@@ -19,7 +19,7 @@ two. (c) Batch heterogeneous ops into one entry at the pipeline.
 **Trade-off.** The lane still runs one entry at a time, and a keyed bind
 still grows with the task's *live* instances. A platform with tens of
 thousands of running sandboxes in one task still pays for them on every
-placement (entry 3).
+placement (entry 4; entry 2 since narrowed it to rollouts).
 
 **Why (performance, measured, then simplicity).** The profile said where the
 time was. Under the lifecycle load, the bind's one statement was about half
@@ -36,7 +36,46 @@ durability argument an adversarial review put in place. Pipeline-level
 batching overlaps the separate "more work per entry" effort. The bind fix
 is exact, small, and measurable here.
 
-## 2. The rewrite keeps today's binding choice exactly
+## 2. A keyed bind searches instances with no current allocation first, and every live instance only when that finds none
+
+**Call.** The bind runs one of three variants of the same query
+(2026-11-12, plan §11): a ratification's named instance by key; otherwise
+the live instances whose `current_alloc_id` is NULL, from a new partial
+index `idx_instance_keyed_unbound`; and only when that returns nothing,
+every live instance as before. All three keep the `NOT EXISTS` probe, so
+"unbound for this config" means exactly what it meant.
+
+```text
+legion_scheduler_keyed_binds_total{query="target"|"unbound"|"live"}
+```
+
+**Alternatives.** (a) Leave it, as entry 3 did, until a measurement shows
+live instances dominating. (b) Make `current_alloc_id` the definition of
+"bound" (entry 3's alternative a). (c) Have the planner name the instance
+each placement is for, and verify it at apply (entry 3's alternative b).
+(d) A maintained per-config "bound" column.
+
+**Trade-off.** The binding choice is no longer exactly the old one: while
+an instance with no allocation and one bound under an older config both
+wait (a create during a rollout), the first binds before the second even
+if it is younger. And a rollout still pays the live scan per placement,
+as before.
+
+**Why (performance, with exactness kept).** Entry 3 rejected (b) because
+`current_alloc_id` does not encode "bound for this config" and its
+invariants are conventions. This uses the pointer only to choose *where to
+look first*, never to decide who qualifies: the `NOT EXISTS` probe still
+decides, and an instance the pointer misdescribes (a pointer left set
+without an allocation of this config) is still found by the fallback. In
+steady state the unpointed set is exactly the instances waiting for a
+placement, so the bind stops growing with the live population, which is
+what the sandbox platform needs (tens of thousands of running sandboxes per
+task). (c) changes the plan's wire shape and moves an O(live) scan to the
+planner rather than removing it; (d) adds a column every allocation write
+must keep in step. The ordering change only affects which of two waiting
+instances lands on which node, never whether both are placed.
+
+## 3. The rewrite keeps today's binding choice exactly
 
 **Call.** The new query picks the same instance the old one did: same
 filters, same ordering, with `NOT IN (SELECT ...)` replaced by a correlated
@@ -59,7 +98,7 @@ shape, which belongs to the planning work. The `IS NOT NULL` term matters:
 `instance_id` is declared `STRING PRIMARY KEY` on a rowid table, which
 SQLite lets hold a NULL, and `NOT IN` never matched one.
 
-## 3. The partial index leaves out parked instances, and accepts the live ones
+## 4. The partial index leaves out parked instances, and accepts the live ones
 
 **Call.** `idx_instance_keyed_live` holds keyed rows whose state is not
 `terminated`, `stopped`, or `suspended`, keyed by `(job_id, group_name,
@@ -81,7 +120,7 @@ cost is that SQLite only uses a partial index when the query's `WHERE`
 implies the index's, so the two terms must stay word for word. The query
 plan test fails the build if they drift.
 
-## 4. The allocation probe index replaces the old one rather than joining it
+## 5. The allocation probe index replaces the old one rather than joining it
 
 **Call.** `idx_allocation_instance_config (instance_id, task_config_id)`
 replaces `idx_allocation_instance_id (instance_id)`.
@@ -95,7 +134,7 @@ by the composite's prefix.
 removal. Keeping both would add an index write to each for no read the
 composite cannot serve.
 
-## 5. No knob
+## 6. No knob
 
 **Call.** The change is unconditional.
 
@@ -108,7 +147,7 @@ cost is index maintenance that is small next to the scan it removes. A
 switch would keep a second query path alive for nothing a user would
 choose (`AGENTS.md`: no dual code paths for the old form).
 
-## 6. The index change is a new migration, not an edit of an old one
+## 7. The index change is a new migration, not an edit of an old one
 
 **Call.** Add the two indexes and drop `idx_allocation_instance_id` in a
 migration appended to `migration_list()`.
@@ -128,7 +167,7 @@ means, and `allocation` is rebuilt by later migrations that recreate
 `idx_allocation_instance_id`, so an edit far back would be undone anyway.
 Appending is how every other schema change in the file is made.
 
-## 7. The lane profiler stays out of the tree
+## 8. The lane profiler stays out of the tree
 
 **Call.** The branch's WIP lane profiler (`crates/manager/src/storage/raft/lane_profile.rs`
 and its hooks in the capture, the driver, the log store, and the state

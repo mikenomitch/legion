@@ -99,47 +99,49 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 - [ ] **Plan-commit cost is the throughput ceiling past 10k nodes.** On AWS
       the plan phase is ~25x the micro-bench (26 ms/eval at 20k, 45 ms at 50k),
       `apply` is ~82% of it, and the slowest coalesced commit grows 9.2 → 23.3 ms
-      from 5k to 50k nodes for the same plan size. Profile the commit at 50k
-      (suspects: free-pool rebuild, reprojection, heartbeats sharing the lane)
-      ([plan §13](plans/plan-path-fleet-scaling-plan.md)). Also caps edge ratification.
+      from 5k to 50k nodes for the same plan size ([plan §13](plans/plan-path-fleet-scaling-plan.md)).
+      Also caps edge ratification. A local release profile at 5k and 50k rules
+      out the in-commit suspects (free-pool rebuild, reprojection: `apply`
+      grows 11% for 10x the fleet); what grows is outside the plan's transaction, most
+      likely the other lanes' writes sharing the `single` pipeline
+      ([calls #3](calls/write-path-cost-followups_calls.md)). Next: on the rig,
+      read `legion_raft_pipeline_depth{lane}` and `legion_store_coalesce_batch_size`
+      at 50k while the campaign runs; the structural fix is
+      [lane-isolation phase 3](plans/lane-isolation-plan.md).
   - [ ] Batch more plans per commit: ~1.75 plans/commit today. Re-measure with
         `run-campaign.sh --eval-threads 8` at 20k now that conflicts are zero.
   - [ ] Plan N / apply N in one commit was declined (handlers write as they go;
-        [call 2](calls/eval-path-raft-cost-plan_calls.md)). Cost it against
-        this commit, not the eval loop.
-- [ ] **The plan apply still parses each attempted node row** (review SCH5's
-      unshipped half; [plan §6.2](plans/placement-and-commit-cost-plan.md) ·
-      [calls #2](calls/placement-and-commit-cost-plan_calls.md)). Reusing the
-      read model's `Arc<Node>` by epoch is unsound; hash the raw attribute bytes
-      in the transaction and compare. Measure serialize+hash vs parse at 10k first.
+        [call 2](calls/eval-path-raft-cost-plan_calls.md)). Each eval's own
+        writes already share its plan's entry (fused settle, fused claim); the
+        open question is plans per entry, measured by the item above.
 - [ ] **One capture mutex serializes every lane, and every write runs twice**
       (review SCH1; `CAPTURE_MUTEX` in `raft/capture.rs`, one write connection).
-      Group commit and single execution under `single` shipped. Open:
-  - [ ] The leader still executes twice under `lanes`; unblocked by per-lane
-        files ([plan §6.3.6](plans/raft-write-path-plan.md)).
-  - [ ] A database file per lane (own WAL lock and capture mutex). Needs its own
-        plan ([§6.4](plans/raft-write-path-plan.md) · [calls #6](calls/raft-write-path-plan_calls.md)).
+      Group commit and single execution under `single` shipped; the rest is
+      planned in [lane-isolation-plan.md](plans/lane-isolation-plan.md)
+      ([calls](calls/lane-isolation-plan_calls.md)), not built:
+  - [x] A database file per lane needs its own plan: written, phase 3 of
+        [lane-isolation](plans/lane-isolation-plan.md#63-phase-3-a-database-file-per-lane).
+  - [ ] Build per-lane database files (own WAL lock, capture mutex and write
+        connection per lane; commutative tables per lane; per-file snapshots
+        and backup) — lane-isolation phase 3.
+  - [ ] The leader still executes twice under `lanes` — lane-isolation phase 4,
+        after phase 3 ([raft-write-path §6.3.6](plans/raft-write-path-plan.md)).
 - [ ] **Pipeline the scheduler lane**: capture entry N+1 while N commits. Keyed
       sandbox lifecycles are bound at ~50/s on 4 vCPU against a ~125/s target.
-      Blocked on projecting from the changeset's own values, not re-read rows
-      ([raft-write-path §6.2.4](plans/raft-write-path-plan.md) · [calls #5](calls/raft-write-path-plan_calls.md);
-      [scheduler-lane-entry-cost §6.2](plans/scheduler-lane-entry-cost-plan.md)).
-- [ ] **A keyed bind still visits every live instance of the task**, two index
-      lookups each, so tens of thousands of running instances cost milliseconds
-      per placement ([scheduler-lane-entry-cost §11](plans/scheduler-lane-entry-cost-plan.md)).
-- [ ] **Power-cut test of the purge barrier.** Ordering is unit-tested
-      (`purge_runs_the_barrier_before_deleting`); cut power right after a purge
-      (unsynced VM block device or `dm-flakey`) to prove the applied marker never
-      regresses below the purge horizon ([plan §6.1](plans/raft-write-path-plan.md)).
-- [ ] **`STRING` and `TIMESTAMP` columns still carry NUMERIC affinity**: ids and
-      timestamps that look numeric are stored as INTEGER. A re-type is a
-      value-rewriting migration ([calls 2](calls/jsonb-text-affinity-plan_calls.md)).
-- [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup).
-      Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
-- [ ] **Other mutating handlers still commit on a runtime worker.** `StopJob`,
-      `DestroyJob`, KV writes and most mutating RPCs call the store inline, as
-      `RunJob` did; a burst starves evals and heartbeats. Move them behind
-      `run_blocking_admission` as they show up.
+      Planned as [lane-isolation phases 1–2](plans/lane-isolation-plan.md):
+      project the read model from the changeset's own values (no re-read rows),
+      then `raft.pipelineDepth` with an audited allowlist.
+- [ ] **A rollout's keyed placements still scan every live instance.** Outside
+      a rollout a keyed bind seeks only instances with no allocation; a rollout
+      rebinding instances bound under the old config falls back to the live
+      query, two index lookups per live instance per placement
+      ([scheduler-lane-entry-cost calls #2](calls/scheduler-lane-entry-cost-plan_calls.md)).
+      `legion_scheduler_keyed_binds_total{query="live"}` shows when it happens.
+- [ ] **Re-measure the 10k cleanup's job stop/destroy drain** (was ~4 evals/s
+      on AWS) now that stop/destroy statements seek and handlers wait off the
+      runtime; locally a destroy went 3.2 → 1.0 ms at 4,000 jobs. If it is still
+      slow, profile with `legion_eval_phase_seconds{kind="job_stop"}`
+      ([calls #2](calls/write-path-cost-followups_calls.md)).
 
 ### Candidates and indexes
 
@@ -1281,6 +1283,12 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **Scheduler basics** — ledger command, scheduler plugin framework, random/bin-pack/spread schedulers, constraints, affinities, task groups, rescheduling, health-check reschedule, attribute-change re-evaluation
 - **Per-eval planning cost flat in fleet size** — persistent read-model maps, budgeted index walk, shared node set, O(jobs) scan indexes, eval phase metrics; confirmed on AWS to 50k nodes ([plan](plans/plan-path-fleet-scaling-plan.md) · [calls #15](calls/plan-path-fleet-scaling-plan_calls.md) · [docs](../docs/benchmarks.md))
 - **`RunJob` no longer parks tokio workers** — submit under `block_in_place` (`run_blocking_admission`), PR #40 ([docs](../docs/benchmarks.md))
+- **Every store write waits for quorum off the async runtime** — `Store::replicated` waits under `block_in_place`, so `StopJob`, `DestroyJob`, KV writes and every other mutating handler stop parking tokio workers, not just `RunJob` ([calls #1](calls/write-path-cost-followups_calls.md) · [docs](../docs/metrics.md#diagnosing-a-manager-throughput-ceiling))
+- **The plan apply no longer parses node rows the read model already holds** — the row is still read, and its bytes compared to the read model's node; apply −21% on a realistic 10k fleet (review SCH5's second half; [plan §6.2](plans/placement-and-commit-cost-plan.md) · [calls #2](calls/placement-and-commit-cost-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#apply-time-re-validation))
+- **A keyed bind outside a rollout no longer grows with live instances** — `idx_instance_keyed_unbound` first, the live query as fallback, `legion_scheduler_keyed_binds_total` ([plan §11](plans/scheduler-lane-entry-cost-plan.md) · [calls #2](calls/scheduler-lane-entry-cost-plan_calls.md) · [docs](../docs/sandboxes-at-scale.md))
+- **Job stop/destroy no longer scans tables per job** — `job.name`, `task_status.job_id` and five foreign keys indexed; schema tests fail on an unindexed foreign key or a scanning stop/destroy statement; destroy 3.2 → 1.0 ms per job at 4,000 jobs locally, now flat in the job count ([calls #2](calls/write-path-cost-followups_calls.md) · [docs](../docs/state-store.md#column-affinity))
+- **`STRING`/`TIMESTAMP` columns re-typed** — TEXT (`job.created_at` INTEGER), numeric values rewritten in the same migration; a job named `2026` reads back ([plan](plans/jsonb-text-affinity-plan.md) · [calls #7–#9](calls/jsonb-text-affinity-plan_calls.md) · [docs](../docs/state-store.md#column-affinity))
+- **Power-cut test of the purge barrier** — loop-mounted ext4 images with writeback off; marker 20 ≥ purge 15 with the barrier, 0 without ([plan §6.1](plans/raft-write-path-plan.md) · [calls #4](calls/write-path-cost-followups_calls.md) · [docs](../docs/testing-and-benchmarks.md#power-cut-test-of-the-raft-logs-purge-barrier))
 - **Read-connection pool fixed and sized `evalThreads + 4` (cap 16)** — steal-on-contention, `legion_store_read_lock_wait_seconds` ([calls 5](calls/eval-path-raft-cost-plan_calls.md))
 - **Fewer raft rounds per eval** — fused complete-and-claim, one-round fan-out, batch claim/complete, intake group commit, eval loop off tokio threads, condvar coalescer handoff ([plan](plans/eval-path-raft-cost-plan.md) · [calls](calls/eval-path-raft-cost-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#batching))
 - **Eval-notifier thundering herd fixed** — one wake per claimable eval, `legion_eval_claim_total{outcome}`

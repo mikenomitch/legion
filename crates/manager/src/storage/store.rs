@@ -357,6 +357,97 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Where the plan-apply walk's node rows came from, counted per plan and
+/// published once as `legion_scheduler_plan_node_rows_total{source}`.
+#[derive(Debug, Default)]
+struct NodeRowSources {
+    read_model: u64,
+    parsed: u64,
+}
+
+impl NodeRowSources {
+    fn publish(&self) {
+        let metrics = crate::telemetry::metrics();
+        if self.read_model > 0 {
+            metrics
+                .scheduler_plan_node_rows_total
+                .inc_by(&["read_model"], self.read_model);
+        }
+        if self.parsed > 0 {
+            metrics
+                .scheduler_plan_node_rows_total
+                .inc_by(&["parsed"], self.parsed);
+        }
+    }
+}
+
+/// Whether `row` (a `SELECT {NODE_JOINED_ATTRS}` row) holds exactly what
+/// `node` would serialize to, every column but the heartbeat. Byte equality
+/// is exact, not a digest: serde_json parses its own output back to an
+/// equal value, so a match proves `node_from_row(row)` would build `node`
+/// (less `last_heartbeat`). Allocation-free; a mismatch stops at its first
+/// differing byte.
+fn node_row_matches(node: &Node, row: &Row<'_>) -> Result<bool, rusqlite::Error> {
+    use rusqlite::types::ValueRef;
+    fn text<'a>(row: &'a Row<'_>, index: usize) -> Result<Option<&'a [u8]>, rusqlite::Error> {
+        Ok(match row.get_ref(index)? {
+            ValueRef::Text(bytes) => Some(bytes),
+            _ => None,
+        })
+    }
+    let strings: [(usize, &str); 4] = [
+        (0, &node.id),
+        (1, &node.pool),
+        (2, &node.status),
+        (3, &node.availability),
+    ];
+    for (index, expected) in strings {
+        if text(row, index)? != Some(expected.as_bytes()) {
+            return Ok(false);
+        }
+    }
+    let documents: [(usize, &Value); 4] = [
+        (4, &node.config_attrs),
+        (5, &node.fingerprint_attrs),
+        (6, &node.dynamic_attrs),
+        (7, &node.health_checks),
+    ];
+    for (index, value) in documents {
+        let Some(bytes) = text(row, index)? else {
+            return Ok(false);
+        };
+        if !serializes_to(value, bytes) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `serde_json::to_vec(value)` would equal `expected`, without
+/// building the vector: the serializer writes into a sink that compares as
+/// it goes and fails the write at the first difference.
+fn serializes_to(value: &Value, expected: &[u8]) -> bool {
+    struct Compare<'a> {
+        rest: &'a [u8],
+    }
+    impl std::io::Write for Compare<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.rest.strip_prefix(buf) {
+                Some(rest) => {
+                    self.rest = rest;
+                    Ok(buf.len())
+                }
+                None => Err(std::io::Error::other("differs")),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Compare { rest: expected };
+    serde_json::to_writer(&mut sink, value).is_ok() && sink.rest.is_empty()
+}
+
 /// A node's `publicAddress` config attribute (`LEGION_WORKER_PUBLIC_ADDRESS`
 /// on the worker): where clients outside the private network reach it.
 fn node_public_address(config_attrs: &Value) -> Option<String> {
@@ -2215,44 +2306,70 @@ impl Drop for RedactSecretColumns<'_> {
     }
 }
 
-/// The keyed binding query: the oldest unbound live keyed instance of a
-/// (job, group, task) for one task config, with the node-local and restore
-/// preferences described in `Store::assign_keyed_instance_tx`. Parameters:
-/// `?1` job, `?2` group, `?3` task, `?4` task config id, `?5` node id, `?6`
-/// target instance (or `''`), `?7` now (unix seconds).
-const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, instance.group_name, \
-                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
-                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named, instance.promoted_from, instance.owner \
-                 FROM instance \
-                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
-                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
-                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
-                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
-                 AND instance.task_name = ?3 \
-                 AND instance.mode = 'keyed' \
-                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
-                 AND instance.instance_id IS NOT NULL \
-                 AND NOT EXISTS (\
-                     SELECT 1 FROM allocation \
-                     WHERE allocation.instance_id = instance.instance_id \
-                     AND allocation.task_config_id = ?4\
-                 ) \
-                 AND COALESCE(instance.pending_op, '') != 'fork' \
-                 AND (?6 = '' OR instance.instance_id = ?6) \
-                 AND (instance.restore_from IS NULL OR COALESCE((\
-                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
-                     ELSE snapshot.node_id END FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from\
-                 ), ?5) = ?5) \
-                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
-                     WHERE reschedule_hold.instance_id = instance.instance_id \
-                     AND reschedule_hold.not_before_unix > ?7) ASC, \
-                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
-                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
-                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;";
+/// The keyed binding query, in three variants that differ only in how they
+/// find candidates (`Store::assign_keyed_instance_tx` picks one): the oldest
+/// unbound live keyed instance of a (job, group, task) for one task config,
+/// with the node-local and restore preferences described there. Parameters
+/// for all three: `?1` job, `?2` group, `?3` task, `?4` task config id, `?5`
+/// node id, `?6` target instance (only [`KEYED_BIND_TARGET_SQL`] reads it),
+/// `?7` now (unix seconds).
+macro_rules! keyed_bind_sql {
+    ($from:literal, $candidates:literal) => {
+        concat!(
+            "SELECT instance.instance_id, instance.job_id, instance.group_name, \
+             instance.task_name, instance.mode, instance.state, instance.slot_index, \
+             instance.current_alloc_id, instance.storage_handle, instance.created_at, \
+             instance.updated_at, instance.restore_from, instance.identity_epoch, \
+             instance.named, instance.promoted_from, instance.owner \
+             FROM ",
+            $from,
+            " LEFT JOIN volume ON volume.instance_id = instance.instance_id \
+             AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+             AND instance.task_name = ?3 \
+             AND instance.mode = 'keyed' \
+             AND instance.state NOT IN ('terminated', 'stopped', 'suspended') ",
+            $candidates,
+            " AND instance.instance_id IS NOT NULL \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM allocation \
+                 WHERE allocation.instance_id = instance.instance_id \
+                 AND allocation.task_config_id = ?4\
+             ) \
+             AND COALESCE(instance.pending_op, '') != 'fork' \
+             AND (instance.restore_from IS NULL OR COALESCE((\
+                 SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
+                 ELSE snapshot.node_id END FROM snapshot \
+                 WHERE snapshot.snapshot_id = instance.restore_from\
+             ), ?5) = ?5) \
+             ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
+                 WHERE reschedule_hold.instance_id = instance.instance_id \
+                 AND reschedule_hold.not_before_unix > ?7) ASC, \
+             (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+             COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
+                 WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
+             instance.created_at ASC, instance.instance_id ASC LIMIT 1;"
+        )
+    };
+}
+
+/// Every live keyed instance of the task: the general form, and the
+/// fallback when [`KEYED_BIND_UNBOUND_SQL`] finds nothing. Visits each live
+/// instance once, two index probes each.
+const KEYED_BIND_SQL: &str = keyed_bind_sql!("instance", "");
+
+/// Only live instances with no current allocation, from
+/// `idx_instance_keyed_unbound`: cost follows the instances waiting for a
+/// placement, not the live population. Pinned to its index because the
+/// live index matches the same equality prefix and SQLite could take it.
+const KEYED_BIND_UNBOUND_SQL: &str = keyed_bind_sql!(
+    "instance INDEXED BY idx_instance_keyed_unbound",
+    "AND instance.current_alloc_id IS NULL"
+);
+
+/// A ratification's named instance: a point lookup by its key.
+const KEYED_BIND_TARGET_SQL: &str = keyed_bind_sql!("instance", "AND instance.instance_id = ?6");
 
 impl Store {
     #[instrument(err, skip_all)]
@@ -3090,7 +3207,7 @@ impl Store {
         let mut conn = Self::lock_conn(conn, "migration")?;
         info!("Running migrations");
         let fresh: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
-        migrations.to_latest(&mut conn)?;
+        crate::storage::migrations::migrate_to_latest(&migrations, &mut conn)?;
         // A brand-new database has no rows for any data step to migrate:
         // record them all as done (`storage::data_migrations` module docs).
         if fresh == 0 {
@@ -3208,8 +3325,12 @@ impl Store {
             if capture::in_local_projection() {
                 return f(self);
             }
-            return capture::local_projected_mutation(self, f, |store| {
-                store.shadow_check_read_model(op)
+            // Off the runtime like the raft path's quorum wait: the commit
+            // takes the write lock and syncs the WAL.
+            return crate::storage::block_off_runtime(|| {
+                capture::local_projected_mutation(self, f, |store| {
+                    store.shadow_check_read_model(op)
+                })
             });
         }
 
@@ -6248,7 +6369,11 @@ impl Store {
         // the whole candidate union would parse ~k× more node-attr JSON
         // than the pre-candidate code for nothing (measurable at 10k
         // nodes); a placement only pays for the rows its skips touched.
-        let mut nodes_by_id: HashMap<String, Option<Node>> = HashMap::new();
+        // Each row is still READ here (it is the apply-time fence), but it
+        // is parsed only when it differs from the read model's node: see
+        // `node_for_apply_tx`.
+        let mut nodes_by_id: HashMap<String, Option<Arc<Node>>> = HashMap::new();
+        let mut node_rows = NodeRowSources::default();
         let node_row_sql =
             format!("SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id = ?1;");
 
@@ -6418,10 +6543,8 @@ impl Store {
                 let node = match nodes_by_id.entry(node_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
-                        let row = tx
-                            .prepare_cached(&node_row_sql)?
-                            .query_row([node_id], |row| self.node_from_row(row))
-                            .optional()?;
+                        let row =
+                            self.node_for_apply_tx(tx, &node_row_sql, node_id, &mut node_rows)?;
                         entry.insert(row)
                     }
                 };
@@ -6648,6 +6771,7 @@ impl Store {
         for rank in &candidate_ranks {
             metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
         }
+        node_rows.publish();
         for revalidated in &bind_passes {
             metrics.scheduler_plan_bind_pass.inc(&[if *revalidated {
                 "revalidated"
@@ -7453,6 +7577,55 @@ impl Store {
         };
 
         Ok(job)
+    }
+
+    /// One candidate's node for the plan-apply walk, read inside the apply
+    /// transaction (`sql` is `SELECT {NODE_JOINED_ATTRS} … WHERE node.id =
+    /// ?1`). `None` when the row is gone.
+    ///
+    /// The row is always read: it is the apply-time fence against cordons,
+    /// node loss and re-registrations that bump no allocation epoch. What
+    /// this skips is the *parse*. When the read model holds a node whose
+    /// fields serialize to exactly the row's bytes, that `Arc<Node>` is
+    /// returned instead of a freshly parsed one: equal bytes parse to an
+    /// equal node, so the walk sees what parsing would have given it, and
+    /// the cost is a streaming serialize-and-compare that stops at the first
+    /// differing byte instead of building four JSON trees. Any difference —
+    /// a projection that has not landed yet, a row written in a
+    /// non-canonical form, a lock the read model's writer holds — falls back
+    /// to the parse, so the read model is never trusted, only checked.
+    ///
+    /// The one field not compared is `last_heartbeat`, which the walk never
+    /// reads (the row's value is not authoritative on a liveness owner
+    /// either: `node_from_row` replaces it with the live beat).
+    fn node_for_apply_tx(
+        &self,
+        tx: &Connection,
+        sql: &str,
+        node_id: &str,
+        sources: &mut NodeRowSources,
+    ) -> R<Option<Arc<Node>>> {
+        // `try_read`: never wait on the read model while holding the write
+        // connection. A writer holding it means a projection is in flight,
+        // and the row is the safer answer anyway.
+        let cached = self
+            .read_model
+            .try_read()
+            .ok()
+            .and_then(|model| model.nodes.get(node_id).cloned());
+        let mut stmt = tx.prepare_cached(sql)?;
+        let mut rows = stmt.query([node_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        if let Some(cached) = cached {
+            if node_row_matches(&cached, row)? {
+                sources.read_model += 1;
+                return Ok(Some(cached));
+            }
+        }
+        sources.parsed += 1;
+        Ok(Some(Arc::new(self.node_from_row(row)?)))
     }
 
     fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
@@ -15421,39 +15594,65 @@ impl Store {
         // that captured it (which still holds the parts).
         //
         // This runs once per keyed placement, inside the plan apply, so it is
-        // serial scheduler-lane time, and it must not grow with the task's
-        // suspended or retired population. Two things keep it lean
-        // (migration `idx_instance_keyed_live`):
+        // serial scheduler-lane time, and it must grow with neither the
+        // task's parked population nor its live one. Three variants of one
+        // query (`keyed_bind_sql!`) keep it lean:
         //
-        // - The `mode`/`state` terms match the partial index
-        //   `idx_instance_keyed_live` word for word, so only live keyed rows
-        //   are visited. Suspended, stopped, and terminated rows, most of a
-        //   large sandbox population, are never read. SQLite uses a partial
-        //   index only when the query's WHERE implies the index's, so editing
-        //   either term can silently fall back to scanning every instance of
-        //   the job (`keyed_bind_query_uses_the_live_partial_index` guards it).
-        // - "Unbound for this config" is a correlated `NOT EXISTS` probe of
-        //   `idx_allocation_instance_config`, answered from the two indexes
-        //   alone, so a bound row costs two index lookups and no table read.
-        //   The `NOT IN (SELECT ...)` it replaces built an ephemeral B-tree of
-        //   every allocation of the config on every placement. The explicit
-        //   `instance_id IS NOT NULL` keeps the forms equivalent: `NOT IN`
-        //   never matched a NULL id, and `NOT EXISTS` alone would.
-        let instance: Option<Instance> = tx
-            .prepare_cached(KEYED_BIND_SQL)?
-            .query_row(
-                params![
-                    job_id,
-                    group,
-                    task_name,
-                    task_id,
-                    node_id,
-                    target_instance.unwrap_or_default(),
-                    Self::now_unix()
-                ],
-                |row| self.instance_from_row(row),
-            )
-            .optional()?;
+        // - A ratification names its instance: a point lookup.
+        // - Otherwise, first only the live instances with no current
+        //   allocation (`idx_instance_keyed_unbound`): a new instance, a
+        //   resume, a replacement after a lost node. In steady state these
+        //   are exactly the instances waiting for this placement, so the
+        //   cost follows the queue, not the live population
+        //   (scheduler-lane-entry-cost plan §11).
+        // - Only when none of those fits, every live instance
+        //   (`idx_instance_keyed_live`): an instance still bound under an
+        //   older config of the task (a create-first rollout rebinding it),
+        //   or one whose current pointer is set while it has no allocation
+        //   of this config. That is the pre-index cost, paid only when the
+        //   cheap set is empty.
+        //
+        // All three keep the same terms, so the choice changes cost, never
+        // which instances qualify. It can change which qualifying instance
+        // binds: while both an unpointed instance and one bound under an
+        // older config wait, the unpointed one binds first even if it is
+        // younger (calls: scheduler-lane-entry-cost #2).
+        //
+        // The `mode`/`state` terms match the partial indexes word for word,
+        // which is what lets SQLite use them; the query-plan tests guard
+        // that. "Unbound for this config" is a correlated `NOT EXISTS` probe
+        // of `idx_allocation_instance_config`, answered from indexes alone;
+        // `instance_id IS NOT NULL` keeps it equivalent to the `NOT IN` it
+        // replaced, which never matched a NULL id.
+        let target = target_instance.filter(|id| !id.is_empty());
+        let bind = |sql: &str| -> R<Option<Instance>> {
+            Ok(tx
+                .prepare_cached(sql)?
+                .query_row(
+                    params![
+                        job_id,
+                        group,
+                        task_name,
+                        task_id,
+                        node_id,
+                        target.unwrap_or_default(),
+                        Self::now_unix()
+                    ],
+                    |row| self.instance_from_row(row),
+                )
+                .optional()?)
+        };
+        let metrics = &crate::telemetry::metrics().scheduler_keyed_binds_total;
+        let instance: Option<Instance> = if target.is_some() {
+            metrics.inc(&["target"]);
+            bind(KEYED_BIND_TARGET_SQL)?
+        } else if let Some(instance) = bind(KEYED_BIND_UNBOUND_SQL)? {
+            metrics.inc(&["unbound"]);
+            Some(instance)
+        } else {
+            metrics.inc(&["live"]);
+            bind(KEYED_BIND_SQL)?
+        };
 
         let instance = match instance {
             Some(instance) => instance,
@@ -23299,6 +23498,97 @@ mod tests {
         }
     }
 
+    /// A job whose name is all digits round-trips. Under the old NUMERIC
+    /// affinity its id and name were stored as an INTEGER, which every
+    /// `String` read of the row refused.
+    #[test]
+    fn a_job_named_with_digits_reads_back_test() -> R<()> {
+        let store = setup_store()?;
+        submit_job(&store, "2026", vec![task("api")])?;
+        assert_eq!(store.get_job_config("2026")?.name, "2026");
+        let conn = store.read_connection()?;
+        let stored: String = conn.query_row(
+            "SELECT typeof(id) FROM job WHERE name = '2026';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, "text");
+        Ok(())
+    }
+
+    /// The plan-apply walk reads each candidate's row but reuses the read
+    /// model's node only when the row holds exactly the bytes that node
+    /// serializes to; anything else is parsed.
+    #[test]
+    fn plan_apply_reuses_a_read_model_node_only_for_an_identical_row_test() -> R<()> {
+        let store = setup_store()?;
+        let mut msg = make_node_msg("n1", "active");
+        msg.config_attrs = json!({ "class": "web", "zone": "a" }).to_string();
+        msg.fingerprint_attrs = json!({ "memory_total": "8589934592", "cpu": 4 }).to_string();
+        store.insert_node(msg)?;
+        let sql = format!("SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id = ?1;");
+        let check = |store: &Store| -> R<(Option<Arc<Node>>, NodeRowSources)> {
+            let conn = store.write_connection()?;
+            let mut sources = NodeRowSources::default();
+            let node = store.node_for_apply_tx(&conn, &sql, "n1", &mut sources)?;
+            Ok((node, sources))
+        };
+
+        // Fresh registration: the row is what the read model holds.
+        let cached = store.scheduling_read_model()?.nodes["n1"].clone();
+        let (node, sources) = check(&store)?;
+        let node = node.expect("row exists");
+        assert!(
+            Arc::ptr_eq(&node, &cached),
+            "an identical row reuses the read model's node"
+        );
+        assert_eq!((sources.read_model, sources.parsed), (1, 0));
+
+        // The same document with other whitespace and key order: equal as
+        // JSON, different bytes. Parsed, and the parse agrees.
+        store.write_connection()?.execute(
+            "UPDATE node SET config_attrs = '{ \"zone\": \"a\", \"class\": \"web\" }' WHERE id = 'n1';",
+            [],
+        )?;
+        let (node, sources) = check(&store)?;
+        assert_eq!((sources.read_model, sources.parsed), (0, 1));
+        assert_eq!(node.expect("row").config_attrs, cached.config_attrs);
+
+        // A cordon the read model has not seen (a projection still in
+        // flight): the row wins.
+        store.write_connection()?.execute(
+            "UPDATE node SET availability = 'draining' WHERE id = 'n1';",
+            [],
+        )?;
+        assert_eq!(
+            store.scheduling_read_model()?.nodes["n1"].availability,
+            "available"
+        );
+        let (node, sources) = check(&store)?;
+        assert_eq!(node.expect("row").availability, "draining");
+        assert_eq!((sources.read_model, sources.parsed), (0, 1));
+
+        // A row that is gone is gone, whatever the read model says.
+        store
+            .write_connection()?
+            .execute("DELETE FROM node WHERE id = 'n1';", [])?;
+        assert!(check(&store)?.0.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_to_compares_without_allocating_test() {
+        let value = json!({ "b": [1, 2.5, "x"], "a": { "nested": true } });
+        let canonical = serde_json::to_vec(&value).unwrap();
+        assert!(serializes_to(&value, &canonical));
+        assert!(!serializes_to(&value, &canonical[..canonical.len() - 1]));
+        let mut longer = canonical.clone();
+        longer.push(b' ');
+        assert!(!serializes_to(&value, &longer));
+        assert!(!serializes_to(&value, b"{}"));
+        assert!(serializes_to(&json!({}), b"{}"));
+    }
+
     fn make_node_msg(id: &str, status: &str) -> NodeMsg {
         NodeMsg {
             id: id.to_string(),
@@ -31054,6 +31344,93 @@ mod tests {
             !plan.contains("LIST SUBQUERY"),
             "no materialized list of every allocation of the config:\n{plan}"
         );
+        Ok(())
+    }
+
+    /// The two cheap variants seek: the unbound query reads only
+    /// instances with no current allocation, and a ratification's named
+    /// instance is a point lookup. Neither walks the live index.
+    #[test]
+    fn keyed_bind_variants_seek_their_indexes_test() -> R<()> {
+        let store = setup_store()?;
+        let conn = store.read_connection()?;
+        let plan_of = |sql: &str| -> R<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let details: Vec<String> = stmt
+                .query_map(
+                    params!["job", "default", "task", 1i64, "node-a", "user-1", 0i64],
+                    |row| row.get::<_, String>(3),
+                )?
+                .collect::<Result<_, _>>()?;
+            Ok(details.join("\n"))
+        };
+        let unbound = plan_of(KEYED_BIND_UNBOUND_SQL)?;
+        assert!(
+            unbound.contains("USING INDEX idx_instance_keyed_unbound"),
+            "the unbound bind must seek its partial index:\n{unbound}"
+        );
+        assert!(!unbound.contains("idx_instance_keyed_live"), "{unbound}");
+        let target = plan_of(KEYED_BIND_TARGET_SQL)?;
+        // The primary key or the live index's full key: either is a point
+        // lookup of the one instance.
+        assert!(
+            target.contains("SEARCH instance USING")
+                && target
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("instance_id=?)")),
+            "a named bind must be a point lookup of the instance:\n{target}"
+        );
+        for plan in [&unbound, &target] {
+            assert!(
+                plan.contains("USING COVERING INDEX idx_allocation_instance_config"),
+                "{plan}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The cheap query binds the instances that have no allocation; the
+    /// live query still finds an instance bound only under an older config,
+    /// so a rollout rebinds every live instance as before.
+    #[test]
+    fn keyed_binds_take_the_unbound_query_and_fall_back_for_a_rollout_test() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-cheap";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+        let old_task = task_id_for(&store, "sandbox", job_id)?;
+        for id in ["one", "two"] {
+            store.create_keyed_instance(job_id, "default", "sandbox", Some(id))?;
+        }
+        let binds = &crate::telemetry::metrics().scheduler_keyed_binds_total;
+        let unbound_before = binds.get(&["unbound"]);
+        let first = store.place_alloc("node-a", old_task)?;
+        let second = store.place_alloc("node-a", old_task)?;
+        let mut bound = vec![first.instance_id.unwrap(), second.instance_id.unwrap()];
+        bound.sort();
+        assert_eq!(bound, ["one", "two"]);
+        assert!(binds.get(&["unbound"]) >= unbound_before + 2);
+        for id in ["one", "two"] {
+            assert!(store
+                .get_instance(id)?
+                .context("instance")?
+                .current_alloc_id
+                .is_some());
+        }
+
+        // A new config: both instances still point at old-config
+        // allocations, so only the live query can rebind them.
+        let updated = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            ..stateful_keyed_task("sandbox", false)
+        };
+        let new_config = submit_job(&store, job_id, vec![updated])?;
+        let new_task = task_id_for_config(&store, "sandbox", &new_config)?;
+        let live_before = binds.get(&["live"]);
+        let rebound = store.place_alloc("node-a", new_task)?;
+        assert!(rebound.instance_id.is_some());
+        assert!(binds.get(&["live"]) > live_before);
         Ok(())
     }
 

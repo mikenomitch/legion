@@ -232,10 +232,25 @@ job-intake write paths. A migration rebuilds the affected tables in place.
 It preserves data, column order, indexes, and rowids, so a rolling manager
 upgrade across it is safe.
 
-`STRING` and `TIMESTAMP` columns keep NUMERIC affinity on purpose. For those
-columns SQLite's numeric conversion can succeed (numeric-looking ids,
-unix-seconds timestamps), so changing their type would change what is stored
-and break comparisons against existing rows.
+Columns once declared `STRING` and `TIMESTAMP` had the same NUMERIC
+affinity, with a worse effect: for them the conversion could succeed, so a
+numeric-looking value (a job named `2026`, an id made of digits) was stored
+as an INTEGER, and reading it back as text failed. They are now `TEXT`,
+except `job.created_at`, which stores unix seconds and is `INTEGER` like
+`job.updated_at`. The migration rewrites the declared types in place
+(column order, rowids, indexes and foreign keys are untouched, so raft
+changesets are unaffected). In the same transaction it rewrites any value
+those columns had stored as a number back to the text it was written as,
+rebuilds the indexes of the tables it touched, and checks every foreign key
+(it runs with foreign-key enforcement off for that one migration, because
+SQLite's deferred-constraint counter miscounts keys whose comparison
+changes mid-transaction). A manager logs `Rewrote numeric values in
+re-typed TEXT columns` when there were any.
+
+New columns are declared `TEXT`, `INTEGER`, `REAL` or `BLOB`; a test fails
+when any column of the schema is declared `STRING` or `TIMESTAMP`, or when
+a foreign key has no index on its child side (deleting a parent row would
+scan the child table).
 
 ## Allocation Epoch and Plan Submission Safety
 

@@ -8,9 +8,11 @@ task's whole population, which was the largest piece of serial lane time in
 the profile (§5, §14). Phases 2 and 3 are designed here and not built: a
 pipelined lane that captures entry N+1 while entry N commits, and one fsync
 per entry instead of two. Each needs its own gate before it ships (§9).
-Deliberately deferred: binding in O(log n) of the live population (§11),
-and the AWS-rig run of every number here (all are from one loaded laptop,
-§14.1).
+Phase 2 now lives in [lane-isolation-plan.md](lane-isolation-plan.md),
+behind projection from the changeset. Binding outside a rollout no longer
+grows with the live population (2026-11-12, §11, calls #2). Deliberately
+deferred: the AWS-rig run of every number here (all are from one loaded
+laptop, §14.1).
 
 ## 1. Problem statement
 
@@ -279,12 +281,12 @@ small fixed cost on instance writes.
 
 ## 11. Open questions
 
-- **Bind in O(log n) of the live population.** The bind still visits every
-  live instance of the task, two index probes each. Making it independent
-  of the live count needs either a maintained "unbound for config" marker
-  or the planner naming the instance it placed for. Both change more than
-  a query. Lean: wait for a measurement where live instances per task, not
-  parked ones, dominate.
+- ~~**Bind in O(log n) of the live population.**~~ Resolved 2026-11-12
+  (calls #2): the bind first seeks the live instances with no current
+  allocation (`idx_instance_keyed_unbound`) and falls back to every live
+  instance only when none qualifies, so only a rollout's placements still
+  pay the live scan. `legion_scheduler_keyed_binds_total{query}` shows the
+  split. The `keyed_bind` bench numbers are in §14.
 - **Does the reference host show the same share?** Every number here is
   from a loaded laptop. Lean: the AWS sandbox campaign runs the ladder
   before and after.
@@ -332,3 +334,20 @@ live population too and is untouched here.
 The bench's first version planned its fill in `Fresh` mode, which asks for
 one placement per live instance and fails once some are bound. It now
 plans in `Reschedule` mode, as a create's `job_reschedule` eval does.
+
+### 14.3 The unbound-first bind (2026-11-12)
+
+Release `keyed_bind`, `local_disk` store, a 4-vCPU container, one run each;
+base is this change with the bind forced to the live query and
+`idx_instance_keyed_unbound` not created (calls #2). One new keyed
+placement against `resident` placed instances:
+
+| resident | base | this change | base apply | this change apply |
+| --- | --- | --- | --- | --- |
+| 1,000 | 4.56 ms | 3.40 ms | 1,524 µs | 718 µs |
+| 5,000 | 10.02 ms | 7.35 ms | 2,895 µs | 881 µs |
+
+The apply phase now grows 1.2x from 1,000 to 5,000 resident, against 1.9x
+before: the bind reads the waiting instance, not the live population. The
+rest of the plan (`tasks`, `build`) still grows with the live population;
+it is not serial lane time.
