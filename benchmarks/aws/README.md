@@ -980,6 +980,10 @@ and tear it down when the campaign is over.
 
 ## Known limitations (also see docs/worker-simulation.md)
 
+Open rig work — tooling, competitor harness gaps, and the campaign runs
+still owed — is listed under "Open work" in
+[the rig's plan](../../internal_docs/plans/aws-comparative-benchmark-plan.md#open-work).
+
 - **Legion sim fleets changed shape on 2026-10-12** (sandbox-scaling plan
   Phases 0–2). Simulated nodes now report allocation health, as real
   workers do, and take their work over `Manager.StreamWork` instead of the

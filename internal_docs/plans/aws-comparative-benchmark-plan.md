@@ -316,6 +316,52 @@ then K8s, each one campaign per scenario with a control-plane reset in
 between. The Nomad and K8s install paths are new and expected to need
 fixes on first contact, so each starts with a `--smoke` cell.
 
+## Open work
+
+The rig's own to-do list. It lives here rather than in
+[`TODO.md`](../TODO.md), which keeps only the Legion bugs the rig turns
+up (for example the fixed-2s heartbeat ablation, under "Heartbeats and
+liveness").
+
+### Campaign runs still owed
+
+- [ ] **The rest of the cross-system matrix**: the CLI control row (row 5)
+      on the NVMe rig, the 10k storm on all three systems, memory per cell
+      (row 6), and `REPORT.md`.
+- [ ] **The Legion B (streaming) campaign and the 20k validation burst**
+      (phases 2 and 5).
+- [ ] **Bake the operator AMI against real AWS**: console output survives
+      the stop, and the bake finishes inside 90 minutes (calls #29).
+
+### Rig tooling
+
+- [ ] **Bake a rig AMI.** Control plane, loadgen, and spot workers each pay
+      their own cloud-init (~10 min at bring-up, 6–8 min per ASG scale-up,
+      which stalled a whole session). `scripts/rig-toolchain.sh` is written;
+      it needs a `bake-rig-ami.sh` and a terraform lookup, like the operator
+      AMI.
+- [ ] **Cache the built binary in S3, keyed on git rev.** `distfast` took 28
+      min against 24.5 for full LTO (the cost is ~900 crates, not linking);
+      `build-and-upload.sh` already fingerprints plugins, not the main
+      binary.
+- [ ] **Per-run sim node prefixes.** Now that `stop-sim-fleet.sh` forgets
+      its nodes, the per-campaign store reset and the
+      one-scenario-per-campaign rule could go; both are left as they were
+      (calls 43).
+
+### Competitor harness gaps
+
+- [ ] **Nomad's Python placement follower misses 14–34 events** in 50k
+      cells, undercounting throughput. Use a compiled follower or Nomad's
+      own count.
+- [ ] **K8s at 200,000 pods**: the scheduler's apiserver stopped completing
+      TLS handshakes. Point the driver at another apiserver and rerun the
+      40-per-node `dense_fleet` cell.
+- [ ] **Nomad can't run `mixed_heterogeneous`**: nodesim has no node `meta`.
+      Patch it if the report needs that row.
+- [ ] **K8s failover drill**: `failover-drill.sh` has no fault command for
+      the scheduler's lease holder.
+
 ## Testing plan
 
 The rig itself gets a smoke path: a `--dry-run` driver mode against a

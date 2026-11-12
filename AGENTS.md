@@ -200,8 +200,7 @@ the code** — not in a follow-up, and not "later".
   it belongs to, with a sentence of context and a link to the plan section or
   code that explains it. This is the same information as the plan's deferred list
   and the judgement-calls doc — TODO.md is where it stays visible.
-- **Link the PR** on anything that is in flight rather than merged, and keep the
-  "In flight (open PRs)" table at the top honest.
+- **Link the PR** on anything that is in flight rather than merged.
 - If the work has no entry yet and was not trivial, add one and check it off, so
   the Done section stays a real record of what exists.
 
