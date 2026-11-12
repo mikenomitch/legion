@@ -172,6 +172,72 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// `distinct` replicas (late-binding plan apply, Phase 4)
+// ---------------------------------------------------------------------------
+//
+// Ten jobs of `replicas` copies each, every copy on a different `rack`, over
+// a 1,000-node fleet of 250 racks. Uncontended, so every placement binds
+// rank 0: what moves with the coupling rule is the candidate lists a
+// `distinct` plan carries (one node each when `distinct` coupled its
+// replicas, up to `plan_candidates` each without) and the wider epoch sample
+// that covers their union.
+
+const DISTINCT_REPLICA_STEPS: &[usize] = &[10, 100];
+
+fn distinct_fallback_lists_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("distinct_fallback_lists");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    for &replicas in DISTINCT_REPLICA_STEPS {
+        let bench_id = BenchmarkId::new("spread", format!("nodes_1000_replicas_{replicas}"));
+        group.throughput(Throughput::Elements((replicas * JOB_COUNT) as u64));
+        group.bench_function(bench_id, |b| {
+            b.iter_batched(
+                || {
+                    let (store, dir) = setup_store("spread").expect("store");
+                    for idx in 0..1_000 {
+                        let attrs = json!({ "rack": format!("rack-{}", idx % 250) });
+                        store
+                            .insert_node(make_node_msg(&format!("node-{idx:06}"), attrs))
+                            .expect("node");
+                    }
+                    let jobs: Vec<JobConfig> = (0..JOB_COUNT)
+                        .map(|job_idx| JobConfig {
+                            priority: Default::default(),
+                            name: format!("distinct-job-{job_idx}"),
+                            tasks: vec![TaskConfig {
+                                count: TaskCount::new(replicas as u32),
+                                constraints: json!([{ "key": "rack", "operator": "distinct" }]),
+                                ..TaskConfig::new(format!("task-{job_idx}"), "noop")
+                            }],
+                            rollout: None,
+                            rollout_by_group: Default::default(),
+                            version: None,
+                            pending_extensions: Default::default(),
+                            extensions: Default::default(),
+                        })
+                        .collect();
+                    let job_ids = submit_jobs(&store, &jobs).expect("jobs");
+                    (store, dir, job_ids)
+                },
+                |(store, dir, job_ids)| {
+                    for job_config_id in job_ids {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let outcome = scheduler
+                            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(outcome.allocations.len(), replicas);
+                    }
+                    (store, dir)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Candidate construction (scheduling-index plan, Phase 0)
 // ---------------------------------------------------------------------------
 //
@@ -1399,6 +1465,7 @@ fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
 criterion_group!(
     benches,
     scheduler_speed_benchmark,
+    distinct_fallback_lists_benchmark,
     candidate_construction_benchmark,
     plan_under_fill_benchmark,
     plan_fleet_scaling_benchmark,

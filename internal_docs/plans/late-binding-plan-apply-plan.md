@@ -5,10 +5,14 @@
 **Status: SHIPPED** (phases 0–3, 2026-07-29). Public doc:
 [docs/late-binding-plan-apply.md](../../docs/late-binding-plan-apply.md).
 Implementation deviations are recorded in the judgement-calls doc.
-Deliberately deferred to the backlog phase (§8, Phase 4): capacity-aware
-candidate skipping, per-component partial commit, striped disjoint
-candidate lists for identical replicas, and any serialized/batched lane
-for physically-full pools. Known gap kept out of scope: capacity
+Phase 4 backlog, as of 2026-11-12: capacity-aware candidate skipping
+shipped as the walk's pass 2, which rebuilds each touched node's free pool
+inside the apply transaction (calls #17). Striped disjoint lists were
+replaced by dropping the `distinct` coupling edge, since the walk already
+enforces `distinct` (calls #2, "Revised since"). Per-component partial
+commit and a serialized/batched lane for physically-full pools are not
+planned: each was gated on evidence (calls #5, #6) that nobody has
+collected. Known gap kept out of scope: capacity
 exhaustion (a replan finding no eligible nodes) still fails the eval
 terminally — blocked-eval waits belong to the gang-scheduling plan.
 
@@ -425,7 +429,8 @@ Each phase ships and stands alone.
   singleton components walk independently; coupled components unchanged.
   Ships the heterogeneous-job win (disjoint-pool tasks fall back
   independently).
-- **Phase 4 — Backlog (each optional, separately justified):**
+- **Phase 4 — Backlog (each optional, separately justified; status in
+  the header):**
   capacity-aware candidate skipping (applier-side ledger for the
   touched-but-fits case); per-component partial commit + eval refill
   (Omega's incremental transaction, riding the Reschedule refill

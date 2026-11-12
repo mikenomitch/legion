@@ -103,19 +103,25 @@ race is bounded. You pay it only when a race happens.
 
 ## Coupled placements
 
-Two placements in one plan are **coupled** when independent fallbacks
-could break their combined fit math:
+Two placements in one plan are **coupled** when they are in the same
+multi-task co-placement group. The group is one scheduling unit: its tasks
+must land together on the node the planner chose for all of them. A
+coupled group keeps an exact, all-or-nothing apply on that node.
+Everything else walks independently, including every single-task job,
+every replica of a count-N service, and every replica of a task with a
+`distinct` constraint.
 
-- They belong to a task with a `distinct` constraint. The constraint
-  couples that task's placements even across disjoint node lists, because
-  two different nodes can share a zone.
-- They are in the same multi-task co-placement group (the group is one
-  scheduling unit).
-
-Coupling is transitive (connected components). Placements in a coupled
-component keep an exact, all-or-nothing apply on their chosen nodes.
-Everything else walks independently, including every single-task job and
-every replica of a count-N service.
+**`distinct` replicas fall back too, and the walk keeps them apart.** The
+apply re-checks `distinct` itself. It seeds a tracker from the task's
+committed allocations, rejects any candidate whose attribute value
+(say, its zone) is already taken, and adds each bind before the next
+placement is walked. If replica 0 loses its node and falls back onto the
+zone replica 1 planned for, replica 1 moves down its own list to a free
+zone. If it has none left, the plan is rejected rather than doubling up a
+zone, and the eval retries against the new state. A replica's list never
+names a zone its earlier siblings planned for (the planner's tracker
+filters them out), so a fallback can't reach a zone freed by the race
+until the next plan.
 
 **Overlapping candidate lists don't count as coupling.** Two placements of
 one plan may name the same node, and both may land on it. The walk debits
@@ -230,11 +236,12 @@ doesn't depend on the setting and is always on.
   retries is requeued (see [the requeue backstop](#the-requeue-backstop)).
   When a replan finds no capacity at all, the eval still fails with a
   placement error. Capacity exhaustion is not a conflict.
-- **Coupled components don't fall back.** A task with a `distinct`
-  constraint and a multi-task co-placement group still apply
-  all-or-nothing on their chosen nodes. Spreading disjoint lists across
-  identical replicas and committing part of a component are not
-  implemented.
+- **Co-placement groups don't fall back.** A multi-task co-placement
+  group still applies all-or-nothing on its chosen node.
+- **A plan applies whole or not at all.** When one placement has no
+  candidate left, the whole plan is rejected and replanned, including the
+  placements that would have bound. Committing the placements that fit and
+  replanning only the rest is not implemented.
 - **Policy plugins.** Third-party scheduling-policy plugins select a
   single node and expose no ranking, so their placements carry a single
   candidate (exact-CAS semantics). The built-in `bin_pack` and `spread`

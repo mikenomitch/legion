@@ -357,6 +357,17 @@ deliberate — the eval workers *are* the concurrent readers — but it means a
 new default has a memory consequence as well as a concurrency one, and
 Phase 0b must record manager RSS per cell rather than assuming it is free.
 
+The cap also brings back the coupling the pool's sizing was meant to remove.
+Heartbeat reads run inline on tokio runtime threads, and the runtime has
+`available_parallelism()` of them. The pool is `evalThreads + 4` capped at
+16, so on a host with more than 12 cores and `evalThreads` defaulting to
+the core count, the pool is narrower than the runtime again, and a read
+queueing for a connection parks a runtime thread. Nothing has been observed
+failing this way; the `read_pool_is_sized_from_readers_and_capped_by_page_cache`
+test only asserts the decoupling up to 12 cores. Whatever default this plan
+picks should be checked against it: either keep the pool wider than the
+runtime at the chosen value, or move the heartbeat's reads off the runtime.
+
 **Documentation as it stands.**
 [docs/diagnosing-scheduler-performance.md](../../docs/diagnosing-scheduler-performance.md)
 already carries the corrected guidance: a dated correction block on the

@@ -828,6 +828,8 @@ pub struct Metrics {
     pub scheduler_plan_bind_pass: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
+    /// `legion_eval_handler_timeouts_total{kind}`
+    pub eval_handler_timeouts_total: Arc<CounterVec>,
     /// `legion_evals_blocked{key_kind}`
     pub evals_blocked: Arc<GaugeVec>,
     /// `legion_apps{status}` (docs/apps.md, "Health and visibility")
@@ -1202,6 +1204,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let eval_handler_timeouts_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_eval_handler_timeouts_total",
+                help: "Eval handlers that ran past the eval loop's handler deadline. The worker stops waiting, requeues the eval with a delay, and moves on to the rest of its batch; the handler's thread is not stopped and its result is discarded if it ever returns.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
         });
         let evals_blocked = Arc::new(GaugeVec {
             meta: FamilyMeta {
@@ -2223,6 +2233,7 @@ impl Metrics {
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_handler_timeouts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&apps) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
@@ -2305,6 +2316,7 @@ impl Metrics {
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
+            eval_handler_timeouts_total,
             evals_blocked,
             apps,
             gang_blocked_jobs,
@@ -3703,6 +3715,7 @@ mod tests {
             "legion_job_submits_total",
             "legion_eval_queue_depth",
             "legion_evals_processed_total",
+            "legion_eval_handler_timeouts_total",
             "legion_grpc_in_flight",
             "legion_grpc_request_duration_seconds",
             "legion_grpc_requests_total",

@@ -60,6 +60,40 @@ only for plans with exactly one placement, everything else unchanged —
 simpler, but a GPU task + CPU sidecar in disjoint pools would forfeit
 late binding for no correctness reason.
 
+**Revised since.** Two of the three edges are gone; only the co-placement
+group remains. The overlap edge went first
+([plan-apply-conflict-reduction plan](../plans/plan-apply-conflict-reduction-plan.md)):
+the walk debits each bind from the node's in-transaction free pool. The
+`distinct` edge went on 2026-11-12, in place of Phase 4's "striped disjoint
+lists": the walk already seeds a `distinct` tracker from the task's committed
+allocations and checks every candidate against it, adding each bind as it
+goes (`load_allocation_task_state`), so a fallback onto a sibling's zone is
+skipped there. Keeping the edge only cost the fallback. Striping was the
+alternative: hand each replica a list disjoint from its siblings' by
+attribute value, so fallbacks can never collide. It was rejected because
+the planner can't see which zones a race will free or take, and the apply
+check is already exact. What it costs: a replica can't fall back to a zone
+an earlier sibling planned for, even if that sibling moved elsewhere,
+because the planner filtered that zone out of its list. Such a plan is
+rejected and replanned, which is what every `distinct` race cost before.
+Pinned by `plan_walk_enforces_distinct_across_fallbacks`.
+
+The uncontended cost, from `cargo bench --bench scheduler_bench` on
+`main` (`11fc82cb`) and on the change, same 4-core box:
+
+| Cell | `main` | Change | Criterion verdict |
+| --- | ---: | ---: | --- |
+| `distinct_fallback_lists/spread/nodes_1000_replicas_10` | 45.67 ms | 44.49 ms | no change (p = 0.29) |
+| `distinct_fallback_lists/spread/nodes_1000_replicas_100` | 258.77 ms | 277.58 ms | +7.3% (p < 0.05) |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_1000` | 172.34 ms | 173.11 ms | no change (p = 0.82) |
+
+The 100-replica cell pays for lists of up to 8 candidates per replica
+instead of 1: a wider epoch sample over their union, and a larger
+submission. That is the same per-placement cost every non-`distinct` plan
+already pays for its fallback lists. Accepted: it buys the fallback that
+turns a race into a rank instead of a full replan, which costs far more
+than 7% of an uncontended plan.
+
 **Trade-off.** A count-N service on one pool is one coupled component
 and gains nothing from this plan until Phase 4 (striped disjoint lists,
 partial commit). Accepted: those plans are exactly where intra-plan

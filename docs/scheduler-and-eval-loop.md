@@ -98,6 +98,48 @@ convergence steps, so running an eval again after a failover wastes work
 but never duplicates effects; the old recovery relied on the same property.
 The batch cap bounds how much one crash makes repeat.
 
+### Handler deadline
+
+A worker waits **at most five minutes** for one eval's handler. A handler
+still running after that is treated as stuck, not slow. Its legitimate
+worst case is far shorter: the plan-conflict loop runs at most
+`plan_conflict_max_retries` attempts (clamped to 20), with backoffs capped
+by `plan_conflict_backoff_max_ms`, and a raft write that can't reach a
+leader fails within 15 seconds. When the deadline passes, the worker:
+
+1. stops waiting for that handler;
+2. requeues the eval: it goes back to `pending` and can't be claimed again
+   for five minutes;
+3. records an `eval.requeued` event with `meta.reason: "handler_timeout"`,
+   increments `legion_eval_handler_timeouts_total{kind}`, and logs `Eval
+   handler ran past its deadline` at `warn`;
+4. carries on with the rest of its batch.
+
+The requeue goes through the batch's ordinary settle, so it is fenced by
+the claim epoch like any other outcome.
+
+Without the deadline, a stuck handler kept its own eval and every eval
+behind it in the batch claimed until scheduler-lane leadership changed. On
+a stable leader, that is never.
+
+What it does not do:
+
+- **It doesn't stop the handler.** Handlers run synchronously on tokio's
+  blocking pool, and a blocking task can't be cancelled. The stuck thread
+  keeps running, and whatever it returns is discarded. Writes it makes in
+  the meantime are the same idempotent reconcile a second run would make.
+  A plan it applies is still fenced by the job-config epoch. If its plan
+  settles its own eval, it deletes a row that would otherwise just run
+  again.
+- **It doesn't fail the eval.** A stuck handler says nothing about whether
+  the eval's work is wanted, so the eval is retried rather than dropped.
+  An eval that hangs every time it runs is retried every ten minutes or so
+  (five of waiting, five of delay), and each attempt strands one
+  blocking-pool thread. Watch `legion_eval_handler_timeouts_total`: any
+  nonzero value is a bug to report, with the eval kind it names.
+- **It isn't configurable.** The deadline and the requeue delay are fixed
+  at five minutes.
+
 When the queue is empty, workers block on either:
 
 - `Notify` wake-up (an eval became claimable: an enqueue of zero-delay
@@ -350,8 +392,10 @@ transaction's own re-validation, whatever its epoch. A concurrent plan that
 touched the first choice costs a fallback rank, or nothing, instead of a
 whole-plan rejection.
 
-Coupled placements (shared `distinct` keys, multi-task groups) keep exact
-all-or-nothing semantics. Overlapping candidate lists are not coupling.
+Only multi-task co-placement groups are coupled and keep exact
+all-or-nothing semantics. Overlapping candidate lists are not coupling, and
+neither is a `distinct` constraint: the walk re-checks `distinct` against
+committed rows and the plan's own binds.
 Candidate lists are on by default (`schedulerSettings.plan_candidates = 8`),
 and `0` disables them and restores single-node submissions. The epoch
 sample (below) covers the union of every placement's candidate list, and

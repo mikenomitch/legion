@@ -141,44 +141,6 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       `RunJob` did; a burst starves evals and heartbeats. Move them behind
       `run_blocking_admission` as they show up.
 
-### Eval loop and concurrency
-
-- [ ] **A hung eval handler is never re-swept.** A stale worker can no longer
-      settle an eval a newer claim holds (claim-epoch fence, 2026-11-08), and a
-      plan's own settle is still unfenced (benign). A handler that never returns
-      keeps its claim until leadership changes; a periodic re-sweep needs a
-      stated bound on handler time ([docs](../docs/scheduler-and-eval-loop.md)).
-- [ ] **Decide the `evalThreads` default** ([plan](plans/eval-thread-default-plan.md),
-      picks no number yet). `available_parallelism()` placed slowest in the
-      2026-08-05 sweep and the curve never turned over. When it moves, also fix
-      the read pool (`evalThreads + 4`, capped at 16) re-coupling with the runtime
-      on >12-core hosts, and `configs/manager.ncl`'s pinned `evalThreads = 4`.
-- [ ] **`web_fleet` at 5k got slower with the `RunJob` offload** (1,175 → 968
-      alloc/s, one run) while every other size got faster. Find whether faster
-      admission changes coalescer batching or crowds heartbeats before tuning.
-- [ ] **`legion_eval_queue_depth` lags up to a second on a deep queue** (above
-      `evalThreads × 16` pending; [calls #6](calls/placement-and-commit-cost-plan_calls.md)).
-      A `kind` label would want the same treatment.
-- [ ] **Adaptive scheduler concurrency, phases 4–5**
-      ([plan](plans/adaptive-scheduler-concurrency-plan.md)). Everything waits on
-      the Phase 0 matrix (plan §11, §16):
-  - [ ] Flip the default to `enforce` if the matrix shows it beats the best
-        static `evalThreads`; then make the `evalThreads` guidance unconditional.
-  - [ ] The `pool` label on `legion_plan_apply_total` (deferred with Phase 0;
-        [calls #2](calls/adaptive-scheduler-concurrency-plan_calls.md)).
-  - [ ] Phase 5: per-pool controllers, fallback rate and lane pipeline wait as
-        extra signals, live reload of `adaptiveConcurrency`.
-  - [ ] Only `job_stop` is exempt from throttling; if recovery latency matters,
-        add a priority lane for recovery kinds ([calls #1](calls/adaptive-scheduler-concurrency-plan_calls.md)).
-- [ ] **Late-binding plan apply, Phase 4 backlog** ([plan §8](plans/late-binding-plan-apply-plan.md)):
-      capacity-aware candidate skipping, per-component partial commit + eval
-      refill, striped disjoint candidate lists for identical replicas (highest
-      value: rejections lose a plan's one candidate per task), and a batched
-      apply lane for physically full pools.
-- [ ] **Fused top-k candidate scoring** for ranked candidate lists, like the
-      one-candidate argmax path; when `candidate_construction` says it pays
-      ([calls #20](calls/late-binding-plan-apply-plan_calls.md)).
-
 ### Candidates and indexes
 
 - [ ] **The `fit` index does not see `maxAllocations`.** A capped node still
@@ -1312,6 +1274,8 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **Declarable scheduling indexes** — `partition_by` × `dims` indexes, nearest-fit candidates, shadow mode, default `fit` index ([plan](plans/scheduling-index-plan.md) · [docs](../docs/scheduling-indexes.md))
 - **Late-binding plan apply (phases 0–3)** — ranked candidates per placement, conflict-exhausted evals requeue with backoff, `plan_candidates` ([plan](plans/late-binding-plan-apply-plan.md) · [docs](../docs/late-binding-plan-apply.md))
 - **Adaptive scheduler concurrency (phases 1–3)** — AIMD planner gate with goodput guard, `legion scheduler concurrency`; default `observe` ([plan](plans/adaptive-scheduler-concurrency-plan.md) · [calls](calls/adaptive-scheduler-concurrency-plan_calls.md) · [docs](../docs/adaptive-scheduler-concurrency.md))
+- **Late-binding plan apply, Phase 4 (part)** — capacity-aware skipping shipped as the walk's pass 2 ([calls #17](calls/late-binding-plan-apply-plan_calls.md)); `distinct` replicas get fallback lists, the walk enforces `distinct` ([calls #2](calls/late-binding-plan-apply-plan_calls.md) · [docs](../docs/late-binding-plan-apply.md#coupled-placements)). Partial commit and a full-pool lane not planned ([plan](plans/late-binding-plan-apply-plan.md))
+- **Eval handler deadline** — a handler past five minutes is requeued with a delay and the rest of its batch runs; `legion_eval_handler_timeouts_total{kind}`, `eval.requeued` `reason: handler_timeout` ([plan](plans/eval-handler-deadline-plan.md) · [calls](calls/eval-handler-deadline-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#handler-deadline))
 - **Builtin names in a worker type's `resources` fail startup** — no longer silently ignored ([calls](calls/node-resource-overrides_calls.md) · [docs](../docs/resource-enforcement.md))
 - **`run_dispatch_future` requires a `Send` future** — a guard held across `.await` on the dispatch path no longer compiles
 - **Scheduler basics** — ledger command, scheduler plugin framework, random/bin-pack/spread schedulers, constraints, affinities, task groups, rescheduling, health-check reschedule, attribute-change re-evaluation
