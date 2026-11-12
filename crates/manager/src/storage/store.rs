@@ -28432,6 +28432,91 @@ mod tests {
         Ok(())
     }
 
+    /// A `distinct` task's replicas carry real fallback lists (no longer a
+    /// coupled component), so the apply walk is what keeps them apart: a
+    /// replica that falls back onto a zone its sibling planned for pushes
+    /// the sibling down its own list, and when the sibling has nowhere else
+    /// to go the plan is rejected rather than doubling up a zone.
+    #[test]
+    fn plan_walk_enforces_distinct_across_fallbacks() -> R<()> {
+        let zoned = |id: &str, zone: &str| NodeMsg {
+            config_attrs: json!({ "zone": zone }).to_string(),
+            ..make_node_msg(id, "ready")
+        };
+        let distinct_task = |name: &str| TaskConfig {
+            count: TaskCount::new(2),
+            constraints: json!([{ "key": "zone", "operator": "distinct" }]),
+            ..task(name)
+        };
+        let walk = |store: &Store, job: &str, lists: [&[&str]; 2]| -> R<PlanApplyOutcome> {
+            let (job_config_id, task_id) = submit_walk_job(store, job, distinct_task("api"))?;
+            let nodes: HashSet<String> = lists
+                .iter()
+                .flat_map(|list| list.iter().map(|node| node.to_string()))
+                .collect();
+            let expected_versions = store.allocation_version_vector(&job_config_id, &nodes)?;
+            let placements: Vec<PlanSubmissionPlacement> = lists
+                .iter()
+                .map(|list| PlanSubmissionPlacement {
+                    task_id,
+                    candidates: list.iter().map(|node| node.to_string()).collect(),
+                    instance_id: None,
+                })
+                .collect();
+            let submission = store.insert_plan_submission_with_candidates(
+                &job_config_id,
+                "fresh",
+                &placements,
+                &expected_versions,
+            )?;
+            // Between the sample and the apply, node-a is drained: replica 0
+            // falls back onto node-b, the zone replica 1 planned for.
+            store.set_node_availability("node-a", "drained")?;
+            store.apply_plan_submission(&submission)
+        };
+
+        let store = setup_store()?;
+        store.insert_node(zoned("node-a", "z1"))?;
+        store.insert_node(zoned("node-b", "z2"))?;
+        store.insert_node(zoned("node-c", "z3"))?;
+        match walk(
+            &store,
+            "distinct-slides",
+            [&["node-a", "node-b"], &["node-b", "node-c"]],
+        )? {
+            PlanApplyOutcome::Applied(applied) => {
+                let bound: Vec<&str> = applied
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.node_id.as_str())
+                    .collect();
+                assert_eq!(bound, vec!["node-b", "node-c"], "one replica per zone");
+                assert_eq!(applied.candidate_ranks, vec![1, 1]);
+            }
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                bail!("replica 1 had a free zone to fall back to: {reason}")
+            }
+        }
+
+        let store = setup_store()?;
+        store.insert_node(zoned("node-a", "z1"))?;
+        store.insert_node(zoned("node-b", "z2"))?;
+        match walk(
+            &store,
+            "distinct-full",
+            [&["node-a", "node-b"], &["node-b"]],
+        )? {
+            PlanApplyOutcome::Applied(applied) => bail!(
+                "two replicas bound into {} zone(s) with only z2 left",
+                applied.allocations.len()
+            ),
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(reason.contains("does not satisfy constraints"), "{reason}");
+            }
+        }
+        Ok(())
+    }
+
     /// Pass 2 of the bind walk: every candidate's epoch moved, so pass 1
     /// binds nothing — but the in-transaction revalidation says they still
     /// fit, so the placement binds rather than rejecting. This is the

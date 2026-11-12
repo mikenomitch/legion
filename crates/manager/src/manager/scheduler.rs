@@ -2813,10 +2813,6 @@ impl<'a> Scheduler<'a> {
         );
         let mut group_per_key: HashMap<String, Option<String>> = HashMap::new();
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
-        // Distinct-constraint keys per task, for the coupling partition below:
-        // placements of a task that carries a `distinct` constraint must not
-        // fall back independently (the tracker couples their choices).
-        let mut distinct_keys_by_task: HashMap<i64, Vec<String>> = HashMap::new();
         // Hard filters (constraints + permit) of every member of a group. A
         // multi-task group is placed on a single node, so that node must
         // satisfy all of them. Arc'd and shared with `build_task_plan` via
@@ -2860,7 +2856,6 @@ impl<'a> Scheduler<'a> {
                 ConstraintSet::new(&task_config.constraints).with_context(|| {
                     format!("Failed to parse constraints for task {}", task_config.name)
                 })?;
-            distinct_keys_by_task.insert(*task_id, constraint_set.distinct_keys());
             let permit_set = PermitSet::new(&task_config.permit, namespace)
                 .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
             let filters = Arc::new((constraint_set, permit_set));
@@ -3431,12 +3426,7 @@ impl<'a> Scheduler<'a> {
             index_report.push(plan.index_usage.clone());
         }
 
-        Self::decouple_plan_components(
-            &mut placements,
-            &distinct_keys_by_task,
-            &task_id_to_group,
-            &group_sizes,
-        );
+        Self::decouple_plan_components(&mut placements, &task_id_to_group, &group_sizes);
         unplaced.extend(runtime_unplaced);
 
         Ok(BuiltPlan {
@@ -3454,12 +3444,21 @@ impl<'a> Scheduler<'a> {
     /// node, so the apply walk can never invalidate the planner's combined
     /// fit math (docs/late-binding-plan-apply.md).
     ///
-    /// Coupling edges:
-    /// - **a task with a `distinct` constraint** — the tracker couples that
-    ///   task's placements even across disjoint node lists (two nodes can
-    ///   share a zone);
-    /// - **membership in the same multi-task co-placement group** — the
-    ///   group is one selection unit.
+    /// The one coupling edge is **membership in the same multi-task
+    /// co-placement group**: the group is one selection unit, so its tasks
+    /// must land on the node the planner chose for all of them together.
+    ///
+    /// **A `distinct` constraint is NOT an edge.** It was, because the
+    /// planner's tracker couples a task's replicas even across disjoint
+    /// node lists (two nodes can share a zone). But the apply walk enforces
+    /// `distinct` itself: it seeds a tracker from the task's committed
+    /// allocations, checks every candidate against it, and adds each bind
+    /// before the next placement is considered
+    /// (`load_allocation_task_state`, `apply_plan_submission_on`). A
+    /// fallback that would share a zone with a sibling is skipped there.
+    /// Keeping the edge only cost the fallback: every replica of a
+    /// `distinct` task carried a one-node list, so one race rejected the
+    /// whole plan.
     ///
     /// **Overlapping candidate lists are NOT an edge.** They were, on the
     /// theory that two independent fallbacks onto a shared node could
@@ -3480,7 +3479,6 @@ impl<'a> Scheduler<'a> {
     /// all-or-nothing epoch CAS on their exact chosen nodes.
     fn decouple_plan_components(
         placements: &mut [PlannedAllocation],
-        distinct_keys_by_task: &HashMap<i64, Vec<String>>,
         task_id_to_group: &HashMap<i64, String>,
         group_sizes: &HashMap<String, usize>,
     ) {
@@ -3505,20 +3503,8 @@ impl<'a> Scheduler<'a> {
 
         let mut parent: Vec<usize> = (0..placements.len()).collect();
         {
-            let mut by_distinct_task: HashMap<i64, usize> = HashMap::new();
             let mut by_group: HashMap<&str, usize> = HashMap::new();
             for (index, placement) in placements.iter().enumerate() {
-                let has_distinct = distinct_keys_by_task
-                    .get(&placement.task_config_id)
-                    .is_some_and(|keys| !keys.is_empty());
-                if has_distinct {
-                    match by_distinct_task.entry(placement.task_config_id) {
-                        Entry::Occupied(entry) => union(&mut parent, *entry.get(), index),
-                        Entry::Vacant(entry) => {
-                            entry.insert(index);
-                        }
-                    }
-                }
                 if let Some(group) = task_id_to_group.get(&placement.task_config_id) {
                     if group_sizes.get(group).copied().unwrap_or(0) > 1 {
                         match by_group.entry(group.as_str()) {
@@ -11091,12 +11077,7 @@ mod tests {
             planned("node-c", 2, &["node-c", "node-b"]),
             planned("node-e", 3, &["node-e", "node-f"]),
         ];
-        Scheduler::decouple_plan_components(
-            &mut placements,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-        );
+        Scheduler::decouple_plan_components(&mut placements, &HashMap::new(), &HashMap::new());
         for placement in &placements {
             assert_eq!(
                 placement.candidates.len(),
@@ -11116,43 +11097,26 @@ mod tests {
             planned("node-b", 2, &["node-b", "node-c"]),
             planned("node-c", 3, &["node-c", "node-d"]),
         ];
-        Scheduler::decouple_plan_components(
-            &mut placements,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-        );
+        Scheduler::decouple_plan_components(&mut placements, &HashMap::new(), &HashMap::new());
         for placement in &placements {
             assert_eq!(placement.candidates.len(), 2);
         }
     }
 
+    /// A `distinct` task's replicas keep their fallback lists: the apply
+    /// walk re-checks `distinct` against committed rows and the plan's own
+    /// binds, so the edge that used to collapse them bought nothing.
     #[test]
-    fn decouple_components_couples_distinct_tasks_across_disjoint_lists() {
-        let distinct_keys: HashMap<i64, Vec<String>> =
-            HashMap::from([(1, vec!["zone".to_string()])]);
+    fn decouple_components_leaves_distinct_tasks_their_lists() {
         let mut placements = vec![
             planned("node-a", 1, &["node-a", "node-b"]),
             planned("node-c", 1, &["node-c", "node-d"]),
             planned("node-e", 2, &["node-e", "node-f"]),
         ];
-        Scheduler::decouple_plan_components(
-            &mut placements,
-            &distinct_keys,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-        assert_eq!(
-            placements[0].candidates.len(),
-            1,
-            "distinct-constrained placements couple even with disjoint lists"
-        );
-        assert_eq!(placements[1].candidates.len(), 1);
-        assert_eq!(
-            placements[2].candidates.len(),
-            2,
-            "the unrelated task keeps its list"
-        );
+        Scheduler::decouple_plan_components(&mut placements, &HashMap::new(), &HashMap::new());
+        for placement in &placements {
+            assert_eq!(placement.candidates.len(), 2);
+        }
     }
 
     #[test]
@@ -11164,22 +11128,17 @@ mod tests {
             planned("node-a", 1, &["node-a", "node-b"]),
             planned("node-c", 2, &["node-c", "node-d"]),
         ];
-        Scheduler::decouple_plan_components(&mut placements, &HashMap::new(), &groups, &sizes);
+        Scheduler::decouple_plan_components(&mut placements, &groups, &sizes);
         assert_eq!(placements[0].candidates.len(), 1);
         assert_eq!(placements[1].candidates.len(), 1);
     }
 
     #[test]
     fn decouple_components_leaves_a_single_placement_alone() {
-        let distinct_keys: HashMap<i64, Vec<String>> =
-            HashMap::from([(1, vec!["zone".to_string()])]);
+        let groups: HashMap<i64, String> = HashMap::from([(1, "app".to_string())]);
+        let sizes: HashMap<String, usize> = HashMap::from([("app".to_string(), 2)]);
         let mut placements = vec![planned("node-a", 1, &["node-a", "node-b"])];
-        Scheduler::decouple_plan_components(
-            &mut placements,
-            &distinct_keys,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
+        Scheduler::decouple_plan_components(&mut placements, &groups, &sizes);
         assert_eq!(
             placements[0].candidates.len(),
             2,

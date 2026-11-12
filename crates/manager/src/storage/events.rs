@@ -334,7 +334,33 @@ pub mod drafts {
         .meta(json!({
             "evalKind": eval.kind,
             "delayMs": delay.as_millis() as u64,
+            "reason": "plan_conflict",
             "error": format!("{error:#}"),
+        }))
+    }
+
+    /// `eval.requeued` for a handler that outran the eval loop's deadline
+    /// (docs/scheduler-and-eval-loop.md, "Handler deadline"). The same kind
+    /// as a conflict requeue, told apart by `meta.reason`.
+    pub fn eval_handler_timed_out(eval: &Eval, deadline: Duration, delay: Duration) -> EventDraft {
+        EventDraft::warn(
+            "eval.requeued",
+            format!(
+                "Eval {} ({}) handler ran past the {}s handler deadline; requeued, retrying in {}ms",
+                eval.id,
+                eval.kind,
+                deadline.as_secs(),
+                delay.as_millis()
+            ),
+        )
+        .job(&eval.job_id)
+        .node(&eval.node_name)
+        .eval(&eval.id)
+        .meta(json!({
+            "evalKind": eval.kind,
+            "delayMs": delay.as_millis() as u64,
+            "reason": "handler_timeout",
+            "deadlineMs": deadline.as_millis() as u64,
         }))
     }
 

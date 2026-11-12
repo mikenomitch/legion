@@ -150,6 +150,12 @@ neighbor rules a cause in or out, and which knob to turn), see
 - **`legion_eval_conflict_requeues_total`** (counter): evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
+- **`legion_eval_handler_timeouts_total{kind}`** (counter): eval handlers
+  that ran past the eval loop's five-minute handler deadline. The worker
+  stopped waiting, requeued the eval with a five-minute delay, and moved on
+  to the rest of its batch. The stuck handler's thread is not stopped. Any
+  nonzero value is a stuck handler worth reporting, with the `kind` it names
+  (see [Handler deadline](scheduler-and-eval-loop.md#handler-deadline)).
 - **`legion_evals_blocked{key_kind}`** (gauge): evals waiting blocked on
   capacity, by the kind of key they wait under: `class`, `node`,
   `escaped`, or `runtime` (the task's runtime is

@@ -60,6 +60,24 @@ only for plans with exactly one placement, everything else unchanged —
 simpler, but a GPU task + CPU sidecar in disjoint pools would forfeit
 late binding for no correctness reason.
 
+**Revised since.** Two of the three edges are gone; only the co-placement
+group remains. The overlap edge went first
+([plan-apply-conflict-reduction plan](../plans/plan-apply-conflict-reduction-plan.md)):
+the walk debits each bind from the node's in-transaction free pool. The
+`distinct` edge went on 2026-11-12, in place of Phase 4's "striped disjoint
+lists": the walk already seeds a `distinct` tracker from the task's committed
+allocations and checks every candidate against it, adding each bind as it
+goes (`load_allocation_task_state`), so a fallback onto a sibling's zone is
+skipped there. Keeping the edge only cost the fallback. Striping was the
+alternative: hand each replica a list disjoint from its siblings' by
+attribute value, so fallbacks can never collide. It was rejected because
+the planner can't see which zones a race will free or take, and the apply
+check is already exact. What it costs: a replica can't fall back to a zone
+an earlier sibling planned for, even if that sibling moved elsewhere,
+because the planner filtered that zone out of its list. Such a plan is
+rejected and replanned, which is what every `distinct` race cost before.
+Pinned by `plan_walk_enforces_distinct_across_fallbacks`.
+
 **Trade-off.** A count-N service on one pool is one coupled component
 and gains nothing from this plan until Phase 4 (striped disjoint lists,
 partial commit). Accepted: those plans are exactly where intra-plan
