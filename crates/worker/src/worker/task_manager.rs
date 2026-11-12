@@ -3436,6 +3436,54 @@ impl WorkerTaskManager {
         allocation_id >= 0 || self.claims.by_local_key(allocation_id).is_some()
     }
 
+    /// The first static port the payload's task pins (`ports[].static` in
+    /// `task_network`) that another allocation on this node still holds,
+    /// running or stopping, with that allocation's id.
+    fn static_port_holder(&self, payload: &TaskAllocation) -> Option<(u16, i64)> {
+        if payload.task_network.trim().is_empty() {
+            return None;
+        }
+        let declared: crate::structs::NetworkConfig =
+            serde_json::from_str(&payload.task_network).ok()?;
+        let wanted: Vec<u16> = declared
+            .ports
+            .iter()
+            .filter_map(|port| port.static_port)
+            .collect();
+        if wanted.is_empty() {
+            return None;
+        }
+        let held = self
+            .allocations
+            .iter()
+            .map(|(id, allocation)| (*id, allocation))
+            .chain(
+                self.draining
+                    .iter()
+                    .map(|(id, entry)| (*id, &entry.allocation)),
+            )
+            .chain(
+                self.terminating
+                    .iter()
+                    .map(|(id, entry)| (*id, &entry.allocation)),
+            )
+            .filter(|(id, _)| *id != payload.allocation_id);
+        for (id, allocation) in held {
+            let Some(network) = allocation.network.as_ref() else {
+                continue;
+            };
+            if let Some(port) = network
+                .ports
+                .iter()
+                .map(|port| port.host_port)
+                .find(|port| wanted.contains(port))
+            {
+                return Some((port, id));
+            }
+        }
+        None
+    }
+
     /// Hand over every task this worker is running or still stopping, for
     /// an in-process worker that stops its work when the process exits
     /// (macOS single-process dev mode; docs/task-runtime-container.md,
@@ -5044,6 +5092,19 @@ impl WorkerTaskManager {
             debug!(
                 allocation_id = alloc.id,
                 "Allocation already running with this payload; ignoring the duplicate dispatch"
+            );
+            return Ok(BeginOutcome::InFlight);
+        }
+        // A static port another allocation here still holds: the one a
+        // destructive rollout replaces, inside its graceful stop, or one the
+        // same reconcile is about to stop. Starting now would fail to bind;
+        // the next reconcile starts it once the port is free.
+        if let Some((port, holder)) = self.static_port_holder(allocation) {
+            debug!(
+                allocation_id = alloc.id,
+                port,
+                holder,
+                "Static port still held by another allocation on this node; deferring the start"
             );
             return Ok(BeginOutcome::InFlight);
         }
@@ -9014,6 +9075,64 @@ mod tests {
             allocation_id: None,
             session: None,
         }
+    }
+
+    /// TODO "Destructive static-port rollouts": a replacement whose static
+    /// port another allocation here still holds is not started (it would
+    /// fail to bind); it starts on a later reconcile once the port is free.
+    #[test]
+    fn a_static_port_replacement_waits_for_the_old_holder_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let with_port = |id: i64| {
+            let mut payload = provisional_payload(id);
+            payload.task_network =
+                json!({ "mode": "host", "ports": [{ "name": "http", "static": 18_481 }] })
+                    .to_string();
+            payload.network =
+                json!({ "ports": [{ "name": "http", "hostPort": 18_481 }] }).to_string();
+            payload
+        };
+        launch_task_allocation(&manager, &with_port(501))?;
+        assert!(manager.lock().expect("tm").allocation_pid(501).is_some());
+
+        let outcome = manager
+            .lock()
+            .expect("tm")
+            .begin_task_allocation(&with_port(502))?;
+        assert!(
+            matches!(outcome, BeginOutcome::InFlight),
+            "the old allocation still holds port 18481"
+        );
+        assert!(manager.lock().expect("tm").allocation_pid(502).is_none());
+
+        manager
+            .lock()
+            .expect("tm")
+            .stop_allocation_inner(501, true)?;
+        // Still inside its stop: the replacement keeps waiting.
+        if manager.lock().expect("tm").has_terminating() {
+            assert!(matches!(
+                manager
+                    .lock()
+                    .expect("tm")
+                    .begin_task_allocation(&with_port(502))?,
+                BeginOutcome::InFlight
+            ));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while manager.lock().expect("tm").has_terminating() {
+            manager.lock().expect("tm").reap_terminating();
+            assert!(std::time::Instant::now() < deadline, "501 never stopped");
+            thread::sleep(Duration::from_millis(20));
+        }
+        launch_task_allocation(&manager, &with_port(502))?;
+        assert!(
+            manager.lock().expect("tm").allocation_pid(502).is_some(),
+            "started once the port is free"
+        );
+        stop_and_reap(&manager);
+        Ok(())
     }
 
     /// An unratified provisional start is recorded beside the state file;
