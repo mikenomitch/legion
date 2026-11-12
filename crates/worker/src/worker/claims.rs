@@ -9,10 +9,14 @@
 //! provisional work unchanged, and ratification records the manager's id
 //! alongside the local key rather than moving anything.
 //!
-//! Both structures are in memory only, and that is a design decision, not an
-//! omission: a worker restart kills provisional work by design (plan §6.6), so
-//! there is nothing to persist for an unratified claim. Ratified claims are
-//! persisted through the normal allocation path, carrying their external id.
+//! Both structures are in memory only: a worker restart kills provisional
+//! work by design (plan §6.6), so an unratified claim is never restored. What
+//! is written down is only what that kill needs after a crash: each
+//! unratified claim's pid, start time, and cgroup leaf, in
+//! `provisional_claims.json` beside the state file
+//! ([`crate::worker::state::ProvisionalProcess`]), which the next worker
+//! process reads and stops. Ratified claims are persisted through the normal
+//! allocation path, carrying their external id.
 //!
 //! The two safety properties this module owns:
 //!

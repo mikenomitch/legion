@@ -971,6 +971,9 @@ pub struct WorkerTaskManager {
     /// without surviving a worker restart, and a warning says so).
     session_log: Option<crate::worker::session_log::SessionLog>,
     session_log_unavailable: bool,
+    /// The local keys last written to the provisional-claims file, so the
+    /// file is rewritten only when that set changes.
+    provisional_written: Vec<i64>,
     /// Session runs in flight and the replies of finished ones
     /// (docs/session-runs.md).
     run_registry: Arc<session_runs::RunRegistry>,
@@ -1159,6 +1162,7 @@ impl WorkerTaskManager {
             stage_waiters: HashMap::new(),
             session_log: None,
             session_log_unavailable: false,
+            provisional_written: Vec::new(),
             run_registry,
             idle_sessions: HashMap::new(),
             session_specs: HashMap::new(),
@@ -4224,6 +4228,9 @@ impl WorkerTaskManager {
             self.forget_session_extras(&claim.instance_id);
         }
         self.persist_state();
+        if !claim.is_session() {
+            self.persist_provisional();
+        }
         info!(
             claim_id,
             allocation_id,
@@ -4293,6 +4300,9 @@ impl WorkerTaskManager {
         self.terminated_reports
             .retain(|report| report.allocation_id != claim.local_key);
         self.allocation_health.remove(&claim.local_key);
+        if !claim.is_session() {
+            self.persist_provisional();
+        }
         Some(claim)
     }
 
@@ -5843,6 +5853,22 @@ impl WorkerTaskManager {
     }
 
     pub fn restore_allocations(&mut self) -> R<Vec<(Allocation, TaskConfig)>> {
+        // Unratified provisional work a crashed worker left running: nobody
+        // will ratify it now (its lease died with that process), so stop it.
+        for process in self.state_store.take_provisional() {
+            let stopped = stop_recorded_process(
+                Some(process.pid),
+                process.pid_start_time,
+                process.resource_assignment.as_ref(),
+            );
+            warn!(
+                claim_id = %process.claim_id,
+                local_key = process.local_key,
+                pid = process.pid,
+                stopped,
+                "Stopped an unratified provisional allocation a previous worker process left running"
+            );
+        }
         let loaded = self.state_store.load_records()?;
         if !loaded.unreadable.is_empty() {
             // What a previous worker wrote in a shape this build cannot read
@@ -6323,6 +6349,44 @@ impl WorkerTaskManager {
             self.persist_state();
         } else if claim.is_session() {
             self.log_running_session(local_key);
+        } else {
+            self.persist_provisional();
+        }
+    }
+
+    /// Write the processes of the unratified, non-session claims to the
+    /// provisional-claims file ([`crate::worker::state::ProvisionalProcess`]),
+    /// when the set of them has changed, so a worker restarted after a crash
+    /// stops them instead of leaving them running unmanaged. Sessions have
+    /// their own log.
+    fn persist_provisional(&mut self) {
+        let mut processes: Vec<crate::worker::state::ProvisionalProcess> = self
+            .claims
+            .unratified()
+            .into_iter()
+            .filter_map(|claim| {
+                let instance = self.instances.get(&claim.local_key)?;
+                let pid = instance.pid?;
+                Some(crate::worker::state::ProvisionalProcess {
+                    claim_id: claim.claim_id,
+                    local_key: claim.local_key,
+                    pid,
+                    pid_start_time: process_start_time(pid),
+                    resource_assignment: instance.resource_assignment.clone(),
+                })
+            })
+            .collect();
+        processes.sort_by_key(|process| process.local_key);
+        let keys: Vec<i64> = processes.iter().map(|process| process.local_key).collect();
+        if keys == self.provisional_written {
+            return;
+        }
+        match self.state_store.save_provisional(&processes) {
+            Ok(()) => self.provisional_written = keys,
+            Err(err) => warn!(
+                error = %format!("{err:#}"),
+                "Could not record provisional claims; a worker crash would leave them running"
+            ),
         }
     }
 
@@ -8950,6 +9014,66 @@ mod tests {
             allocation_id: None,
             session: None,
         }
+    }
+
+    /// An unratified provisional start is recorded beside the state file;
+    /// a worker restarted after a crash stops it rather than leaving it
+    /// running with nothing to stop it. Ratifying it takes it off the list.
+    #[test]
+    fn a_crash_does_not_leave_unratified_claims_running_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let admitted = manager
+            .lock()
+            .expect("task manager")
+            .admit_claim(claim_record("clm_crash", "user-1", Gate::Serve))?;
+        let payload = provisional_payload(admitted.local_key);
+        launch_provisional_allocation(&manager, &payload, &admitted.claim_id, Gate::Serve)?;
+        let pid = manager
+            .lock()
+            .expect("task manager")
+            .allocation_pid(admitted.local_key)
+            .expect("pid");
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let recorded: Vec<crate::worker::state::ProvisionalProcess> =
+            serde_json::from_slice(&std::fs::read(store.provisional_path())?)?;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].pid, pid);
+        assert_eq!(recorded[0].claim_id, "clm_crash");
+
+        // The worker "crashes": its state is dropped without stopping
+        // anything, and a new process restores from the same directory.
+        std::mem::forget(manager);
+        let mut restarted = manager_in(&temp_dir);
+        restarted.restore_allocations()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pid_is_running(pid) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!pid_is_running(pid), "the orphaned claim was stopped");
+        assert!(!store.provisional_path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_killed_claim_leaves_the_provisional_record_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let admitted = manager
+            .lock()
+            .expect("task manager")
+            .admit_claim(claim_record("clm_ok", "user-2", Gate::Serve))?;
+        let payload = provisional_payload(admitted.local_key);
+        launch_provisional_allocation(&manager, &payload, &admitted.claim_id, Gate::Serve)?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        assert!(store.provisional_path().exists());
+        let mut guard = manager.lock().expect("task manager");
+        guard.kill_claim(&admitted.claim_id, "test over");
+        assert!(
+            !store.provisional_path().exists(),
+            "a killed claim leaves the record"
+        );
+        Ok(())
     }
 
     #[test]

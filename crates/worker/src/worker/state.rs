@@ -92,6 +92,25 @@ pub struct LoadedState {
     pub unreadable: Vec<UnreadableRecord>,
 }
 
+/// The process of one unratified provisional claim (docs/edge-boot.md),
+/// written so that a worker restarted after a crash stops it.
+///
+/// Unratified work is never adopted: the manager does not know it, its
+/// lease died with the worker, and a ratified copy may run elsewhere. Only
+/// what is needed to stop it is kept, apart from the state file, so a
+/// provisional start does not pay a full state write.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionalProcess {
+    pub claim_id: String,
+    pub local_key: i64,
+    pub pid: u32,
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
+    #[serde(default)]
+    pub resource_assignment: Option<crate::task_plugins::ResourceAssignment>,
+}
+
 /// A persisted record this build cannot read in full: what could be read of
 /// it, which is enough to stop the process it describes.
 #[derive(Debug, Clone)]
@@ -247,6 +266,43 @@ impl WorkerStateStore {
             .parent()
             .map(|parent| parent.join("rootfs-cache"))
             .unwrap_or_else(|| PathBuf::from("rootfs-cache"))
+    }
+
+    /// The processes of unratified provisional claims
+    /// (`<state-dir>/provisional_claims.json`; see [`ProvisionalProcess`]).
+    pub fn provisional_path(&self) -> PathBuf {
+        self.path.with_file_name("provisional_claims.json")
+    }
+
+    /// Replace the provisional-claims file; an empty list removes it. Not
+    /// fsynced: the file answers a worker *process* crash, which the page
+    /// cache survives, while a host crash takes the processes with it.
+    pub fn save_provisional(&self, processes: &[ProvisionalProcess]) -> R<()> {
+        let path = self.provisional_path();
+        if processes.is_empty() {
+            match fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(err).with_context(|| format!("remove {}", path.display()))
+                }
+                _ => return Ok(()),
+            }
+        }
+        self.ensure_state_dir()?;
+        write_owner_only(&path, serde_json::to_string(processes)?.as_bytes(), false)
+    }
+
+    /// Read and remove the provisional-claims file a previous worker process
+    /// left. Unreadable content is dropped with a warning.
+    pub fn take_provisional(&self) -> Vec<ProvisionalProcess> {
+        let path = self.provisional_path();
+        let Ok(contents) = fs::read(&path) else {
+            return Vec::new();
+        };
+        let _ = fs::remove_file(&path);
+        serde_json::from_slice(&contents).unwrap_or_else(|err| {
+            warn!(path = %path.display(), error = %err, "Unreadable provisional-claims file; ignoring it");
+            Vec::new()
+        })
     }
 
     /// The node's session log (`<state-dir>/sessions.db`, session
