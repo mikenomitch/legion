@@ -593,7 +593,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             );
         }
     }
-    apply_container_env(&config.container);
+    let allow_caps = apply_container_env(&config.container);
     let runtime_classes = apply_runtime_classes(&config.container);
     // One host guard for the datapath and artifact fetches alike.
     let host_guard = Arc::new(host_guard_for(&config.security));
@@ -928,6 +928,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             json!(runtime_classes),
         );
     }
+    // The capabilities container tasks may have here: a task that adds one
+    // beyond the default set carries an implicit `container.allowCaps
+    // contains` constraint, so it places only where it would start.
+    config_attrs.insert(
+        crate::task_plugins::ALLOW_CAPS_ATTR.into(),
+        json!(crate::task_plugins::allow_caps_attribute(&allow_caps)),
+    );
     // A runc too old for idmapped mounts fails every default container
     // start; saying so keeps user-namespaced container tasks off this node.
     if let Some(value) =
@@ -2047,7 +2054,7 @@ fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforce
 /// block) clears it, which is the default allowlist. A payload that does not
 /// parse also falls back to the default, with a warning: the default is the
 /// narrow side, so a bad config never grants more than it meant to.
-fn apply_container_env(raw: &str) {
+fn apply_container_env(raw: &str) -> crate::task_plugins::CapabilityAllowlist {
     let allowlist = crate::structs::WorkerContainerConfig::from_payload(raw)
         .and_then(|config| {
             crate::task_plugins::CapabilityAllowlist::from_config(config.allow_caps.as_deref())
@@ -2072,6 +2079,7 @@ fn apply_container_env(raw: &str) {
             allowlist.to_env_value(),
         );
     }
+    allowlist
 }
 
 /// Publishes the worker type's OCI runtime classes to the container runtime

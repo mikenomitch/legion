@@ -52,8 +52,8 @@ pub mod vsock_exec;
 
 pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
 pub use container::{
-    container_task_capabilities, idmapped_mounts_attribute, ContainerTaskPlugin,
-    IDMAPPED_MOUNTS_ATTR,
+    allow_caps_attribute, container_task_capabilities, idmapped_mounts_attribute,
+    ContainerTaskPlugin, ALLOW_CAPS_ATTR, IDMAPPED_MOUNTS_ATTR,
 };
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};

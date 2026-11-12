@@ -268,6 +268,10 @@ const STRUCTURAL_NODE_ATTRS: &[&str] = &[
     "container.runtimeClasses",
     // crate::task_plugins::IDMAPPED_MOUNTS_ATTR
     "container.idmappedMounts",
+    // crate::task_plugins::ALLOW_CAPS_ATTR
+    "container.allowCaps",
+    // crate::structs::host_guard::NODE_RULES_ATTR
+    "hostGuardRules",
 ];
 
 /// Whether `key` is a node attribute Legion reads as structure.

@@ -392,6 +392,80 @@ pub fn idmapped_mounts_attribute() -> Option<&'static str> {
     idmapped_mount_gap(&binary, &version).map(|_| "unsupported")
 }
 
+/// The node attribute a worker advertises its container capability
+/// allowlist under (the worker type's `container.allowCaps`, expanded: `ALL`
+/// becomes every capability name). A container task whose effective set
+/// holds a capability outside the default set carries an implicit
+/// `container.allowCaps contains "CAP_X"` for each such one
+/// ([`constrain_to_allowed_capabilities`]), so it places only on a node that
+/// would start it.
+pub const ALLOW_CAPS_ATTR: &str = "container.allowCaps";
+
+/// This node's value for [`ALLOW_CAPS_ATTR`]. Apple `container` ignores the
+/// capability fields, so a macOS node takes any task and advertises every
+/// name.
+pub fn allow_caps_attribute(allowlist: &oci_bundle::CapabilityAllowlist) -> Vec<String> {
+    let apple = matches!(
+        ContainerRuntime::detect(),
+        Ok(ContainerRuntime::AppleContainer)
+    );
+    match allowlist {
+        _ if apple => oci_bundle::ALL_CAPABILITIES
+            .iter()
+            .map(|cap| cap.to_string())
+            .collect(),
+        oci_bundle::CapabilityAllowlist::All => oci_bundle::ALL_CAPABILITIES
+            .iter()
+            .map(|cap| cap.to_string())
+            .collect(),
+        oci_bundle::CapabilityAllowlist::Only(caps) => caps.clone(),
+    }
+}
+
+/// Give a container task whose effective capability set reaches beyond the
+/// default set one implicit `container.allowCaps contains "CAP_X"` per such
+/// capability, so the scheduler places it only where the node's allowlist
+/// would let it start (a refused start used to fail on the node). A task
+/// constrained to macOS, and one whose config does not parse (it fails
+/// validation on its own), gets none. Idempotent.
+fn constrain_to_allowed_capabilities(task: &mut TaskConfig) {
+    if constrained_to_macos(task) {
+        return;
+    }
+    let Ok(caps) =
+        ContainerTaskConfig::from_value(&task.config).and_then(|config| config.capabilities())
+    else {
+        return;
+    };
+    let extra: Vec<String> = caps
+        .into_iter()
+        .filter(|cap| !oci_bundle::DEFAULT_CAPABILITIES.contains(&cap.as_str()))
+        .collect();
+    if extra.is_empty() {
+        return;
+    }
+    let mut rules = match std::mem::take(&mut task.constraints) {
+        Value::Array(rules) => rules,
+        Value::Object(map) => map
+            .into_iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect(),
+        Value::Null => Vec::new(),
+        other => {
+            task.constraints = other;
+            return;
+        }
+    };
+    for cap in extra {
+        let rule =
+            serde_json::json!({ "key": ALLOW_CAPS_ATTR, "operator": "contains", "value": cap });
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    task.constraints = Value::Array(rules);
+}
+
 /// Give a user-namespaced container task (the default) the implicit
 /// constraint `container.idmappedMounts is_not_set`, so it places only on
 /// nodes whose OCI runtime can start it. Constraints in the object form
@@ -1160,9 +1234,13 @@ impl TaskPlugin for ContainerTaskPlugin {
     ///   `container.idmappedMounts is_not_set`, so it never places on a node
     ///   whose runc predates idmapped mounts ([`constrain_to_idmapped_mounts`]);
     /// - a task that names a runtime class places only where the class is
-    ///   (the node attribute `container.runtimeClasses`).
+    ///   (the node attribute `container.runtimeClasses`);
+    /// - a task that adds a capability beyond the default set places only
+    ///   where the node's `container.allowCaps` allows it
+    ///   ([`constrain_to_allowed_capabilities`]).
     fn normalize_task(&self, task: &mut TaskConfig) {
         constrain_to_idmapped_mounts(task);
+        constrain_to_allowed_capabilities(task);
         crate::task_plugins::runtime_class::constrain_to_class(task);
     }
 
@@ -2886,6 +2964,80 @@ mod tests {
             );
             assert_eq!(argv, vec![binary, "exec", "legion-node-1-42", "/bin/true"]);
         }
+    }
+
+    /// TODO "Capability-aware placement": a task that adds a capability
+    /// beyond the default set places only on a node whose advertised
+    /// `container.allowCaps` holds it, instead of placing anywhere and
+    /// failing at start. A task within the default set gets no constraint.
+    #[test]
+    fn a_task_adding_capabilities_places_only_where_they_are_allowed_test() -> R<()> {
+        let node = |caps: Vec<String>| crate::structs::Node {
+            id: "n".into(),
+            pool: "default".into(),
+            status: "ready".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
+            config_attrs: serde_json::json!({ ALLOW_CAPS_ATTR: caps }),
+            fingerprint_attrs: serde_json::json!({}),
+            dynamic_attrs: serde_json::json!({}),
+            health_checks: serde_json::json!({}),
+        };
+        let default_node = node(oci_bundle::CapabilityAllowlist::default().to_config());
+        let admin_node = node(
+            oci_bundle::CapabilityAllowlist::from_config(Some(&["NET_ADMIN".to_string()]))?
+                .to_config(),
+        );
+        let all_node = node(
+            oci_bundle::ALL_CAPABILITIES
+                .iter()
+                .map(|cap| cap.to_string())
+                .collect(),
+        );
+
+        let mut task = TaskConfig {
+            config: serde_json::json!({
+                "image": "alpine",
+                "command": ["sleep", "1"],
+                "security": { "capabilities": { "add": ["NET_ADMIN"], "drop": ["CHOWN"] } },
+            }),
+            ..TaskConfig::new("vpn", "container")
+        };
+        ContainerTaskPlugin.normalize_task(&mut task);
+        ContainerTaskPlugin.normalize_task(&mut task);
+        let caps_rules: Vec<&Value> = task
+            .constraints
+            .as_array()
+            .expect("list form")
+            .iter()
+            .filter(|rule| rule["key"] == ALLOW_CAPS_ATTR)
+            .collect();
+        assert_eq!(caps_rules.len(), 1, "idempotent: {caps_rules:?}");
+        assert_eq!(caps_rules[0]["value"], "CAP_NET_ADMIN");
+        let constraints = crate::constraints::ConstraintSet::new(&task.constraints)?;
+        assert!(!constraints.is_satisfied(&default_node, None));
+        assert!(constraints.is_satisfied(&admin_node, None));
+        assert!(constraints.is_satisfied(&all_node, None));
+
+        let mut narrow = TaskConfig {
+            config: serde_json::json!({
+                "image": "alpine",
+                "command": ["sleep", "1"],
+                "security": { "capabilities": { "drop": ["ALL"] } },
+            }),
+            ..TaskConfig::new("narrow", "container")
+        };
+        ContainerTaskPlugin.normalize_task(&mut narrow);
+        assert!(!narrow
+            .constraints
+            .as_array()
+            .is_some_and(|rules| rules.iter().any(|rule| rule["key"] == ALLOW_CAPS_ATTR)));
+        assert_eq!(
+            allow_caps_attribute(&oci_bundle::CapabilityAllowlist::All).len(),
+            oci_bundle::ALL_CAPABILITIES.len()
+        );
+        Ok(())
     }
 
     /// Regression (TODO "`container: pass` readiness"): a runc before 1.2

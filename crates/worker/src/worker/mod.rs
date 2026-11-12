@@ -59,6 +59,8 @@ mod node_attr_test {
             crate::task_plugins::sandbox_addr::BRIDGES_ATTR,
             crate::task_plugins::runtime_class::NODE_ATTR,
             crate::task_plugins::IDMAPPED_MOUNTS_ATTR,
+            crate::task_plugins::ALLOW_CAPS_ATTR,
+            crate::structs::host_guard::NODE_RULES_ATTR,
         ] {
             assert!(crate::structs::node::is_structural_node_attr(key), "{key}");
         }
