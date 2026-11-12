@@ -791,7 +791,8 @@ Two code paths exist:
   `legion_nodes_recovered_total{path="reconcile"}`. See
   [node-liveness.md](node-liveness.md).
 - Capacity pass: a worker registration or an uncordon queues one `node_join`
-  eval with no node. It re-evaluates jobs short of their count and jobs with
+  eval with no node, and so, while some plan has left replicas unplaced,
+  does freed capacity or a lost node heartbeating again. It re-evaluates jobs short of their count and jobs with
   `count.per` tasks that have no pending or blocked eval (see
   [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
   A job whose placement found no room has a blocked eval, which the

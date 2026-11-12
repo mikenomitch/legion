@@ -214,6 +214,10 @@ minted key wraps none of the data keys, so (b) would hand back a useless key.
 
 ## 10. Capacity wakeups are one nodeless `node_join` eval (SC4)
 
+> **Revised 2026-11-12:** the remaining triggers (heartbeat recovery, and
+> frees outside the report handlers) now come from the blocked-eval wake
+> loop; see [correctness-gaps calls #2](correctness-gaps-2026-11-12_calls.md).
+
 **Call.** Worker registration and uncordon call
 `Store::request_capacity_reconcile`, which queues one `node_join` eval with no
 node unless one is already pending. It reconciles configs that are short of
@@ -351,6 +355,10 @@ merging this with R4, a fenced manager skips the final sync, because the
 replica belongs to the new primary by then.
 
 ## 17. Fresh plans still count the replaced job's allocations as free (SC7, not changed)
+
+> **Superseded 2026-11-12:** the atomic swap shipped; the apply transaction
+> removes the replaced allocations after the walk binds. See
+> [correctness-gaps calls #1](correctness-gaps-2026-11-12_calls.md).
 
 **Call.** No change. Counting the old config's allocations as free during a
 Fresh plan is deliberate and documented in `plan_and_apply_internal`.

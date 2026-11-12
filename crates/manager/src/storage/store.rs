@@ -1030,6 +1030,17 @@ struct AppliedEvictions {
     metric_rows: Vec<(String, String, String, u64)>,
 }
 
+/// What a Fresh plan's apply removed of the versions it replaces
+/// ([`Store::retire_replaced_allocations_tx`]).
+#[derive(Debug, Default)]
+struct RetiredAllocations {
+    /// The deleted rows.
+    allocations: Vec<Allocation>,
+    /// `allocation.stopping` and `allocation.removed`, staged in the
+    /// transaction and published after it commits.
+    events: Vec<SchedulerEventRecord>,
+}
+
 /// What a heartbeat from a given node costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BeatDisposition {
@@ -1503,11 +1514,12 @@ impl PlanApplyEffects {
         }
     }
 
-    /// Record the allocations this plan evicted: same scopes, spliced
-    /// out. Placed and evicted rows land in ONE publish (they are one
-    /// delta), so the mirror never passes through the intermediate state
-    /// a remove-then-add pair of refreshes exposed.
-    fn touch_evicted(&mut self, allocations: &[Allocation]) {
+    /// Record the allocations this plan removed (its evictions, and the
+    /// older versions a Fresh plan replaced): same scopes, spliced out.
+    /// Placed and removed rows land in ONE publish (they are one delta), so
+    /// the mirror never passes through the intermediate state a
+    /// remove-then-add pair of refreshes exposed.
+    fn touch_removed(&mut self, allocations: &[Allocation]) {
         for allocation in allocations {
             self.node_ids.insert(allocation.node_id.clone());
             self.job_config_ids.insert(allocation.job_config_id.clone());
@@ -6408,10 +6420,11 @@ impl Store {
         //
         // Mirror the planner's ledger view: a Fresh plan replaces the JOB's
         // allocations wholesale, so `plan_and_apply` drops every allocation
-        // of the planned config's job before planning (`drop_replaced`) —
-        // `handle_job_submit` only deletes the previous config's rows after
-        // this apply, so those rows are still in the table here and must not
-        // be double counted. Reschedule plans drop nothing.
+        // of the planned config's job before planning (`SnapshotDrop::Job`).
+        // The previous config's rows are still in the table during the walk
+        // (this transaction removes them after it binds,
+        // `retire_replaced_allocations_tx`), so they must not be double
+        // counted. Reschedule plans drop nothing.
         let drop_own = plan_mode == "fresh";
         let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
         // What each rebuilt pool was derived from, kept so the plan can hand
@@ -6753,6 +6766,21 @@ impl Store {
         // Hand the next plan a warm cache. Runs AFTER the epoch bumps above,
         // because the epoch is part of the fingerprint the next plan checks.
         self.publish_node_usage_tx(tx, &mut pool_usage, &allocations, &task_requests)?;
+        // A Fresh plan was built, and its pools above were rebuilt, as
+        // though the job's older configs held nothing (`drop_own`). Make
+        // that true in this same transaction: their allocations leave as
+        // the new ones arrive, so no committed state, and no crash between
+        // two writes, has both versions on a node (audit SC7). After the
+        // walk on purpose: the walk's node-epoch fence compares against the
+        // plan's snapshot, and these removals are this plan's own writes;
+        // and the new allocations already exist, so a stateful instance the
+        // old version held rebinds to its replacement rather than passing
+        // through `rescheduling` (`release_instance_bindings_tx`).
+        let replaced = if plan_mode == "fresh" && target_instance.is_none() {
+            self.retire_replaced_allocations_tx(tx, &submission.job_config_id)?
+        } else {
+            RetiredAllocations::default()
+        };
         if body_savepoint {
             tx.execute_batch("RELEASE legion_plan_body;")?;
         }
@@ -6762,13 +6790,18 @@ impl Store {
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
                 .and_then(|draft| self.stage_event_locked(tx, draft));
         let mut effects = PlanApplyEffects {
-            events: placed_event.into_iter().chain(preempted.events).collect(),
+            events: placed_event
+                .into_iter()
+                .chain(preempted.events)
+                .chain(replaced.events)
+                .collect(),
             ..PlanApplyEffects::default()
         };
-        // Evicted and placed rows refresh together, in one read of
-        // committed state — the mirror never passes through the
+        // Evicted, replaced and placed rows refresh together, in one read
+        // of committed state — the mirror never passes through the
         // intermediate state a remove-then-add pair of refreshes exposed.
-        effects.touch_evicted(&preempted.victims);
+        effects.touch_removed(&preempted.victims);
+        effects.touch_removed(&replaced.allocations);
         effects.touch_placed(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         debug!(
@@ -7340,6 +7373,79 @@ impl Store {
                 .into_iter()
                 .map(|((pool, band, namespace), count)| (pool, band, namespace, count))
                 .collect(),
+        })
+    }
+
+    /// Remove, inside a Fresh plan's apply transaction, every allocation of
+    /// the planned job that belongs to another of its configs: the version
+    /// the plan replaces. The planner and the apply walk both counted these
+    /// rows as free (`SnapshotDrop::Job`, `drop_own`), so leaving them for
+    /// a later write overcommitted their nodes until it landed, and a crash
+    /// in between kept the overcommit until the next failover (audit SC7).
+    ///
+    /// The removal is what `remove_allocs_for_job_config` did after the
+    /// apply, moved into it: the stateful instances the rows held rebind to
+    /// the plan's new allocations (or go to `rescheduling` when the plan
+    /// left theirs unplaced), the epochs move, the workers get an `update`
+    /// stop notice, and the events are staged. The planned config's own
+    /// rows are left alone, as before: `job_update` removes them before its
+    /// plan, and a first submit has none.
+    fn retire_replaced_allocations_tx(
+        &self,
+        tx: &Connection,
+        job_config_id: &str,
+    ) -> R<RetiredAllocations> {
+        let attrs = crate::storage::queries::ALLOCATION_WITH_JOB_ATTRS;
+        let mut stmt = tx.prepare_cached(&format!(
+            "SELECT {attrs} FROM allocation \
+             INNER JOIN job_config ON job_config.id = allocation.job_config_id \
+             WHERE job_config.job_id = (SELECT job_id FROM job_config WHERE id = ?1) \
+               AND allocation.job_config_id != ?1 \
+             ORDER BY allocation.id;"
+        ))?;
+        let replaced = Self::collect_rows(
+            stmt.query_map([job_config_id], |row| self.allocation_from_row(row))?,
+        )?;
+        drop(stmt);
+        if replaced.is_empty() {
+            return Ok(RetiredAllocations::default());
+        }
+
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM allocation WHERE id = ?;")?;
+            for allocation in &replaced {
+                delete.execute([allocation.id])?;
+            }
+        }
+        self.release_instance_bindings_tx(tx, &replaced)?;
+        self.bump_epochs_for_allocations_tx(tx, &replaced)?;
+
+        let mut events = Vec::new();
+        if let Some(event) = self.record_stop_notices_tx(tx, &replaced, StopCause::Update)? {
+            events.push(event);
+        }
+        let mut by_config: BTreeMap<&str, Vec<Allocation>> = BTreeMap::new();
+        for allocation in &replaced {
+            by_config
+                .entry(allocation.job_config_id.as_str())
+                .or_default()
+                .push(allocation.clone());
+        }
+        for (replaced_config, group) in by_config {
+            if let Some(event) = drafts::allocations_removed_for_job_config(replaced_config, &group)
+                .and_then(|draft| self.stage_event_locked(tx, draft))
+            {
+                events.push(event);
+            }
+        }
+        debug!(
+            %job_config_id,
+            replaced = replaced.len(),
+            "Fresh plan retired the allocations of the version it replaces"
+        );
+        Ok(RetiredAllocations {
+            allocations: replaced,
+            events,
         })
     }
 
@@ -17928,6 +18034,18 @@ impl Store {
                             "Reconciled job config allocations"
                         );
                     }
+                    // A capacity pass or a lost node's replan that still
+                    // left work behind says so, like an eval's plan does.
+                    if !outcome.unplaced.is_empty() {
+                        if let Some(job_id) = self.job_id_for_job_config(job_config_id)? {
+                            self.events().plan_unplaced(
+                                &job_id,
+                                job_config_id,
+                                None,
+                                &outcome.unplaced,
+                            );
+                        }
+                    }
                     return Ok(());
                 }
                 Err(err) if Eval::error_is_plan_conflict(&err) => {
@@ -17960,7 +18078,7 @@ impl Store {
 
     /// Reconcile several job configs, isolating failures.
     ///
-    /// The node-loss, drain, and new-node passes call this AFTER they have
+    /// The node-loss and drain passes call this AFTER they have
     /// already removed the allocations being replaced, so a reconcile that
     /// fails with nothing queued behind it leaves the job under-count with
     /// no retry: the node holds no allocations any more, so the lost-node
@@ -18424,7 +18542,41 @@ impl Store {
                 job_config_ids.push(job_config_id);
             }
         }
-        self.reconcile_job_configs_or_requeue(job_config_ids)
+        // Unlike the node-loss and drain passes, this one removed nothing
+        // first, so a plan that still finds no room leaves the job exactly
+        // as it was: waiting, with `capacity_waiters` set again by that
+        // plan, for the next capacity event. A delayed `job_reschedule`
+        // here would only make the next pass skip the job (it has an eval
+        // queued) until the delay ran out. Any other failure still gets
+        // the retry.
+        let mut unqueued_error = None;
+        for job_config_id in job_config_ids {
+            let Err(error) = self.reconcile_job_config_allocations(&job_config_id) else {
+                continue;
+            };
+            if crate::manager::blocked::PlacementBlocked::in_chain(&error).is_some() {
+                debug!(
+                    %job_config_id,
+                    error = %format!("{error:#}"),
+                    "Capacity pass still found no room; the job waits for the next capacity event"
+                );
+                continue;
+            }
+            // Otherwise as `reconcile_job_configs_or_requeue`.
+            let Some(job_id) = self.job_id_for_job_config(&job_config_id)? else {
+                continue;
+            };
+            if self
+                .queue_reschedule_retry(&job_id, &job_config_id, &error)
+                .is_err()
+            {
+                unqueued_error.get_or_insert(error);
+            }
+        }
+        match unqueued_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     #[instrument(err, skip_all)]

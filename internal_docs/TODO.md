@@ -166,33 +166,6 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       coupling, so a pin invalidated mid-plan (`volume delete --force`) can still
       direct a placement. Low severity; reconciliation covers it.
 
-### Correctness gaps
-
-- [ ] **Fresh plans overcommit while the old config still runs** (audit SC7).
-      Apply counts the replaced job's allocations as free. Remove them inside the
-      same apply, with care for stateful release and rebind
-      ([calls #17](calls/architecture-audit-2026-10-09_calls.md)).
-- [ ] **The capacity pass has triggers it doesn't listen to yet** (audit SC4).
-      Allocations freed by stop or scale-in and a node recovering by heartbeat
-      queue nothing, and batch tasks are never woken ([calls #10](calls/architecture-audit-2026-10-09_calls.md)).
-- [ ] **A partly placed job says nothing about the envelopes it left out.**
-      When a session task's envelope does not fit an eligible node, the
-      only traces are the "Placed N allocation(s)" event and a manager
-      WARN log line; the pending/capacity-demand view skips `count.per`
-      tasks, so an unplaced envelope never shows as pending
-      ([`pending_capacity_work`](../crates/manager/src/storage/store/demand_ops.rs));
-      and a session start or run on that task then answers
-      `FAILED_PRECONDITION no node runs an envelope for <job>/<task> yet`,
-      which misleads when the node is eligible but full
-      ([`sessions.rs`](../crates/manager/src/manager/sessions.rs)). The
-      cheapest diagnostic: one warn-level scheduler event per eval naming
-      each unplaced task with its reason, from `outcome.unplaced`
-      ([`eval.rs`](../crates/manager/src/manager/eval.rs)). Found while
-      chasing an isolate test harness whose node was sized from its
-      fingerprint, not `config_attrs.resources`
-      ([`ResourcePool::from_node`](../crates/common/src/resources.rs));
-      pre-existing for every session task.
-
 ### Placement features
 
 - [ ] **Soft taints.** Pools act as hard taints (`crates/common/src/constraints.rs`) and the
@@ -1661,11 +1634,20 @@ judgement calls in [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-
 - **Removed, pending a full verify pass**: the Verify list (runs needing real hardware, KVM, macOS, root on cgroup v2, or the AWS rig); it is rebuilt from that pass rather than kept here.
 - **Removed, decided**: seventeen limitations and ideas, each with where its decision lives ([calls #10](calls/todo-closeout-2026-11-10_calls.md)).
 
+## Correctness gaps closed (2026-11-12)
+
+The three "Correctness gaps" under Scheduling & placement; judgement calls in
+[correctness-gaps-2026-11-12_calls.md](calls/correctness-gaps-2026-11-12_calls.md).
+
+- **A resubmit no longer overcommits while the old version runs** (audit SC7): a Fresh plan's apply transaction removes the replaced config's allocations after its placements bind, so no committed state holds both versions; stateful slots rebind to their replacement in the same transaction ([calls #1](calls/correctness-gaps-2026-11-12_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#placement-application-and-conflict-safety)).
+- **Every capacity event on a schedulable node can queue the capacity pass** (audit SC4, finished): a lost node heartbeating again, and frees from preemption, drains, and gang losses, retry jobs left short, from the blocked-eval wake loop; stop, scale-in, and unfinished batch tasks were already covered ([calls #2](calls/correctness-gaps-2026-11-12_calls.md) · [docs](../docs/scheduler-and-eval-loop.md)).
+- **A partly placed job says what it left**: a warn `plan.unplaced` event per eval or capacity-pass replan names each unplaced task (a `count.per` envelope included) with its reason, and a session start that finds no envelope quotes that reason instead of implying no node is eligible ([calls #3, #4](calls/correctness-gaps-2026-11-12_calls.md) · [docs](../docs/event-stream.md) · [docs](../docs/session-mode.md)).
+
 ## Spot checks, audits and security closures
 
 - **Pre-launch spot check fixes (2026-10-11, #17)** — workers on other hosts (reachable bind, mTLS, CSR issuance); task lifecycle (batch finish, restart policies, staged health checks, stderr in failures); scheduler (DAG waits, static ports, partial placement); manager availability (worker failover, follower write forwarding, `transfer-leader`); Linux container hardening and install guide; CLI/diagnostics (`--json` everywhere, camelCase); `ListManagers` lists every raft member; cluster-wide CA pin after failover; CH VMM versions compared as semver ([findings](launch-spot-check-findings.md) · [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md))
 - **AWS spot-check re-run fixes (2026-10-12)** — exponential reschedule backoff as a replicated `reschedule_hold` with events and `--force-reschedule`; slot instances return to their volume's node uncharged; per-address `~/.legion/tokens/`; SIGPIPE exit 141; `state query` errors as `InvalidArgument`; errors name CLI flags; MCP node attrs as objects; `job plan` previews age-gated preemption; instance `nodeId`; macOS `--run-worker` stops its containers on shutdown ([calls](calls/launch-spot-check-fixes-plan_calls.md))
-- **Architecture audit (2026-10-09)** — worker W1–W6 (W3 partial), raft/store R1–R5 (R5 partial), scheduler SC1–SC6 (SC4 partial), manager lifecycle M1–M6 (M6 partial) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
+- **Architecture audit (2026-10-09)** — worker W1–W6 (W3 partial), raft/store R1–R5 (R5 partial), scheduler SC1–SC7 (SC4 and SC7 finished 2026-11-12), manager lifecycle M1–M6 (M6 partial) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
 - **Sandbox spot check (2026-10-12)** — `node.pressure` events from a lane-less follower are forwarded and journaled ([calls](calls/durability-and-ops-execution-plan_calls.md) · [docs](../docs/event-stream.md))
 - **Swappable seams (2026-10-14)** — one datapath `Attachment`, one listener/dialer (`netd::listen`), typed `netd::Netd` boundary, DNS on `hickory-proto`, egress proxy HTTP on hyper (pipelined requests judged), mesh upstreams honour `mesh_tls`, one object-storage layer (`crates/worker/src/objects/`), VIP blocks follow the node's OS ([plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [docs](../docs/codebase-conventions.md#datapath-conventions))
 - **Pluggable cluster CA providers** — `clusterCa.provider = builtin | file | exec` with a Vault PKI helper and `legion net ca provider test` ([plan](plans/cluster-ca-provider-plan.md) · [calls](calls/cluster-ca-provider-plan_calls.md) · [docs](../docs/cluster-ca.md))

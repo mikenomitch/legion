@@ -385,6 +385,53 @@ pub mod drafts {
         }))
     }
 
+    /// `plan.unplaced` (warn) — a plan placed part of a job and left the
+    /// rest unplaced. One event per eval (or capacity-pass reconcile) that
+    /// leaves work behind, naming each unplaced task with its count and the
+    /// planner's reason. A plan that places nothing blocks its eval instead
+    /// (`eval.blocked`), so this covers the partial case, which before
+    /// showed only as `allocation.placed` and a manager log line. A
+    /// `count.per` task (a session's envelope) is listed when an eligible
+    /// node has no room for it. `None` when nothing was left unplaced.
+    pub fn plan_unplaced(
+        job_id: &str,
+        job_config_id: &str,
+        eval_id: Option<&str>,
+        unplaced: &[crate::manager::scheduler::UnplacedTask],
+    ) -> Option<EventDraft> {
+        if unplaced.is_empty() {
+            return None;
+        }
+        let count: u32 = unplaced.iter().map(|task| task.count).sum();
+        let tasks = unplaced
+            .iter()
+            .map(|task| format!("{} ({}): {}", task.task_name, task.count, task.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let draft = EventDraft::warn(
+            "plan.unplaced",
+            format!("Job {job_id} left {count} allocation(s) unplaced: {tasks}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "jobConfigId": job_config_id,
+            "unplaced": count,
+            "tasks": unplaced
+                .iter()
+                .map(|task| json!({
+                    "task": task.task_name,
+                    "taskConfigId": task.task_config_id,
+                    "count": task.count,
+                    "reason": task.reason,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+        Some(match eval_id {
+            Some(eval_id) => draft.eval(eval_id),
+            None => draft,
+        })
+    }
+
     /// `eval.unblocked` — capacity that could help a blocked eval appeared
     /// (`cause`: `register`, `node`, `ready`, `freed`, or `missed` when it
     /// appeared while the eval was still running), or a manager starting as
@@ -2961,6 +3008,22 @@ impl EventRecorder<'_> {
             job_id,
             removed_count,
             cause,
+        ));
+    }
+
+    /// `plan.unplaced` — see [`drafts::plan_unplaced`].
+    pub fn plan_unplaced(
+        self,
+        job_id: &str,
+        job_config_id: &str,
+        eval_id: Option<&str>,
+        unplaced: &[crate::manager::scheduler::UnplacedTask],
+    ) {
+        self.emit_opt(drafts::plan_unplaced(
+            job_id,
+            job_config_id,
+            eval_id,
+            unplaced,
         ));
     }
 

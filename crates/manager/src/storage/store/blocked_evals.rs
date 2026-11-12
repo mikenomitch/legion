@@ -227,6 +227,45 @@ impl Store {
         self.request_runtime_wake();
     }
 
+    /// Why the scheduler last left `job_id`'s task `task_name` unplaced, if
+    /// it recorded a reason: the job's blocked eval when it blocked on that
+    /// task (a plan that placed nothing), else the newest `plan.unplaced`
+    /// event naming it (a plan that placed the rest). `None` when neither
+    /// says anything about the task. For error messages that would
+    /// otherwise have to guess, such as a session start finding no envelope
+    /// on an eligible node that is full. The event read walks the bounded
+    /// journal newest first, on an error path only.
+    pub fn last_unplaced_reason(&self, job_id: &str, task_name: &str) -> R<Option<String>> {
+        if let Some(blocked) = self.blocked_evals_by_job()?.get(job_id) {
+            let job_blocked = blocked.to_job_blocked();
+            if job_blocked.task == task_name && !job_blocked.message.is_empty() {
+                return Ok(Some(job_blocked.message));
+            }
+        }
+        let conn = self.read_connection()?;
+        let metadata: Option<String> = conn
+            .prepare_cached(
+                "SELECT metadata_json FROM scheduler_event
+                 WHERE kind = 'plan.unplaced' AND job_id = ?1
+                 ORDER BY id DESC LIMIT 1;",
+            )?
+            .query_row([job_id], |row| row.get(0))
+            .optional()?;
+        drop(conn);
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        let metadata: Value = serde_json::from_str(&metadata).unwrap_or_default();
+        Ok(metadata
+            .get("tasks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|task| task.get("task").and_then(Value::as_str) == Some(task_name))
+            .and_then(|task| task.get("reason").and_then(Value::as_str))
+            .map(str::to_owned))
+    }
+
     /// Every blocked eval, oldest first.
     pub fn blocked_evals(&self) -> R<Vec<BlockedEval>> {
         let conn = self.read_connection()?;
@@ -549,7 +588,35 @@ impl Store {
         self.lock_capacity_events().processed = upto;
         let woken_ids: HashSet<&str> = woken.iter().map(|(eval, _, _)| eval.id.as_str()).collect();
         self.publish_blocked_gauge(&blocked, &woken_ids);
+        // A blocked eval is a job that placed nothing; a job that placed
+        // part of its count waits for the capacity pass instead. The same
+        // events are what can help it, so one on a node that takes work
+        // queues that pass too (a no-op unless some plan left replicas
+        // unplaced). This is the one trigger every source of room shares:
+        // a lost node heartbeating again flips its availability back
+        // without registering, and frees from preemption, drains, or gang
+        // losses never pass through the terminal-report handlers that
+        // queue the pass themselves.
+        if self.capacity_events_on_schedulable_nodes(&nodes) {
+            self.request_capacity_reconcile_if_waiting();
+        }
         Ok(woken.len() + runtime_woken)
+    }
+
+    /// Whether any of these capacity events is on a node that can take work
+    /// now (registered, `available`, and not lost). A cordon or a node
+    /// going lost records an event too, and adds no room.
+    fn capacity_events_on_schedulable_nodes(&self, events: &[(String, &'static str)]) -> bool {
+        let Ok(model) = self.read_model_reader() else {
+            // Unknown: the pass is cheap, and missing one strands a job.
+            return !events.is_empty();
+        };
+        events.iter().any(|(node_id, _)| {
+            model
+                .nodes
+                .get(node_id)
+                .is_some_and(|node| node.availability == "available" && node.status != "lost")
+        })
     }
 
     /// The runtime half of the wake pass (docs/runtime-disable.md): after a

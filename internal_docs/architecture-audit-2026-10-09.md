@@ -109,7 +109,7 @@ and may have drifted.
 - Under-capacity jobs never converge as nodes join, and per-node
   (`count.per`) tasks never reach new nodes. `docs/autoscaling.md` says
   otherwise.
-- **Status:** Partly fixed. Registration and uncordon queue one capacity pass. Open: stop and scale-in, heartbeat recovery, and batch tasks don't trigger it (calls #10, TODO).
+- **Status:** Fixed. Registration and uncordon queue one capacity pass (calls #10); stop, scale-in, and unfinished batch tasks followed in the spot-check fixes; every other capacity event on a schedulable node, heartbeat recovery included, queues it since 2026-11-12 ([correctness-gaps calls #2](calls/correctness-gaps-2026-11-12_calls.md)).
 
 ### SC5. Plans don't check the job or config is still wanted
 - `plan_and_apply_internal` never checks job status or that `job_config_id` is
@@ -204,7 +204,7 @@ and may have drifted.
 ### SC7. Fresh plans spend capacity the old config still holds
 - Apply counts the replaced job's allocations as free, and the old config is
   removed only after apply, so nodes briefly overcommit.
-- **Status:** Not changed. Deliberate: without it, resubmitting a job that uses more than half a node fails. The atomic swap is in TODO (calls #17).
+- **Status:** Fixed (2026-11-12). The Fresh plan's apply transaction removes the replaced config's allocations after its placements bind, so the swap is atomic and resubmitting a job that uses more than half a node still works ([correctness-gaps calls #1](calls/correctness-gaps-2026-11-12_calls.md); calls #17 is the earlier decision).
 
 ### S5. `RotateMeshCa` is cluster-wide behind a pool-scoped check
 - It uses `check_acl(Net, Write, AclScope::any())`, which any pool-scoped net
