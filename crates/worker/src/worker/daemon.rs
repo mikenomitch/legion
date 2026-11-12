@@ -436,23 +436,32 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         "Worker state directory (keep it stable across restarts: it is how a \
          restarted worker re-adopts its running tasks)"
     );
-    // Another identity's tasks on this host are nobody's now, and the
-    // manager places their work again: say so where the operator looks.
-    for (other, live) in
-        crate::worker::state::other_identities_with_live_tasks(&worker_state_dir(), &name)
-    {
-        warn!(
-            worker_name = %name,
-            other_identity = %other,
-            live_tasks = live,
-            "Worker identity {other} in this data dir left {live} task(s) running that this \
-             worker does not manage; unless a worker named {other} is running, start this \
-             worker as `--name {other}` to re-adopt them, or stop them"
-        );
-    }
     // Before anything writes into it: each entry's mode is part of the
     // isolation between allocations (see `prepare_layout`).
     WorkerStateStore::new(state_path.clone()).prepare_layout()?;
+    // One process per identity: the lock is held for the worker's life.
+    crate::worker::state::hold_identity_lock(&state_path)?;
+    // Another identity's tasks on this host are nobody's when no worker
+    // holds its lock, and the manager has placed their work again: stop
+    // them, so they do not run twice (P1-5).
+    for abandoned in crate::worker::state::abandoned_identities(&worker_state_dir(), &name) {
+        let other = abandoned.name.clone();
+        match crate::worker::task_manager::stop_abandoned_identity(abandoned) {
+            Ok(stopped) => warn!(
+                worker_name = %name,
+                other_identity = %other,
+                stopped,
+                "Stopped {stopped} task(s) left running by worker identity {other}, which no \
+                 worker in this data dir runs; the manager places their work again"
+            ),
+            Err(err) => warn!(
+                worker_name = %name,
+                other_identity = %other,
+                error = %format!("{err:#}"),
+                "Could not stop the tasks worker identity {other} left running"
+            ),
+        }
+    }
     credentials.persist_to(WorkerStateStore::new(state_path.clone()));
     managers.persist_to(WorkerStateStore::new(state_path.clone()));
     // The node's key is generated (or loaded) here and never leaves this

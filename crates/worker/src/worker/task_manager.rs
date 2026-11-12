@@ -6671,28 +6671,106 @@ fn kill_pid(pid: u32) -> bool {
     }
 }
 
-/// Stop what an unreadable persisted record describes
-/// ([`crate::worker::state::UnreadableRecord`]): everything in its cgroup
-/// leaf, and its process group when the pid is still the one it recorded
-/// (same start time; a record from before start times were persisted is
-/// taken on liveness alone, as a restore adopts it).
-fn stop_unreadable_record(record: &crate::worker::state::UnreadableRecord) {
-    let by_cgroup = record
-        .resource_assignment
-        .as_ref()
-        .is_some_and(crate::worker::resources::kill_cgroup);
-    let by_group = record.pid.is_some_and(|pid| {
-        let ours = match (process_start_time(pid), record.pid_start_time) {
+/// Stop the live tasks an abandoned identity's state names (another
+/// `--name` in this data dir that no worker runs; see
+/// [`crate::worker::state::abandoned_identities`]), then set its state file
+/// aside as `worker_state.json.abandoned-<ts>` so nothing adopts them again.
+/// Returns how many processes were stopped. The manager has already given
+/// that identity's node up and placed its work again, so these would run
+/// twice.
+pub fn stop_abandoned_identity(identity: crate::worker::state::AbandonedIdentity) -> R<usize> {
+    let store = WorkerStateStore::new(identity.state_path.clone());
+    let loaded = store.load_records()?;
+    let mut stopped = 0;
+    let readable = loaded.records.iter().map(|record| {
+        (
+            Some(record.allocation.id),
+            record.pid,
+            record.pid_start_time,
+            record.resource_assignment.as_ref(),
+        )
+    });
+    let unreadable = loaded.unreadable.iter().map(|record| {
+        (
+            record.allocation_id,
+            record.pid,
+            record.pid_start_time,
+            record.resource_assignment.as_ref(),
+        )
+    });
+    for (allocation_id, pid, pid_start_time, assignment) in readable.chain(unreadable) {
+        let live = pid.is_some_and(|pid| match (process_start_time(pid), pid_start_time) {
+            (None, _) => false,
+            (Some(started), Some(recorded)) => started == recorded,
+            (Some(_), None) => true,
+        });
+        if !live {
+            continue;
+        }
+        if stop_recorded_process(pid, pid_start_time, assignment) {
+            stopped += 1;
+        }
+        warn!(
+            identity = %identity.name,
+            allocation_id = ?allocation_id,
+            pid = ?pid,
+            "Stopped a task left running by a worker identity no worker runs"
+        );
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let aside = identity
+        .state_path
+        .with_file_name(format!("worker_state.json.abandoned-{stamp}"));
+    std::fs::rename(&identity.state_path, &aside).with_context(|| {
+        format!(
+            "set {} aside as {}",
+            identity.state_path.display(),
+            aside.display()
+        )
+    })?;
+    drop(identity.lock);
+    Ok(stopped)
+}
+
+/// Stop a recorded task: everything in its cgroup leaf, and its process
+/// group when the pid is still the one it recorded (same start time; a
+/// record from before start times were persisted is taken on liveness
+/// alone, as a restore adopts it). Whether anything was signalled.
+fn stop_recorded_process(
+    pid: Option<u32>,
+    pid_start_time: Option<u64>,
+    assignment: Option<&crate::task_plugins::ResourceAssignment>,
+) -> bool {
+    let by_cgroup = assignment.is_some_and(crate::worker::resources::kill_cgroup);
+    let by_group = pid.is_some_and(|pid| {
+        let ours = match (process_start_time(pid), pid_start_time) {
             (None, _) => false,
             (Some(started), Some(recorded)) => started == recorded,
             (Some(_), None) => true,
         };
         ours && (crate::worker::state::kill_orphaned_task_group(pid) || kill_pid(pid))
     });
+    by_cgroup || by_group
+}
+
+/// Stop what an unreadable persisted record describes
+/// ([`crate::worker::state::UnreadableRecord`]): everything in its cgroup
+/// leaf, and its process group when the pid is still the one it recorded
+/// (same start time; a record from before start times were persisted is
+/// taken on liveness alone, as a restore adopts it).
+fn stop_unreadable_record(record: &crate::worker::state::UnreadableRecord) {
+    let stopped = stop_recorded_process(
+        record.pid,
+        record.pid_start_time,
+        record.resource_assignment.as_ref(),
+    );
     warn!(
         allocation_id = ?record.allocation_id,
         pid = ?record.pid,
-        stopped = by_cgroup || by_group,
+        stopped,
         error = %record.error,
         "Stopped the process of a persisted allocation this build cannot read"
     );

@@ -611,6 +611,116 @@ pub fn kill_orphaned_task_group(pid: u32) -> bool {
     }
 }
 
+/// The file a running worker holds an exclusive `flock` on for its identity,
+/// beside its state file (`<workers dir>/<name>/worker.lock`). The kernel
+/// drops the lock when the process exits, however it exits, so a free lock
+/// means no worker runs that identity now.
+pub const IDENTITY_LOCK_FILE: &str = "worker.lock";
+
+/// An exclusive lock on one worker identity's directory; released on drop.
+#[derive(Debug)]
+pub struct IdentityLock {
+    #[allow(dead_code)]
+    file: fs::File,
+}
+
+impl IdentityLock {
+    /// Take the lock in `dir` without waiting. `Ok(None)` when another
+    /// process holds it. Where `flock` does not exist the lock is always
+    /// granted.
+    pub fn try_acquire(dir: &Path) -> R<Option<IdentityLock>> {
+        fs::create_dir_all(dir)?;
+        let path = dir.join(IDENTITY_LOCK_FILE);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock on a file descriptor we own for the lock's life.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    return Ok(None);
+                }
+                return Err(err).with_context(|| format!("lock {}", path.display()));
+            }
+        }
+        Ok(Some(IdentityLock { file }))
+    }
+}
+
+/// Hold the identity lock for the worker whose state file is `state_path`
+/// for the rest of this process. A second start in the same process (an
+/// in-process restart, a test) reuses the lock it already holds; another
+/// process holding it fails the start, since two workers sharing one
+/// identity's state would each adopt and stop the other's tasks.
+pub fn hold_identity_lock(state_path: &Path) -> R<()> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, IdentityLock>>> = OnceLock::new();
+    let dir = state_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut held = HELD
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if held.contains_key(&dir) {
+        return Ok(());
+    }
+    match IdentityLock::try_acquire(&dir)? {
+        Some(lock) => {
+            held.insert(dir, lock);
+            Ok(())
+        }
+        None => bail!(
+            "another worker process is running with the state in {} (it holds {}); \
+             stop it, or start this worker under its own --name",
+            dir.display(),
+            dir.join(IDENTITY_LOCK_FILE).display()
+        ),
+    }
+}
+
+/// Another identity in this data dir that no worker is running: its lock,
+/// taken, and its state file.
+#[derive(Debug)]
+pub struct AbandonedIdentity {
+    pub name: String,
+    pub state_path: PathBuf,
+    pub lock: IdentityLock,
+}
+
+/// The other identities in `workers_dir` whose state names live tasks and
+/// whose lock is free: no worker process runs them, so their tasks are
+/// managed by nobody. Each comes back with its lock held, so no worker
+/// starts under that name while the caller stops them.
+pub fn abandoned_identities(workers_dir: &Path, current: &str) -> Vec<AbandonedIdentity> {
+    other_identities_with_live_tasks(workers_dir, current)
+        .into_iter()
+        .filter_map(|(name, _)| {
+            let dir = workers_dir.join(&name);
+            match IdentityLock::try_acquire(&dir) {
+                Ok(Some(lock)) => Some(AbandonedIdentity {
+                    state_path: dir.join("worker_state.json"),
+                    name,
+                    lock,
+                }),
+                Ok(None) => None,
+                Err(err) => {
+                    warn!(identity = %name, error = %format!("{err:#}"), "Could not lock another worker identity's directory");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// Other worker identities in the same data dir (`<workers dir>/<name>/`)
 /// whose state still names running processes: the task's own process, by
 /// pid and start time. Returns each identity with how many.
@@ -618,8 +728,8 @@ pub fn kill_orphaned_task_group(pid: u32) -> bool {
 /// A worker started under a new `--name` (a re-join after the manager
 /// refused the old name, say) reads only its own state, so the tasks the old
 /// identity left running are managed by nobody while the manager places
-/// their work again. Nothing here stops them: another worker may be running
-/// under that name. The caller says so instead.
+/// their work again. Nothing here stops them: [`abandoned_identities`] keeps
+/// only those no worker holds the lock of.
 pub fn other_identities_with_live_tasks(workers_dir: &Path, current: &str) -> Vec<(String, usize)> {
     let Ok(entries) = fs::read_dir(workers_dir) else {
         return Vec::new();
@@ -842,6 +952,66 @@ mod tests {
             other_identities_with_live_tasks(dir.path(), "current"),
             vec![("old".to_string(), 1)]
         );
+        Ok(())
+    }
+
+    /// P1-5: a worker under a new name stops the tasks another identity left
+    /// running once it holds that identity's lock (no worker runs it), and
+    /// sets the state aside; while another process holds the lock, it leaves
+    /// them alone.
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_identities_are_stopped_only_when_unlocked_test() -> R<()> {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir()?;
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()?;
+        let pid = child.id();
+        let started = process_start_time(pid).context("start time")?;
+        fs::create_dir_all(dir.path().join("old"))?;
+        fs::write(
+            dir.path().join("old").join("worker_state.json"),
+            serde_json::to_string(&vec![record(1, pid, Some(started))])?,
+        )?;
+
+        // A worker runs as `old`: its lock is held, so nothing is touched.
+        let held = IdentityLock::try_acquire(&dir.path().join("old"))?.context("lock")?;
+        assert!(abandoned_identities(dir.path(), "current").is_empty());
+        assert!(IdentityLock::try_acquire(&dir.path().join("old"))?.is_none());
+        drop(held);
+
+        let mut abandoned = abandoned_identities(dir.path(), "current");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].name, "old");
+        let stopped = crate::worker::task_manager::stop_abandoned_identity(abandoned.remove(0))?;
+        assert_eq!(stopped, 1);
+        let status = child.wait()?;
+        assert!(
+            !status.success(),
+            "the orphaned task was killed: {status:?}"
+        );
+        assert!(!dir.path().join("old").join("worker_state.json").exists());
+        assert!(fs::read_dir(dir.path().join("old"))?
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("worker_state.json.abandoned-")));
+        assert!(abandoned_identities(dir.path(), "current").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_identity_lock_refuses_a_second_process_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("me").join("worker_state.json");
+        hold_identity_lock(&state)?;
+        // The same process may start again under the same identity.
+        hold_identity_lock(&state)?;
+        // Anyone else (a separate open file, as another process has) may not.
+        assert!(IdentityLock::try_acquire(&dir.path().join("me"))?.is_none());
         Ok(())
     }
 
