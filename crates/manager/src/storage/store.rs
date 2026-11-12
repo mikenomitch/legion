@@ -63,6 +63,7 @@ mod gang_waits;
 mod gang_losses;
 // Gang members: each gang allocation's rank, size, and leader address.
 mod gang_members;
+mod gang_sweep;
 // Scaling inputs: the reads behind the rollup loop and GetScalingInputs.
 mod scaling_ops;
 // Task autoscaling's state: scale writes with compare-and-set, pins,
@@ -109,6 +110,10 @@ pub use forget_ops::ForgetOutcome;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
 pub use gang_members::GangMember;
+pub use gang_sweep::{
+    GangReservation, GangReservationSettings, GangSweep, DEFAULT_GANG_RESERVATION_AFTER,
+    DEFAULT_GANG_RESERVATION_HOLD,
+};
 pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
@@ -5193,6 +5198,19 @@ impl Store {
                 })
             })?)?;
         Ok(rows)
+    }
+
+    /// The nodes running allocations of `task_config_id`: where a whole
+    /// gang's members are, for whole-gang preemption
+    /// (docs/gang-scheduling.md, "Preemption"). One range over
+    /// `idx_allocation_task_config_id`.
+    pub fn nodes_of_task(&self, task_config_id: i64) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT node_id FROM allocation WHERE task_config_id = ?1 ORDER BY node_id;",
+        )?;
+        let rows = stmt.query_map([task_config_id], |row| row.get::<_, String>(0))?;
+        Self::collect_rows(rows)
     }
 
     /// How many allocations each of `task_config_ids` has across the whole

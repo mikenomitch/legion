@@ -466,6 +466,7 @@ start:
   [GitOps](docs/gitops.md) · [Autoscaling](docs/autoscaling.md) ·
   [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
+  [Spot Interruption](docs/spot-interruption.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md) ·
   [Devices and GPUs](docs/devices.md)

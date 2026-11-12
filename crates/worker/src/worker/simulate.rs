@@ -1565,6 +1565,8 @@ async fn heartbeat_sim_node(
         Vec::new()
     };
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
+        gang_restarts: Vec::new(),
+        interruption: None,
         // Simulated nodes have no content store to advertise, and run no
         // direct exec sessions.
         content_locations: None,

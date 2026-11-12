@@ -73,7 +73,22 @@ impl From<NodeMsg> for Node {
     }
 }
 
+/// The dynamic attribute that records a node's pending interruption
+/// (docs/spot-interruption.md): `{ deadline, source, detail }`, set from a
+/// worker's spot watcher or by `legion node interrupt`, and `null` once
+/// withdrawn.
+pub const INTERRUPTION_ATTR: &str = "legion.interruption";
+
 impl Node {
+    /// The node's pending interruption, if one stands
+    /// (docs/spot-interruption.md): gangs do not place here, and gang
+    /// members here are moved before it goes.
+    pub fn pending_interruption(&self) -> Option<&serde_json::Value> {
+        self.dynamic_attrs
+            .get(INTERRUPTION_ATTR)
+            .filter(|notice| notice.is_object())
+    }
+
     pub fn last_heartbeat_too_slow(last_heartbeat: &str) -> R<bool> {
         let last_heartbeat = OffsetDateTime::parse(last_heartbeat, &Rfc3339).or_else(|_| {
             let fmt = format_description!(

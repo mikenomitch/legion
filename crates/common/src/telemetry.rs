@@ -864,6 +864,10 @@ pub struct Metrics {
     pub gang_blocked_jobs: Arc<Gauge>,
     /// `legion_gang_outcomes_total{outcome}`
     pub gang_outcomes_total: Arc<CounterVec>,
+    /// `legion_gang_wakes_skipped_total`
+    pub gang_wakes_skipped_total: Arc<Counter>,
+    /// `legion_gang_reservations`
+    pub gang_reservations: Arc<Gauge>,
     /// `legion_evals_unblocked_total{event}`
     pub evals_unblocked_total: Arc<CounterVec>,
     /// `legion_blocked_wait_seconds`
@@ -1294,10 +1298,26 @@ impl Metrics {
         let gang_outcomes_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_gang_outcomes_total",
-                help: "Gang lifecycle decisions (docs/gang-scheduling.md), by outcome: `timeout` (a gang did not reach its quorum within placementTimeout and its job failed), `replace` (a member was lost and is replaced alone), `restart` (a member was lost and the whole gang stops to be placed again), `fail` (a member was lost and the gang's job failed). Counted on the manager that made the decision.",
+                help: "Gang lifecycle decisions (docs/gang-scheduling.md), by outcome: `timeout` (a gang did not reach its quorum within placementTimeout and its job failed), `replace` (a member was lost and is replaced alone), `restart` (a member was lost and the whole gang stops to be placed again), `restartInPlace` (a member was lost and the survivors restart where they run), `fail` (a member was lost and the gang's job failed). Counted on the manager that made the decision.",
                 labels: &["outcome"],
             },
             series: Series::new(),
+        });
+        let gang_wakes_skipped_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_gang_wakes_skipped_total",
+                help: "Capacity events that would have woken a blocked gang but did not, because the free capacity on the nodes that could take it still holds fewer members than its quorum needs (docs/gang-scheduling.md, \"While it waits\"). Each one is a re-plan the gang did not pay for.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let gang_reservations = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_gang_reservations",
+                help: "Gangs holding a capacity reservation (docs/gang-scheduling.md, \"Reservations\"): a gang that waited past schedulerSettings.gangReservation.after keeps freed capacity on its reserved nodes from smaller work. Set by the scheduler-lane leader; zero elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
         });
         let evals_unblocked_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -2311,6 +2331,8 @@ impl Metrics {
             Arc::clone(&apps) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_outcomes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_wakes_skipped_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_reservations) as Arc<dyn RenderMetric>,
             Arc::clone(&object_status_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
@@ -2398,6 +2420,8 @@ impl Metrics {
             apps,
             gang_blocked_jobs,
             gang_outcomes_total,
+            gang_wakes_skipped_total,
+            gang_reservations,
             object_status_writes_total,
             evals_unblocked_total,
             blocked_wait_seconds,

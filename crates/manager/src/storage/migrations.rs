@@ -2740,6 +2740,45 @@ fn migration_list() -> Vec<M<'static>> {
         // index"): the scheduling index its candidates should come from, or
         // `scan`. NULL = automatic selection.
         M::up("ALTER TABLE task_config ADD COLUMN index_hint TEXT;").down(""),
+        // Gang follow-ups (docs/gang-scheduling.md). `gang_member.epoch` is
+        // the gang's incarnation: raised for every member when the members'
+        // view of the gang changes (a scale, a replaced rank 0) or the gang
+        // restarts in place, and delivered to workers on every heartbeat so
+        // each member restarts in place with the new values.
+        // `placed_unix` is when the member was placed, and `ready` whether it
+        // has reported healthy once, for `gang.readyTimeout`; only unready
+        // rows are ever scanned. Scheduler lane, like the rest of the table.
+        M::up(
+            "ALTER TABLE gang_member ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE gang_member ADD COLUMN placed_unix INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE gang_member ADD COLUMN ready INTEGER NOT NULL DEFAULT 0;
+             CREATE INDEX IF NOT EXISTS idx_gang_member_unready ON gang_member(allocation_id) WHERE ready = 0;",
+        )
+        .down(""),
+        // Gang reservations (docs/gang-scheduling.md, "Reservations"): a gang
+        // that has waited past `schedulerSettings.gangReservation.after`
+        // reserves room for the members its quorum still needs on a set of
+        // nodes (`nodes`: JSON `{node_id: members}`), and other work of its
+        // band or below may use only the capacity beyond it there until the
+        // gang places or `expires_unix` passes. One row per job config.
+        // `gang_wait.reserved_unix` records that a wait has had its one
+        // reservation. Scheduler lane, like `gang_wait`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS gang_reservation (
+            job_config_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            task_name TEXT NOT NULL,
+            band TEXT NOT NULL,
+            request TEXT NOT NULL,
+            nodes TEXT NOT NULL,
+            created_unix INTEGER NOT NULL,
+            expires_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_gang_reservation_job ON gang_reservation(job_id);
+        ALTER TABLE gang_wait ADD COLUMN reserved_unix INTEGER;",
+        )
+        .down("DROP TABLE IF EXISTS gang_reservation;"),
     ]
 }
 

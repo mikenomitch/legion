@@ -309,7 +309,12 @@ $ legion job plan trainer.ncl   # no rack has room
 Validation: `topology.key` must be a non-empty string; `mode` one of
 `required`, `preferred`; unknown fields rejected, as for the rest of `gang`.
 
-### 6.6 Spot interruption (AI7, deferred)
+### 6.6 Spot interruption (AI7, deferred; shipped 2026-11-12)
+
+> Built by its own plan, [spot-interruption-plan.md](spot-interruption-plan.md):
+> the worker's EC2 watcher and `legion node interrupt` record a
+> `legion.interruption` node attribute, gangs keep off such nodes, and their
+> members move first. The text below is the deferral as written.
 
 Evaluated and deferred. A spot notice today reaches Legion, if at all, as a
 node drain (the `aws-asg` plugin or an external handler). A drain is already
@@ -384,7 +389,10 @@ No compatibility shims (AGENTS.md). What changes for an existing cluster:
 - Should the balanced-allocation term be a `schedulerSettings.weights`
   knob? Lean: not until someone needs to turn it; it is a tie-break.
 - Multi-level topology (prefer one rack, else one zone)? Lean: a list of
-  keys later (`keys = ["rack", "zone"]`), when a user asks.
+  keys later (`keys = ["rack", "zone"]`), when a user asks. **Resolved
+  2026-11-12:** `topology.keys` shipped with the gang follow-ups, together
+  with a preemption-aware domain filter that lifts the eight-domain bound to
+  sixteen plausible domains ([gang plan, Revision 3](gang-scheduling-plan.md#revision-3-the-follow-ups-2026-11-12)).
 
 ## 12. Measurements (2026-11-08)
 

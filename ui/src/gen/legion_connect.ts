@@ -3397,6 +3397,14 @@ export const Manager = {
     /**
      * Applies dynamic attribute updates to a node and triggers affected evaluations.
      *
+     * The attribute `legion.interruption` records a pending interruption of
+     * the node (docs/spot-interruption.md): `{ "deadline": <unix seconds>,
+     * "source": "operator", "detail": "..." }`, or `null` to withdraw it
+     * (`legion node interrupt`). Setting one moves every gang member on the
+     * node now (stop cause `interruption`, and each gang's `onMemberLoss`
+     * applies), and no gang places on the node while it stands. Requires
+     * `node:write` on the node's pool.
+     *
      * @generated from rpc legion.Manager.UpdateNodeDynamic
      */
     updateNodeDynamic: {

@@ -491,6 +491,15 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         });
     let sessions_config = parse_sessions_payload(&config.artifacts);
+    // The spot interruption watcher, when this worker type asks for one
+    // (docs/spot-interruption.md).
+    if let Some(spot) =
+        serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(&config.artifacts)
+            .ok()
+            .and_then(|payload| payload.spot_interruption)
+    {
+        crate::worker::interruption::spawn_watcher(spot);
+    }
     // Device plugins, static devices, and CDI dirs (docs/devices.md).
     let device_manager = Arc::new(crate::devices::plugin::DeviceManager::new(
         parse_devices_payload(&config.artifacts),
@@ -3030,7 +3039,17 @@ pub async fn heartbeat_tick(
             Some(isolates) => isolates.stats("", "").await,
             None => (Vec::new(), Vec::new()),
         };
+        // Gang members restarted in place since the last beat
+        // (docs/gang-scheduling.md, "Local restarts"); put back if this beat
+        // is lost.
+        let gang_restarts = task_manager
+            .lock()
+            .expect("task manager")
+            .drain_gang_restarts();
+        let gang_restarts_for_redrive = gang_restarts.clone();
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            gang_restarts,
+            interruption: crate::worker::interruption::current_notice(),
             runtime_refusals,
             isolate_tasks,
             isolate_hosts,
@@ -3089,6 +3108,7 @@ pub async fn heartbeat_tick(
                 // Same for checkpoint outcomes; the manager would re-send the
                 // request anyway, but a capture should not wait a heartbeat.
                 manager.requeue_snapshot_reports(snapshot_reports_for_redrive);
+                manager.requeue_gang_restarts(gang_restarts_for_redrive);
                 // And the direct exec audit, so a dead connection loses no
                 // record of who opened a shell.
                 crate::worker::direct_exec::restore_audit(exec_audit);
@@ -3504,6 +3524,11 @@ pub async fn heartbeat_tick(
             });
         }
 
+        // A gang whose view changed (a scale, a new rank 0, an in-place
+        // restart) restarts its members on this node in place, with the new
+        // `LEGION_GANG_*` values (docs/gang-scheduling.md).
+        apply_gang_views(task_manager, &reply.gang_members);
+
         // Refresh loops must never outlive their allocation — but treat
         // allocations launched this tick as live even if their async launch
         // hasn't registered them in the snapshot yet.
@@ -3539,6 +3564,46 @@ pub async fn ping_tick(
         },
         reply.sync_now,
     ))
+}
+
+/// Restart in place every gang member on this node whose gang moved to a
+/// newer epoch (`HeartbeatReply.gang_members`), with its `LEGION_GANG_*`
+/// variables rewritten first. Each restart runs off the heartbeat, like a
+/// live file's `changeMode = "restart"`.
+fn apply_gang_views(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    views: &[crate::structs::GangMemberView],
+) {
+    if views.is_empty() {
+        return;
+    }
+    let restarts: Vec<(i64, u64)> = {
+        let mut manager = task_manager.lock().expect("task manager");
+        views
+            .iter()
+            .filter_map(|view| {
+                manager
+                    .apply_gang_view(view)
+                    .map(|local| (local, view.epoch))
+            })
+            .collect()
+    };
+    for (local, epoch) in restarts {
+        let task_manager = task_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            info!(
+                allocation_id = local,
+                epoch, "Gang view changed; restarting the member in place"
+            );
+            if let Err(err) = task_manager
+                .lock()
+                .expect("task manager")
+                .restart_allocation(local)
+            {
+                warn!(allocation_id = local, error = ?err, "Gang in-place restart failed");
+            }
+        });
+    }
 }
 
 /// Rewrite the `onChange = "update"` KV files of running allocations

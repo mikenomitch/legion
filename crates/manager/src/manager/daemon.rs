@@ -4233,6 +4233,20 @@ fn spawn_blocked_eval_waker(store: &Store) {
                 Ok(Err(err)) => warn!(error = ?err, "Gang placement timeout pass failed"),
                 Err(err) => warn!(error = ?err, "Gang placement timeout pass panicked"),
             }
+            // Time-driven gang work: views after a scale, readiness
+            // timeouts, reservations (`Store::gang_sweep`).
+            let sweep_store = store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let sweep = sweep_store.gang_sweep()?;
+                crate::manager::server::fail_unready_gang_members(&sweep_store, &sweep.not_ready);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(error = ?err, "Gang sweep failed"),
+                Err(err) => warn!(error = ?err, "Gang sweep panicked"),
+            }
         }
     });
 }
@@ -4437,12 +4451,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         // The top-level `content`, `contentStore`, `sessions`, `devices`,
         // and `isolate` blocks ride in the artifacts payload (see
         // `WorkerArtifactsPayload`).
+        if let Some(spot) = wcp.spot_interruption.as_ref() {
+            spot.validate().with_context(|| {
+                format!("invalid spotInterruption config in worker config {path_str}")
+            })?;
+        }
         let artifacts = if wcp.artifacts.is_none()
             && wcp.content.is_none()
             && wcp.content_store.is_none()
             && wcp.sessions.is_none()
             && wcp.devices.is_none()
             && isolate.is_none()
+            && wcp.spot_interruption.is_none()
         {
             String::new()
         } else {
@@ -4453,6 +4473,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 sessions: wcp.sessions.clone(),
                 devices: wcp.devices.clone(),
                 isolate,
+                spot_interruption: wcp.spot_interruption.clone(),
             })?
         };
 

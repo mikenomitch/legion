@@ -1207,7 +1207,7 @@ pub mod drafts {
     /// failed (docs/gang-scheduling.md, "When a member is lost").
     pub fn job_gang_member_lost(
         lost: &Allocation,
-        cause: StopCause,
+        cause: &str,
         loss: &crate::storage::store::GangLoss,
     ) -> EventDraft {
         use crate::structs::MemberLossPolicy;
@@ -1229,14 +1229,18 @@ pub mod drafts {
             MemberLossPolicy::Restart => {
                 format!("restarting the whole gang ({} stopped)", loss.stopped)
             }
+            MemberLossPolicy::RestartInPlace => format!(
+                "restarting the gang in place ({} member(s) restart on their nodes)",
+                loss.restarted_in_place
+            ),
             MemberLossPolicy::Fail => {
                 format!("failing the job ({} allocation(s) stopped)", loss.stopped)
             }
         };
-        let cause = if cause.is_known() {
-            cause.as_str()
-        } else {
+        let cause = if cause.is_empty() || cause == StopCause::Unknown.as_str() {
             "failed"
+        } else {
+            cause
         };
         let message = format!(
             "Gang {} of job {} lost allocation {} on node {} ({cause}): {state}; {action}",
@@ -3145,7 +3149,7 @@ impl EventRecorder<'_> {
     pub fn job_gang_member_lost(
         self,
         lost: &Allocation,
-        cause: StopCause,
+        cause: &str,
         loss: &crate::storage::store::GangLoss,
     ) {
         self.emit(drafts::job_gang_member_lost(lost, cause, loss));

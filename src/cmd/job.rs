@@ -3239,6 +3239,16 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                             deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                         );
                     }
+                    if gang.reserved_members > 0 {
+                        let until = chrono::DateTime::from_timestamp(gang.reservation_expires, 0)
+                            .map(|until| until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                            .unwrap_or_default();
+                        println!(
+                            "  Reserved room for {} member(s) on {} node(s) until {until} \
+                             (gangReservation)",
+                            gang.reserved_members, gang.reserved_nodes
+                        );
+                    }
                 }
                 // Not short of room: the task's runtime is disabled
                 // (docs/runtime-disable.md), and only the enable helps.

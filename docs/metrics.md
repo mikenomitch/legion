@@ -190,11 +190,21 @@ neighbor rules a cause in or out, and which knob to turn), see
 - **`legion_gang_outcomes_total{outcome}`** (counter): what happened to
   gangs that lost a member or waited too long: `replace` (the member was
   replaced alone, or the survivors kept running for a `replace` top-up),
-  `restart` (the survivors stopped so the whole gang re-places), `fail` (the
+  `restart` (the survivors stopped so the whole gang re-places),
+  `restartInPlace` (the survivors restart on their nodes under a new gang
+  epoch), `fail` (the
   job failed: `onMemberLoss = "fail"` or the move budget ran out), and
   `timeout` (the gang did not reach its quorum within `placementTimeout`).
   A rising `restart` rate is a gang whose members keep dying; see
   [When a member is lost](gang-scheduling.md#when-a-member-is-lost).
+- **`legion_gang_reservations`** (gauge): gangs holding a capacity
+  [reservation](gang-scheduling.md#reservations) because they waited past
+  `schedulerSettings.gangReservation.after`. Set by the scheduler-lane
+  leader's gang sweep; 0 on other managers.
+- **`legion_gang_wakes_skipped_total`** (counter): capacity events that would
+  have woken a blocked gang but did not, because the nodes that could take it
+  still hold fewer members than its quorum needs. Each is a re-plan the gang
+  did not pay for.
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a

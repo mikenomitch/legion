@@ -39,7 +39,7 @@ pub use preemption::{
 pub mod index_kinds;
 mod policy;
 mod preemption;
-mod topology;
+pub(crate) mod topology;
 
 const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
 
@@ -232,6 +232,11 @@ impl GangReport {
             topology_mode: self.topology_mode.clone(),
             topology_domain: self.topology_domain.clone(),
             topology_domains: self.topology_domains,
+            // Filled from the reservation table where a job is read
+            // (`Store::overlay_blocked_jobs`), never by a plan.
+            reserved_members: 0,
+            reserved_nodes: 0,
+            reservation_expires: 0,
         }
     }
 
@@ -689,6 +694,10 @@ struct PreemptorContext<'a> {
 struct PreemptionChoice {
     node_id: String,
     victims: Vec<VictimCandidate>,
+    /// Whole-gang preemption: the evicted gang's members on other nodes,
+    /// which go with the ones on `node_id` (docs/gang-scheduling.md,
+    /// "Preemption"). Empty otherwise.
+    collateral: Vec<VictimCandidate>,
     /// True when the victims are only evictable once they age past
     /// `victimExemptAge`. Only a dry run places on such a choice.
     deferred: bool,
@@ -805,10 +814,21 @@ impl PreemptionPass {
         resource_policy: &ResourcePolicy,
         candidates: &[&Node],
     ) -> R<()> {
+        let ids: Vec<&str> = candidates.iter().map(|node| node.id.as_str()).collect();
+        self.load_node_ids(store, resource_policy, &ids)
+    }
+
+    /// [`Self::load_candidates`] by node id.
+    fn load_node_ids(
+        &mut self,
+        store: &Store,
+        resource_policy: &ResourcePolicy,
+        node_ids: &[&str],
+    ) -> R<()> {
         let index = self.by_node.get_or_insert_with(HashMap::new);
-        let missing: Vec<&str> = candidates
+        let missing: Vec<&str> = node_ids
             .iter()
-            .map(|node| node.id.as_str())
+            .copied()
             .filter(|node_id| !index.contains_key(*node_id))
             .collect();
         if missing.is_empty() {
@@ -868,10 +888,20 @@ impl PreemptionPass {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<crate::structs::StopConfig>(raw).ok())
                 .unwrap_or_default();
+            let disruption_floor = disruption
+                .as_ref()
+                .map(|disruption| disruption.min_available_for(row.task_count))
+                .unwrap_or(0);
+            let gang_floor = row
+                .gang_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<crate::structs::GangConfig>(raw).ok())
+                .map(|gang| gang.preemption_floor());
             index
                 .entry(row.node_id.clone())
                 .or_default()
                 .push(VictimCandidate {
+                    whole_gang: gang_floor.is_some() && disruption_floor == 0,
                     allocation_id: row.allocation_id,
                     node_id: row.node_id.clone(),
                     job_id: row.job_id,
@@ -884,18 +914,7 @@ impl PreemptionPass {
                     // A gang's quorum is a floor of its own: taking a
                     // member below it idles every other member, so the
                     // stricter of the two binds (docs/gang-scheduling.md).
-                    min_available: disruption
-                        .map(|disruption| disruption.min_available_for(row.task_count))
-                        .unwrap_or(0)
-                        .max(
-                            row.gang_json
-                                .as_deref()
-                                .and_then(|raw| {
-                                    serde_json::from_str::<crate::structs::GangConfig>(raw).ok()
-                                })
-                                .map(|gang| gang.preemption_floor())
-                                .unwrap_or(0),
-                        ),
+                    min_available: disruption_floor.max(gang_floor.unwrap_or(0)),
                     task_running: running_by_task
                         .get(&row.task_config_id)
                         .copied()
@@ -1835,6 +1854,11 @@ impl<'a> Scheduler<'a> {
         scheduler.plan_candidates = scheduler.plan_candidates_setting()?;
         scheduler.preemption =
             PreemptionSettings::from_scheduler_settings(store.scheduler_settings.as_ref())?;
+        // Validated here so a bad block fails startup; the gang sweep reads
+        // it (`Store::gang_reservation_settings`).
+        crate::storage::store::GangReservationSettings::from_scheduler_settings(
+            store.scheduler_settings.as_ref(),
+        )?;
         Ok(scheduler)
     }
 
@@ -3062,6 +3086,16 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             resource_policy,
         );
+        // Room long-waiting gangs reserved (docs/gang-scheduling.md,
+        // "Reservations") is not this plan's to take, unless the plan is the
+        // gang's own or its band outranks the gang's: it sees each reserved
+        // node's free capacity less the reserved members' requests, so it
+        // can still use whatever is beyond them (backfill).
+        resource_ledger.withhold_reservations(
+            &self.store.gang_reservations()?,
+            job_config_id,
+            preemptor.band,
+        );
         let mut group_per_key: HashMap<String, Option<String>> = HashMap::new();
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         // Hard filters (constraints + permit) of every member of a group. A
@@ -3435,6 +3469,24 @@ impl<'a> Scheduler<'a> {
                 // groups (which place all or nothing on one node anyway) and
                 // away from `count.per`.
                 let gang = task_config.gang.clone().filter(|_| group_key.is_none());
+                // A gang never places on a node with a pending interruption
+                // (a spot reclaim notice; docs/spot-interruption.md): it
+                // would be moved off again within minutes.
+                let uninterrupted: Vec<_>;
+                let candidates_for_group = if gang.is_some()
+                    && candidates_for_group
+                        .iter()
+                        .any(|node| node.pending_interruption().is_some())
+                {
+                    uninterrupted = candidates_for_group
+                        .iter()
+                        .copied()
+                        .filter(|node| node.pending_interruption().is_none())
+                        .collect();
+                    uninterrupted.as_slice()
+                } else {
+                    candidates_for_group
+                };
                 let placed_before = placements.len();
                 let mut gang_unplaced: Vec<UnplacedTask> = Vec::new();
                 // The one placement call, over a candidate list and into an
@@ -3486,29 +3538,93 @@ impl<'a> Scheduler<'a> {
                         let running = running_by_task.get(&task_id).copied().unwrap_or(0);
                         let quorum = gang.quorum(desired_count);
                         let need_now = quorum.saturating_sub(running);
-                        let domains = topology::domains(
-                            candidates_for_group,
-                            &topology.key,
-                            &resource_ledger.pools,
-                            &plan.task_request,
-                            needed,
-                        );
-                        let pinned = Self::running_topology_domain(
-                            &own_by_node,
-                            task_id,
-                            node_lookup,
-                            &topology.key,
-                        );
-                        let order = topology::trial_order(
-                            &domains,
-                            needed,
-                            need_now,
-                            pinned.as_deref(),
-                            topology.mode,
-                        );
+                        // Every level's domains over free capacity. A
+                        // domain whose estimate cannot reach the quorum is
+                        // tried only when preemption could make room in
+                        // it, so where it could, the estimate counts what
+                        // preemption would reclaim (`reachable`).
+                        let free_levels: Vec<Vec<topology::TopologyDomain<'_>>> = topology
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                topology::domains(
+                                    candidates_for_group,
+                                    key,
+                                    &resource_ledger.pools,
+                                    None,
+                                    &plan.task_request,
+                                    needed,
+                                )
+                            })
+                            .collect();
+                        let can_preempt =
+                            preemption_pass.enabled && preemption_pass.preemptor_band.can_preempt();
+                        let short = free_levels
+                            .iter()
+                            .flatten()
+                            .any(|domain| domain.estimate < need_now.max(1));
+                        let levels = if can_preempt && short {
+                            preemption_pass.load_candidates(
+                                self.store,
+                                resource_policy,
+                                candidates_for_group,
+                            )?;
+                            let mut reclaim: HashMap<String, ResourcePool> = HashMap::new();
+                            for node in candidates_for_group.iter() {
+                                let Some(pool) = resource_ledger.pools.get(node.id.as_str()) else {
+                                    continue;
+                                };
+                                let mut pool = (**pool).clone();
+                                for candidate in preemption_pass.candidates_on_node(&node.id) {
+                                    if preemption_pass.preemptor_band.outranks(candidate.band)
+                                        && !candidate.node_pinned
+                                    {
+                                        pool.release(&candidate.request);
+                                    }
+                                }
+                                reclaim.insert(node.id.clone(), pool);
+                            }
+                            topology
+                                .keys
+                                .iter()
+                                .map(|key| {
+                                    topology::domains(
+                                        candidates_for_group,
+                                        key,
+                                        &resource_ledger.pools,
+                                        Some(&reclaim),
+                                        &plan.task_request,
+                                        needed,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            free_levels
+                        };
+                        let orders: Vec<Vec<usize>> = topology
+                            .keys
+                            .iter()
+                            .zip(&levels)
+                            .map(|(key, domains)| {
+                                let pinned = Self::running_topology_domain(
+                                    &own_by_node,
+                                    task_id,
+                                    node_lookup,
+                                    key,
+                                );
+                                topology::trial_order(
+                                    domains,
+                                    needed,
+                                    need_now,
+                                    pinned.as_deref(),
+                                    topology.mode,
+                                )
+                            })
+                            .collect();
                         let mut outcome = topology::TopologyOutcome {
                             domain: String::new(),
-                            domains: domains.len() as u32,
+                            key: String::new(),
+                            domains: levels.first().map_or(0, |domains| domains.len() as u32),
                         };
                         let mut accepted: Option<R<()>> = None;
                         let mut closest: Option<(u32, String, UnplacedTask)> = None;
@@ -3558,20 +3674,35 @@ impl<'a> Scheduler<'a> {
                                 ) = saved;
                                 Ok(None)
                             };
-                        for index in order {
-                            let domain = &domains[index];
-                            if let Some((attempt, trial_unplaced)) =
-                                try_on(&domain.nodes, &domain.label, &mut closest)?
-                            {
-                                outcome.domain = domain.label.clone();
-                                gang_unplaced = trial_unplaced;
-                                accepted = Some(attempt);
-                                break;
+                        let mut tried = 0usize;
+                        'levels: for ((key, domains), order) in
+                            topology.keys.iter().zip(&levels).zip(&orders)
+                        {
+                            for index in order {
+                                if tried >= topology::MAX_TOPOLOGY_TRIALS {
+                                    break 'levels;
+                                }
+                                tried += 1;
+                                let domain = &domains[*index];
+                                let label = format!("{key}={}", domain.label);
+                                if let Some((attempt, trial_unplaced)) =
+                                    try_on(&domain.nodes, &label, &mut closest)?
+                                {
+                                    outcome.domain = domain.label.clone();
+                                    outcome.key = key.clone();
+                                    outcome.domains = domains.len() as u32;
+                                    gang_unplaced = trial_unplaced;
+                                    accepted = Some(attempt);
+                                    break 'levels;
+                                }
                             }
                         }
+                        // A preferred gang that no domain of any level holds
+                        // spans the fewest domains of the outermost level.
+                        let outermost = levels.last().map(Vec::as_slice).unwrap_or_default();
                         if accepted.is_none() && topology.mode == TopologyMode::Preferred {
                             if let Some((nodes, _spanned)) =
-                                topology::fewest_domains(&domains, need_now)
+                                topology::fewest_domains(outermost, need_now)
                             {
                                 let mut ignored = None;
                                 if let Some((attempt, trial_unplaced)) =
@@ -3589,30 +3720,70 @@ impl<'a> Scheduler<'a> {
                                 place_on!(candidates_for_group, Some(&mut gang_unplaced))
                             }
                             None => {
-                                let key = &topology.key;
+                                let levels_text = topology.keys.join(" or ");
+                                let key = &levels_text;
                                 let shortfall = match closest {
                                     Some((placed, label, mut shortfall)) => {
                                         shortfall.reason = format!(
                                             "No single {key} fits the {need_now} member(s) the gang \
                                              needs together (topology {key}, required); the \
-                                             closest, {key}={label}, fits {placed}. {}",
+                                             closest, {label}, fits {placed}. {}",
                                             shortfall.reason
                                         );
-                                        outcome.domain = label;
+                                        let (level, value) =
+                                            label.split_once('=').unwrap_or(("", label.as_str()));
+                                        outcome.key = level.to_string();
+                                        outcome.domain = value.to_string();
                                         (placed, shortfall)
                                     }
                                     None => {
-                                        let reason = if domains.is_empty() {
-                                            format!(
-                                                "No eligible node has the topology attribute \
-                                                 {key} (topology {key}, required)"
-                                            )
-                                        } else {
-                                            format!(
-                                                "The {key} its running members occupy has no \
-                                                 eligible node left, and a top-up stays in its \
-                                                 domain (topology {key}, required)"
-                                            )
+                                        // No domain was worth a try. The
+                                        // largest by estimate is the closest.
+                                        let best = topology
+                                            .keys
+                                            .iter()
+                                            .zip(&levels)
+                                            .flat_map(|(key, domains)| {
+                                                domains.iter().map(move |domain| (key, domain))
+                                            })
+                                            .max_by_key(|(_, domain)| {
+                                                (
+                                                    domain.reachable,
+                                                    std::cmp::Reverse(domain.token.clone()),
+                                                )
+                                            });
+                                        let pinned_gone = running > 0;
+                                        let (reason, fits) = match best {
+                                            None => (
+                                                format!(
+                                                    "No eligible node has the topology attribute \
+                                                     {key} (topology {key}, required)"
+                                                ),
+                                                0,
+                                            ),
+                                            Some(_) if pinned_gone => (
+                                                format!(
+                                                    "The {key} its running members occupy has no \
+                                                     room or no eligible node left, and a top-up \
+                                                     stays in its domain (topology {key}, required)"
+                                                ),
+                                                0,
+                                            ),
+                                            Some((level, domain)) => {
+                                                outcome.key = level.clone();
+                                                outcome.domain = domain.label.clone();
+                                                let fits = domain.reachable.min(need_now);
+                                                (
+                                                    format!(
+                                                        "No single {key} fits the {need_now} \
+                                                         member(s) the gang needs together \
+                                                         (topology {key}, required); the closest, \
+                                                         {level}={}, has room for {fits}",
+                                                        domain.label
+                                                    ),
+                                                    fits,
+                                                )
+                                            }
                                         };
                                         let blocked =
                                             crate::manager::blocked::PlacementBlocked::for_task(
@@ -3622,7 +3793,7 @@ impl<'a> Scheduler<'a> {
                                                 reason.clone(),
                                             );
                                         (
-                                            0,
+                                            fits,
                                             UnplacedTask {
                                                 task_config_id: task_id,
                                                 task_name: task_config.name.clone(),
@@ -3686,10 +3857,11 @@ impl<'a> Scheduler<'a> {
                         .unwrap_or(0),
                     waiting_since: 0,
                     deadline: 0,
-                    topology_key: topology
-                        .as_ref()
-                        .map(|topology| topology.key.clone())
-                        .unwrap_or_default(),
+                    topology_key: match (topology.as_ref(), topology_outcome.as_ref()) {
+                        (Some(_), Some(outcome)) if !outcome.key.is_empty() => outcome.key.clone(),
+                        (Some(topology), _) => topology.key().to_string(),
+                        (None, _) => String::new(),
+                    },
                     topology_mode: topology
                         .as_ref()
                         .map(|topology| topology.mode.as_str().to_string())
@@ -4674,6 +4846,16 @@ impl<'a> Scheduler<'a> {
                     // again for the next one — freeing its capacity twice on
                     // paper and evicting one allocation to pay for two.
                     preemption.retire_victims(&chosen.node_id, &chosen.victims);
+                    // A whole gang's members elsewhere go with it, and the
+                    // room they free is real for the rest of this plan.
+                    for victim in &chosen.collateral {
+                        resource_ledger.release(&victim.node_id, &victim.request);
+                        *preemption
+                            .taken_by_task
+                            .entry(victim.task_config_id)
+                            .or_default() += 1;
+                        preemption.retire_victims(&victim.node_id, std::slice::from_ref(victim));
+                    }
                     if let Some(chosen_node) = node_lookup.get(chosen.node_id.as_str()) {
                         scoring_cache.refresh_node(
                             chosen_node,
@@ -4684,9 +4866,15 @@ impl<'a> Scheduler<'a> {
                     let exempt_age = self.preemption.victim_exempt_age;
                     preemption
                         .victims
-                        .extend(chosen.victims.iter().map(|victim| {
-                            victim.planned(Self::victim_wait(&chosen, victim, exempt_age))
-                        }));
+                        .extend(
+                            chosen
+                                .victims
+                                .iter()
+                                .chain(&chosen.collateral)
+                                .map(|victim| {
+                                    victim.planned(Self::victim_wait(&chosen, victim, exempt_age))
+                                }),
+                        );
                     eligible = full_but_allowed
                         .iter()
                         .copied()
@@ -5774,6 +5962,20 @@ impl<'a> Scheduler<'a> {
                 found = lifted;
             }
         }
+        // No victim set fits within every floor. A gang at its quorum
+        // cannot lose one member, but it can lose all of them: take a whole
+        // lower-band gang when that is what makes room, its members on
+        // other nodes included (docs/gang-scheduling.md, "Preemption").
+        let mut whole_gang = false;
+        if found.best.is_none() {
+            if let Some((choice, cost)) =
+                self.whole_gang_preemption(&candidates, ask, resource_ledger, pass)?
+            {
+                found.node_scores.insert(choice.node_id.clone(), cost);
+                found.best = Some((choice, cost));
+                whole_gang = true;
+            }
+        }
         let deferred = found
             .best
             .as_ref()
@@ -5803,7 +6005,7 @@ impl<'a> Scheduler<'a> {
             .copied()
             .filter(|node| found.node_scores.get(&node.id).copied() == Some(best_cost))
             .collect();
-        if tied.len() > 1 {
+        if tied.len() > 1 && !whole_gang {
             let mut ids: Vec<&str> = tied.iter().map(|node| node.id.as_str()).collect();
             ids.sort_unstable();
             if let Some(first) = ids.first() {
@@ -5825,6 +6027,7 @@ impl<'a> Scheduler<'a> {
                                 choice = PreemptionChoice {
                                     node_id: node.id.clone(),
                                     victims,
+                                    collateral: Vec::new(),
                                     deferred,
                                 };
                             }
@@ -5841,6 +6044,7 @@ impl<'a> Scheduler<'a> {
                 choice
                     .victims
                     .iter()
+                    .chain(&choice.collateral)
                     .map(|victim| victim.planned(Self::victim_wait(&choice, victim, exempt_age))),
             );
             info!(
@@ -5866,6 +6070,122 @@ impl<'a> Scheduler<'a> {
             return Ok(None);
         }
         Ok(Some(choice))
+    }
+
+    /// Whole-gang preemption (docs/gang-scheduling.md, "Preemption"; the
+    /// Volcano shape): on each candidate node, each lower-band gang with
+    /// members there that only its quorum protects is a victim set of its
+    /// own — every member of the gang, on every node — topped up with
+    /// ordinary victims when its members on this node alone do not free
+    /// enough. A gang is all or nothing: any member too young, node-pinned,
+    /// or in a band the preemptor does not outrank keeps the whole gang. The
+    /// cheapest choice wins by the same cost as any victim set, so the whole
+    /// gang's size counts against it. Only reached when no ordinary victim
+    /// set fits.
+    fn whole_gang_preemption(
+        &self,
+        candidates: &[&Node],
+        ask: &ResourceRequest,
+        resource_ledger: &ResourceLedger,
+        pass: &mut PreemptionPass,
+    ) -> R<Option<(PreemptionChoice, (usize, u32))>> {
+        let exempt_age = self.preemption.victim_exempt_age;
+        let exempt_secs = exempt_age.as_secs() as i64;
+        let mut gangs: Vec<i64> = candidates
+            .iter()
+            .flat_map(|node| pass.candidates_on_node(&node.id))
+            .filter(|candidate| candidate.whole_gang)
+            .map(|candidate| candidate.task_config_id)
+            .collect();
+        gangs.sort_unstable();
+        gangs.dedup();
+        if gangs.is_empty() {
+            return Ok(None);
+        }
+        let mut best: Option<(PreemptionChoice, (usize, u32))> = None;
+        for task_config_id in gangs {
+            // Every member, wherever it runs.
+            let nodes = self.store.nodes_of_task(task_config_id)?;
+            let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
+            pass.load_node_ids(self.store, &self.store.resource_policy, &refs)?;
+            let members: Vec<VictimCandidate> = nodes
+                .iter()
+                .flat_map(|node_id| pass.candidates_on_node(node_id))
+                .filter(|candidate| candidate.task_config_id == task_config_id)
+                .collect();
+            let takeable = !members.is_empty()
+                && members.iter().all(|member| {
+                    pass.preemptor_band.outranks(member.band)
+                        && !member.node_pinned
+                        && member.age_secs.is_none_or(|age| age >= exempt_secs)
+                });
+            if !takeable {
+                continue;
+            }
+            for node in candidates {
+                let on_node: Vec<&VictimCandidate> = members
+                    .iter()
+                    .filter(|member| member.node_id == node.id)
+                    .collect();
+                if on_node.is_empty() {
+                    continue;
+                }
+                let Some(free) = resource_ledger.pools.get(node.id.as_str()) else {
+                    continue;
+                };
+                let mut pool = (**free).clone();
+                for member in &on_node {
+                    pool.release(&member.request);
+                }
+                let others: Vec<VictimCandidate> = pass
+                    .candidates_on_node(&node.id)
+                    .into_iter()
+                    .filter(|candidate| candidate.task_config_id != task_config_id)
+                    .collect();
+                let (extra, _) = choose_victims(
+                    ask,
+                    &pool,
+                    &others,
+                    pass.preemptor_band,
+                    exempt_age,
+                    &pass.taken_by_task,
+                );
+                let Some(extra) = extra else {
+                    continue;
+                };
+                let mut victims: Vec<VictimCandidate> =
+                    on_node.iter().map(|member| (*member).clone()).collect();
+                victims.extend(extra);
+                let collateral: Vec<VictimCandidate> = members
+                    .iter()
+                    .filter(|member| member.node_id != node.id)
+                    .cloned()
+                    .collect();
+                let mut all = victims.clone();
+                all.extend(collateral.iter().cloned());
+                let cost = preemption_cost(&all);
+                if best.as_ref().is_none_or(|(_, best_cost)| cost < *best_cost) {
+                    best = Some((
+                        PreemptionChoice {
+                            node_id: node.id.clone(),
+                            victims,
+                            collateral,
+                            deferred: false,
+                        },
+                        cost,
+                    ));
+                }
+            }
+        }
+        if let Some((choice, _)) = best.as_ref() {
+            info!(
+                preemptor_job = %pass.preemptor_job,
+                node_id = %choice.node_id,
+                victims = choice.victims.len() + choice.collateral.len(),
+                "Preemption takes a whole lower-band gang"
+            );
+        }
+        Ok(best)
     }
 
     /// Seconds until `victim` may be evicted under `choice`: 0 unless the
@@ -5931,6 +6251,7 @@ impl<'a> Scheduler<'a> {
                     PreemptionChoice {
                         node_id: node.id.clone(),
                         victims,
+                        collateral: Vec::new(),
                         deferred: lift_guard,
                     },
                     cost,
@@ -7331,6 +7652,33 @@ impl ResourceLedger {
             );
         }
         ResourceLedger { pools }
+    }
+
+    /// Debit every reservation that binds a plan of `job_config_id` in
+    /// `band` from its nodes' pools (see `build_plan`). A pool can go below
+    /// zero, which fits nothing until the reserved room is free.
+    fn withhold_reservations(
+        &mut self,
+        reservations: &[crate::storage::store::GangReservation],
+        job_config_id: &str,
+        band: Band,
+    ) {
+        for reservation in reservations {
+            if reservation.job_config_id == job_config_id || !reservation.binds(band) {
+                continue;
+            }
+            let Ok(request) = ResourceRequest::from_value(&reservation.request) else {
+                continue;
+            };
+            for (node_id, members) in &reservation.nodes {
+                if let Some(pool) = self.pools.get_mut(node_id) {
+                    let pool = Arc::make_mut(pool);
+                    for _ in 0..*members {
+                        pool.consume(&request);
+                    }
+                }
+            }
+        }
     }
 
     fn can_fit(&self, node_id: &str, request: &ResourceRequest) -> bool {
@@ -13096,7 +13444,7 @@ mod tests {
     fn topology_gang(mode: crate::structs::TopologyMode) -> Option<crate::structs::GangConfig> {
         Some(crate::structs::GangConfig {
             topology: Some(crate::structs::GangTopology {
-                key: "rack".into(),
+                keys: vec!["rack".into()],
                 mode,
             }),
             ..Default::default()
@@ -13156,6 +13504,113 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 4);
         assert_eq!(racks_of(&store, "trainer")?, vec!["small"]);
+        Ok(())
+    }
+
+    /// A node in `rack`, itself in `zone`: two 256 MiB members each.
+    fn zoned_node(store: &Store, id: &str, rack: &str, zone: &str) -> R<()> {
+        store.insert_node(make_node_msg_with_sources(
+            id,
+            json!({ "rack": rack, "zone": zone }),
+            json!({
+                "memory_total": "536870912",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        Ok(())
+    }
+
+    /// `keys = ["rack", "zone"]`: no rack holds the gang, so it places in
+    /// one zone, and never across zones; the report names the level.
+    #[test]
+    fn a_multi_level_topology_gang_falls_back_to_the_next_level() -> R<()> {
+        let store = setup_store()?;
+        zoned_node(&store, "a-1", "a", "east")?;
+        zoned_node(&store, "b-1", "b", "east")?;
+        zoned_node(&store, "c-1", "c", "west")?;
+        zoned_node(&store, "d-1", "d", "south")?;
+        let scheduler = Scheduler::new(&store)?;
+        let levels = |mode| {
+            Some(crate::structs::GangConfig {
+                topology: Some(crate::structs::GangTopology {
+                    keys: vec!["rack".into(), "zone".into()],
+                    mode,
+                }),
+                ..Default::default()
+            })
+        };
+
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                levels(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let preview = scheduler.plan_only_preview(&trainer, PlanMode::Fresh)?;
+        let report = &preview.gang_reports[0];
+        assert!(report.would_place);
+        assert_eq!(report.topology_key, "zone");
+        assert_eq!(report.topology_domain, "east");
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 3);
+        assert_eq!(
+            racks_of(&store, "trainer")?,
+            vec!["a", "b"],
+            "one zone: east"
+        );
+
+        // Five members fit no zone: required waits, holding nothing.
+        let big = submit_config(
+            &store,
+            &gang_job(
+                "big",
+                Band::Normal,
+                5,
+                levels(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let error = scheduler
+            .plan_and_apply(&big, PlanMode::Fresh)
+            .expect_err("no zone holds five");
+        let gang = gang_detail(&error);
+        assert_eq!(gang["wouldPlace"], false);
+        let reason = gang["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("No single rack or zone fits"), "{reason}");
+        Ok(())
+    }
+
+    /// A domain that holds the gang only by preempting is tried, and one
+    /// that cannot hold it even then is not: rack `a` is full of `low`
+    /// work, rack `b` has room for one member beside `normal` work.
+    #[test]
+    fn a_topology_gang_tries_the_domain_preemption_can_clear() -> R<()> {
+        let store = setup_store()?;
+        rack_node(&store, "a-1", "a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let filler = submit_config(&store, &gang_job("filler", Band::Low, 2, None))?;
+        scheduler.plan_and_apply(&filler, PlanMode::Fresh)?;
+        rack_node(&store, "b-1", "b")?;
+        let busy = submit_config(&store, &gang_job("busy", Band::Normal, 1, None))?;
+        scheduler.plan_and_apply(&busy, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                2,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert_eq!(outcome.evictions.len(), 2, "both low members make room");
+        assert_eq!(racks_of(&store, "trainer")?, vec!["a"]);
         Ok(())
     }
 
@@ -13520,28 +13975,58 @@ mod tests {
     }
 
     /// Preemption never takes a gang below its quorum: evicting one member
-    /// would idle the rest. With `min` below the count, the members above
-    /// the quorum are fair game.
+    /// would idle the rest. It takes the whole gang instead, every member,
+    /// when that is what makes room. With `min` below the count, the members
+    /// above the quorum are fair game one at a time.
     #[test]
-    fn preemption_never_takes_a_gang_below_its_quorum() -> R<()> {
+    fn preemption_takes_a_whole_gang_never_part_of_one() -> R<()> {
         let store = setup_store()?;
         small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
         let scheduler = Scheduler::new(&store)?;
-        let gang = submit_config(&store, &gang_job("trainer", Band::Low, 2, whole_gang()))?;
+        // Two members on each node, so taking one node's members alone
+        // would leave the gang split.
+        let gang = submit_config(&store, &gang_job("trainer", Band::Low, 4, whole_gang()))?;
         scheduler.plan_and_apply(&gang, PlanMode::Fresh)?;
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
         age_allocations(&store)?;
 
         let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+        assert_eq!(
+            outcome.evictions.len(),
+            4,
+            "the whole gang goes, its members on the other node too"
+        );
+        assert!(store
+            .get_allocs()?
+            .iter()
+            .all(|allocation| allocation.job_id != "trainer"));
+
+        // A gang that also sets disruption.minAvailable keeps that floor:
+        // the user asked for it, so not even the whole gang is taken.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let mut job = gang_job("trainer", Band::Low, 2, whole_gang());
+        job.tasks[0].disruption = Some(crate::structs::DisruptionConfig {
+            min_available: Some(json!(1)),
+            ..Default::default()
+        });
+        let gang = submit_config(&store, &job)?;
+        scheduler.plan_and_apply(&gang, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
         let error = scheduler
             .plan_and_apply(&api, PlanMode::Fresh)
-            .expect_err("the whole gang is under its floor");
+            .expect_err("the floor binds");
         assert!(
             error.to_string().contains("disruption.minAvailable"),
             "the floor is named: {error}"
         );
         assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
 
-        // A quorum of one: one member may go.
+        // A quorum of one: one member may go, alone.
         let store = setup_store()?;
         small_node(&store, "node-a")?;
         let scheduler = Scheduler::new(&store)?;
@@ -13562,6 +14047,368 @@ mod tests {
         let api = submit_banded(&store, "api", Band::High, 1, None)?;
         let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
         assert_eq!(outcome.evictions.len(), 1);
+        Ok(())
+    }
+
+    /// The gang views on a node, by rank.
+    fn views(store: &Store, node: &str) -> R<Vec<crate::structs::GangMemberView>> {
+        let mut views = store.gang_views_for_node(node)?;
+        views.sort_by_key(|view| view.rank);
+        Ok(views)
+    }
+
+    /// A `job scale` reaches every running member: the sweep rewrites their
+    /// size and raises the gang's epoch, which is what workers restart them
+    /// in place on (docs/gang-scheduling.md, "Starting together").
+    #[test]
+    fn a_scale_refreshes_every_members_view_under_a_new_epoch() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 2, whole_gang()))?;
+        scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        let before: Vec<_> = ["node-a", "node-b"]
+            .iter()
+            .map(|node| views(&store, node))
+            .collect::<R<Vec<_>>>()?
+            .concat();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|view| view.epoch == 0 && view.size == 2));
+        assert_eq!(store.gang_sweep()?.views_synced, 0, "nothing to refresh");
+
+        store.set_task_scale_override("trainer", "worker", "worker", 3, 2, "test", "", "")?;
+        assert_eq!(store.gang_sweep()?.views_synced, 1);
+        let after: Vec<_> = ["node-a", "node-b"]
+            .iter()
+            .map(|node| views(&store, node))
+            .collect::<R<Vec<_>>>()?
+            .concat();
+        assert!(
+            after
+                .iter()
+                .all(|view| view.epoch == 1 && view.size == 3 && view.min == 3),
+            "{after:?}"
+        );
+        assert_eq!(store.gang_sweep()?.views_synced, 0, "and it settles");
+
+        // The third member places into the same epoch.
+        scheduler.plan_and_apply(&trainer, PlanMode::Reschedule)?;
+        let member = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == "trainer")
+            .map(|allocation| store.gang_member(allocation.id))
+            .collect::<R<Vec<_>>>()?;
+        assert_eq!(member.len(), 3);
+        assert!(member
+            .iter()
+            .flatten()
+            .all(|member| member.epoch == 1 && member.size == 3));
+        let ranks: std::collections::BTreeSet<u32> =
+            member.iter().flatten().map(|member| member.rank).collect();
+        assert_eq!(ranks, [0, 1, 2].into_iter().collect());
+        Ok(())
+    }
+
+    /// `onMemberLoss = "restartInPlace"`: a loss raises the survivors' epoch
+    /// instead of stopping them.
+    #[test]
+    fn restart_in_place_raises_the_survivors_epoch() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                Some(crate::structs::GangConfig {
+                    on_member_loss: crate::structs::MemberLossPolicy::RestartInPlace,
+                    ..Default::default()
+                }),
+            ),
+        )?;
+        scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        let allocations: Vec<_> = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == "trainer")
+            .collect();
+        let lost = allocations[0].clone();
+        store.remove_allocation_by_id_explained(
+            lost.id,
+            crate::structs::StopCause::Failed,
+            None,
+        )?;
+        let loss = store
+            .gang_member_lost(&lost, "failed", false)?
+            .expect("a gang");
+        assert_eq!(
+            loss.action,
+            crate::structs::MemberLossPolicy::RestartInPlace
+        );
+        assert_eq!(loss.restarted_in_place, 2);
+        assert_eq!(loss.stopped, 0, "the survivors keep their nodes");
+        for survivor in &allocations[1..] {
+            let member = store.gang_member(survivor.id)?.expect("a member");
+            assert_eq!(member.epoch, 1);
+        }
+        // The replacement joins the new epoch.
+        scheduler.plan_and_apply(&trainer, PlanMode::Reschedule)?;
+        let epochs: Vec<u64> = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == "trainer")
+            .map(|allocation| store.gang_member(allocation.id))
+            .collect::<R<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(|member| member.epoch)
+            .collect();
+        assert_eq!(epochs, vec![1, 1, 1]);
+        Ok(())
+    }
+
+    /// A local restart that breaks the quorum: `restartInPlace` raises the
+    /// epoch, `restart` hands it back as a member failure, `replace` does
+    /// nothing, and `onLocalRestart = "ignore"` opts out.
+    #[test]
+    fn a_local_restart_is_a_member_loss_unless_ignored() -> R<()> {
+        for (policy, local, expected) in [
+            (
+                crate::structs::MemberLossPolicy::RestartInPlace,
+                crate::structs::LocalRestartPolicy::Loss,
+                Some(crate::structs::MemberLossPolicy::RestartInPlace),
+            ),
+            (
+                crate::structs::MemberLossPolicy::Restart,
+                crate::structs::LocalRestartPolicy::Loss,
+                Some(crate::structs::MemberLossPolicy::Restart),
+            ),
+            (
+                crate::structs::MemberLossPolicy::Replace,
+                crate::structs::LocalRestartPolicy::Loss,
+                None,
+            ),
+            (
+                crate::structs::MemberLossPolicy::Restart,
+                crate::structs::LocalRestartPolicy::Ignore,
+                None,
+            ),
+        ] {
+            let store = setup_store()?;
+            small_node(&store, "node-a")?;
+            let scheduler = Scheduler::new(&store)?;
+            let trainer = submit_config(
+                &store,
+                &gang_job(
+                    "trainer",
+                    Band::Normal,
+                    2,
+                    Some(crate::structs::GangConfig {
+                        on_member_loss: policy,
+                        on_local_restart: local,
+                        ..Default::default()
+                    }),
+                ),
+            )?;
+            scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+            let member = store
+                .get_allocs()?
+                .into_iter()
+                .find(|allocation| allocation.job_id == "trainer")
+                .expect("a member");
+            assert_eq!(
+                store.gang_member_restarted(&member, "exit 1; restarting")?,
+                expected,
+                "{policy:?} / {local:?}"
+            );
+            let epoch = store.gang_member(member.id)?.expect("member").epoch;
+            assert_eq!(
+                epoch,
+                u64::from(expected == Some(crate::structs::MemberLossPolicy::RestartInPlace))
+            );
+        }
+        Ok(())
+    }
+
+    /// `readyTimeout`: a member that reports healthy is marked ready; one
+    /// that has not, past the timeout, is handed back to be failed.
+    #[test]
+    fn the_sweep_marks_ready_members_and_returns_late_ones() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                2,
+                Some(crate::structs::GangConfig {
+                    ready_timeout: Some(std::time::Duration::from_secs(60)),
+                    ..Default::default()
+                }),
+            ),
+        )?;
+        scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        let members: Vec<_> = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == "trainer")
+            .collect();
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[crate::structs::AllocationHealth {
+                allocation_id: members[0].id,
+                healthy: true,
+                status: "healthy".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let sweep = store.gang_sweep()?;
+        assert_eq!(sweep.ready, 1);
+        assert!(sweep.not_ready.is_empty(), "the other is not late yet");
+        // Placed two minutes ago: past its one-minute timeout.
+        store.write_connection()?.execute(
+            "UPDATE gang_member SET placed_unix = placed_unix - 120;",
+            [],
+        )?;
+        let sweep = store.gang_sweep()?;
+        assert_eq!(sweep.ready, 0, "already marked");
+        let late: Vec<i64> = sweep.not_ready.iter().map(|member| member.id).collect();
+        assert_eq!(late, vec![members[1].id], "the ready one is never late");
+        Ok(())
+    }
+
+    /// A gang that has waited past `gangReservation.after` reserves room,
+    /// smaller work of its band can no longer take it, and the gang places
+    /// once the room is free; a higher band ignores the reservation.
+    #[test]
+    fn a_long_waiting_gang_reserves_room_that_smaller_work_cannot_take() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let scheduler = Scheduler::new(&store)?;
+        let filler = submit_config(&store, &gang_job("filler", Band::Normal, 2, None))?;
+        scheduler.plan_and_apply(&filler, PlanMode::Fresh)?;
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 4, whole_gang()))?;
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("two of four fit");
+        let blocked = crate::manager::blocked::PlacementBlocked::in_chain(&error)
+            .cloned()
+            .expect("blocked");
+        // What the eval worker does with that: block the eval, starting the
+        // wait clock.
+        let eval = store.enqueue_eval("job_submit", Some("trainer"), Some(&trainer), None, None)?;
+        store.write_blocked_eval(
+            &eval.id,
+            &blocked.key,
+            &blocked.detail,
+            crate::storage::events::EventDraft::info("eval.blocked", "test"),
+        )?;
+        assert_eq!(store.gang_sweep()?.reserved, 0, "not waited long enough");
+        store
+            .write_connection()?
+            .execute("UPDATE gang_wait SET since_unix = since_unix - 600;", [])?;
+        assert_eq!(store.gang_sweep()?.reserved, 1);
+        let reservation = store.gang_reservation(&trainer)?.expect("a reservation");
+        assert_eq!(reservation.members(), 4);
+        assert_eq!(store.gang_sweep()?.reserved, 0, "one per wait");
+
+        // The filler leaves; a small job of the same band cannot take the
+        // freed room, though a high one can.
+        store.remove_allocs_for_job("filler")?;
+        let small = submit_config(&store, &gang_job("small", Band::Normal, 1, None))?;
+        let error = scheduler
+            .plan_and_apply(&small, PlanMode::Fresh)
+            .expect_err("the room is reserved");
+        assert!(
+            crate::manager::blocked::PlacementBlocked::in_chain(&error).is_some(),
+            "{error}"
+        );
+        let urgent = submit_banded(&store, "urgent", Band::High, 1, None)?;
+        let preview = scheduler.plan_only_preview(&urgent, PlanMode::Fresh)?;
+        assert_eq!(
+            preview.allocations.len(),
+            1,
+            "a higher band ignores the reservation"
+        );
+        // And the gang itself places into its reservation.
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 4);
+        Ok(())
+    }
+
+    /// A gang never places on a node with a pending interruption.
+    #[test]
+    fn a_gang_does_not_place_on_an_interrupted_node() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let mut notice = serde_json::Map::new();
+        notice.insert(
+            crate::structs::INTERRUPTION_ATTR.to_string(),
+            json!({ "deadline": 0, "source": "operator", "detail": "test" }),
+        );
+        store.update_node_dyamic("node-b", &notice)?;
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 4, whole_gang()))?;
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("only node-a takes gangs");
+        assert_eq!(gang_detail(&error)["placeable"], 2);
+        // Work that is not a gang still may.
+        let plain = submit_config(&store, &gang_job("plain", Band::Normal, 4, None))?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&plain, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            4
+        );
+        Ok(())
+    }
+
+    /// The members on an interrupted node are moved off it: `restart`
+    /// stops the whole gang to place it again elsewhere.
+    #[test]
+    fn an_interruption_moves_gang_members_off_the_node() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 2, whole_gang()))?;
+        scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        let busy = store
+            .get_allocs()?
+            .into_iter()
+            .find(|allocation| allocation.job_id == "trainer")
+            .map(|allocation| allocation.node_id)
+            .expect("a member");
+        let plain = submit_config(&store, &gang_job("plain", Band::Normal, 1, None))?;
+        scheduler.plan_and_apply(&plain, PlanMode::Fresh)?;
+        let moved = store.move_gangs_off_interrupted_node(&busy)?;
+        assert!(moved >= 1);
+        let left: Vec<_> = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == "trainer")
+            .collect();
+        assert!(left.is_empty(), "restart stops the survivors too: {left:?}");
+        assert_eq!(
+            store
+                .get_allocs()?
+                .iter()
+                .filter(|allocation| allocation.job_id == "plain")
+                .count(),
+            1,
+            "other work stays"
+        );
         Ok(())
     }
 
