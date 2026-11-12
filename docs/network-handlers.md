@@ -1551,10 +1551,23 @@ $ legion net policy test web --to http://instance-data.ec2.internal/
   Hint: the host guard is set on the worker (hostGuard.allow), not in job policy
 ```
 
-`net policy test` runs on the manager, so it judges the built-in classes
-(and resolves names from the manager). A node's own addresses and its
-`hostGuard` entries are judged on the worker; a `net.denied` event from the
-node is the authority. `legion net doctor` lists the guard as an
+`net policy test` runs on the manager, so it resolves names from the
+manager. It judges the built-in classes, then each node's own guard as the
+node advertises it (the `hostGuardRules` node attribute: its `hostGuard`
+`allow` and `deny` entries and its interface addresses at registration),
+over the nodes of `--pool`, or every node without it. A target every such
+node refuses is denied by `host-guard`, naming how many nodes refuse it. One
+that only some refuse (one node's own address, say) is judged by policy as
+usual, and the explanation ends with which nodes refuse it:
+
+```console
+$ legion net policy test web --pool edge --to 10.0.1.7:80
+✓ allow: no egress policy applies to this task; everything is allowed (the host guard refuses it on 1 of 2 node(s) (edge-a): 10.0.1.7 is an address of this node; allocations may not reach it)
+```
+
+A node's addresses are those it had at registration, and a name can resolve
+differently on a node than on the manager, so a `net.denied` event from the
+node is still the authority. `legion net doctor` lists the guard as an
 informational step for every allocation whose egress proxy is up.
 
 **Operator overrides**, in the worker-type config, for the rare host service

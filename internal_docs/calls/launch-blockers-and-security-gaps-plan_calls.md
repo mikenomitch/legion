@@ -131,6 +131,9 @@ expects anyway: it places them again.
 
 ## 7. A worker under a new name warns about the old identity's tasks; it does not stop them
 
+> **Superseded (2026-11-12)** by [round 2, calls #2](launch-blockers-round-2-plan_calls.md):
+> a per-identity lock now lets the worker stop them.
+
 **Call.** At startup, live tasks recorded by another identity in the same data
 dir are reported in a warning naming `--name <old>`.
 
@@ -146,6 +149,9 @@ lock is a new surface for a case the spot check did not hit (it used a fixed
 name).
 
 ## 8. Guarded git is pinned; OCI and S3 are judged but not pinned
+
+> **Superseded (2026-11-12)** by [round 2, calls #1](launch-blockers-round-2-plan_calls.md):
+> OCI and S3 are now pinned through a guarded forward proxy.
 
 **Call.** Git (a subprocess) is pinned with `http.curloptResolve`, refuses
 redirects, pins ssh by `HostName`, refuses `git://`, and skips LFS smudge.

@@ -226,9 +226,11 @@ does not lead the owning raft lane forwards the write to the leader. So a
 worker is not tied to the manager in its join token.
 
 - Every `WorkerRegister` and `Heartbeat` reply carries `manager_addresses`:
-  every raft member's advertised address (its `persistence.raft.advertiseAddr`,
-  which is the same listener as its API), with the answering manager's API
-  scheme. The worker keeps the set, always including the address from its
+  for every raft member, its `server.advertiseAddr` (the address its join
+  tokens carry) when its published config sets one, else its raft advertise
+  address (`persistence.raft.advertiseAddr`, which is the same listener as
+  its API) with the answering manager's API scheme. The list is recomputed
+  at most every 30 seconds. The worker keeps the set, always including the address from its
   token, and persists it to `managers.json` in its state directory whenever
   it changes.
 - The worker talks to one manager at a time. After two consecutive
@@ -255,10 +257,13 @@ worker is not tied to the manager in its join token.
 - A restarted worker starts from the persisted set: if the token's manager
   does not answer, it tries the others in turn, forever, with backoff.
 
-Limits: the addresses are the raft advertise addresses, so they must be
-reachable from workers. When they are not (managers that peer over a private
-network the workers cannot see), the worker tries each, keeps the ones that
-answer, and always keeps its token's address. Outside raft mode the list is
+Limits: a manager without `server.advertiseAddr` is listed by its raft
+advertise address, which must then be reachable from workers. When it is not
+(managers that peer over a private network the workers cannot see), set
+`server.advertiseAddr` on each manager; otherwise the worker tries each,
+keeps the ones that answer, and always keeps its token's address. A manager
+whose config row has not been published yet (a follower still waiting for a
+leader at startup) is listed by its raft address until it is. Outside raft mode the list is
 empty and the worker keeps its one manager.
 
 ### Running a worker under a service manager
@@ -276,12 +281,21 @@ elsewhere). Two settings decide whether that works under systemd:
   fixed `LEGION_DATA_DIR` (or `WorkingDirectory=`) and a fixed `--name`. A
   worker started from another directory finds no state, registers as a
   different node, and cannot see the tasks the previous process left
-  running; the worker logs the state directory it uses at startup. A worker
-  started under a new `--name` in the same data dir warns when another
-  identity there left tasks running (`Worker identity <name> in this data
-  dir left N task(s) running that this worker does not manage`); start it
-  under the old name to re-adopt them, or stop them. It does not stop them
-  itself, because another worker may be running under that name.
+  running; the worker logs the state directory it uses at startup.
+
+  Each running worker holds an exclusive lock on its identity's directory
+  (`workers/<node>/worker.lock`, an `flock` the kernel drops when the
+  process exits). A second worker process started under the same name and
+  data dir refuses to start. A worker started under a new `--name` stops the
+  tasks any other identity in the data dir left running when no worker holds
+  that identity's lock, and sets its state aside as
+  `worker_state.json.abandoned-<ts>` (`Stopped N task(s) left running by
+  worker identity <name>, which no worker in this data dir runs`): the
+  manager has given that node up and placed the work again, so they would
+  otherwise run twice. Tasks of an identity whose worker is running are left
+  alone. Two workers that share a data dir under different names therefore
+  stop each other's tasks if one starts while the other is down; give each
+  its own `LEGION_DATA_DIR`.
 - **`KillMode=process`.** systemd's default (`control-group`) kills every
   task with the worker on `systemctl stop` or `restart`, so nothing is left
   to re-adopt and every restart restarts every task. `KillMode=process`

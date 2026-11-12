@@ -26,41 +26,35 @@ can be closed.
 
 Worker-plane auth Phases 0–8 shipped ([plan](plans/worker-plane-auth-plan.md) ·
 [calls](calls/worker-plane-auth-plan_calls.md)); the AWS spot-check fixes are in
-[launch-spot-check-findings.md](launch-spot-check-findings.md) and
-[launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md).
+[launch-spot-check-findings.md](launch-spot-check-findings.md),
+[launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md),
+and [launch-blockers-round-2-plan.md](plans/launch-blockers-round-2-plan.md).
 Their remaining real-hardware runs are under Verify.
 
 ### Worker plane and the host guard
 
-- [ ] **The manager's pin lookups have no `hostGuard.allow`.** They are judged
-      by the built-in classes and the manager's own addresses (2026-11-08), so a
-      dev registry on the manager's host needs a digest or `resolve = "always"`,
-      and the OCI client still resolves the name again unjudged
-      ([docs](../docs/artifacts.md#what-the-host-guard-checks)).
-- [ ] **OCI and S3 artifact fetches are judged but not pinned.** oci-client and
-      object_store re-resolve the host and follow redirects (blob CDN, token
-      `realm`, S3 `302`) unjudged. Needs a worker-local guarded forward proxy or
-      object_store 0.12's connector hook ([plan §9](plans/launch-blockers-and-security-gaps-plan.md)).
-- [ ] **`legion net policy test` judges only the built-in classes**, not a
-      node's own addresses or its `hostGuard` entries ([calls 27](calls/worker-plane-auth-plan_calls.md)).
 - [ ] **Vendor Docker's default seccomp allowlist** once CI can run it on every
       runtime; the shipped profile is a denylist over the same blocked set
       ([calls 37](calls/worker-plane-auth-plan_calls.md)).
+- [ ] **A plain-`http` cross-origin redirect through the guarded proxy loses
+      its label** (reqwest drops `Proxy-Authorization`), so it is refused but
+      the fetch error lacks the guard's reason
+      ([round-2 calls #1](calls/launch-blockers-round-2-plan_calls.md)).
+- [ ] **`hostGuardRules` node addresses are as of registration**; refresh them
+      on heartbeat if interfaces change under a running worker
+      ([round-2 calls #4](calls/launch-blockers-round-2-plan_calls.md)).
 
 ### Spot-check leftovers
 
 - [ ] **A node can read no content store but its own** (no per-store read
       credentials; cluster `artifacts.auth` never reaches part URLs). Decide
       whether cross-store restores deserve a surface.
-- [ ] **A worker started under a new `--name` in the same data dir only warns**
-      that another identity left tasks running (`other_identities_with_live_tasks`).
-      A per-identity lock would let it stop them ([calls #7](calls/launch-blockers-and-security-gaps-plan_calls.md);
-      P1-5, [plan §8.4](plans/launch-spot-check-fixes-plan.md)).
-- [ ] **Unratified provisional claims are never persisted**, so a worker crash
-      leaves them running with nothing to stop them.
 - [ ] **No way to reach a microVM sandbox over HTTP** without a hand-built TAP,
       guest IP config, and host DNAT. Gated mode has no host-to-guest ingress
       relay (gated sandboxes never get a netns, `crates/worker/src/worker/daemon.rs`).
+- [ ] **A provisional claim killed but still in its graceful stop when the
+      worker crashes is not recorded** in `provisional_claims.json`, so it can
+      outlive the crash ([round-2 calls #5](calls/launch-blockers-round-2-plan_calls.md)).
 
 ### Spot-check-fix follow-ups
 
@@ -71,32 +65,23 @@ Their remaining real-hardware runs are under Verify.
       keyed binder's ordering, and since 2026-11-08 the hold lookup matches by
       job, group, and task across configs; before/after `scheduler_bench`
       numbers were never taken.
-- [ ] **Capability-aware placement.** A task that adds capabilities places
-      anywhere and fails at start on a node whose `container.allowCaps`
-      refuses them; authors pin by pool. The allowlist bounds the node, not
-      the author (calls 1).
 - [ ] **On Linux `command` replaces the image `ENTRYPOINT`; on macOS it does
       not**, so one jobspec runs different commands per OS (calls 51). Needs a
       plan.
 - [ ] **Pre-vote for partitioned raft members.** A member cut off by a
       partition still deposes the leader when it heals; openraft 0.9 has no
       pre-vote (calls 17).
-- [ ] **Workers fail over to raft advertise addresses**
-      (`HeartbeatReply.manager_addresses`), which must be reachable from
-      workers. Consider serving each manager's `server.advertiseAddr` (calls 7).
 - [ ] **Fold the partial-placement remainder into blocked evals.** A partial
       plan's remainder waits on `capacity_waiters`, a second retry path, and
       `job info` shows `blocked` only when nothing placed (calls 21).
-- [ ] **Removed-allocation history and worker log retention disagree**
-      (manager forgets after 24h, worker keeps logs 7 days). Add a `--node`
-      override or configurable retention.
-- [ ] **Destructive static-port rollouts race the old process's graceful
-      stop**; the new process may fail to bind once. A worker can also stop an
-      unwanted allocation and start its static-port replacement in one tick.
 - [ ] **Image pulls**:
-  - the `container` runtime's extracted rootfs and ORAS layers are not cached;
-  - a hung pull blocks other starts of the same image (oci-client has no read timeout);
-  - bundled webpki roots can't pull through a TLS-intercepting proxy (`rustls-tls-native-roots` would);
+  - the `container` runtime's extracted rootfs is not cached (ORAS layers are,
+    by digest: [docs](../docs/artifacts.md#oras-layers));
+  - [x] a hung pull blocks other starts of the same image — registry reads
+    now time out after 60s of silence ([round-2 plan](plans/launch-blockers-round-2-plan.md));
+  - [x] bundled webpki roots can't pull through a TLS-intercepting proxy —
+    native roots were already loaded (object_store enables the reqwest
+    feature); now named in the workspace;
   - on macOS a pull failure reports as a task exit, not a staging failure.
 
 ---
@@ -1348,7 +1333,8 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Rerun `05-dag.ncl` on the 3-manager rig: a DAG advances past its first step ([launch-spot-check-findings.md](launch-spot-check-findings.md)).
 - [ ] Rerun `05-dag.ncl` twice with different `run` values: the resubmit's rollout progresses ([rollouts.md](../docs/rollouts.md#lifecycle-specific-behavior)).
 - [ ] Rerun the `durability = "store"` suspend and cross-node resume on the rig (contentStore auth on part fetch, node-independent `vmdev` links, gated-restore wait) ([suspend-and-resume.md](../docs/suspend-and-resume.md)).
-- [ ] Reproduce P1-5 on the rig: re-run `install.sh` over a worker with running tasks and confirm no orphans or second copies ([plan §8.4](plans/launch-spot-check-fixes-plan.md)).
+- [ ] Reproduce P1-5 on the rig: re-run `install.sh` over a worker with running tasks and confirm no orphans or second copies, now that a worker under a new name stops an unlocked identity's tasks ([plan §8.4](plans/launch-spot-check-fixes-plan.md) · [round-2 calls #2](calls/launch-blockers-round-2-plan_calls.md)).
+- [ ] On the rig: pull a private image and an S3 artifact through the guarded proxy (blob CDN and token redirects work; a redirect to `169.254.169.254` is refused), and with `HTTPS_PROXY` set ([round-2 plan](plans/launch-blockers-round-2-plan.md)).
 - [ ] Run the sandbox spot check (RUNBOOK §12, `tests/spot-check/smoke.sh sandboxes`; needs `legion-guest` and the §12.0 config), never run so far.
 - [ ] Verify the sandbox clean stop on the KVM rig, cloud-hypervisor and Firecracker: `09-sandboxes.ncl` task `ws`, write `/workspace/probe`, `instance stop` + `start`, plus the `sandbox-suspend` boots count ([calls](calls/sandbox-clean-stop_calls.md)).
 - [ ] Confirm on the rig whether the disk-fit fix explains sc-wkr-1's 2G refusal ([calls 74](calls/launch-spot-check-fixes-plan_calls.md)).
@@ -1854,6 +1840,7 @@ judgement calls in [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-
 - **Swappable seams (2026-10-14)** — one datapath `Attachment`, one listener/dialer (`netd::listen`), typed `netd::Netd` boundary, DNS on `hickory-proto`, egress proxy HTTP on hyper (pipelined requests judged), mesh upstreams honour `mesh_tls`, one object-storage layer (`crates/worker/src/objects/`), VIP blocks follow the node's OS ([plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [docs](../docs/codebase-conventions.md#datapath-conventions))
 - **Pluggable cluster CA providers** — `clusterCa.provider = builtin | file | exec` with a Vault PKI helper and `legion net ca provider test` ([plan](plans/cluster-ca-provider-plan.md) · [calls](calls/cluster-ca-provider-plan_calls.md) · [docs](../docs/cluster-ca.md))
 - **Security gap closure (2026-10-17)** — naming a KV key needs `kv:read`; root worker confined to the allocation (name charset, `unpack_in`, no link following); host-level covers exec checks, `file://`, `auth.nodeIdentity`; unforgeable identities (sub templates, audiences, bound boot tickets); allowlisted exec env; reused idempotency keys with a different request fail; fleet certs need a worker-type grant; `templateKv` re-renders can't read new keys ([plan](plans/security-gap-closure-plan.md) · [calls](calls/security-gap-closure-plan_calls.md) · [docs](../docs/auth-and-acls.md))
+- **Launch blockers, round 2 (2026-11-12)** — OCI/S3 fetches pinned through a guarded loopback proxy (redirects judged); manager `artifacts.hostGuard` for pin lookups; `net policy test` judges each node's advertised guard (`hostGuardRules`); per-identity worker lock stops an unlocked identity's tasks (P1-5); unratified provisional claims recorded so a crash's restart stops them; capability-aware placement (`container.allowCaps contains`); workers fail over to `server.advertiseAddr`; removed-allocation history 7 days / 1000 per job; static-port starts wait for the port; 60s registry read timeout ([plan](plans/launch-blockers-round-2-plan.md) · [calls](calls/launch-blockers-round-2-plan_calls.md) · [docs](../docs/artifacts.md#what-the-host-guard-checks))
 - **Launch blockers and security gaps (2026-11-08)** — node caches serve private images only to credentialed jobs (`image_source`); lanes dependency stall, rollout DAG freeze, missing sidecar, fractional-step deadlock; record-by-record worker state; host-guarded git/OCI/S3 fetches; `legion exec` joins gated namespaces; old runc kept off user-namespaced placements ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls](calls/launch-blockers-and-security-gaps-plan_calls.md) · [docs](../docs/artifacts.md#who-a-cached-image-is-served-to))
 - **Worker-plane auth Phase 0: ACLs on by default** — first management token minted to `<dataDir>/bootstrap-token` and `~/.legion/token`; `BootstrapAcl` removed ([plan](plans/worker-plane-auth-plan.md) · [docs](../docs/auth-and-acls.md#quick-start))
 - **Phase 1: mTLS worker plane** — per-RPC caller classes, CSR issuance, CA pin in join tokens, advertise addresses, CA rotation by cross-signing ([plan](plans/worker-plane-auth-plan.md) · [docs](../docs/architecture-managers-workers.md#the-worker-plane))

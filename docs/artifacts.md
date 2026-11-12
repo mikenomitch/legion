@@ -399,9 +399,9 @@ hold it to what was judged:
 | `git::ssh://` | the remote's host | Yes: ssh connects to the first judged address and checks the host key under the remote's name |
 | `git::git://` | — | Refused on a guarded worker: nothing can pin it. Use `https://` or `ssh://` |
 | `git::file://` | — | No network |
-| `oci://` | the registry's host | No: the registry client resolves the name again, and follows a blob's or token's redirect on its own |
-| A runtime's own image pull (a `container` or `sandbox` `image` with no staged image artifact) | the registry's host, as `oci://` | No, as `oci://` |
-| `s3://` | the custom endpoint: the `endpoint` query parameter, else the one the KV credential names | No: the S3 client resolves it again and follows redirects |
+| `oci://` | the registry's host, then every connection the registry client opens | Yes: through the worker's guarded proxy (below), which judges and pins every connection, a blob CDN's and a token `realm`'s redirects included |
+| A runtime's own image pull (a `container` or `sandbox` `image` with no staged image artifact) | as `oci://` | Yes, as `oci://` |
+| `s3://` | the custom endpoint (the `endpoint` query parameter, else the one the KV credential names), then every connection the S3 client opens | Yes: through the guarded proxy, redirects included |
 
 A guarded `git` fetch also sets `GIT_LFS_SKIP_SMUDGE=1`: a repository's own
 `.lfsconfig` names the LFS host, which nobody judged, so LFS files stage as
@@ -416,36 +416,80 @@ An `s3://` source's `region` (the query parameter or the credential's) must
 be lowercase letters, digits, and hyphens, because it becomes part of the
 default AWS endpoint's host name.
 
-**What is not held.** An `oci://` registry and an `s3://` endpoint are judged
-before the fetch, but their clients resolve the name again and follow
-redirects, and neither the second lookup nor a redirect's target is judged.
-For OCI, every blob is checked against the manifest's digest, so a redirect
-cannot put anything but the image's own bytes in the task directory. An S3
-endpoint that passes the check and answers with a redirect to a guarded
-address is followed.
+**The guarded proxy.** The OCI and S3 clients build their own HTTP clients,
+resolve names on their own, and follow redirects on their own, so the worker
+cannot pin them the way it pins `http(s)` and git. Instead it hands them an
+HTTP proxy: a listener on `127.0.0.1` inside the worker process that speaks
+`CONNECT` (for `https`) and absolute-form requests (for plain `http`). Every
+connection the client opens, the registry's or endpoint's and each
+redirect's, is resolved there, judged, and dialed only to an address the
+guard lets through. A refused destination gets `403` with `Legion-Denied-By:
+host-guard`, and the fetch's error names it:
+
+```console
+staging failed: oci://registry.example/team/tool:v1: pull manifest for ...: the host guard refused 169.254.169.254:80: registry.example resolves to 169.254.169.254 (link-local); allocations may not reach it; it is opened only by the worker's hostGuard.allow
+```
+
+The registry or endpoint is still judged by name first, for the clearer
+message. The proxy only narrows: everything it forwards to is an address a
+process on the host can dial directly, and a gated allocation cannot reach it
+(loopback and the node's addresses are guarded). It starts on the first
+guarded OCI or S3 fetch, on a small runtime of its own.
+
+Limits:
+
+- **An operator's own proxy wins.** When the worker's environment names an
+  HTTP proxy (`HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY`, either case; for
+  S3 also `AWS_PROXY_URL`), the clients send through it as before, and the
+  registry or endpoint is judged by name only: that proxy resolves and
+  connects on its own.
+- **An ambient S3 principal** (instance metadata, the ECS container
+  endpoint) reaches its credential endpoint directly: `169.254.169.254`,
+  `169.254.170.2`, and `fd00:ec2::254` are left off the proxy, since the
+  node's environment, not the job, chooses them.
+- **A plain-`http` redirect to another host** loses the label the proxy
+  files its refusals under (the client drops `Proxy-Authorization` on a
+  cross-origin redirect), so it is still refused but the error shows the
+  client's own `403` rather than the guard's reason.
+- For OCI, every blob is also checked against the manifest's digest, so even
+  an unguarded worker cannot put anything but the image's own bytes in the
+  task directory.
+
+A registry that stops sending mid-pull fails the pull after 60 seconds
+without a byte, so a hung registry does not hold every other start of the
+same image behind it.
 
 **The manager's pin lookups.** The tag and branch lookups the manager makes
 at submit (`resolve = "pin"`, below) also go to a host the job chose, from
 the manager, so they are judged the same way: `git ls-remote` is held to
-the judged addresses as in the table above, and an OCI registry is judged
-before the tag's `HEAD`. The manager judges with the guard's built-in
-classes (loopback, the unspecified address, link-local, cloud metadata) and
-its own interface addresses. It has no `hostGuard.allow` or `hostGuard.deny`
-(those are worker settings), so nothing opens a guarded address for a pin
-lookup:
+the judged addresses as in the table above, and an OCI registry's `HEAD`
+goes through the manager's own guarded proxy. The manager judges with the
+guard's built-in classes (loopback, the unspecified address, link-local,
+cloud metadata) and its own interface addresses, plus the manager config's
+`artifacts.hostGuard`, which takes the worker's `allow` and `deny` forms:
+
+```nickel
+artifacts = {
+  # A dev registry on the manager's own host, pinned at submit.
+  hostGuard = { allow = ["127.0.0.1:5000"] },
+},
+```
+
+Without an entry, a pin lookup to a guarded address fails:
 
 ```console
-resolve artifact git::https://127.0.0.1:3000/acme/tools?ref=main at submit failed; fix the reference or set resolve: "always" to re-resolve at staging instead: the source refused the reference: the manager will not look up git::https://127.0.0.1:3000/acme/tools?ref=main at submit: its host guard refuses loopback, link-local and cloud metadata addresses, and the manager's own, and no setting opens them for a pin lookup. Pin the digest or commit yourself, or set resolve: "always" so the worker resolves it, where hostGuard.allow applies: ...
+resolve artifact git::https://127.0.0.1:3000/acme/tools?ref=main at submit failed; fix the reference or set resolve: "always" to re-resolve at staging instead: the source refused the reference: the manager will not look up git::https://127.0.0.1:3000/acme/tools?ref=main at submit: its host guard refuses loopback, link-local and cloud metadata addresses, and the manager's own. Open one ip:port with the manager's artifacts.hostGuard.allow, pin the digest or commit yourself, or set resolve: "always" so the worker resolves it, where its own hostGuard.allow applies: ...
 ```
 
 A source on the manager's own machine (a dev registry on `localhost`) takes
-an explicit digest or commit, or `resolve = "always"`, which resolves it on
-the worker at staging, under that worker's `hostGuard.allow`. A `git://`
-source cannot be pinned by the manager, for the reason a guarded worker
-refuses it. Private ranges (`10.0.0.0/8` and the like) are not a guarded
-class, on the manager or a worker. The same limit as the worker's applies to
-OCI: the registry client resolves the name again for the `HEAD`, which is
-not judged.
+an `artifacts.hostGuard.allow` entry, an explicit digest or commit, or
+`resolve = "always"`, which resolves it on the worker at staging, under that
+worker's `hostGuard.allow`. `artifacts.hostGuard.counterInterval` is refused:
+it is a worker setting. A `git://` source cannot be pinned by the manager,
+for the reason a guarded worker refuses it. Private ranges (`10.0.0.0/8` and
+the like) are not a guarded class, on the manager or a worker. The manager's
+proxy follows the worker's rules, including deferring to an `HTTPS_PROXY` in
+the manager's environment.
 
 ## Pinning: `resolve = "pin"` vs `'always'`
 

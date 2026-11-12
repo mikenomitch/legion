@@ -257,10 +257,13 @@ Only old allocations that hold the blocking port are stopped, and old
 `batch` allocations are never stopped this way (`batchKillAfter` still
 governs them). A port held by another job is an ordinary capacity block.
 
-Known limitation: the old process gets its normal graceful stop (`stop`
-signal, then `killAfter`), and the replacement is dispatched right away. If
-the old process is still shutting down when the new one starts, the new one
-fails to bind and goes through its `restart` policy until the port is free.
+The old process gets its normal graceful stop (`stop` signal, then
+`killAfter`), and the replacement is dispatched right away. The worker holds
+the replacement back while any other allocation on the node, running or
+still stopping, holds one of its static ports, and starts it on the first
+reconcile after the port is free, so the new process does not race the old
+one for the bind. The wait lasts as long as the old process's stop: up to its
+drain window plus `killAfter`.
 
 `completeIncomplete` behavior:
 

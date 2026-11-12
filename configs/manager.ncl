@@ -275,6 +275,12 @@
     # artifacts. Off until the artifact cache lands (re-download per
     # allocation otherwise).
     containerImageDesugar = false,
+    # The host guard for this manager's `resolve = "pin"` lookups at submit
+    # (docs/artifacts.md, "What the host guard checks"). Loopback,
+    # link-local, cloud metadata, and the manager's own addresses are
+    # refused; `allow` opens one ip:port each (a dev registry here), `deny`
+    # adds ranges. Default: no entries.
+    hostGuard = { allow = [], deny = [] },
   },
   # Workload identity (OIDC issuer; see docs/workload-identity.md).
   # On by default: apps (the bundled autoscaler) and API sockets authenticate

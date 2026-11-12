@@ -601,8 +601,19 @@ Every failure ends the same way: the node kills the work.
 | Ratification refused | the ratify reply (or a heartbeat catch-up verdict) | one RPC |
 | Manager unreachable | the lease deadline | `ratifyTimeout` (default 5s) |
 | Node loses contact after ratification | the existing self-fence | `stateful.onLost.selfTerminateAfter` |
-| Worker restart with claims held | startup reconcile | immediate (provisional work is never resumed) |
+| Worker restart with claims held, including a crash | startup, before the state is restored | immediate (provisional work is never resumed) |
 | Manager forgot about it | the existing heartbeat reconcile | one heartbeat after the lease |
+
+A worker process that crashes cannot kill its claims itself, so each
+unratified claim's pid, start time, and cgroup leaf are written to
+`provisional_claims.json` beside the worker state (when the set of them
+changes; not fsynced, since only a process crash leaves them running). The
+next worker process stops each one whose process is still the one recorded,
+logs `Stopped an unratified provisional allocation a previous worker process
+left running`, and removes the file. Sessions are recorded in their own log
+([session mode](session-mode.md)) and are not in this file. A claim already
+killed but still inside its graceful stop when the worker crashed is not
+recorded.
 
 The last row matters because the worker already stops anything the manager
 does not list. Provisional work is **exempt from that sweep for the length of

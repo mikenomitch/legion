@@ -361,10 +361,15 @@ the manager and handed to each worker when it registers):
 - Narrowing the list below the default set is allowed. Container tasks on
   those nodes then have to drop what the list leaves out, for example with
   `drop = ["ALL"]` and a short `add`.
-- Adding a capability to a task does not change where it places, and the
-  scheduler does not steer a task toward nodes that allow it. Pin such tasks
-  to the worker types that do, with a constraint on the type's `pool` or an
-  attribute.
+- A task that adds a capability beyond the default set places only on nodes
+  that allow it. Every node advertises its expanded allowlist as the
+  `container.allowCaps` attribute (`["ALL"]` becomes every capability name;
+  a macOS node, where Apple `container` ignores the fields, advertises every
+  name), and the task gets one implicit constraint per extra capability,
+  `container.allowCaps contains "CAP_SYS_ADMIN"`. A task with no node that
+  allows it shows that constraint in `job plan` and `job info` as why it is
+  unplaced. Tasks within the default set, and tasks constrained to macOS,
+  get no constraint.
 - At submit, `job run` and `job plan` reject a container task whose
   effective set *no* worker type allows, with the same advice:
   `task tool would run with capabilities no worker type allows container
