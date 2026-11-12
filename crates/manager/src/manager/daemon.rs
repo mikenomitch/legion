@@ -3528,7 +3528,7 @@ async fn eval_worker_loop(
                 .observe(&[&eval.kind], handle_started.elapsed().as_secs_f64());
             match handled {
                 HandlerWait::Finished(completion) => {
-                    completions.push((eval.id.clone(), completion))
+                    completions.push((eval.id.clone(), *completion))
                 }
                 // The handler panicked or was cancelled. Its outcome is
                 // unknown, so record nothing for it and CARRY ON with the
@@ -3659,8 +3659,9 @@ async fn eval_worker_loop(
 /// How waiting on one eval handler ended ([`await_eval_handler`]).
 #[derive(Debug)]
 enum HandlerWait {
-    /// The handler returned this outcome.
-    Finished(EvalCompletion),
+    /// The handler returned this outcome (boxed: it is ten times the size
+    /// of the other variants).
+    Finished(Box<EvalCompletion>),
     /// The handler panicked or was cancelled; its outcome is unknown.
     Failed(tokio::task::JoinError),
     /// The handler was still running at the deadline. It keeps running on
@@ -3676,7 +3677,7 @@ async fn await_eval_handler(
     deadline: Duration,
 ) -> HandlerWait {
     match tokio::time::timeout(deadline, handler).await {
-        Ok(Ok(completion)) => HandlerWait::Finished(completion),
+        Ok(Ok(completion)) => HandlerWait::Finished(Box::new(completion)),
         Ok(Err(join_error)) => HandlerWait::Failed(join_error),
         Err(_elapsed) => HandlerWait::TimedOut,
     }
