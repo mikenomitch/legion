@@ -16126,7 +16126,7 @@ message GetAllocationLogsRequest {
   int64 offset = 6;
 
   // Also return the job's recently removed allocations (newest first, at
-  // most 10, removed within the last 24 hours) after its live ones. Without
+  // most 10, removed within the last 7 days, and at most 1000 per job remembered) after its live ones. Without
   // it they are returned only when the job has no live allocation. Ignored
   // when `allocation_id` is set, which reaches a removed allocation anyway.
   bool include_removed = 7;

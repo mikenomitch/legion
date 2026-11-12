@@ -299,9 +299,15 @@ pub const STOP_NOTICE_RETENTION_SECS: i64 = 600;
 
 // How long the manager remembers a removed allocation (its job, task, and
 // node) so `legion job logs` can still fetch its output from the worker,
-// which keeps the files for `LEGION_LOG_RETENTION_DAYS`. See
-// `docs/logging.md`, "Logs of removed allocations".
-pub const ALLOCATION_HISTORY_RETENTION_SECS: i64 = 24 * 60 * 60;
+// which keeps the files for `LEGION_LOG_RETENTION_DAYS`: the same default
+// window, so a log the worker still has is one the manager can still find.
+// See `docs/logging.md`, "Logs of removed allocations".
+pub const ALLOCATION_HISTORY_RETENTION_SECS: i64 =
+    DEF_TASK_LOG_RETENTION_DAYS as i64 * 24 * 60 * 60;
+// The most removed allocations the manager remembers per job, newest kept,
+// so a job that churns through allocations cannot grow the history without
+// bound inside the retention window.
+pub const ALLOCATION_HISTORY_PER_JOB: i64 = 1000;
 // How many removed allocations `legion job logs <job>` returns at most when
 // it falls back to (or is asked for) the job's removed allocations, newest
 // first. `--allocation <id>` reaches any one of them.

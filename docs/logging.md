@@ -272,9 +272,10 @@ rollout replaced it, or the job was destroyed. So removed allocations stay
 readable:
 
 - The manager remembers every removed allocation (its job, task, node, status,
-  and why it was removed) for **24 hours**, in the `allocation_history` table.
+  and why it was removed) for **7 days**, in the `allocation_history` table,
+  keeping each job's newest 1,000.
 - The worker keeps the files until the allocation's directory has been idle
-  for `LEGION_LOG_RETENTION_DAYS` (7 days by default).
+  for `LEGION_LOG_RETENTION_DAYS` (7 days by default), the same window.
 
 ```bash
 # A job with no live allocation (failed, finished, stopped, or destroyed)
@@ -287,7 +288,7 @@ legion job logs web
 # A job that is running shows only its live allocations; add the removed ones:
 legion job logs web --include-removed
 
-# Any one allocation, live or removed in the last 24 hours:
+# Any one allocation, live or removed in the last 7 days:
 legion job logs --allocation 31
 ```
 
@@ -301,9 +302,10 @@ cause: `stop`, `update`, `reschedule`, `node_lost`, `preempted`, `destroy`,
 
 Limits:
 
-- After 24 hours the manager no longer knows where a removed allocation ran,
-  so `legion job logs` stops offering it. The files are still on the node
-  until the worker's retention expires; read them there
+- After 7 days, or once a job has removed 1,000 newer allocations, the
+  manager no longer knows where a removed allocation ran, so `legion job logs`
+  stops offering it. A worker whose `LEGION_LOG_RETENTION_DAYS` is raised past
+  7 keeps files the manager can no longer point at; read them there
   (`<worker-state-dir>/logs/<allocation-id>/`) or ship them with a collector
   ([below](#shipping-logs-externally)).
 - A removed allocation whose node is gone, or whose files the worker already

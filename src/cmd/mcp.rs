@@ -973,12 +973,12 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_logs",
-            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures. Allocations removed in the last 24 hours (failed and rescheduled, stopped, the job destroyed) are still readable: a job with no live allocation returns its most recently removed ones, each marked `removed` with its `removalCause`.",
+            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures. Allocations removed in the last 7 days (failed and rescheduled, stopped, the job destroyed) are still readable: a job with no live allocation returns its most recently removed ones, each marked `removed` with its `removalCause`.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Job name to gather allocation logs for." },
-                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id (live, or removed in the last 24 hours) instead of a whole job." },
+                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id (live, or removed in the last 7 days) instead of a whole job." },
                     "stream": { "type": "string", "enum": ["stdout", "stderr", "all"], "description": "Which stream to read (default all)." },
                     "max_bytes": { "type": "integer", "description": "Max bytes per stream (0 = worker default cap)." },
                     "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." },

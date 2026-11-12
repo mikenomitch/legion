@@ -15616,6 +15616,9 @@ impl Store {
             params![now_unix - ALLOCATION_HISTORY_RETENTION_SECS],
         )?;
         let cause = if cause.is_known() { cause.as_str() } else { "" };
+        let mut jobs: Vec<&str> = removed.iter().map(|alloc| alloc.job_id.as_str()).collect();
+        jobs.sort_unstable();
+        jobs.dedup();
         for alloc in removed {
             let task_name: String = tx
                 .query_row(
@@ -15643,6 +15646,19 @@ impl Store {
                     cause,
                     now_unix
                 ],
+            )?;
+        }
+        // Keep each touched job's newest [`ALLOCATION_HISTORY_PER_JOB`].
+        for job in jobs {
+            tx.execute(
+                "DELETE FROM allocation_history
+                 WHERE job_id = ?1
+                   AND allocation_id NOT IN (
+                     SELECT allocation_id FROM allocation_history
+                     WHERE job_id = ?1
+                     ORDER BY removed_at_unix DESC, allocation_id DESC
+                     LIMIT ?2);",
+                params![job, crate::constants::ALLOCATION_HISTORY_PER_JOB],
             )?;
         }
         Ok(())
@@ -30302,6 +30318,11 @@ mod tests {
             1
         );
 
+        // The retention matches the worker's default log retention.
+        assert_eq!(
+            ALLOCATION_HISTORY_RETENTION_SECS,
+            crate::constants::DEF_TASK_LOG_RETENTION_DAYS as i64 * 86_400
+        );
         // Past the retention they are no longer offered.
         store.write_connection()?.execute(
             "UPDATE allocation_history SET removed_at_unix = removed_at_unix - ?1;",
@@ -30310,6 +30331,42 @@ mod tests {
         assert!(store
             .removed_allocations(Some("logs-web"), None, 10)?
             .is_empty());
+        Ok(())
+    }
+
+    /// The history keeps a job's newest `ALLOCATION_HISTORY_PER_JOB`
+    /// removals: the oldest goes when a removal would pass the cap.
+    #[test]
+    fn allocation_history_is_capped_per_job() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        submit_job(&store, "churn", vec![TaskConfig::new("web", "noop")])?;
+        let task_id = task_id_for(&store, "web", "churn")?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        {
+            let conn = store.write_connection()?;
+            for i in 0..crate::constants::ALLOCATION_HISTORY_PER_JOB {
+                conn.execute(
+                    "INSERT INTO allocation_history
+                     (allocation_id, job_id, job_config_id, task_config_id, task_name, node_id,
+                      status, cause, removed_at_unix)
+                     VALUES (?1, 'churn', 'jc', 1, 'web', 'node-a', 'placed', '', ?2);",
+                    params![1_000_000 + i, now - 1000 + i],
+                )?;
+            }
+        }
+        let live = store.place_alloc("node-a", task_id)?;
+        store.remove_allocation_by_id(live.id)?;
+        let count: i64 = store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM allocation_history WHERE job_id = 'churn';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, crate::constants::ALLOCATION_HISTORY_PER_JOB);
+        assert!(store
+            .removed_allocations(None, Some(1_000_000), 1)?
+            .is_empty());
+        assert_eq!(store.removed_allocations(None, Some(live.id), 1)?.len(), 1);
         Ok(())
     }
 

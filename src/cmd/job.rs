@@ -284,7 +284,7 @@ pub fn config() -> Command {
             Arg::new("include-removed")
                 .long("include-removed")
                 .help(
-                    "Also show the job's allocations removed in the last 24 hours (shown \
+                    "Also show the job's allocations removed in the last 7 days (shown \
                      anyway when the job has no live allocation)",
                 )
                 .action(ArgAction::SetTrue),
