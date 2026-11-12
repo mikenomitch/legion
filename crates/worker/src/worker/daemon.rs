@@ -947,6 +947,14 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             Value::String(target.url.clone()),
         );
     }
+    // The guard's own rules, so `legion net policy test` judges this node's
+    // addresses and its `hostGuard` entries as the datapath does.
+    config_attrs.insert(
+        crate::structs::host_guard::NODE_RULES_ATTR.into(),
+        serde_json::to_value(crate::structs::host_guard::NodeGuardRules::for_this_host(
+            security_config(&config.security).host_guard.as_ref(),
+        ))?,
+    );
     // `legion node info` shows whether host-mode tasks are guarded here.
     config_attrs.insert(
         crate::worker::netd::kernel_guard::NODE_ATTR.into(),
@@ -1843,15 +1851,21 @@ fn kernel_guarded_allocations(
         .collect()
 }
 
-fn host_guard_for(security: &str) -> crate::structs::host_guard::HostGuard {
-    let config = if security.trim().is_empty() {
+/// The worker's security payload (`WorkerConfig.security`), or the default
+/// when absent or unreadable.
+fn security_config(security: &str) -> crate::structs::WorkerSecurityConfig {
+    if security.trim().is_empty() {
         crate::structs::WorkerSecurityConfig::default()
     } else {
         serde_json::from_str(security).unwrap_or_else(|err| {
             warn!(error = ?err, "Invalid worker security config; using the default host guard");
             crate::structs::WorkerSecurityConfig::default()
         })
-    };
+    }
+}
+
+fn host_guard_for(security: &str) -> crate::structs::host_guard::HostGuard {
+    let config = security_config(security);
     let guard = match config.host_guard.as_ref() {
         Some(host_guard) => {
             crate::structs::host_guard::HostGuard::new(host_guard).unwrap_or_else(|err| {

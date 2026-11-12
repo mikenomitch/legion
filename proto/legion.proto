@@ -19868,8 +19868,13 @@ message TestNetPolicyReply {
   // gated denies everything nothing allows. `host-guard` for an egress
   // target the host guard refuses, which is answered before any policy: the
   // manager resolves the name and judges the built-in classes (loopback,
-  // link-local, cloud metadata). A node's own addresses and its `hostGuard`
-  // overrides are judged on the worker only.
+  // link-local, cloud metadata), then each node's own guard as the node
+  // advertises it (its interface addresses and `hostGuard.allow`/`deny`,
+  // the `hostGuardRules` node attribute), over the nodes of `node_pool` or
+  // every node when it is empty. A target every such node refuses is
+  // `host-guard`; one only some refuse is judged by policy as usual, and
+  // `explanation` ends with which nodes refuse it. Node addresses are those
+  // at the node's registration.
   string source = 2;
 
   // The rule's `reason`, if any.

@@ -11695,8 +11695,11 @@ impl Manager for ManagerDaemonService {
         }
         // The host guard sits below every policy, so it answers first, by
         // the address the name resolves to (resolved here, on the manager).
-        // Its built-in classes are the same on every node; a node's own
-        // addresses and its `hostGuard` overrides are judged on the worker.
+        // Its built-in classes are the same on every node. A node's own
+        // addresses and its `hostGuard` entries are judged with the rules
+        // each node in the pool advertises (`hostGuardRules`): a target every
+        // such node refuses is denied here; one some of them refuse is noted.
+        let mut guard_note = String::new();
         if direction == "egress" {
             let guard_host = host
                 .clone()
@@ -11711,6 +11714,27 @@ impl Manager for ManagerDaemonService {
                     port,
                 )
                 .await;
+                let node_refusals = match &refused {
+                    Ok(_) => {
+                        self.node_guard_refusals(&guard_host, port, &req.node_pool)
+                            .await
+                    }
+                    Err(_) => NodeGuardRefusals::default(),
+                };
+                let refused = match refused {
+                    Ok(_) if node_refusals.every_node() => Err(
+                        crate::worker::netd::guard::GuardRefusal::Denied(node_refusals.summary()),
+                    ),
+                    Ok(_) if !node_refusals.refused.is_empty() => {
+                        guard_note = format!(
+                            " (the host guard refuses it on {}: {})",
+                            node_refusals.nodes_text(),
+                            node_refusals.refused[0].1
+                        );
+                        Ok(())
+                    }
+                    other => other.map(|_| ()),
+                };
                 if let Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) = refused {
                     let hint = crate::structs::host_guard::GuardDenial::hint();
                     return Ok(Response::new(TestNetPolicyReply {
@@ -11776,7 +11800,7 @@ impl Manager for ManagerDaemonService {
                 direction: direction.into(),
                 protocol: String::new(),
                 explanation: format!(
-                    "no {direction} policy applies to this task; everything is allowed"
+                    "no {direction} policy applies to this task; everything is allowed{guard_note}"
                 ),
                 hint: String::new(),
             }));
@@ -11867,7 +11891,7 @@ impl Manager for ManagerDaemonService {
             reason,
             direction: direction.into(),
             protocol: chain.protocol.clone(),
-            explanation,
+            explanation: format!("{explanation}{guard_note}"),
             hint: String::new(),
         }))
     }
@@ -13977,6 +14001,44 @@ fn request_fingerprint(request: &impl serde::Serialize) -> String {
         .collect()
 }
 
+/// Which nodes' own guards refuse a `TestNetPolicy` target.
+#[derive(Debug, Default)]
+struct NodeGuardRefusals {
+    /// Nodes that advertised rules and were judged.
+    judged: usize,
+    /// (node id, the guard's reason) for each node that refused.
+    refused: Vec<(String, String)>,
+}
+
+impl NodeGuardRefusals {
+    fn every_node(&self) -> bool {
+        self.judged > 0 && self.refused.len() == self.judged
+    }
+
+    fn nodes_text(&self) -> String {
+        const SHOWN: usize = 3;
+        let mut names: Vec<&str> = self
+            .refused
+            .iter()
+            .take(SHOWN)
+            .map(|(node, _)| node.as_str())
+            .collect();
+        if self.refused.len() > SHOWN {
+            names.push("...");
+        }
+        format!(
+            "{} of {} node(s) ({})",
+            self.refused.len(),
+            self.judged,
+            names.join(", ")
+        )
+    }
+
+    fn summary(&self) -> String {
+        format!("{} on {}", self.refused[0].1, self.nodes_text())
+    }
+}
+
 /// The reply a keyed `CreateInstance` replays from its idempotency record:
 /// `<id>`, or `<id> <snapshot>` for a create from a snapshot (ids never
 /// contain spaces).
@@ -15220,6 +15282,46 @@ impl ManagerDaemonService {
     }
 
     /// Resolve (job, task) to the task config and its selector facts.
+    /// Judge `host:port` with the guard each node advertises
+    /// ([`host_guard::NODE_RULES_ATTR`](crate::structs::host_guard::NODE_RULES_ATTR)):
+    /// the nodes of `pool`, or every node when it is empty. Nodes that
+    /// advertise no rules (an older build, a node that has not registered
+    /// since) are left out of both counts.
+    async fn node_guard_refusals(&self, host: &str, port: u16, pool: &str) -> NodeGuardRefusals {
+        use crate::structs::host_guard::{NodeGuardRules, NODE_RULES_ATTR};
+        let Ok(nodes) = self.store.get_nodes() else {
+            return NodeGuardRefusals::default();
+        };
+        let pool = pool.trim();
+        let mut out = NodeGuardRefusals::default();
+        for node in nodes {
+            if !pool.is_empty() && node.pool != pool {
+                continue;
+            }
+            let Some(rules) = node
+                .config_attrs
+                .get(NODE_RULES_ATTR)
+                .and_then(|value| serde_json::from_value::<NodeGuardRules>(value.clone()).ok())
+            else {
+                continue;
+            };
+            let Ok(guard) = rules.guard() else { continue };
+            out.judged += 1;
+            if let Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) =
+                crate::worker::netd::guard::resolve_and_guard(
+                    &crate::worker::netd::guard::SystemResolver,
+                    Some(&guard),
+                    host,
+                    port,
+                )
+                .await
+            {
+                out.refused.push((node.id, reason));
+            }
+        }
+        out
+    }
+
     fn net_policy_task_facts(
         &self,
         job_id: &str,
@@ -16746,6 +16848,105 @@ mod tests {
         assert_eq!(test("agents").await?.verdict, "allow");
         store.set_sandbox_gated_default(true);
         assert_eq!(test("agents").await?.source, "gated-default");
+        Ok(())
+    }
+
+    /// `net policy test` judges a node's own addresses and its `hostGuard`
+    /// entries with the rules the node advertises: a target every node in
+    /// the pool refuses is denied by `host-guard`; one only some refuse is
+    /// allowed with a note naming them; an `allow` entry opens it.
+    #[tokio::test]
+    async fn net_policy_test_judges_each_nodes_advertised_guard() -> R<()> {
+        use crate::structs::host_guard::{NodeGuardRules, NODE_RULES_ATTR};
+        let store = setup_store()?;
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "web",
+            "runtime": "container",
+            "config": { "image": "alpine", "command": ["sleep", "1"] },
+        }))?;
+        store.handle_job_submit(
+            &JobConfig {
+                priority: Default::default(),
+                name: "web".into(),
+                tasks: vec![task],
+                rollout: None,
+                rollout_by_group: Default::default(),
+                version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
+            },
+            &[submission()],
+        )?;
+        let node = |id: &str, pool: &str, rules: NodeGuardRules| -> R<()> {
+            insert_node(&store, id)?;
+            let mut msg: NodeMsg = store.get_node(id)?.into();
+            msg.pool = pool.into();
+            msg.config_attrs = json!({ NODE_RULES_ATTR: rules }).to_string();
+            store.insert_node(msg)?;
+            Ok(())
+        };
+        let addr = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
+        node(
+            "edge-a",
+            "edge",
+            NodeGuardRules {
+                deny: vec!["198.51.100.0/24".into()],
+                node_addresses: vec![addr("10.0.1.7")],
+                ..Default::default()
+            },
+        )?;
+        node(
+            "edge-b",
+            "edge",
+            NodeGuardRules {
+                allow: vec!["10.0.1.7:9100".into()],
+                deny: vec!["198.51.100.0/24".into()],
+                node_addresses: vec![addr("10.0.1.8")],
+            },
+        )?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let test = |to: &'static str, pool: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .test_net_policy(Request::new(TestNetPolicyRequest {
+                        job_id: "web".into(),
+                        to: to.into(),
+                        node_pool: pool.into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner())
+            }
+        };
+
+        let denied = test("198.51.100.4:443", "edge").await?;
+        assert_eq!(denied.verdict, "deny");
+        assert_eq!(denied.source, "host-guard");
+        assert!(
+            denied.reason.contains("2 of 2 node(s)"),
+            "{}",
+            denied.reason
+        );
+
+        // edge-a's own address: refused there, reachable from edge-b.
+        let partly = test("10.0.1.7:80", "edge").await?;
+        assert_eq!(partly.verdict, "allow");
+        assert!(
+            partly.explanation.contains("1 of 2 node(s) (edge-a)"),
+            "{}",
+            partly.explanation
+        );
+        // edge-b's allow entry does not open edge-a's address on edge-a.
+        let opened = test("10.0.1.7:9100", "edge").await?;
+        assert_eq!(opened.verdict, "allow");
+        assert!(
+            opened.explanation.contains("edge-a"),
+            "{}",
+            opened.explanation
+        );
+        // Another pool's nodes are not consulted.
+        assert_eq!(test("198.51.100.4:443", "default").await?.verdict, "allow");
         Ok(())
     }
 

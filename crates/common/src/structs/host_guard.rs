@@ -305,6 +305,51 @@ impl HostGuard {
     }
 }
 
+/// The node attribute a worker advertises its guard under, so the manager's
+/// `TestNetPolicy` judges a node's own addresses and its `hostGuard` entries
+/// as the node would.
+pub const NODE_RULES_ATTR: &str = "hostGuardRules";
+
+/// A node's guard as it advertises it ([`NODE_RULES_ATTR`]): its
+/// `hostGuard.allow` and `deny` entries and its interface addresses at
+/// registration.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeGuardRules {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub node_addresses: Vec<IpAddr>,
+}
+
+impl NodeGuardRules {
+    /// The rules of a worker with `config`, on this host.
+    pub fn for_this_host(config: Option<&HostGuardConfig>) -> Self {
+        let config = config.cloned().unwrap_or_default();
+        NodeGuardRules {
+            allow: config.allow,
+            deny: config.deny,
+            node_addresses: interface_addresses()
+                .into_iter()
+                .filter(|ip| builtin_class(*ip).is_none())
+                .collect(),
+        }
+    }
+
+    /// The guard these rules describe.
+    pub fn guard(&self) -> R<HostGuard> {
+        let guard = HostGuard::new(&HostGuardConfig {
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+            counter_interval: None,
+        })?;
+        guard.set_node_addrs(self.node_addresses.clone());
+        Ok(guard)
+    }
+}
+
 /// Every address on this host's interfaces, for the node-address class.
 #[cfg(unix)]
 pub fn interface_addresses() -> Vec<IpAddr> {
@@ -453,6 +498,32 @@ mod host_guard_test {
             denial.reason(None),
             "an IP literal is not repeated as a name"
         );
+    }
+
+    #[test]
+    fn advertised_rules_rebuild_the_node_guard_test() -> R<()> {
+        let rules = NodeGuardRules {
+            allow: vec!["10.0.1.7:9100".into()],
+            deny: vec!["192.0.2.0/24".into()],
+            node_addresses: vec![ip("10.0.1.7")],
+        };
+        let round_trip: NodeGuardRules = serde_json::from_value(serde_json::to_value(&rules)?)?;
+        assert_eq!(round_trip, rules);
+        let guard = rules.guard()?;
+        assert_eq!(
+            guard.judge(ip("10.0.1.7"), 80).expect_err("own").class,
+            GuardClass::NodeAddress
+        );
+        assert!(guard.judge(ip("10.0.1.7"), 9100).is_ok());
+        assert_eq!(
+            guard.judge(ip("192.0.2.9"), 443).expect_err("deny").class,
+            GuardClass::OperatorDeny
+        );
+        assert!(!NodeGuardRules::for_this_host(None)
+            .node_addresses
+            .iter()
+            .any(IpAddr::is_loopback));
+        Ok(())
     }
 
     #[cfg(unix)]
