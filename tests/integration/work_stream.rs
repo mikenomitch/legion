@@ -45,7 +45,8 @@ use legion::structs::suspend::SuspendConfig;
 use legion::structs::{
     stream_work_request, AllocationHealth, CreateInstanceRequest, GetInstanceRequest,
     HeartbeatReply, HeartbeatRequest, InstanceMode, Node, NodeMsg, SnapshotReport,
-    StartInstanceRequest, StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkRequest,
+    StartInstanceRequest, StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkReport,
+    StreamWorkRequest,
     Submission, SuspendInstanceRequest, WhoAmIRequest,
 };
 use legion::worker::work_stream::WorkMirror;
@@ -445,6 +446,54 @@ fn a_placement_reaches_a_streaming_worker_within_a_round_trip() -> R<()> {
     assert!(
         p50 <= rtt_p50 + Duration::from_millis(50),
         "p50 delivery {p50:?} is not within a round trip ({rtt_p50:?}) of the commit"
+    );
+    probe.close();
+    Ok(())
+}
+
+/// A health transition a streaming worker reports on the stream reaches the
+/// manager's store with no heartbeat at all (task-start critical path plan,
+/// phase 4).
+#[test]
+fn a_health_report_on_the_stream_lands_without_a_heartbeat() -> R<()> {
+    let cluster = local(&[("w-1", 200)])?;
+    let probe = Probe::open(&cluster.rt, cluster.addr, "w-1", (0, 0), true)?;
+    probe.expect("the opening resync");
+    create_and_place(&cluster.store, 1)?;
+    let placed = probe.expect("the placement");
+    let allocation_id = placed.upserts[0].allocation_id;
+    assert!(cluster
+        .store
+        .allocation_health_for_allocations(&[allocation_id])?
+        .get(&allocation_id)
+        .is_none_or(|health| !health.healthy));
+
+    let report = |healthy: bool| StreamWorkRequest {
+        frame: Some(stream_work_request::Frame::Report(StreamWorkReport {
+            allocation_health: vec![AllocationHealth {
+                allocation_id,
+                healthy,
+                status: if healthy { "healthy" } else { "starting" }.into(),
+                artifact_states: None,
+            }],
+        })),
+    };
+    let sent = Instant::now();
+    cluster.rt.block_on(probe.requests.send(report(true)))?;
+    wait_for(Duration::from_secs(5), "the reported health", || {
+        cluster
+            .store
+            .allocation_health_for_allocations(&[allocation_id])
+            .ok()
+            .and_then(|health| health.get(&allocation_id).map(|health| health.healthy))
+            == Some(true)
+    });
+    println!(
+        "work_stream_measure {}",
+        json!({
+            "measure": "health_report_to_store",
+            "us": sent.elapsed().as_micros() as u64,
+        })
     );
     probe.close();
     Ok(())

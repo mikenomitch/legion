@@ -1157,11 +1157,16 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             node_identity: Some(node_identity.clone()),
             netd: Some(netd.clone()),
         });
+        // Health transitions go to the manager on the stream as they
+        // happen, not on the next heartbeat.
+        let (report_tx, report_rx) = crate::worker::work_stream::report_channel();
+        lock_manager(&task_manager).set_health_reports(report_tx);
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
             move |request| credentials.attach(request),
             name.clone(),
             WORK_MIRROR.clone(),
+            report_rx,
             move |applied| launch_streamed_work(&launcher, applied),
         ));
     }

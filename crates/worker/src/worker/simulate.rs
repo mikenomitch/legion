@@ -1285,6 +1285,8 @@ async fn run_sim_node(
             move |request| attach_node.credentials.attach(request),
             node.name.clone(),
             node.mirror.clone(),
+            // A simulated node has no tasks of its own to report on.
+            crate::worker::work_stream::report_channel().1,
             move |applied| {
                 let desired = applied_node
                     .mirror

@@ -1288,6 +1288,9 @@ pub struct WorkerTaskManager {
     /// time never changes, and keeping the first read is what identifies
     /// *this* process should its pid be reused.
     pid_start_times: std::sync::Mutex<HashMap<i64, (u32, u64)>>,
+    /// Where health transitions go between heartbeats (the work stream's
+    /// `report` frames). `None` without a work stream.
+    health_reports: Option<crate::worker::work_stream::ReportSender>,
     /// The latest live checkpoint of each running session (periodic or
     /// worker-stop), by session id. Its parts stay pinned until it is
     /// replaced, the session suspends or ends.
@@ -1450,6 +1453,7 @@ impl WorkerTaskManager {
             runtime_gate,
             session_pid_starts: HashMap::new(),
             pid_start_times: std::sync::Mutex::new(HashMap::new()),
+            health_reports: None,
             session_checkpoints: HashMap::new(),
             session_captures: Default::default(),
             resuming_sessions: HashMap::new(),
@@ -3312,15 +3316,45 @@ impl WorkerTaskManager {
         healthy: bool,
         status: impl Into<String>,
     ) {
-        self.allocation_health.insert(
+        let entry = AllocationHealth {
             allocation_id,
-            AllocationHealth {
-                allocation_id,
-                healthy,
-                status: status.into(),
-                artifact_states: None,
-            },
-        );
+            healthy,
+            status: status.into(),
+            artifact_states: None,
+        };
+        let was_healthy = self
+            .allocation_health
+            .get(&allocation_id)
+            .map(|previous| previous.healthy);
+        // A flip (or a new start that is healthy at once) goes to the
+        // manager on the work stream now, rather than on the next beat.
+        if was_healthy.unwrap_or(false) != healthy {
+            self.report_health(&entry);
+        }
+        self.allocation_health.insert(allocation_id, entry);
+    }
+
+    /// Send the worker's health reports to `sender` (the work stream's
+    /// report channel; see `work_stream::report_channel`).
+    pub fn set_health_reports(&mut self, sender: crate::worker::work_stream::ReportSender) {
+        self.health_reports = Some(sender);
+    }
+
+    /// Hand one health transition to the work stream, under the manager's
+    /// id. Dropped when there is no stream, the queue is full, or the
+    /// manager has no allocation for it (an unratified start): the next
+    /// heartbeat carries it either way.
+    fn report_health(&self, entry: &AllocationHealth) {
+        let Some(sender) = self.health_reports.as_ref() else {
+            return;
+        };
+        let Some(allocation_id) = self.external_id(entry.allocation_id) else {
+            return;
+        };
+        let _ = sender.try_send(AllocationHealth {
+            allocation_id,
+            ..entry.clone()
+        });
     }
 
     /// Report a gated allocation's network capture as not ready: it has no
@@ -3356,6 +3390,9 @@ impl WorkerTaskManager {
             .get(&allocation_id)
             .is_some_and(|health| health.status.starts_with(NET_CAPTURE_UNAVAILABLE));
         if still_masked {
+            if prior.healthy {
+                self.report_health(&prior);
+            }
             self.allocation_health.insert(allocation_id, prior);
         }
     }
@@ -11396,6 +11433,38 @@ mod tests {
             "a duplicate verdict must not start a second health monitor"
         );
         assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        Ok(())
+    }
+
+    /// A health flip goes to the work stream's report channel under the
+    /// manager's id; an unchanged health, and an unratified start the
+    /// manager has no allocation for, do not.
+    #[test]
+    fn health_flips_are_reported_to_the_work_stream_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let (reports, mut received) = crate::worker::work_stream::report_channel();
+        manager.set_health_reports(reports);
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        assert!(received.try_recv().is_err(), "starting is not a flip");
+        manager.set_allocation_health(alloc().id, true, "healthy");
+        let report = received.try_recv().expect("the flip");
+        assert_eq!((report.allocation_id, report.healthy), (alloc().id, true));
+        manager.set_allocation_health(alloc().id, true, "healthy");
+        assert!(received.try_recv().is_err(), "no flip, no report");
+        manager.set_allocation_health(alloc().id, false, "check failed");
+        assert!(!received.try_recv().expect("the flip back").healthy);
+
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager.set_allocation_health(admitted.local_key, true, "healthy");
+        assert!(
+            received.try_recv().is_err(),
+            "the manager has no allocation for an unratified start"
+        );
         Ok(())
     }
 

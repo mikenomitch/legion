@@ -2051,7 +2051,9 @@ service Manager {
   // The worker opens this stream once and keeps it open. Its first frame is
   // `StreamWorkRequest.open`, naming its node and the last position it
   // applied (`last_epoch`, `last_seq`); every later frame is an `ack` of the
-  // highest `seq` it applied. The manager sends `StreamWorkReply` messages:
+  // highest `seq` it applied, or a `report` of health transitions the
+  // manager applies at once instead of waiting for the next heartbeat
+  // (`StreamWorkReport`). The manager sends `StreamWorkReply` messages:
   //
   // - **Deltas.** Each committed change to an allocation on the node (placed,
   //   updated, stopped, removed) becomes the next message on the node's
@@ -10632,9 +10634,36 @@ message StreamWorkRequest {
   oneof frame {
     // The first frame, and only the first.
     StreamWorkOpen open = 1;
-    // Every later frame: the highest message the worker has applied.
+    // A later frame: the highest message the worker has applied.
     StreamWorkAck ack = 2;
+    // A later frame: something the worker reports at once rather than on
+    // its next heartbeat.
+    StreamWorkReport report = 3;
   }
+}
+
+// What a streaming worker reports between heartbeats (docs/
+// architecture-managers-workers.md, "Reports between heartbeats").
+//
+// A start used to reach the manager on the worker's next heartbeat: about a
+// second on average at the default two-second cadence, and up to the
+// adaptive cadence (21 seconds on a 20,000-node fleet), so rollouts and
+// service discovery waited that long for work that was already serving. A
+// streaming worker now sends each health transition the moment it happens.
+//
+// A hint, like the manager's pushes: the heartbeat's `allocation_health`
+// still carries every allocation's health on every beat and stays the
+// record. A report lost with its stream costs one heartbeat interval. A
+// heartbeat whose snapshot was taken just before a transition can arrive
+// after the transition's report and set the older health back until the
+// next beat. The manager applies a report as it applies a heartbeat's
+// health, under the node the stream's `open` was authenticated for.
+message StreamWorkReport {
+  // Allocations whose health changed (`healthy` flipped, or the first
+  // report of a new start), by the manager's allocation ids, in the form
+  // `HeartbeatRequest.allocation_health` uses. Unratified edge and session
+  // starts are not included: the manager has no allocation for them.
+  repeated AllocationHealth allocation_health = 1;
 }
 
 // Opens a `StreamWork` stream.

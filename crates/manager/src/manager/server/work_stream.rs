@@ -19,7 +19,9 @@
 use super::*;
 use crate::storage::revisions::Revision;
 use crate::storage::work_log::{NodeWorkLog, PendingWork, WorkLog};
-use crate::structs::{stream_work_request, StopNotice, StreamWorkReply, StreamWorkRequest};
+use crate::structs::{
+    stream_work_request, StopNotice, StreamWorkReply, StreamWorkReport, StreamWorkRequest,
+};
 
 /// How long a resuming stream waits for this manager's replica to catch up
 /// to the worker's revision before it gives up and resyncs (a worker that
@@ -200,6 +202,27 @@ pub(super) fn next_work_message(
         Vec::new()
     };
     Ok(work_log.commit_message(log, resync, upserts, stops, checkpoints))
+}
+
+/// Apply a worker's [`StreamWorkReport`] (health transitions between
+/// heartbeats) on the blocking pool, without waiting for it.
+fn apply_stream_report(store: &Store, node_id: &str, report: StreamWorkReport) {
+    if report.allocation_health.is_empty() {
+        return;
+    }
+    let store = store.clone();
+    let node_id = node_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) =
+            store.upsert_allocation_health_snapshots(&node_id, &report.allocation_health)
+        {
+            warn!(
+                node_id = %node_id,
+                error = ?err,
+                "Error applying a streamed health report"
+            );
+        }
+    });
 }
 
 impl ManagerDaemonService {
@@ -429,6 +452,14 @@ impl ManagerDaemonService {
                         Ok(Some(StreamWorkRequest {
                             frame: Some(stream_work_request::Frame::Ack(ack)),
                         })) => work_log.ack(&log, ack.epoch, ack.seq),
+                        // Health transitions between heartbeats, applied as
+                        // a heartbeat's are, under the node this stream was
+                        // opened (and is reauthenticated) for. Off the
+                        // runtime and off this loop: the write can wait on
+                        // a quorum round.
+                        Ok(Some(StreamWorkRequest {
+                            frame: Some(stream_work_request::Frame::Report(report)),
+                        })) => apply_stream_report(&store, &node_id, report),
                         Ok(Some(_)) => {}
                         Ok(None) | Err(_) => break,
                     },
