@@ -293,7 +293,7 @@ starts an unnamed session. The reply carries `mode = "session"`,
 
 | Error | Meaning |
 | --- | --- |
-| `FAILED_PRECONDITION` "no node runs an envelope" | The envelopes have not been placed yet. Check `legion job status <JOB>`: are there eligible workers with the `sessions` capability? |
+| `FAILED_PRECONDITION` "no node runs an envelope" | No envelope of the task is placed. When the scheduler left one unplaced, the message quotes its reason, for example a node that is eligible but has no room for the envelope; `legion events list --kind plan.unplaced --job <JOB>` lists every such plan. Without a reason, check `legion job status <JOB>`: are there eligible workers with the `sessions` capability? The capacity pass places the envelope once room appears. |
 | `RESOURCE_EXHAUSTED` "every envelope ... is full" | No envelope has room. Retryable once sessions end; raise `envelope.resources` or add nodes. When the envelopes are [elastic](#elastic-envelopes), the message says so: they grow within a heartbeat, so retry in a few seconds |
 | `RESOURCE_EXHAUSTED` "no node accepted the session" | The three nodes tried all refused, with each node's reason |
 | `UNAVAILABLE` "runtime ... is disabled" (code `RUNTIME_DISABLED`) | An operator [disabled the task's runtime](runtime-disable.md) for the job's namespace. Retryable once it is enabled. The same refusal answers an edge start and a resume of a suspended session, which stays suspended |

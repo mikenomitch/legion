@@ -595,9 +595,9 @@ enum SnapshotDrop<'a> {
     /// None — a Reschedule plan counts everything that is running.
     Nothing,
     /// Every allocation of a job: a Fresh plan replaces the job wholesale
-    /// (its handler already dropped the rows, or drops them the moment
-    /// the plan applies), so counting them would demand headroom for two
-    /// copies of the job.
+    /// (its handler already dropped the rows, or the plan's own apply
+    /// transaction removes them), so counting them would demand headroom
+    /// for two copies of the job.
     Job(&'a str),
     /// Every allocation of one config: the read-only preview of the same.
     JobConfig(&'a str),
@@ -2177,12 +2177,13 @@ impl<'a> Scheduler<'a> {
 
         // A `Fresh` plan replaces the job's allocations wholesale: whichever
         // handler asked for it either already dropped the previous ones
-        // (`job_update`) or drops them the moment this plan applies
-        // (`job_submit`). Counting them against node capacity here would
-        // demand headroom for two copies of the job and fail a plain
-        // resubmit of anything using more than half a node — and it would
-        // contradict `plan_only` / `plan_for_config`, which drop them and so
-        // report a plan the apply path then refuses.
+        // (`job_update`), or the apply transaction that commits this plan
+        // removes them (`job_submit`, `Store::retire_replaced_allocations_tx`),
+        // so no committed state holds both. Counting them against node
+        // capacity here would demand headroom for two copies of the job and
+        // fail a plain resubmit of anything using more than half a node —
+        // and it would contradict `plan_only` / `plan_for_config`, which
+        // drop them and so report a plan the apply path then refuses.
         let job_lookup_started = std::time::Instant::now();
         let replaced_job_id = if matches!(mode, PlanMode::Fresh) {
             self.store.job_id_for_job_config(job_config_id)?

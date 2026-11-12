@@ -171,6 +171,9 @@ impl Cluster {
             run_eval_worker(self.store())?;
             let now = self.store().wake_blocked_evals()?;
             if now == 0 {
+                // A wake pass can queue a capacity pass without waking a
+                // blocked eval (a job that placed part of its work).
+                run_eval_worker(self.store())?;
                 return Ok(woken);
             }
             woken += now;

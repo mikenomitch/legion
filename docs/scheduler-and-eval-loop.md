@@ -312,7 +312,15 @@ Main paths in `Scheduler`:
 
 Modes:
 
-- `Fresh`: place full desired set.
+- `Fresh`: place full desired set. A Fresh plan replaces the job's
+  allocations wholesale, so it plans as though the job held nothing. A
+  resubmit (`job_submit` for a changed spec) applies it while the previous
+  version still runs, and the apply transaction that inserts the new
+  allocations removes the previous version's allocations too: no committed
+  state holds both versions, so a node is never overcommitted by a resubmit,
+  even across a crash. A stateful instance the old version held rebinds to
+  its replacement in that same transaction. A restart (`job_update`) removes
+  the job's allocations before it plans.
 - `Reschedule`: place only missing count relative to existing allocations.
 
 ## Placement Application and Conflict Safety
@@ -553,7 +561,9 @@ inserting it:
   transaction, and every placement must still fit, with earlier placements
   in the same plan debited. The free pool is current capacity minus the
   allocation rows the transaction can see, excluding a Fresh plan's own
-  replaced job. This is the same arithmetic as the planner's ledger.
+  replaced job. This is the same arithmetic as the planner's ledger. The
+  replaced rows are then deleted in the same transaction, after every
+  placement has bound.
 
 The fresh node row is always read, but it is not always parsed. When the
 row's bytes are exactly what the read model's copy of the node serializes
@@ -647,19 +657,28 @@ tasks of the job, and the replicas of this task that did fit, are applied.
   could help appears (see [Blocked evals](#blocked-evals)). The error it
   blocks with carries the same message, so `job plan`, the eval outcome and
   the `eval.blocked` event all name the same reason.
-- A **partially placed** plan succeeds, and its unplaced remainder is placed
+- A **partially placed** plan succeeds, writes one `plan.unplaced` warn
+  event naming each task it left and why (see
+  [event-stream.md](event-stream.md)), and its unplaced remainder is placed
   by the next pass that has room: the **capacity pass**, a `node_join` eval
   with no node that re-plans every active job short of its count. It is
   queued when a node registers or is uncordoned, and, while some plan has
-  left replicas unplaced, whenever capacity frees up: a worker reports an
-  allocation finished, a failed allocation is removed, a job stops, or a job
-  scales in. One pass covers any number of frees (it is not queued again
-  while one is pending), and when nothing is waiting a free queues nothing.
+  left replicas unplaced, whenever capacity appears: a worker reports an
+  allocation finished, a failed allocation is removed, a job stops, a job
+  scales in, and any other capacity event on a schedulable node (the same
+  events that wake [blocked evals](#blocked-evals): a lost node that
+  heartbeats again, a node's pool or attributes changing, allocations
+  leaving a node through preemption or a drain). A cordon or a node going
+  lost queues nothing. One pass covers any number of events (it is not
+  queued again while one is pending), and when nothing is waiting an event
+  queues nothing.
 - Only the manager that leads the scheduler lane queues the pass. After a
   restart or a leadership change the first freed capacity runs one pass,
   which finds out whether anything is waiting.
 - A job with an eval already queued, or blocked, is skipped by the pass
-  (that eval runs against the new capacity anyway).
+  (that eval runs against the new capacity anyway). A job the pass re-plans
+  and still cannot place keeps waiting for the next capacity event; the pass
+  queues no retry for it.
 - A batch task is retried only while it has not finished (its status is not
   `success`, `complete`, or `failed`).
 
@@ -698,8 +717,9 @@ What this means in practice:
   holds the port stops the old allocation first (see
   [rollouts.md](rollouts.md#static-ports-and-surge)).
 
-Ports a Fresh plan's own previous allocations hold count as taken until the
-handler removes those rows, matching what the apply sees. Ports assigned
+Ports a Fresh plan's own previous allocations hold count as taken, matching
+what the apply sees: its placements bind before the same transaction removes
+those rows. Ports assigned
 dynamically by this same plan are not known until apply, so a static port
 inside the dynamic range can still collide at apply time with a dynamic port
 handed out in the same plan; the candidate walk then falls back to the next
@@ -1164,7 +1184,10 @@ Typical triggers:
 - A node registering or being uncordoned -> one cluster-wide `node_join`
   capacity pass, which re-plans only jobs short of their count that have no
   pending or blocked eval (a backstop: a job that could not place normally
-  has a blocked eval, which the wake pass handles).
+  has a blocked eval, which the wake pass handles). While some plan has left
+  replicas unplaced, freed capacity and any other capacity event on a
+  schedulable node (a lost node heartbeating again, say) queue the same
+  pass.
 - Capacity events -> blocked evals back to `pending` (see
   [Blocked evals](#blocked-evals)).
 

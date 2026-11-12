@@ -527,7 +527,10 @@ blocked eval:
 
 - Worker registration (`worker_register`) inserts the node, then queues a
   capacity pass: one `node_join` eval with no node. Uncordoning a node
-  (`legion node uncordon`) queues the same pass.
+  (`legion node uncordon`) queues the same pass. So does, while some plan has
+  left replicas unplaced, capacity appearing any other way: allocations
+  finishing or leaving a node, a job stopping or scaling in, or a lost node
+  that starts heartbeating again without re-registering.
 - The pass re-evaluates, with a `Reschedule` plan, every active job that has
   no live rollout and nothing already queued or blocked, when its config has
   a `count.per` task, a service or sidecar task with fewer allocations than

@@ -352,6 +352,7 @@ by project impact. The full template and a worked example:
 - [todo-bug-sweep-2026-11-08_calls.md](calls/todo-bug-sweep-2026-11-08_calls.md)
 - [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-11-10_calls.md)
 - [todo-closeout-2026-11-11_calls.md](calls/todo-closeout-2026-11-11_calls.md)
+- [correctness-gaps-2026-11-12_calls.md](calls/correctness-gaps-2026-11-12_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)
