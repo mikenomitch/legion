@@ -143,29 +143,6 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       slow, profile with `legion_eval_phase_seconds{kind="job_stop"}`
       ([calls #2](calls/write-path-cost-followups_calls.md)).
 
-### Candidates and indexes
-
-- [ ] **The `fit` index does not see `maxAllocations`.** A capped node still
-      projects into a fitting cell, so under `bin_pack` capped nodes rank first
-      and waste the candidate budget. Project `allocations` as a fourth dim or a
-      cap flag that moves the node to the non-fitting tail.
-- [ ] **Node namespace restrictions cost one attribute lookup per node per task**
-      (`PermitSet::is_permitted`; 11.0 → 12.2 ms at 10k nodes;
-      [calls 25](calls/legion-apps-plan_calls.md)). Precompute "accepts every
-      namespace" per node, or fold it into `permits_restrictions`, and re-measure.
-- [ ] **In-place rollout ticks build an O(fleet) exclusion set**
-      (`crates/manager/src/manager/rollout.rs`, `available_node_ids`), forcing the plan's node-set
-      copy. Express it as an allow-list ([plan §13](plans/plan-path-fleet-scaling-plan.md)).
-- [ ] **Truncation-ineligible tasks still scan the fleet** (`count.per`,
-      `distinct`, volumes, multi-task groups); a non-goal of the fleet-scaling plan.
-- [ ] **Scheduling-index follow-ups** ([plan](plans/scheduling-index-plan.md)):
-      index-served group co-placement (calls 10), pluggable index kinds,
-      `count.per` by partition enumeration, device-set dims, task-level
-      `index_hint`, incremental orthant enumeration with early termination.
-- [ ] **Volume-pin staleness in planning**: pins are read mid-plan with no epoch
-      coupling, so a pin invalidated mid-plan (`volume delete --force`) can still
-      direct a placement. Low severity; reconciliation covers it.
-
 ### Placement features
 
 - [ ] **Soft taints.** Pools act as hard taints (`crates/common/src/constraints.rs`) and the
@@ -1205,6 +1182,7 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **The per-pool preemption toggle stays in manager config** — decided, not ACL-scoped: a pool-scoped token cannot exempt its pool (plan Open Question 6 · [calls 17](calls/preemption-and-eviction-plan_calls.md) · [docs](../docs/preemption-and-eviction.md#operator-controls))
 - **Plugin ABI version symbol** — `declare_task_plugin_abi!()` makes stale dylibs fail at load ([docs](../docs/task-runtime-plugins.md))
 - **Declarable scheduling indexes** — `partition_by` × `dims` indexes, nearest-fit candidates, shadow mode, default `fit` index ([plan](plans/scheduling-index-plan.md) · [docs](../docs/scheduling-indexes.md))
+- **Candidates and indexes** — `fit` sends nodes at `maxAllocations` to the tail; a per-node permit flag removes the namespace lookup; in-place rollouts pass an allow-list; every task shape but gangs truncates (`distinct`, stateful with pinned-node top-up, `count.per` by partition enumeration, co-placed groups through the index); plugin index kinds; `devices.*` and item-set dims; `indexHint`; heap-ordered walk; volume pins fenced at apply ([plan](plans/candidates-and-indexes-plan.md) · [calls](calls/candidates-and-indexes-plan_calls.md) · [docs](../docs/scheduling-indexes.md))
 - **Late-binding plan apply (phases 0–3)** — ranked candidates per placement, conflict-exhausted evals requeue with backoff, `plan_candidates` ([plan](plans/late-binding-plan-apply-plan.md) · [docs](../docs/late-binding-plan-apply.md))
 - **Adaptive scheduler concurrency (phases 1–3)** — AIMD planner gate with goodput guard, `legion scheduler concurrency`; default `observe` ([plan](plans/adaptive-scheduler-concurrency-plan.md) · [calls](calls/adaptive-scheduler-concurrency-plan_calls.md) · [docs](../docs/adaptive-scheduler-concurrency.md))
 - **Late-binding plan apply, Phase 4 (part)** — capacity-aware skipping shipped as the walk's pass 2 ([calls #17](calls/late-binding-plan-apply-plan_calls.md)); `distinct` replicas get fallback lists, the walk enforces `distinct` ([calls #2](calls/late-binding-plan-apply-plan_calls.md) · [docs](../docs/late-binding-plan-apply.md#coupled-placements)). Partial commit and a full-pool lane not planned ([plan](plans/late-binding-plan-apply-plan.md))

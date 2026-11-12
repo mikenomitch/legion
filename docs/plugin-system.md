@@ -194,6 +194,7 @@ What a quarantine means per kind:
 | Rollout strategy | Manager | Resolving a rollout that names it fails |
 | Node check | Worker | It reports a failing check, so the node reads as unhealthy |
 | Artifact fetcher | Worker | Fetches of its scheme fail, and the allocation with them |
+| Scheduling-index kind | Manager | Its indexes stop serving; tasks fall back to automatic selection or the scan |
 
 Every quarantine is logged at `error` (`Plugin panicked; quarantining it
 until this process restarts`) and counted in
@@ -238,6 +239,24 @@ Purpose: choose the node placement strategy.
   - `random` (`plugins/scheduling/random/`)
 
 Entry trait: `SchedulingPolicy` in `crates/manager/src/manager/scheduler/policy.rs`.
+
+### Scheduling-index kinds
+
+Purpose: supply the geometry of a scheduling index — how a node maps to a
+cell and how cells rank for a request — when the built-in grid cannot express
+the ordering ([Scheduling Indexes](scheduling-indexes.md#index-kinds)). An index declared
+with `kind = "<name>"` loads `plugins/indexes/<name>/` at manager startup; a
+missing or refused kind fails the startup, naming the index.
+
+- Built-in kind:
+  - `grid`
+- Dynamic example plugin:
+  - `headroom` (`plugins/indexes/headroom/`)
+
+Entry traits: `IndexKindFactory` and `IndexKind` in
+`crates/common/src/scheduling_index.rs`; export with
+`legion::export_index_kind!`. Legion keeps shards, maintenance, truncation,
+and re-verification, so a kind can only reorder candidates.
 
 ## 3) Node Check Plugins
 

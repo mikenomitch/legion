@@ -1547,6 +1547,13 @@
             # rejects `gang` on a task that shares one.
             group = "trainer",
             count = 4,
+            # The scheduling index this task's candidates come from
+            # (docs/scheduling-indexes.md, "Hinting an index"): a name from
+            # the manager's `schedulerSettings.indexes`, or "scan" for the
+            # full scan. Advisory: a hint naming no index, or one this task
+            # cannot use, falls back to automatic selection and `job plan`
+            # says why. Omit it for automatic selection.
+            indexHint = "fit",
             # All-or-nothing placement for this task's replicas
             # (docs/gang-scheduling.md). `gang = true` means every replica
             # places in one plan or none does: a gang that does not fit

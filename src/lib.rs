@@ -29,8 +29,8 @@ pub use legion_worker::{
 // The macros a plugin invokes as `legion::export_*!` / `legion::declare_*!`.
 pub use legion_manager::export_scheduling_policy;
 pub use legion_worker::{
-    declare_plugin_abi, declare_task_plugin_abi, export_artifact_fetcher, export_node_checker,
-    export_rollout_strategy,
+    declare_plugin_abi, declare_task_plugin_abi, export_artifact_fetcher, export_index_kind,
+    export_node_checker, export_rollout_strategy,
 };
 
 pub mod apps;

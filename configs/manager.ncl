@@ -192,8 +192,8 @@
     # score_sample = { min_nodes = 1024, sample = 128 },
     # Declarable scheduling indexes (docs/scheduling-indexes.md): ad-hoc
     # candidate generation for the scheduler. A built-in `fit` index
-    # (nearest-fit over free cpu/memory/disk within the task's pool) is
-    # always declared and arms itself once the fleet reaches
+    # (nearest-fit over free cpu/memory/disk within the task's pool, with
+    # nodes at their maxAllocations cap last) is always declared and arms itself once the fleet reaches
     # `index_min_nodes` available nodes (default 128); below that, planning
     # uses the plain scan and indexes cost nothing.
     # index_min_nodes = 128,      # 0 disables indexing entirely
@@ -203,6 +203,11 @@
     #   # else is an exact-match partition key (`pool` = the node's pool).
     #   topo = ["pool", "region", "zone"],
     #   gpu = ["pool", "region", "resources.gpu_vram", "resources.memory"],
+    #   # `devices.<name>` dims count free devices whose group the name
+    #   # matches (`gpu`, `nvidia/gpu`, `nvidia/gpu/<model>`).
+    #   gpus = ["pool", "devices.nvidia/gpu"],
+    #   # A plugin geometry from plugins/indexes/<kind>/; `options` go to it.
+    #   emptiest = { kind = "headroom", partition_by = ["pool"], options = { resource = "cpu" } },
     #   # Full form when the defaults need overriding.
     #   big_jobs = {
     #     partition_by = ["pool"],

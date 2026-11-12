@@ -818,16 +818,21 @@ Per task, the candidate set is then built one of two ways:
   the node's own `namespaces` restriction: a node whose worker type lists
   namespaces is ineligible for a job outside them, whatever the permit says
   ([namespaces.md](namespaces.md#nodes-that-accept-only-some-namespaces)).
-  The check is one attribute lookup per node, and it rides inside the permit
-  check, so the scan, the index walk, and the apply recheck all make it.
+  The check rides inside the permit check, so the scan, the index walk, and
+  the apply recheck all make it. The plan's cached node set records, per
+  node, whether it declares any restriction block or `namespaces` list; for
+  the common node that declares neither, the permit check reads only its
+  pool, with no attribute lookups.
 - **Scheduling index** ([scheduling-indexes.md](scheduling-indexes.md)):
   when the fleet is at or above `schedulerSettings.index_min_nodes` and a
   declared index binds the task's equality constraints, candidates come
   from that index (partition shard lookup plus a nearest-fit walk over
   free resources). Only those candidates are re-verified with the same
-  predicate the scan applies. The scan remains the authoritative fallback
-  (unusable index, empty coverage, or a truncated list running dry), and
-  `job plan` reports which path served each task.
+  predicate the scan applies. Single tasks, co-placed groups, and each
+  `count.per` group get their own budgeted list; nodes a placement is pinned
+  to are added to it. The scan remains the authoritative fallback (unusable
+  index, empty coverage, or a truncated list running dry), and `job plan`
+  reports which path served each task.
 
 When neither path yields a node with room, and the job's band outranks work
 running on a node it is otherwise allowed on, a **preemption pass** runs.

@@ -249,6 +249,11 @@ fn jobspec_schema_envelope() -> Value {
                             }
                         ]
                     },
+                    "indexHint": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The scheduling index this task's candidates should come from: the name of an index in the manager's schedulerSettings.indexes, or \"scan\" for the full scan. Advisory: a hint naming no index, or one the task cannot use (a partition key it does not bind with an `=` constraint), falls back to automatic selection, and `job plan` says why in the task's index reason. Default: automatic. See docs/scheduling-indexes.md."
+                    },
                     "speculativeStart": {
                         "type": "object",
                         "description": "How far a node may get on a start for this task BEFORE the placement is durable. Absent = off, today's behavior. A task declaring network ports, connect upstreams, or storage whose driver cannot fence a concurrent attach is downgraded to `stage` (reported by `job validate`). See docs/edge-boot.md.",
