@@ -2000,6 +2000,50 @@ service Manager {
   // (`work_stream`), so its size no longer grows with what the node runs.
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
 
+  // Liveness ping: proves the worker is alive and nothing else
+  // (docs/heartbeat-cadence-and-scale.md, "Pings and heartbeats").
+  //
+  // A heartbeat does two jobs: it tells the manager the node is alive, and
+  // it carries the node's reports (allocation health, failures, volume and
+  // checkpoint outcomes) and fetches what the manager has for it (feeds,
+  // verdicts, notices). The second job is what makes a heartbeat cost the
+  // manager real work, so on a large fleet adaptive cadence slows it down,
+  // and before pings existed the lost-node window slowed down with it: a
+  // 20,000-node fleet took about 105 seconds to notice a dead machine.
+  //
+  // A ping is the first job alone. The manager answers it from memory: it
+  // checks the node's credential, looks the node up in its read model, and
+  // records the beat in its in-memory liveness table. No store write, no
+  // blocking-pool hop, no reply payload beyond the two intervals. The
+  // manager sizes the ping interval from `heartbeat.pingRatePerSecond`
+  // and the full heartbeat's from `heartbeat.targetRatePerSecond`, and
+  // derives each node's lost window from the ping interval, so detection
+  // stays fast while full heartbeats back off.
+  //
+  // A worker sends a ping on a liveness tick when no full heartbeat is due,
+  // and a full heartbeat (which also counts as a beat) when one is. Both
+  // reset the worker's stateful self-fence clock. While the two intervals
+  // are equal (every fleet up to the size where full heartbeats start to
+  // back off) every tick is a full heartbeat and the worker sends no pings
+  // at all.
+  //
+  // A ping from a node the manager has marked lost brings it back, exactly
+  // as a heartbeat does: the `lost -> active` transition is replicated, and
+  // the reply sets `sync_now` so the worker sends a full heartbeat at once
+  // instead of waiting out its sync interval.
+  //
+  // ACL: worker plane. The caller's authenticated per-node principal
+  // (`node:<node_id>`) must match the request's `node_id`.
+  //
+  // Errors:
+  // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - NotFound: no node is registered under `node_id` (removed, or the
+  //   manager's state was reset). The worker counts it as a failed beat, as
+  //   it does a heartbeat answered NotFound, so its self-fence clock keeps
+  //   running.
+  // - Internal: recording a `lost -> active` transition failed.
+  rpc Ping (PingRequest) returns (PingReply);
+
   // Sequenced delivery of work to one worker (docs/
   // architecture-managers-workers.md, "Delivery"; sandbox-scaling plan,
   // Phase 2).
@@ -11224,12 +11268,16 @@ message HeartbeatReply {
   // Default: empty list.
   repeated ClaimVerdict claim_verdicts = 6;
 
-  // The interval, in seconds, the manager wants this worker to heartbeat at.
+  // The LIVENESS interval, in seconds: how often the manager wants this
+  // worker to prove it is alive, with a ping or a heartbeat
+  // (docs/heartbeat-cadence-and-scale.md, "Pings and heartbeats"). The
+  // node's lost window is derived from it. How often to send a full
+  // heartbeat is `sync_interval_seconds`.
   //
   // Present whenever the manager runs adaptive cadence, which is the default
-  // (`heartbeat.adaptive`, `heartbeat.targetRatePerSecond` in the manager
+  // (`heartbeat.adaptive`, `heartbeat.pingRatePerSecond` in the manager
   // config). The manager derives it from fleet size alone; at the defaults
-  // every fleet up to 2,500 nodes is served the 2s floor. Absent when the
+  // every fleet up to 10,000 nodes is served the 2s floor. Absent when the
   // operator turned adaptive cadence off (`heartbeat.adaptive = false`) or
   // the manager predates it, and absent means "use your worker-type
   // `heartbeatSeconds`".
@@ -11467,6 +11515,46 @@ message HeartbeatReply {
   // did. Sent on every reply until the node's session report no longer
   // lists a child of the owner, so a lost notice is repeated.
   repeated OwnerNotice owner_notices = 27;
+
+  // The SYNC interval, in seconds: how often the manager wants a full
+  // heartbeat from this worker (docs/heartbeat-cadence-and-scale.md,
+  // "Pings and heartbeats"). Never shorter than `next_interval_seconds`.
+  // Between full heartbeats the worker proves it is alive with `Ping`, once
+  // per liveness interval.
+  //
+  // Sized from fleet size and `heartbeat.targetRatePerSecond`, as the one
+  // heartbeat interval was before pings existed. Present whenever
+  // `next_interval_seconds` is. Absent with adaptive cadence off: the
+  // worker then sends a full heartbeat on every liveness tick and no pings.
+  //
+  // A worker sends a full heartbeat early, without waiting for this, when
+  // it has something the manager is waiting on (a stream message that
+  // stopped an allocation, a finished checkpoint), or when a ping's reply
+  // sets `sync_now`.
+  optional uint32 sync_interval_seconds = 28;
+}
+
+// Request payload for `Ping`.
+message PingRequest {
+  // The pinging worker's node id. Must match the caller's node credential.
+  string node_id = 1;
+}
+
+// Reply to `Ping`.
+message PingReply {
+  // The liveness interval, in seconds, exactly as
+  // `HeartbeatReply.next_interval_seconds` carries it: a floor over the
+  // worker-type `heartbeatSeconds`, absent with adaptive cadence off.
+  optional uint32 next_interval_seconds = 1;
+
+  // The sync interval, in seconds, exactly as
+  // `HeartbeatReply.sync_interval_seconds` carries it.
+  optional uint32 sync_interval_seconds = 2;
+
+  // True when this ping brought the node back from `lost`. The worker sends
+  // a full heartbeat at once, so the manager hears the node's allocation
+  // state now rather than one sync interval later.
+  bool sync_now = 3;
 }
 
 // Why one allocation is being stopped.
@@ -12412,21 +12500,28 @@ message GetHeartbeatCadenceReply {
   // Active nodes this manager currently tracks.
   uint32 active_nodes = 1;
 
-  // The interval, in seconds, this manager is currently telling workers to
-  // use. With adaptive cadence off this is the configured floor
-  // (`heartbeat.minInterval`, 2s by default) and workers keep their
-  // worker-type `heartbeatSeconds` instead.
+  // The liveness interval, in seconds, this manager is currently telling
+  // workers to use: how often each proves it is alive, with a ping or a full
+  // heartbeat (`HeartbeatReply.next_interval_seconds`). Sized from
+  // `heartbeat.pingRatePerSecond`. With adaptive cadence off this is the
+  // configured floor (`heartbeat.minInterval`, 2s by default) and workers
+  // keep their worker-type `heartbeatSeconds` instead.
   uint32 served_interval_seconds = 2;
 
   // The lost-node window derived from it:
-  // `missed_beats_before_lost x served_interval_seconds`.
+  // `missed_beats_before_lost x served_interval_seconds`. A pool whose
+  // worker type beats slower has the wider window of its own cadence
+  // (`pools`).
   uint32 lost_window_seconds = 3;
 
-  // Fraction of active nodes that checked in within one interval, 0.0 to 1.0.
-  // 1.0 means the fleet is keeping up. False node loss begins when this falls
-  // below `served_interval_seconds / lost_window_seconds` — 0.20 at the
-  // defaults. Zero, with `freshness_measurable` false, on a fleet too small to
-  // measure (under 20 nodes) or on a manager that does not own liveness.
+  // Fraction of active nodes that checked in within one interval, 0.0 to 1.0,
+  // each node judged against its OWN liveness interval (so a slow batch pool
+  // is not counted late against a fast pool's cadence). 1.0 means the fleet
+  // is keeping up. False node loss begins when this falls below
+  // `served_interval_seconds / lost_window_seconds` — 0.20 at the defaults.
+  // Zero, with `freshness_measurable` false, on a fleet too small to measure
+  // (under 20 nodes) or on a manager that does not own liveness. A problem
+  // in one pool can hide in this fleet-wide figure; `pools` breaks it down.
   double freshness_ratio = 4;
 
   // Whether `freshness_ratio` means anything. False on a tiny fleet, where the
@@ -12465,6 +12560,46 @@ message GetHeartbeatCadenceReply {
   // false, every number above is zero: a manager that does not own liveness
   // reports nothing rather than guessing.
   bool is_liveness_owner = 11;
+
+  // The full-heartbeat (sync) interval, in seconds, this manager is serving
+  // (`HeartbeatReply.sync_interval_seconds`), sized from
+  // `heartbeat.targetRatePerSecond` and never shorter than
+  // `served_interval_seconds`. When the two are equal, workers send no
+  // pings. Zero with adaptive cadence off, or on a non-owning manager.
+  uint32 sync_interval_seconds = 12;
+
+  // The same report per node pool, sorted by pool name: one row for every
+  // pool with an active node. Empty on a manager that does not own liveness.
+  repeated PoolHeartbeatCadence pools = 13;
+}
+
+// One node pool's line in `GetHeartbeatCadenceReply.pools`.
+message PoolHeartbeatCadence {
+  // The pool's name.
+  string pool = 1;
+
+  // Active nodes in the pool.
+  uint32 active_nodes = 2;
+
+  // The liveness interval most of the pool's nodes are on, in seconds: the
+  // larger of the served liveness interval and the pool's worker-type
+  // `heartbeatSeconds`, as the nodes' own lost windows record it. The
+  // median when nodes in one pool disagree (a worker type changed, or a
+  // window is still moving with the served cadence).
+  uint32 interval_seconds = 3;
+
+  // The lost window that interval gives:
+  // `missed_beats_before_lost x interval_seconds`.
+  uint32 lost_window_seconds = 4;
+
+  // Fraction of the pool's active nodes that checked in within 1.2x their
+  // own liveness interval, 0.0 to 1.0. Zero, with `freshness_measurable`
+  // false, on a pool under 20 nodes, where the ratio is noise.
+  double freshness_ratio = 5;
+
+  // Whether `freshness_ratio` means anything (the pool has 20 or more
+  // active nodes).
+  bool freshness_measurable = 6;
 }
 
 // Request payload for GetNodes.
@@ -19431,6 +19566,11 @@ message NodeLivenessDigestReply {
   // talks to. Absent when the leader has adaptive cadence off or predates
   // this field, and the sender then serves no interval either.
   optional uint32 served_interval_seconds = 4;
+
+  // The full-heartbeat (sync) interval, in seconds, the status-lane leader
+  // is serving, relayed the same way as `served_interval_seconds` (the
+  // liveness interval). Set exactly when `served_interval_seconds` is.
+  optional uint32 served_sync_interval_seconds = 6;
 
   // Set on an accepted digest whose `rollups` the leader could not apply: it
   // holds no state for this sender (it just took the status lane or

@@ -175,6 +175,7 @@ When one is required and what goes in it:
 | [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
 | [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | **shipped** 2026-08-03 (sizing + freshness warning + per-node lost windows + adaptive cadence); phase 5, adaptive cadence **on by default** at 2,500 beats/s, shipped 2026-10-09; the AWS reproduction is not run |
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
+| [liveness-ping-split-plan.md](plans/liveness-ping-split-plan.md) | **shipped** 2026-11-12: liveness pings (`Manager.Ping`) between full heartbeats, a liveness interval sized from `heartbeat.pingRatePerSecond` (10,000/s) that sets every lost window, the full heartbeat on its own sync interval, and per-pool freshness (metric, `legion node cadence` table, warning). The AWS rig rerun is not done; pings as `StreamWork` frames deferred |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (cross-system campaign rerun 2026-10-14 with every store on NVMe, results in [docs/benchmarks.md](../docs/benchmarks.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
 | [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md) | shipped (2026-11-08): Tier 1 spot-check bugs and four security gaps; deferrals in §9, AWS re-run pending |
@@ -313,6 +314,7 @@ by project impact. The full template and a worked example:
 - [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
 - [lazy-memory-restore-plan_calls.md](calls/lazy-memory-restore-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
+- [liveness-ping-split-plan_calls.md](calls/liveness-ping-split-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
 - [managers-page-raft-members_calls.md](calls/managers-page-raft-members_calls.md)
 - [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)

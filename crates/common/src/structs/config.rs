@@ -9,12 +9,12 @@ pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 use crate::prelude::{
     anyhow, bail, default_raft_data_dir, default_store_path, Context, DEF_EVAL_PRIORITY,
     DEF_HEARTBEAT_HEADROOM, DEF_HEARTBEAT_MAX_INTERVAL_SEC, DEF_HEARTBEAT_MIN_INTERVAL_SEC,
-    DEF_HEARTBEAT_TARGET_RATE_PER_SECOND, DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
-    DEF_LIVENESS_DIGEST_INTERVAL_SEC, DEF_LIVENESS_FAILOVER_GRACE_SEC,
-    DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT,
-    DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST, DEF_ROLLOUT_RETENTION_DAYS,
-    DEF_SCHEDULING_POLICY, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
-    MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
+    DEF_HEARTBEAT_PING_RATE_PER_SECOND, DEF_HEARTBEAT_TARGET_RATE_PER_SECOND, DEF_KV_DEBOUNCE_MS,
+    DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC, DEF_LIVENESS_DIGEST_INTERVAL_SEC,
+    DEF_LIVENESS_FAILOVER_GRACE_SEC, DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME,
+    DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST,
+    DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_WORKER_CHECK_SEC,
+    DEF_WORKER_CONFIG_PATH, MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
 };
 use crate::structs::workload_identity::NodeIdentityConfig;
 
@@ -798,12 +798,14 @@ impl From<EncryptionConfigFull> for EncryptionConfig {
 /// Heartbeat cadence and node liveness windows
 /// (docs/heartbeat-cadence-and-scale.md).
 ///
-/// Omitting the whole block gives adaptive cadence at the default
-/// `targetRatePerSecond` (2,500/s): fleets up to 2,500 nodes keep the 2s
-/// floor and the historical 10s lost window, and larger fleets back off
-/// along the ladder. `adaptive: false` restores the old fixed behavior,
-/// where workers keep their worker-type `heartbeatSeconds` and nothing
-/// adapts.
+/// Omitting the whole block gives adaptive cadence at the defaults: the
+/// liveness interval (which sets each node's lost window) is sized from
+/// `pingRatePerSecond` (10,000/s), so fleets up to 10,000 nodes keep the 2s
+/// floor and the historical 10s lost window; the full heartbeat is sized
+/// from `targetRatePerSecond` (2,500/s) and backs off past 2,500 nodes, with
+/// workers proving liveness by ping in between. `adaptive: false` restores
+/// the old fixed behavior, where workers keep their worker-type
+/// `heartbeatSeconds`, send a full heartbeat every beat, and nothing adapts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatConfig {
@@ -813,16 +815,31 @@ pub struct HeartbeatConfig {
     /// `targetRatePerSecond` is ignored.
     #[serde(default)]
     pub adaptive: Option<bool>,
-    /// Aggregate heartbeat rate this control plane will accept, per second.
+    /// Aggregate full-heartbeat rate this control plane will accept, per
+    /// second.
     ///
-    /// The manager computes each worker's interval from FLEET SIZE
-    /// (`headroom x nodes / rate`) and serves it on the heartbeat reply, so
-    /// cadence backs off as the fleet grows instead of healthy nodes being
-    /// marked lost. Default 2,500, which keeps every fleet up to 2,500 nodes
-    /// on the 2s floor. Lower it for a smaller control plane; measure yours
-    /// with `legion node cadence`.
+    /// The manager computes each worker's full-heartbeat (sync) interval
+    /// from FLEET SIZE (`headroom x nodes / rate`) and serves it on the
+    /// heartbeat reply, so the costly half of a beat backs off as the fleet
+    /// grows. Detection does not back off with it: that follows the liveness
+    /// interval (`pingRatePerSecond`). Default 2,500, which keeps every fleet
+    /// up to 2,500 nodes on a 2s full heartbeat. Lower it for a smaller
+    /// control plane; measure yours with `legion node cadence`.
     #[serde(default)]
     pub target_rate_per_second: Option<f64>,
+    /// Aggregate liveness-ping rate this control plane will accept, per
+    /// second.
+    ///
+    /// Sizes the LIVENESS interval the same way `targetRatePerSecond` sizes
+    /// the full heartbeat: `headroom x nodes / rate`, on the same ladder.
+    /// Each node's lost window is derived from the liveness interval, and
+    /// between full heartbeats a worker proves it is alive with a ping the
+    /// manager answers from memory. Default 10,000, which keeps every fleet
+    /// up to 10,000 nodes on the 2s floor and its 10s lost window. Setting it
+    /// equal to `targetRatePerSecond` turns pings off (the two intervals are
+    /// then always equal).
+    #[serde(default)]
+    pub ping_rate_per_second: Option<f64>,
     /// Floor on the served interval, never crossed however small the fleet.
     /// Default `2s`.
     #[serde(default)]
@@ -850,6 +867,10 @@ fn default_heartbeat_target_rate() -> f64 {
     DEF_HEARTBEAT_TARGET_RATE_PER_SECOND
 }
 
+fn default_heartbeat_ping_rate() -> f64 {
+    DEF_HEARTBEAT_PING_RATE_PER_SECOND
+}
+
 /// Resolved [`HeartbeatConfig`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -858,6 +879,8 @@ pub struct HeartbeatConfigFull {
     pub adaptive: bool,
     #[serde(default = "default_heartbeat_target_rate")]
     pub target_rate_per_second: f64,
+    #[serde(default = "default_heartbeat_ping_rate")]
+    pub ping_rate_per_second: f64,
     pub min_interval: String,
     pub max_interval: String,
     pub missed_beats_before_lost: u32,
@@ -869,6 +892,7 @@ impl Default for HeartbeatConfigFull {
         HeartbeatConfigFull {
             adaptive: true,
             target_rate_per_second: DEF_HEARTBEAT_TARGET_RATE_PER_SECOND,
+            ping_rate_per_second: DEF_HEARTBEAT_PING_RATE_PER_SECOND,
             min_interval: format!("{DEF_HEARTBEAT_MIN_INTERVAL_SEC}s"),
             max_interval: format!("{DEF_HEARTBEAT_MAX_INTERVAL_SEC}s"),
             missed_beats_before_lost: DEF_MISSED_BEATS_BEFORE_LOST,
@@ -885,6 +909,9 @@ impl HeartbeatConfig {
             target_rate_per_second: self
                 .target_rate_per_second
                 .unwrap_or(defaults.target_rate_per_second),
+            ping_rate_per_second: self
+                .ping_rate_per_second
+                .unwrap_or(defaults.ping_rate_per_second),
             min_interval: self.min_interval.clone().unwrap_or(defaults.min_interval),
             max_interval: self.max_interval.clone().unwrap_or(defaults.max_interval),
             missed_beats_before_lost: self
@@ -900,6 +927,7 @@ impl From<HeartbeatConfigFull> for HeartbeatConfig {
         HeartbeatConfig {
             adaptive: Some(val.adaptive),
             target_rate_per_second: Some(val.target_rate_per_second),
+            ping_rate_per_second: Some(val.ping_rate_per_second),
             min_interval: Some(val.min_interval),
             max_interval: Some(val.max_interval),
             missed_beats_before_lost: Some(val.missed_beats_before_lost),
@@ -940,6 +968,13 @@ impl HeartbeatConfigFull {
             bail!(
                 "heartbeat.targetRatePerSecond must be a positive number (got {rate}); \
                  set heartbeat.adaptive = false to turn adaptive cadence off"
+            );
+        }
+        let ping_rate = self.ping_rate_per_second;
+        if !(ping_rate.is_finite() && ping_rate > 0.0) {
+            bail!(
+                "heartbeat.pingRatePerSecond must be a positive number (got {ping_rate}); \
+                 set it equal to heartbeat.targetRatePerSecond to turn liveness pings off"
             );
         }
         if self.missed_beats_before_lost == 0 {
@@ -4354,6 +4389,26 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "targetRatePerSecond": 0 }))?;
         let message = format!("{:#}", zero.with_defaults().validate().expect_err("zero"));
         assert!(message.contains("adaptive = false"), "{message}");
+
+        // The ping rate defaults on, parses, and names its own off switch.
+        assert_eq!(
+            full.ping_rate_per_second,
+            DEF_HEARTBEAT_PING_RATE_PER_SECOND
+        );
+        let config: HeartbeatConfig = serde_json::from_value(serde_json::json!({
+            "pingRatePerSecond": 2500,
+        }))?;
+        assert_eq!(config.with_defaults().ping_rate_per_second, 2500.0);
+        let zero: HeartbeatConfig =
+            serde_json::from_value(serde_json::json!({ "pingRatePerSecond": -1 }))?;
+        let message = format!(
+            "{:#}",
+            zero.with_defaults().validate().expect_err("negative")
+        );
+        assert!(
+            message.contains("pingRatePerSecond") && message.contains("targetRatePerSecond"),
+            "{message}"
+        );
 
         // The wire form `GetManagerConfigs` serves round-trips the switch.
         let off = HeartbeatConfig {

@@ -465,7 +465,7 @@ scheduler, but the fix is in a different subsystem.
 ```console
 $ legion node cadence
 Fleet             1000 nodes
-Served interval   2s  (workers use their worker-type heartbeatSeconds)
+Liveness interval 2s  (workers use their worker-type heartbeatSeconds)
 Lost window       10s  (5 missed beats)
 Freshness         0.22 ── FALLING BEHIND  (false loss below 0.20)
 Sustainable       ~220 nodes at 2s on this control plane
@@ -527,9 +527,13 @@ measured the heartbeat ceiling, so they can't be used as scheduler numbers.
    detection margin. If `legion node cadence` says `workers use their
    worker-type heartbeatSeconds`, someone set `heartbeat.adaptive = false`,
    and nothing adapts.
-3. **Accept the cost.** Detection slows down in proportion to the back-off. At
-   1,000 nodes and R=80, Legion takes up to 125 seconds instead of 10 to notice
-   a dead machine.
+3. **Accept the cost.** With liveness pings (on by default), detection holds
+   at the liveness interval while the full heartbeat backs off; lower
+   `pingRatePerSecond` along with `targetRatePerSecond` only if pings are
+   what the control plane cannot keep up with. With pings off (the two rates
+   equal), detection slows down in proportion to the back-off: at 1,000 nodes
+   and R=80, Legion takes up to 125 seconds instead of 10 to notice a dead
+   machine.
 
 Full model, sizing formula, and measurement recipe:
 [Heartbeat cadence and scale](heartbeat-cadence-and-scale.md).

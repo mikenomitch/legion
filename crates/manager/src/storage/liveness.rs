@@ -87,6 +87,11 @@ pub struct LivenessTable {
     /// does not lead the status lane it is the leader's value, relayed on
     /// the liveness digest reply.
     served_interval_seconds: std::sync::atomic::AtomicU64,
+    /// The full-heartbeat (sync) interval served alongside it, in seconds;
+    /// `0` exactly when `served_interval_seconds` is. Written and read by the
+    /// same two places, for the same reason. Never below the liveness
+    /// interval: a worker sends no pings while the two are equal.
+    served_sync_interval_seconds: std::sync::atomic::AtomicU64,
 }
 
 impl Default for LivenessTable {
@@ -102,6 +107,7 @@ impl LivenessTable {
             settings: StdMutex::new(LivenessSettings::default()),
             digest_fallback: std::sync::atomic::AtomicBool::new(false),
             served_interval_seconds: std::sync::atomic::AtomicU64::new(0),
+            served_sync_interval_seconds: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -114,11 +120,34 @@ impl LivenessTable {
         (seconds > 0).then(|| Duration::from_secs(seconds))
     }
 
-    pub fn set_served_interval(&self, interval: Option<Duration>) {
-        self.served_interval_seconds.store(
-            interval.map(|interval| interval.as_secs()).unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// The full-heartbeat interval this manager tells workers to use, or
+    /// `None` when it dictates nothing. Never below
+    /// [`Self::served_interval`].
+    pub fn served_sync_interval(&self) -> Option<Duration> {
+        let seconds = self
+            .served_sync_interval_seconds
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
+    }
+
+    /// Serve a liveness interval and, with it, a full-heartbeat interval.
+    /// `sync` is raised to `liveness` when it is below it (a full heartbeat
+    /// is a beat too, so it is never wanted more often than one); a missing
+    /// `sync` beside a present liveness interval serves the two equal, which
+    /// is "no pings". `None` liveness serves nothing at all.
+    pub fn set_served_intervals(&self, liveness: Option<Duration>, sync: Option<Duration>) {
+        let liveness_secs = liveness.map(|interval| interval.as_secs()).unwrap_or(0);
+        let sync_secs = if liveness_secs == 0 {
+            0
+        } else {
+            sync.map(|interval| interval.as_secs())
+                .unwrap_or(0)
+                .max(liveness_secs)
+        };
+        self.served_interval_seconds
+            .store(liveness_secs, std::sync::atomic::Ordering::Relaxed);
+        self.served_sync_interval_seconds
+            .store(sync_secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether heartbeats must currently travel as replicated writes because
@@ -370,6 +399,8 @@ pub enum DigestOutcome {
     /// serves (`None` when it runs no adaptive cadence or predates the field).
     Accepted {
         served_interval: Option<Duration>,
+        /// The full-heartbeat interval served beside it.
+        served_sync_interval: Option<Duration>,
     },
     /// The peer we asked does not lead the status lane; it named who does.
     NotLeader {

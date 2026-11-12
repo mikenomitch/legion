@@ -40,8 +40,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Node Liveness](node-liveness.md): where node liveness is tracked, what a
   leader election does to it, and why a heartbeat costs no commit.
 - [Heartbeat Cadence and Scale](heartbeat-cadence-and-scale.md): sizing a
-  control plane for a fleet, the per-node lost window, and the freshness
-  ratio that shows whether the fleet is keeping up.
+  control plane for a fleet, liveness pings between full heartbeats, the
+  per-node lost window, and the freshness ratio (fleet-wide and per pool)
+  that shows whether the fleet is keeping up.
 - [UI Architecture](ui-architecture.md): the SolidJS app and its design system.
 
 ## Workloads

@@ -209,10 +209,13 @@ Worker startup (`run_worker`) flow:
    - Heartbeats every `heartbeatSeconds` (worker-type config, default 2s,
      clamped to 1–300s). Each beat gets ±10% jitter so a fleet that started
      together does not stay in lockstep. With adaptive cadence (on by
-     default), the manager serves an interval sized from fleet size on the
-     heartbeat reply, and the worker beats at the larger of that and its
-     own `heartbeatSeconds`. Up to 2,500 nodes the served interval is the
-     same 2s ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
+     default), the manager serves two intervals sized from fleet size on
+     every reply: a liveness interval, which the worker beats at (the larger
+     of it and its own `heartbeatSeconds`), and a longer sync interval for
+     full heartbeats. On a beat with no full heartbeat due, the worker sends
+     a liveness ping (`Manager.Ping`) instead. Up to 2,500 nodes both
+     intervals are 2s and every beat is a full heartbeat
+     ([Pings and heartbeats](heartbeat-cadence-and-scale.md#pings-and-heartbeats)).
    - Node checks every `WORKER_NODE_CHECK_DURATION_SEC` (default 30s).
    - The node certificate is re-issued on the heartbeat loop after a third
      of its 24-hour lifetime, and early when a worker-plane handshake shows
@@ -352,8 +355,11 @@ unmanaged, and logs `killed_orphans = true` on the restore line.
 The heartbeat interval is the main way to control manager load on large
 fleets. For example, 10k workers at a fixed 2s cadence would send 5,000
 heartbeat RPCs per second. Adaptive cadence, on by default, sizes the
-interval from fleet size so the steady load stays at or below 1,250 a second
-(8s at 10k nodes), and `heartbeat.adaptive = false` turns it off.
+full-heartbeat interval from fleet size so the steady load stays at or below
+1,250 a second (8s at 10k nodes), while workers prove liveness every 2s in
+between with a ping the manager answers from memory, so the 10s lost window
+holds up to 10,000 nodes (25s at 20,000, against 105s without pings).
+`heartbeat.adaptive = false` turns it off.
 
 - `heartbeatSeconds` in a worker-type config sets that worker type's
   cadence. Workers receive it at pre-registration. The lost-node window

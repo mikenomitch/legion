@@ -275,6 +275,13 @@ impl<T> Series<T> {
             .map(|(_, cell)| Arc::clone(cell))
     }
 
+    /// Drop every series whose label values `keep` rejects.
+    fn retain(&self, keep: impl Fn(&[String]) -> bool) {
+        if let Ok(mut map) = self.map.write() {
+            map.retain(|(key, _)| keep(key));
+        }
+    }
+
     /// Sorted snapshot for deterministic rendering.
     fn snapshot(&self) -> Vec<(Vec<String>, Arc<T>)> {
         let mut snap: Vec<(Vec<String>, Arc<T>)> = self
@@ -727,6 +734,19 @@ impl FloatGaugeVec {
             .map(|c| c.get())
             .unwrap_or(0.0)
     }
+
+    /// Make `entries` the family's whole content: set each, and DROP every
+    /// series not among them. Dropped rather than zeroed, for families where
+    /// 0 is a meaningful (and alarming) value — a pool that left the fleet
+    /// must not read as a pool where nobody is on time.
+    pub fn replace_all(&self, entries: &[(Vec<String>, f64)]) {
+        self.series
+            .retain(|values| entries.iter().any(|(key, _)| key.as_slice() == values));
+        for (values, v) in entries {
+            let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+            self.set(&refs, *v);
+        }
+    }
 }
 
 impl RenderMetric for FloatGaugeVec {
@@ -872,6 +892,8 @@ pub struct Metrics {
     pub preemption_plans_total: Arc<CounterVec>,
     /// `legion_heartbeats_total`
     pub heartbeats_total: Arc<Counter>,
+    /// `legion_pings_total`
+    pub pings_total: Arc<Counter>,
     /// `legion_nodes{status}`
     pub nodes: Arc<GaugeVec>,
     /// `legion_read_model_nodes{set}`
@@ -1054,8 +1076,12 @@ pub struct Metrics {
     pub store_read_model_lock_wait_seconds: Arc<HistogramVec>,
     /// `legion_heartbeat_freshness_ratio` — **the number to alert on.**
     pub heartbeat_freshness_ratio: Arc<FloatGauge>,
+    /// `legion_heartbeat_pool_freshness_ratio{pool}`
+    pub heartbeat_pool_freshness_ratio: Arc<FloatGaugeVec>,
     /// `legion_heartbeat_served_interval_seconds`
     pub heartbeat_served_interval_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_sync_interval_seconds`
+    pub heartbeat_sync_interval_seconds: Arc<Gauge>,
     /// `legion_heartbeat_lost_window_seconds`
     pub heartbeat_lost_window_seconds: Arc<Gauge>,
     /// `legion_heartbeat_sustainable_nodes`
@@ -1377,6 +1403,14 @@ impl Metrics {
             meta: FamilyMeta {
                 name: "legion_heartbeats_total",
                 help: "Worker heartbeat RPCs accepted by the manager.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let pings_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_pings_total",
+                help: "Worker liveness pings (the Ping RPC) accepted by the manager. Workers ping between full heartbeats once adaptive cadence backs the full heartbeat off.",
                 labels: &[],
             },
             cell: CounterCell::default(),
@@ -2029,10 +2063,26 @@ impl Metrics {
             },
             bits: AtomicU64::new(0),
         });
+        let heartbeat_pool_freshness_ratio = Arc::new(FloatGaugeVec {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_pool_freshness_ratio",
+                help: "legion_heartbeat_freshness_ratio for one node pool: the fraction of the pool's active nodes that checked in within 1.2x their own liveness interval. Only pools with 20 or more active nodes have a series. A pool falling behind can hide in the fleet-wide ratio.",
+                labels: &["pool"],
+            },
+            series: Series::new(),
+        });
         let heartbeat_served_interval_seconds = Arc::new(Gauge {
             meta: FamilyMeta {
                 name: "legion_heartbeat_served_interval_seconds",
-                help: "Heartbeat interval this manager is currently telling workers to use.",
+                help: "Liveness interval this manager is currently telling workers to use: how often each proves it is alive, with a ping or a full heartbeat. Lost windows derive from it.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_sync_interval_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_sync_interval_seconds",
+                help: "Full-heartbeat interval this manager is currently telling workers to use. Equal to legion_heartbeat_served_interval_seconds when workers send no pings.",
                 labels: &[],
             },
             cell: GaugeCell::default(),
@@ -2192,7 +2242,9 @@ impl Metrics {
 
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&heartbeat_freshness_ratio) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_pool_freshness_ratio) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_served_interval_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_sync_interval_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_lost_window_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
@@ -2223,6 +2275,7 @@ impl Metrics {
             Arc::clone(&grpc_request_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_requests_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&pings_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&node_memory_physical_bytes) as Arc<dyn RenderMetric>,
@@ -2359,6 +2412,7 @@ impl Metrics {
             preemptions_total,
             preemption_plans_total,
             heartbeats_total,
+            pings_total,
             nodes,
             read_model_nodes,
             node_memory_physical_bytes,
@@ -2437,7 +2491,9 @@ impl Metrics {
             eval_queue_round_seconds,
             store_read_model_lock_wait_seconds,
             heartbeat_freshness_ratio,
+            heartbeat_pool_freshness_ratio,
             heartbeat_served_interval_seconds,
+            heartbeat_sync_interval_seconds,
             heartbeat_lost_window_seconds,
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
@@ -2545,6 +2601,8 @@ pub struct WorkerMetrics {
     pub log_dropped_lines_total: Arc<CounterVec>,
     /// `legion_worker_heartbeats_total{outcome}`
     pub heartbeats_total: Arc<CounterVec>,
+    /// `legion_worker_pings_total{outcome}`
+    pub pings_total: Arc<CounterVec>,
     /// `legion_worker_heartbeat_duration_seconds`
     pub heartbeat_duration_seconds: Arc<Histogram>,
     /// `legion_worker_allocations_running`
@@ -2723,6 +2781,14 @@ impl WorkerMetrics {
             meta: FamilyMeta {
                 name: "legion_worker_heartbeats_total",
                 help: "Heartbeat round-trips attempted by this worker process, by outcome (ok|error|unauthenticated). Summed over every node in a simulated fleet.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let worker_pings_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_pings_total",
+                help: "Liveness pings sent by this worker process between full heartbeats, by outcome (ok|error|unauthenticated). Zero while the manager serves equal liveness and sync intervals. Summed over every node in a simulated fleet.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -3186,6 +3252,7 @@ impl WorkerMetrics {
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&log_dropped_lines_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&worker_pings_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_window) as Arc<dyn RenderMetric>,
@@ -3233,6 +3300,7 @@ impl WorkerMetrics {
         WorkerMetrics {
             log_dropped_lines_total,
             heartbeats_total,
+            pings_total: worker_pings_total,
             heartbeat_duration_seconds,
             allocations_running,
             allocation_failures_reported_total,

@@ -324,6 +324,7 @@ impl RaftTransport for RaftTransportService {
                     .lane_leader_hint(crate::storage::Lane::Status)
                     .unwrap_or_default(),
                 served_interval_seconds: None,
+                served_sync_interval_seconds: None,
                 rollup_resync: false,
             }));
         }
@@ -352,6 +353,10 @@ impl RaftTransport for RaftTransportService {
             served_interval_seconds: store
                 .liveness()
                 .served_interval()
+                .map(|interval| interval.as_secs() as u32),
+            served_sync_interval_seconds: store
+                .liveness()
+                .served_sync_interval()
                 .map(|interval| interval.as_secs() as u32),
         }))
     }

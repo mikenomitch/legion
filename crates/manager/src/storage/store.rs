@@ -1044,10 +1044,25 @@ enum BeatDisposition {
     Ghost,
 }
 
+/// What [`Store::observe_ping`] did with a ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingPath {
+    /// Recorded in memory; nothing else to do.
+    Observed,
+    /// The beat has to be replicated: run [`Store::update_node_heartbeat`]
+    /// off the async runtime. `recovering` is true when the node is coming
+    /// back from `lost`.
+    Replicate { recovering: bool },
+    /// Not a registered node.
+    Ghost,
+}
+
 /// One active node's replicated liveness row, for the status checker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveNodeLiveness {
     pub id: String,
+    /// The node's pool, for the per-pool freshness breakdown.
+    pub pool: String,
     /// Persisted heartbeat clock. DISPLAY state once liveness is off the raft
     /// path; `None` on a row written before the integer column existed.
     pub last_heartbeat_unix: Option<i64>,
@@ -9303,6 +9318,30 @@ impl Store {
         }
     }
 
+    /// The fast path of a liveness ping (`Manager.Ping`): one read-model
+    /// lookup and one liveness-table write, on the calling thread.
+    ///
+    /// Safe on an async worker because the only case it handles itself —
+    /// an active node outside the mixed-version fallback — never commits.
+    /// Everything that may commit (a `lost -> active` transition, a beat
+    /// that has to travel as a replicated write) comes back as
+    /// [`PingPath::Replicate`] for the caller to run
+    /// [`Self::update_node_heartbeat`] on the blocking pool, exactly as a
+    /// heartbeat would.
+    pub fn observe_ping(&self, id: &str) -> PingPath {
+        match self.beat_disposition(id) {
+            BeatDisposition::Ghost => PingPath::Ghost,
+            BeatDisposition::Transition => PingPath::Replicate { recovering: true },
+            BeatDisposition::Active if self.liveness.digest_fallback() => {
+                PingPath::Replicate { recovering: false }
+            }
+            BeatDisposition::Active => {
+                self.liveness.observe(id);
+                PingPath::Observed
+            }
+        }
+    }
+
     /// Put a recovered node back in the scheduling pool.
     ///
     /// Node loss is a CROSS-LANE composite: the status lane records `lost`,
@@ -9519,7 +9558,8 @@ impl Store {
         let conn = self.read_connection()?;
         // Anchored on `node` (a node_health row orphaned by node removal must
         // not resurrect a ghost), same as `get_node_ids_and_heartbeats`.
-        let sql = "SELECT node.id, node_health.last_heartbeat_unix, node_health.lost_after_seconds
+        let sql = "SELECT node.id, node_health.last_heartbeat_unix, node_health.lost_after_seconds,
+                          node.pool
                    FROM node LEFT JOIN node_health ON node_health.node_id = node.id
                    WHERE COALESCE(node_health.status, 'active') = 'active'";
         let mut stmt = conn.prepare(sql)?;
@@ -9528,6 +9568,7 @@ impl Store {
                 id: row.get(0)?,
                 last_heartbeat_unix: row.get(1)?,
                 lost_after_seconds: row.get(2)?,
+                pool: row.get(3)?,
             })
         })?)?;
         Ok(rows)

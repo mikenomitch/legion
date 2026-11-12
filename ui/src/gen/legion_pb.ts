@@ -21475,12 +21475,16 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   claimVerdicts: ClaimVerdict[] = [];
 
   /**
-   * The interval, in seconds, the manager wants this worker to heartbeat at.
+   * The LIVENESS interval, in seconds: how often the manager wants this
+   * worker to prove it is alive, with a ping or a heartbeat
+   * (docs/heartbeat-cadence-and-scale.md, "Pings and heartbeats"). The
+   * node's lost window is derived from it. How often to send a full
+   * heartbeat is `sync_interval_seconds`.
    *
    * Present whenever the manager runs adaptive cadence, which is the default
-   * (`heartbeat.adaptive`, `heartbeat.targetRatePerSecond` in the manager
+   * (`heartbeat.adaptive`, `heartbeat.pingRatePerSecond` in the manager
    * config). The manager derives it from fleet size alone; at the defaults
-   * every fleet up to 2,500 nodes is served the 2s floor. Absent when the
+   * every fleet up to 10,000 nodes is served the 2s floor. Absent when the
    * operator turned adaptive cadence off (`heartbeat.adaptive = false`) or
    * the manager predates it, and absent means "use your worker-type
    * `heartbeatSeconds`".
@@ -21797,6 +21801,27 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   ownerNotices: OwnerNotice[] = [];
 
+  /**
+   * The SYNC interval, in seconds: how often the manager wants a full
+   * heartbeat from this worker (docs/heartbeat-cadence-and-scale.md,
+   * "Pings and heartbeats"). Never shorter than `next_interval_seconds`.
+   * Between full heartbeats the worker proves it is alive with `Ping`, once
+   * per liveness interval.
+   *
+   * Sized from fleet size and `heartbeat.targetRatePerSecond`, as the one
+   * heartbeat interval was before pings existed. Present whenever
+   * `next_interval_seconds` is. Absent with adaptive cadence off: the
+   * worker then sends a full heartbeat on every liveness tick and no pings.
+   *
+   * A worker sends a full heartbeat early, without waiting for this, when
+   * it has something the manager is waiting on (a stream message that
+   * stopped an allocation, a finished checkpoint), or when a ping's reply
+   * sets `sync_now`.
+   *
+   * @generated from field: optional uint32 sync_interval_seconds = 28;
+   */
+  syncIntervalSeconds?: number;
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -21830,6 +21855,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 25, name: "endpoint_feed", kind: "message", T: EndpointFeed },
     { no: 26, name: "runtime_states", kind: "message", T: RuntimeStateSet },
     { no: 27, name: "owner_notices", kind: "message", T: OwnerNotice, repeated: true },
+    { no: 28, name: "sync_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -21846,6 +21872,109 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   static equals(a: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined, b: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined): boolean {
     return proto3.util.equals(HeartbeatReply, a, b);
+  }
+}
+
+/**
+ * Request payload for `Ping`.
+ *
+ * @generated from message legion.PingRequest
+ */
+export class PingRequest extends Message<PingRequest> {
+  /**
+   * The pinging worker's node id. Must match the caller's node credential.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<PingRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PingRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PingRequest {
+    return new PingRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PingRequest {
+    return new PingRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PingRequest {
+    return new PingRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PingRequest | PlainMessage<PingRequest> | undefined, b: PingRequest | PlainMessage<PingRequest> | undefined): boolean {
+    return proto3.util.equals(PingRequest, a, b);
+  }
+}
+
+/**
+ * Reply to `Ping`.
+ *
+ * @generated from message legion.PingReply
+ */
+export class PingReply extends Message<PingReply> {
+  /**
+   * The liveness interval, in seconds, exactly as
+   * `HeartbeatReply.next_interval_seconds` carries it: a floor over the
+   * worker-type `heartbeatSeconds`, absent with adaptive cadence off.
+   *
+   * @generated from field: optional uint32 next_interval_seconds = 1;
+   */
+  nextIntervalSeconds?: number;
+
+  /**
+   * The sync interval, in seconds, exactly as
+   * `HeartbeatReply.sync_interval_seconds` carries it.
+   *
+   * @generated from field: optional uint32 sync_interval_seconds = 2;
+   */
+  syncIntervalSeconds?: number;
+
+  /**
+   * True when this ping brought the node back from `lost`. The worker sends
+   * a full heartbeat at once, so the manager hears the node's allocation
+   * state now rather than one sync interval later.
+   *
+   * @generated from field: bool sync_now = 3;
+   */
+  syncNow = false;
+
+  constructor(data?: PartialMessage<PingReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PingReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "next_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 2, name: "sync_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "sync_now", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PingReply {
+    return new PingReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PingReply {
+    return new PingReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PingReply {
+    return new PingReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PingReply | PlainMessage<PingReply> | undefined, b: PingReply | PlainMessage<PingReply> | undefined): boolean {
+    return proto3.util.equals(PingReply, a, b);
   }
 }
 
@@ -24561,10 +24690,12 @@ export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> 
   activeNodes = 0;
 
   /**
-   * The interval, in seconds, this manager is currently telling workers to
-   * use. With adaptive cadence off this is the configured floor
-   * (`heartbeat.minInterval`, 2s by default) and workers keep their
-   * worker-type `heartbeatSeconds` instead.
+   * The liveness interval, in seconds, this manager is currently telling
+   * workers to use: how often each proves it is alive, with a ping or a full
+   * heartbeat (`HeartbeatReply.next_interval_seconds`). Sized from
+   * `heartbeat.pingRatePerSecond`. With adaptive cadence off this is the
+   * configured floor (`heartbeat.minInterval`, 2s by default) and workers
+   * keep their worker-type `heartbeatSeconds` instead.
    *
    * @generated from field: uint32 served_interval_seconds = 2;
    */
@@ -24572,18 +24703,23 @@ export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> 
 
   /**
    * The lost-node window derived from it:
-   * `missed_beats_before_lost x served_interval_seconds`.
+   * `missed_beats_before_lost x served_interval_seconds`. A pool whose
+   * worker type beats slower has the wider window of its own cadence
+   * (`pools`).
    *
    * @generated from field: uint32 lost_window_seconds = 3;
    */
   lostWindowSeconds = 0;
 
   /**
-   * Fraction of active nodes that checked in within one interval, 0.0 to 1.0.
-   * 1.0 means the fleet is keeping up. False node loss begins when this falls
-   * below `served_interval_seconds / lost_window_seconds` — 0.20 at the
-   * defaults. Zero, with `freshness_measurable` false, on a fleet too small to
-   * measure (under 20 nodes) or on a manager that does not own liveness.
+   * Fraction of active nodes that checked in within one interval, 0.0 to 1.0,
+   * each node judged against its OWN liveness interval (so a slow batch pool
+   * is not counted late against a fast pool's cadence). 1.0 means the fleet
+   * is keeping up. False node loss begins when this falls below
+   * `served_interval_seconds / lost_window_seconds` — 0.20 at the defaults.
+   * Zero, with `freshness_measurable` false, on a fleet too small to measure
+   * (under 20 nodes) or on a manager that does not own liveness. A problem
+   * in one pool can hide in this fleet-wide figure; `pools` breaks it down.
    *
    * @generated from field: double freshness_ratio = 4;
    */
@@ -24654,6 +24790,25 @@ export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> 
    */
   isLivenessOwner = false;
 
+  /**
+   * The full-heartbeat (sync) interval, in seconds, this manager is serving
+   * (`HeartbeatReply.sync_interval_seconds`), sized from
+   * `heartbeat.targetRatePerSecond` and never shorter than
+   * `served_interval_seconds`. When the two are equal, workers send no
+   * pings. Zero with adaptive cadence off, or on a non-owning manager.
+   *
+   * @generated from field: uint32 sync_interval_seconds = 12;
+   */
+  syncIntervalSeconds = 0;
+
+  /**
+   * The same report per node pool, sorted by pool name: one row for every
+   * pool with an active node. Empty on a manager that does not own liveness.
+   *
+   * @generated from field: repeated legion.PoolHeartbeatCadence pools = 13;
+   */
+  pools: PoolHeartbeatCadence[] = [];
+
   constructor(data?: PartialMessage<GetHeartbeatCadenceReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -24673,6 +24828,8 @@ export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> 
     { no: 9, name: "at_max_interval", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 10, name: "missed_beats_before_lost", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 11, name: "is_liveness_owner", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "sync_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 13, name: "pools", kind: "message", T: PoolHeartbeatCadence, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetHeartbeatCadenceReply {
@@ -24689,6 +24846,95 @@ export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> 
 
   static equals(a: GetHeartbeatCadenceReply | PlainMessage<GetHeartbeatCadenceReply> | undefined, b: GetHeartbeatCadenceReply | PlainMessage<GetHeartbeatCadenceReply> | undefined): boolean {
     return proto3.util.equals(GetHeartbeatCadenceReply, a, b);
+  }
+}
+
+/**
+ * One node pool's line in `GetHeartbeatCadenceReply.pools`.
+ *
+ * @generated from message legion.PoolHeartbeatCadence
+ */
+export class PoolHeartbeatCadence extends Message<PoolHeartbeatCadence> {
+  /**
+   * The pool's name.
+   *
+   * @generated from field: string pool = 1;
+   */
+  pool = "";
+
+  /**
+   * Active nodes in the pool.
+   *
+   * @generated from field: uint32 active_nodes = 2;
+   */
+  activeNodes = 0;
+
+  /**
+   * The liveness interval most of the pool's nodes are on, in seconds: the
+   * larger of the served liveness interval and the pool's worker-type
+   * `heartbeatSeconds`, as the nodes' own lost windows record it. The
+   * median when nodes in one pool disagree (a worker type changed, or a
+   * window is still moving with the served cadence).
+   *
+   * @generated from field: uint32 interval_seconds = 3;
+   */
+  intervalSeconds = 0;
+
+  /**
+   * The lost window that interval gives:
+   * `missed_beats_before_lost x interval_seconds`.
+   *
+   * @generated from field: uint32 lost_window_seconds = 4;
+   */
+  lostWindowSeconds = 0;
+
+  /**
+   * Fraction of the pool's active nodes that checked in within 1.2x their
+   * own liveness interval, 0.0 to 1.0. Zero, with `freshness_measurable`
+   * false, on a pool under 20 nodes, where the ratio is noise.
+   *
+   * @generated from field: double freshness_ratio = 5;
+   */
+  freshnessRatio = 0;
+
+  /**
+   * Whether `freshness_ratio` means anything (the pool has 20 or more
+   * active nodes).
+   *
+   * @generated from field: bool freshness_measurable = 6;
+   */
+  freshnessMeasurable = false;
+
+  constructor(data?: PartialMessage<PoolHeartbeatCadence>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PoolHeartbeatCadence";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "active_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "lost_window_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "freshness_ratio", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 6, name: "freshness_measurable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PoolHeartbeatCadence {
+    return new PoolHeartbeatCadence().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PoolHeartbeatCadence {
+    return new PoolHeartbeatCadence().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PoolHeartbeatCadence {
+    return new PoolHeartbeatCadence().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PoolHeartbeatCadence | PlainMessage<PoolHeartbeatCadence> | undefined, b: PoolHeartbeatCadence | PlainMessage<PoolHeartbeatCadence> | undefined): boolean {
+    return proto3.util.equals(PoolHeartbeatCadence, a, b);
   }
 }
 
@@ -46452,6 +46698,15 @@ export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
   servedIntervalSeconds?: number;
 
   /**
+   * The full-heartbeat (sync) interval, in seconds, the status-lane leader
+   * is serving, relayed the same way as `served_interval_seconds` (the
+   * liveness interval). Set exactly when `served_interval_seconds` is.
+   *
+   * @generated from field: optional uint32 served_sync_interval_seconds = 6;
+   */
+  servedSyncIntervalSeconds?: number;
+
+  /**
    * Set on an accepted digest whose `rollups` the leader could not apply: it
    * holds no state for this sender (it just took the status lane or
    * restarted), the epoch changed, or `base_seq` is not the last sync it
@@ -46473,6 +46728,7 @@ export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
     { no: 2, name: "not_status_leader", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "leader_hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "served_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 6, name: "served_sync_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 5, name: "rollup_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 

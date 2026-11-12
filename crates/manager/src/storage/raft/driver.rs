@@ -1523,6 +1523,10 @@ impl MultiRaftDriver {
                                 .served_interval_seconds
                                 .filter(|seconds| *seconds > 0)
                                 .map(|seconds| std::time::Duration::from_secs(u64::from(seconds))),
+                            served_sync_interval: reply
+                                .served_sync_interval_seconds
+                                .filter(|seconds| *seconds > 0)
+                                .map(|seconds| std::time::Duration::from_secs(u64::from(seconds))),
                         },
                         reply.rollup_resync,
                     )

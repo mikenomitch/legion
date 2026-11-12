@@ -222,7 +222,7 @@ Validation rules (enforced at `job validate` and submit time):
   it at the task level, including on a stateless task, is rejected at parse
   time with a pointer to the right nesting.
 - **The lost window must stay below the self-fence.** A node's lost window is
-  `missedBeatsBeforeLost x its heartbeat interval`
+  `missedBeatsBeforeLost x its liveness interval`
   ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). If that
   reaches `selfTerminateAfter`, a healthy worker would kill its own stateful
   tasks between heartbeats. The manager refuses to start with a worker config
@@ -231,11 +231,14 @@ Validation rules (enforced at `job validate` and submit time):
   60-second batch cadence would need `selfTerminateAfter` raised well past its
   300-second window.
 
-  Adaptive cadence (on by default) is not covered by that startup check. At
-  the default `targetRatePerSecond`, a fleet past about 16,250 nodes is
-  served 21s, so its window (105s) passes the 90s fence. A healthy worker
-  still beats every 21s and only fences after about 70 seconds of failed
-  retries. The margin shrinks with every rung, which is why the served
+  Adaptive cadence (on by default) is not covered by that startup check.
+  The window follows the liveness interval, which liveness pings keep at 2s
+  up to 10,000 nodes at the default `pingRatePerSecond`; a fleet past about
+  65,000 nodes is served 21s, so its window (105s) passes the 90s fence. A
+  healthy worker still beats every 21s, and a ping resets the fence clock
+  as a full heartbeat does, so it only fences after about 70 seconds of
+  failed retries. With pings off (`pingRatePerSecond` equal to
+  `targetRatePerSecond`) the same happens past about 16,250 nodes. The margin shrinks with every rung, which is why the served
   interval stops at 55s by default (`heartbeat.maxInterval`), leaving about
   30 seconds of retries. See the known limitations in
   [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md#known-limitations).

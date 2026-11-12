@@ -77,6 +77,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("WorkerPreRegister", Plane::Worker),
         ("WorkerRegister", Plane::Worker),
         ("Heartbeat", Plane::Worker),
+        ("Ping", Plane::Worker),
         ("StreamWork", Plane::Worker),
         ("HealthCheck", Plane::Worker),
         ("RunJob", Plane::Protected("job:write")),
@@ -520,6 +521,15 @@ async fn call_endpoint(
                 HeartbeatRequest {
                     id: NODE_ID.into(),
                     ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "Ping" => svc
+            .ping(req(
+                PingRequest {
+                    node_id: NODE_ID.into(),
                 },
                 token,
             ))
@@ -2774,6 +2784,25 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
     ))
     .await
     .expect("heartbeat with node token succeeds");
+    // So do liveness pings, with the same credential.
+    let denied = svc
+        .ping(req(
+            PingRequest {
+                node_id: "joined-worker".into(),
+            },
+            None,
+        ))
+        .await
+        .expect_err("ping without node token must fail");
+    assert_eq!(denied.code(), Code::Unauthenticated);
+    svc.ping(req(
+        PingRequest {
+            node_id: "joined-worker".into(),
+        },
+        Some(&node_token),
+    ))
+    .await
+    .expect("ping with node token succeeds");
     svc.health_check(req(
         HealthCheckRequest {
             id: "joined-worker".into(),
@@ -3079,6 +3108,7 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
     for method in [
         "WorkerRegister",
         "Heartbeat",
+        "Ping",
         "HealthCheck",
         "FetchDatapathMaterial",
         "GetArtifactCredential",
