@@ -2188,6 +2188,15 @@ pub struct TaskConfig {
     )]
     #[tabled(skip)]
     pub gang: Option<GangConfig>,
+    /// The scheduling index this task's candidates should come from
+    /// (docs/scheduling-indexes.md, "Hinting an index"): the name of an
+    /// index in the manager's `schedulerSettings.indexes`, or `"scan"` for
+    /// the full scan. Advisory: a hint naming no index, or one this task
+    /// cannot use (a partition key it does not bind), falls back to
+    /// automatic selection and `job plan` says why. `None` = automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub index_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
@@ -2942,6 +2951,8 @@ struct TaskConfigInput {
     #[serde(default, deserialize_with = "deserialize_gang")]
     gang: Option<GangConfig>,
     #[serde(default)]
+    index_hint: Option<String>,
+    #[serde(default)]
     kv: Option<KvInjectionPolicy>,
     #[serde(default)]
     env: Vec<TaskKvEnvInjection>,
@@ -3013,6 +3024,7 @@ extension_point!(
         "stop",
         "disruption",
         "gang",
+        "indexHint",
         "kv",
         "env",
         "files",
@@ -3140,6 +3152,16 @@ impl TaskConfigInput {
                 ));
             }
         }
+        if self
+            .index_hint
+            .as_deref()
+            .is_some_and(|hint| hint.trim().is_empty() || hint.trim() != hint)
+        {
+            return Err(format!(
+                "task {name} indexHint must name a scheduling index (or \"scan\" for the full \
+                 scan) with no surrounding spaces; see docs/scheduling-indexes.md"
+            ));
+        }
         if self.on_lost.is_some() {
             return Err(if self.stateful.is_some() {
                 format!(
@@ -3188,6 +3210,7 @@ impl TaskConfigInput {
             stop: self.stop,
             disruption: self.disruption,
             gang: self.gang.clone(),
+            index_hint: self.index_hint,
             kv_injections: Some(if let Some(existing) = self.kv_injections {
                 TaskKvInjections {
                     kv: self.kv.or(existing.kv),
@@ -3486,6 +3509,7 @@ impl TaskConfig {
             run: None,
             children: None,
             autoscale: None,
+            index_hint: None,
             name: name.into(),
             count: default_task_count(),
             runtime: runtime.into(),

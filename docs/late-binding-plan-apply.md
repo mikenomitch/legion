@@ -52,6 +52,15 @@ manager-level `schedulerSettings`.
   constraint changes, shrunken node totals, and static-port collisions
   that happen between snapshot and apply each cost a rank instead of
   rejecting the plan.
+- **Volume pins are re-read at bind time.** A placement the planner sent to
+  an instance's node-local volume carries that instance (`volume_pin` in the
+  stored submission). The planner read the pin outside any epoch, so the
+  walk re-reads it in the transaction. If the volume moved to another node,
+  or was deleted (`legion volume delete --force`) since the plan snapshot,
+  the candidate is skipped with a reason that says so ("instance … no longer
+  holds a node-local volume on node …"). The plan is then refused, and the
+  eval re-plans against the pins as they are now, instead of steering the
+  instance onto a node its data has left.
 - **Ratifications skip the epochs entirely.** A plan carrying a
   `target_instance` ([edge boot](edge-boot.md)) asks the applier to bind
   this sandbox on this node or report who got there first. It was never

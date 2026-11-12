@@ -15,7 +15,7 @@ use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlacementBlocked, PlanMode, Scheduler};
 use crate::prelude::{bail, debug, info, instrument, warn, Context, R};
-use crate::storage::store::{AllocationHealthSnapshot, Store};
+use crate::storage::store::{AllocationHealthSnapshot, NodeScope, Store};
 pub(crate) use crate::structs::job::step_fractions_for_rollout;
 use crate::structs::{
     Allocation, Eval, JobConfig, Rollout, RolloutCapacityTimeoutAction, RolloutConfig,
@@ -1193,17 +1193,17 @@ fn try_place_for_group(
 
     let mut placement_note: Option<String> = None;
     if plan.config.in_place.unwrap_or(false) {
-        if let Some(excluded_nodes) = build_in_place_exclusions(
+        if let Some(allowed_nodes) = build_in_place_allow_list(
             store,
             plan,
             per_task_target_new,
             &tick_inputs.new_allocations,
         )? {
-            match scheduler.plan_and_apply_with_targets_and_exclusions(
+            match scheduler.plan_and_apply_with_targets_and_scope(
                 &rollout.to_job_config_id,
                 PlanMode::Reschedule,
                 &target_counts,
-                Some(&excluded_nodes),
+                NodeScope::Only(&allowed_nodes),
             ) {
                 Ok(outcome) => {
                     state.blocked_since = None;
@@ -1493,7 +1493,13 @@ fn placement_wait_delay(
     }
 }
 
-fn build_in_place_exclusions(
+/// The nodes an in-place tick may place on: the old allocations' nodes
+/// that are still available, or `None` when the tick needs no in-place
+/// preference (nothing required, already satisfied, or no old node left).
+/// Built by lookup into the cached node set, O(old nodes): the exclusion
+/// set it replaced listed every other available node, and the plan then
+/// copied the fleet without them (candidates-and-indexes plan § 6.3).
+fn build_in_place_allow_list(
     store: &Store,
     plan: &GroupPlan,
     per_task_target_new: &HashMap<String, u32>,
@@ -1557,24 +1563,12 @@ fn build_in_place_exclusions(
         return Ok(None);
     }
 
-    let available_nodes = store.available_node_ids()?;
-    if available_nodes.is_empty() {
+    let available_nodes = store.available_nodes()?;
+    allowed_nodes.retain(|node_id| available_nodes.contains(node_id));
+    if allowed_nodes.is_empty() {
         return Ok(None);
     }
-
-    let allowed_available = allowed_nodes
-        .intersection(&available_nodes)
-        .cloned()
-        .collect::<HashSet<_>>();
-    if allowed_available.is_empty() {
-        return Ok(None);
-    }
-
-    let excluded = available_nodes
-        .difference(&allowed_available)
-        .cloned()
-        .collect::<HashSet<_>>();
-    Ok(Some(excluded))
+    Ok(Some(allowed_nodes))
 }
 
 fn on_capacity_timeout(
@@ -2702,7 +2696,7 @@ mod tests {
     }
 
     #[test]
-    fn in_place_exclusions_prefer_old_nodes() -> R<()> {
+    fn in_place_allow_list_prefers_old_nodes() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
         insert_node(&store, "node-b")?;
@@ -2766,15 +2760,15 @@ mod tests {
         let target = HashMap::from([(String::from("api"), 1_u32)]);
 
         let new_allocations = store.allocs_for_job_config(&rollout.to_job_config_id)?;
-        let excluded = build_in_place_exclusions(&store, web, &target, &new_allocations)?
-            .context("expected in-place exclusions")?;
-        assert!(excluded.contains("node-b"));
-        assert!(!excluded.contains("node-a"));
+        // An allow-list of the old node, not an exclusion of every other.
+        let allowed = build_in_place_allow_list(&store, web, &target, &new_allocations)?
+            .context("expected an in-place allow-list")?;
+        assert_eq!(allowed, HashSet::from([String::from("node-a")]));
         Ok(())
     }
 
     #[test]
-    fn in_place_exclusions_clear_when_replacement_already_on_old_node() -> R<()> {
+    fn in_place_allow_list_clears_when_replacement_already_on_old_node() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
         insert_node(&store, "node-b")?;
@@ -2841,8 +2835,8 @@ mod tests {
         let target = HashMap::from([(String::from("api"), 1_u32)]);
 
         let new_allocations = store.allocs_for_job_config(&rollout.to_job_config_id)?;
-        let excluded = build_in_place_exclusions(&store, web, &target, &new_allocations)?;
-        assert!(excluded.is_none());
+        let allowed = build_in_place_allow_list(&store, web, &target, &new_allocations)?;
+        assert!(allowed.is_none());
         Ok(())
     }
 

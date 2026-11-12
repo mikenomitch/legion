@@ -2736,6 +2736,10 @@ fn migration_list() -> Vec<M<'static>> {
         // the store runs with foreign-key enforcement off
         // (`migrate_to_latest`).
         M::up_with_hook("", retype_string_and_timestamp_columns).down(""),
+        // A task's `indexHint` (docs/scheduling-indexes.md, "Hinting an
+        // index"): the scheduling index its candidates should come from, or
+        // `scan`. NULL = automatic selection.
+        M::up("ALTER TABLE task_config ADD COLUMN index_hint TEXT;").down(""),
     ]
 }
 

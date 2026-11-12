@@ -21,15 +21,19 @@ An index is two optional parts:
   tuple of values is a shard. A task's equality constraints select one shard.
   Use this for topology such as region, zone, pool, or tenant.
 - **`dims`**: up to six numeric dimensions, bucketed into a sparse grid. A dim
-  reads either free resource capacity or any numeric node attribute. Free
-  capacity (`resources.<name>`) is fingerprinted capacity minus current
-  allocation usage, for both built-in and custom resources. A task's resource
+  reads free resource capacity, free devices, or any numeric node attribute.
+  Free capacity (`resources.<name>`) is fingerprinted capacity minus current
+  allocation usage, for both built-in and custom resources; a custom item
+  resource (a list of ids) reads as how many items are free. Free devices
+  (`devices.<name>`) count the healthy, unassigned devices of every device
+  group the name matches (see [Device dims](#device-dims)). A task's resource
   request maps to a grid cell. Candidates come back nearest fit first: nodes
   whose free capacity covers the request, closest match first (or most
   headroom first, see `order`), then everything else.
 
 Partition-only gives a pure inverted index. Dims-only gives a pure fit index.
-Both together give a sharded fit index.
+Both together give a sharded fit index. The grid is the built-in geometry; a
+plugin can replace it (see [Index kinds](#index-kinds)).
 
 Two rules make indexes safe to leave on:
 
@@ -72,6 +76,12 @@ take effect when you restart the manager. The minimal declaration is one line:
         order = "tight",   # "tight" (default under bin_pack) | "loose" (default under spread)
         mode = "on",       # "on" | "shadow" | "off"
       },
+
+      # Free GPUs: an inference task asking for 4 sees nodes with 4+ free first.
+      gpus = ["pool", "devices.nvidia/gpu"],
+
+      # A plugin geometry from plugins/indexes/headroom/ (see "Index kinds").
+      emptiest = { kind = "headroom", partition_by = ["pool"], options = { resource = "cpu" } },
     },
     index_min_nodes = 128, # arming threshold; 0 disables indexing entirely
   },
@@ -97,9 +107,11 @@ Defaults:
   case permits use. It never reads a node attribute named "pool".
 
 Malformed declarations fail the manager at startup with a specific error.
-These include unknown fields, more than 6 dims, a non-positive `step`, and
-`true` for anything but `fit`. Legion rejects them so an index is never
-silently ignored.
+These include unknown fields, more than 6 dims, a non-positive `step`, `true`
+for anything but `fit`, an index named `scan` (reserved for
+[`indexHint`](#hinting-an-index)), `dims` or `order` on a plugin kind,
+`options` on the grid, and a plugin kind that is not installed or refuses its
+options. Legion rejects them so an index is never silently ignored.
 
 ## The built-in `fit` index
 
@@ -108,20 +120,31 @@ Unless you disable or redefine it, every cluster gets:
 ```nickel
 fit = {
   partition_by = ["pool"],
-  dims = ["resources.cpu", "resources.memory", "resources.disk"],
+  dims = [
+    "resources.cpu", "resources.memory", "resources.disk",
+    { attr = "resources.allocations", weight = 0 },
+  ],
 }
 ```
 
 This index ranks nodes by nearest fit over free cpu, memory, and disk, within
 the task's pool.
 
+The `allocations` dim has weight 0, so it never changes the order. It only
+decides whether a cell fits: a node at its `maxAllocations` cap (no free
+allocation slot) sorts into the non-fitting tail, after every node that can
+take one more allocation. Without it, a full capped node looked idle on cpu
+and memory, ranked first under `bin_pack`, and used up the candidate budget on
+nodes the resource ledger then refused. Uncapped nodes (unlimited
+allocations) and capped nodes with room rank exactly as they would without
+the dim.
+
 Nodes that don't declare a resource project into that dim's zero-free bucket.
 They match every request that doesn't ask for the resource, and sort last for
 requests that do. The resource ledger would reach the same conclusion. Disk is
 the most common case. Workers do not fingerprint a schedulable disk resource
 today, so disk exists only where the operator declares
-`config_attrs.resources.disk`. `allocations` is not a dim because its default
-capacity is unlimited, which does not bucket usefully.
+`config_attrs.resources.disk`.
 
 Disable it with `indexes = { fit = false }`, or redefine it by declaring your
 own index named `fit`.
@@ -149,19 +172,44 @@ Per task, the scheduler:
    `distinct` rule does not bind a key. Those tasks fall back to the scan
    instead of guessing.
 3. Scores the remaining indexes by how many of the task's requested resources
-   their dims cover. Highest coverage wins, then more partition keys, then
-   declaration order. This is deterministic and cheap, and runs once per task.
+   their dims cover (`allocations` never counts: every task requests one).
+   Highest coverage wins, then more partition keys, then declaration order.
+   This is deterministic and cheap, and runs once per task. A task's
+   [`indexHint`](#hinting-an-index) overrides this step when the hinted index
+   is usable.
 4. Queries the chosen index's shard and re-verifies every candidate with the
    full constraint, permit, and driver checks.
 
+### Truncation
+
 The scheduler truncates candidate lists to a budget (`max(64, 8 × remaining
-count)`, nearest fit first) only when nothing downstream needs the full set.
-A task always gets the whole shard if it has `count.per`, `distinct`
-constraints, volumes (which can pin placements), sets `gang` (deciding that a
-[gang](gang-scheduling.md) does not fit defers its whole plan, and only the
-full list can prove that), or belongs to a multi-task group. If placement exhausts a truncated list while the fleet still has room,
-the scheduler widens back to the full scan mid-task and keeps going
-(`refills` in the explain output).
+count)`, nearest fit first). If placement exhausts a truncated list while the
+fleet still has room, the scheduler widens back to the full scan once, under
+the same filter the list was drawn with, and keeps going (`refills` in the
+explain output). What each task shape gets:
+
+- **Plain tasks, `distinct` constraints**: one truncated list. A `distinct`
+  task that runs out of distinct values in its list refills like any other.
+- **Volumes and stateful tasks**: one truncated list, plus the nodes the task
+  must or should use: the node holding an instance's node-local volume, a
+  local snapshot's node, and a keyed child's owner node. Those are added to
+  the list whenever they pass the task's filters, so truncation never turns
+  "place on the pinned node" into "the pinned node is not a candidate".
+- **`count.per` tasks**: one truncated list per group. When an index's
+  `partition_by` contains the per key and its other keys are bound, the index
+  lists its shards for each value of the key and walks each one with that
+  group's budget (partition enumeration). Otherwise the task gets an
+  untruncated list split into groups. A refill stays inside its group.
+  `count.per = "pool"` and `"id"` always take the untruncated path.
+- **Multi-task (co-placed) groups**: one truncated list for the whole group,
+  from one walk over the members' summed request, verified against every
+  member's constraints, permit, and volume drivers. The node the group
+  already holds is added to the list. A refill widens under the group's
+  filter, so the group still lands on one node. With `count.per`, the group
+  gets one list per per-key value, as above.
+- **Gangs** always get the whole shard. Deciding that a
+  [gang](gang-scheduling.md) does not fit defers its whole plan, and only the
+  full list can prove that.
 
 Truncation walks cells best first and includes every cell it reaches in full.
 When the budget runs out inside a cell, the rest is a uniform random sample of
@@ -179,6 +227,102 @@ of the shard that passes. For ordinary constraints, that cost does not depend
 on fleet size. A very selective constraint that is not a partition key of any
 index can still cost up to the whole shard. Declare an index partitioned by
 that attribute to make it cheap again.
+
+The walk also orders only the cells it reaches. It ranks each occupied cell
+once and pops them best first from a heap, so a walk that fills its budget
+from the first few cells never sorts the rest.
+
+## Hinting an index
+
+A task can name the index its candidates come from:
+
+```nickel
+tasks = {
+  infer = {
+    runtime = "container",
+    indexHint = "gpus",     # an index in schedulerSettings.indexes, or "scan"
+    constraints = { region = "us-east" },
+    resources = { devices = [{ name = "nvidia/gpu", count = 4 }] },
+  },
+}
+```
+
+- A hinted index that the task can use (not `off`, its plugin kind loaded and
+  healthy, every partition key bound) wins over automatic selection.
+- `indexHint = "scan"` skips every index and scans. `job plan` reports
+  `indexHint = "scan"` as the task's reason.
+- A hint naming no declared index, or one the task cannot use, falls back to
+  automatic selection. The task's `reason` in `job plan` says why, for example
+  `hint gpus unusable: gpus needs [region]`.
+
+A hint is advisory, never an error, because indexes are manager config and
+can change without the job changing. An empty or space-padded `indexHint` is
+refused at submit. Members of a co-placed group share one walk; it uses the
+first member's hint.
+
+## Device dims
+
+`devices.<name>` counts free devices across every device group whose
+`vendor/type/model` the name matches: `devices.gpu` counts every GPU,
+`devices.nvidia/gpu` NVIDIA's, `devices.nvidia/gpu/A100-SXM4-80GB` one model.
+Only healthy, unassigned devices are free. A request's value along the dim is
+the summed `count` of its `resources.devices` entries whose names could match
+(a request for `gpu` counts against `devices.nvidia/gpu`, one for `amd/gpu`
+does not). The default `scale = "log"` buckets counts 1, 2–3, 4–7, 8–15;
+use `{ attr = "devices.gpu", scale = "linear", step = 1 }` to tell every
+count apart.
+
+A custom item resource (`config_attrs.resources.slots = ["a", "b"]`) works the
+same way under `resources.<name>`: free items on the node side, requested
+items on the request side.
+
+The device ledger still checks each request's per-device constraints and
+assigns exact ids. The dim only orders nodes by how many devices they have
+free.
+
+## Index kinds
+
+`kind` selects an index's geometry: how a node maps to a cell and how cells
+are ranked for a request. The default, `kind = "grid"`, is the bucketed grid
+over `dims` this page describes. Any other name loads a plugin from
+`plugins/indexes/<name>/`. Its indexes take `partition_by` and free-form
+`options` instead of `dims` and `order`:
+
+```nickel
+emptiest = { kind = "headroom", partition_by = ["pool"], options = { resource = "cpu" } },
+```
+
+A kind plugin is a Rust dylib that exports an `IndexKindFactory` with
+`legion::export_index_kind!`. The factory's `build(index_name, options)`
+returns one `IndexKind` per declared index. That kind implements:
+
+- `project(node, free) -> Vec<u16>`: the node's cell, at most 16 values.
+  Legion calls it under the scheduler's read-model lock whenever the node or
+  its free capacity changes, so it must be cheap and must not block.
+- `rank(cell, request) -> CellRank { fits, distance }`: cells that fit come
+  before the rest, lower distance first within each.
+- `coverage(request)` (optional): how many of the request's resources the
+  kind orders by, for automatic selection.
+
+Legion keeps everything else: shards, maintenance, the budgeted walk,
+truncation, refills, and re-verification of every candidate. A plugin can make
+the candidate order worse, never a placement invalid.
+`plugins/indexes/headroom/` is a complete example. It orders nodes by the share
+of one resource they have free, which the grid cannot express.
+
+Failure modes:
+
+- **The plugin is missing, built for another Legion, or refuses its
+  `options`.** The manager does not start. The error names the index and the
+  kind.
+- **The plugin panics.** The panic is caught, the kind is quarantined until
+  the manager restarts (`legion_plugin_panics_total{kind="indexes"}`), and its
+  indexes stop serving. Tasks that used them fall back to automatic selection
+  or the scan, and `job plan` gives the reason `kind <name> is quarantined
+  after a plugin failure`.
+
+See [plugin-system.md](plugin-system.md) for building and installing dylib
+plugins.
 
 ## Seeing what happened: `job plan`
 
@@ -244,14 +388,17 @@ cost one comparison.
 
 ## Known limitations
 
-- Candidate sets for multi-task (co-placed) groups are still built by
-  scanning. Only single-task placement, the most common case, uses indexes
-  today.
-- Device-set resources (per-item resources such as explicit GPU device lists)
-  cannot be dims. The ledger still enforces them on every candidate.
 - Selection considers only equality constraints for partition binding. A
   range or regex over `region` falls back to the scan, even if only one region
   could match.
-- Settings changes require a manager restart.
-- There is no per-task index override in the job spec. Selection is always
-  automatic.
+- Partition enumeration serves `count.per` only when the per key is a
+  `partition_by` key of an `on` index whose other keys the task binds; other
+  `count.per` tasks get an untruncated (index-served or scanned) list split
+  into groups.
+- Gang tasks never truncate (see [Truncation](#truncation)).
+- A device dim counts free devices by name only. Per-device constraints in a
+  request (`resources.devices[].constraints`) are checked by the device
+  ledger, not the index, so a node with enough free devices that fail those
+  constraints still ranks as fitting.
+- Settings changes, including plugin kinds and their `options`, require a
+  manager restart.

@@ -910,7 +910,8 @@ before the indexes, 1.3 ms after, and 1.4 ms at 16.7k jobs.
 - `sync_missing_task_volume_claims` still does one task-config query per
   active job per checker tick (TODO.md).
 - In-place rollout ticks build an O(fleet) exclusion set and so a filtered
-  node-set copy (`crates/manager/src/manager/rollout.rs`, TODO.md).
+  node-set copy (`crates/manager/src/manager/rollout.rs`). Shipped since as
+  an allow-list ([candidates-and-indexes plan § 6.3](candidates-and-indexes-plan.md)).
 - `build_plan` still grows mildly with nodes (240 → 398 µs from 5k to 50k);
   not located.
 

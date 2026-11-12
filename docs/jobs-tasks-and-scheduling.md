@@ -231,6 +231,10 @@ Important `TaskConfig` fields:
   runs too long, and a lost member restarts the whole gang (or, with
   `onMemberLoss`, is replaced alone or fails the job). See
   [Gang Scheduling](gang-scheduling.md).
+- `indexHint`: the scheduling index the task's candidates come from, or
+  `"scan"` for the full scan. Advisory: an unknown or unusable hint falls back
+  to automatic selection and `job plan` says why. See
+  [Scheduling Indexes](scheduling-indexes.md#hinting-an-index).
 - `group`: task grouping for rollouts and automatic anti-affinity
 - `runtime`: task-runtime plugin (`exec`, `container`, etc.)
 - `resources`: normalized by the manager's `ResourcePolicy`

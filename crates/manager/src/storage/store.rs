@@ -523,6 +523,18 @@ impl AllocationRef {
 pub struct AvailableNodes {
     sorted: Vec<Arc<Node>>,
     by_id: HashMap<String, usize>,
+    /// Parallel to `sorted`: the node declares no `restriction` block and no
+    /// `namespaces` list ([`crate::constraints::node_is_unrestricted`]), so
+    /// a permit check reduces to its pool. Computed at most once per node
+    /// per set, on first use, instead of two attribute lookups per node per
+    /// task (candidates-and-indexes plan § 6.2): a scan pays it once and
+    /// every later task reuses it, and a budgeted index walk pays only for
+    /// the nodes it visits.
+    /// `0` = not computed yet, `1` = restricted, `2` = unrestricted. A
+    /// relaxed atomic, not a `OnceLock`: two planners racing to fill one
+    /// slot compute the same value, so the race is harmless and the read
+    /// stays one plain load on the scan's hot path.
+    unrestricted: Vec<std::sync::atomic::AtomicU8>,
 }
 
 impl AvailableNodes {
@@ -535,9 +547,14 @@ impl AvailableNodes {
             .enumerate()
             .map(|(position, node)| (node.id.clone(), position))
             .collect();
+        let unrestricted = nodes
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU8::new(0))
+            .collect();
         AvailableNodes {
             sorted: nodes,
             by_id,
+            unrestricted,
         }
     }
 
@@ -548,6 +565,34 @@ impl AvailableNodes {
 
     pub fn get(&self, id: &str) -> Option<&Node> {
         self.by_id.get(id).map(|position| &*self.sorted[*position])
+    }
+
+    /// [`Self::get`] with the node's unrestricted flag, for
+    /// [`crate::constraints::PermitSet::is_permitted_flagged`].
+    pub fn get_flagged(&self, id: &str) -> Option<(&Node, bool)> {
+        self.by_id
+            .get(id)
+            .map(|position| self.flagged_at(*position))
+    }
+
+    fn flagged_at(&self, position: usize) -> (&Node, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let node = &*self.sorted[position];
+        let slot = &self.unrestricted[position];
+        let unrestricted = match slot.load(Relaxed) {
+            0 => {
+                let unrestricted = crate::constraints::node_is_unrestricted(node);
+                slot.store(if unrestricted { 2 } else { 1 }, Relaxed);
+                unrestricted
+            }
+            known => known == 2,
+        };
+        (node, unrestricted)
+    }
+
+    /// Every node in id order, with its unrestricted flag.
+    pub fn iter_flagged(&self) -> impl Iterator<Item = (&Node, bool)> + '_ {
+        (0..self.sorted.len()).map(|position| self.flagged_at(position))
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -577,6 +622,52 @@ impl AvailableNodes {
                 .cloned()
                 .collect(),
         ))
+    }
+
+    /// The subset of `allowed` that is in the set, built by lookup:
+    /// O(|allowed|), whatever the fleet size. What an in-place rollout tick
+    /// plans against (its old nodes) instead of excluding every other node
+    /// ([`NodeScope::Only`]).
+    pub fn only(&self, allowed: &HashSet<String>) -> Self {
+        Self::new(
+            allowed
+                .iter()
+                .filter_map(|id| self.by_id.get(id.as_str()))
+                .map(|position| Arc::clone(&self.sorted[*position]))
+                .collect(),
+        )
+    }
+}
+
+/// What [`Store::scheduling_index_per_groups`] returns: the serving index's
+/// name and one budgeted walk per `count.per` group token.
+pub type PerGroupWalks<T> = (String, Vec<(String, crate::scheduling_index::IndexWalk<T>)>);
+
+/// Which available nodes a plan may use.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum NodeScope<'a> {
+    /// Every available node.
+    #[default]
+    All,
+    /// Every available node but these (a reschedule away from a failed
+    /// node).
+    Exclude(&'a HashSet<String>),
+    /// Only these, when available (an in-place rollout's old nodes).
+    Only(&'a HashSet<String>),
+}
+
+impl NodeScope<'_> {
+    /// `nodes` narrowed to this scope; shares the input when nothing is
+    /// cut.
+    pub fn apply(self, nodes: Arc<AvailableNodes>) -> Arc<AvailableNodes> {
+        match self {
+            NodeScope::All => nodes,
+            NodeScope::Exclude(excluded) => match nodes.without(excluded) {
+                Some(filtered) => Arc::new(filtered),
+                None => nodes,
+            },
+            NodeScope::Only(allowed) => Arc::new(nodes.only(allowed)),
+        }
     }
 }
 
@@ -973,6 +1064,16 @@ pub struct PlanSubmissionPlacement {
     /// and in the format-1 shape, which bind any unbound instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// The instance whose node-local volume pinned this placement to
+    /// `candidates[0]`. The planner read that pin from SQLite mid-plan, with
+    /// no epoch over it, so the apply re-reads it inside its transaction and
+    /// refuses the candidate when the pin moved or vanished (a `volume
+    /// delete --force` in between): the eval re-plans against current pins
+    /// instead of steering the instance onto a node its data left
+    /// (candidates-and-indexes plan § 6.11). Absent for unpinned placements
+    /// and in rows written before the fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_pin: Option<String>,
 }
 
 /// A successfully applied plan: the inserted allocations plus the candidate
@@ -1435,6 +1536,7 @@ impl PlanPlacements {
                 task_id: *task_id,
                 candidates: vec![node_id.clone()],
                 instance_id: None,
+                volume_pin: None,
             })
             .collect()
     }
@@ -2426,10 +2528,15 @@ impl Store {
         let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
         let checkpoint_conn: MemSafeConn = Arc::new(Mutex::new(Connection::open(&db_path)?));
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
-        let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
+        let mut index_settings = IndexSettings::from_scheduler_settings(
             config.scheduler_settings.as_ref(),
             &config.scheduling_policy,
-        )?);
+        )?;
+        // `kind = "<plugin>"` indexes take their geometry from
+        // `plugins/indexes/<plugin>/`; a missing or broken one fails startup
+        // like any malformed declaration (docs/scheduling-indexes.md).
+        crate::manager::scheduler::index_kinds::resolve_plugin_kinds(&mut index_settings)?;
+        let index_settings = Arc::new(index_settings);
 
         let resource_policy_fingerprint: Arc<str> = resource_policy.fingerprint().into();
         let store = Store {
@@ -3923,7 +4030,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale, run, children
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale, run, children, index_hint
             FROM task_config;
             "#,
         )?;
@@ -3946,6 +4053,7 @@ impl Store {
                 suspend: parse_json_column(31, row.get(31)?)?,
                 run: parse_json_column(35, row.get(35)?)?,
                 children: parse_json_column(36, row.get(36)?)?,
+                index_hint: row.get(37)?,
                 gang: parse_json_column(32, row.get(32)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
@@ -5122,7 +5230,7 @@ impl Store {
     pub fn scheduling_index_query(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &crate::scheduling_index::IndexRequest,
         budget: Option<usize>,
         ordered: bool,
     ) -> R<crate::scheduling_index::IndexQueryOutcome> {
@@ -5139,7 +5247,7 @@ impl Store {
     pub fn scheduling_index_walk<T>(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &crate::scheduling_index::IndexRequest,
         budget: usize,
         verify: impl FnMut(&str) -> Option<T>,
     ) -> R<Result<crate::scheduling_index::IndexWalk<T>, crate::scheduling_index::IndexQueryOutcome>>
@@ -5148,6 +5256,44 @@ impl Store {
             .read_model_reader()?
             .indexes
             .walk_verified(bindings, request, budget, verify))
+    }
+
+    /// `count.per` partition enumeration plus one budgeted walk per
+    /// enumerated shard, under one read-model guard
+    /// ([`crate::scheduling_index::IndexSet::enumerate_partitions`]). `None`
+    /// when no index can serve the per key. `budget(token)` sizes each
+    /// group's walk; `verify` runs with the guard held and must not touch
+    /// the store.
+    pub fn scheduling_index_per_groups<T>(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &crate::scheduling_index::IndexRequest,
+        per_key: &str,
+        mut budget: impl FnMut(&str) -> usize,
+        mut verify: impl FnMut(&str) -> Option<T>,
+    ) -> R<Option<PerGroupWalks<T>>> {
+        let guard = self.read_model_reader()?;
+        let Some(enumeration) = guard
+            .indexes
+            .enumerate_partitions(bindings, request, per_key)
+        else {
+            return Ok(None);
+        };
+        let groups = enumeration
+            .groups
+            .iter()
+            .map(|(token, shard)| {
+                let walk = guard.indexes.walk_shard_verified(
+                    enumeration.index_pos,
+                    shard,
+                    request,
+                    budget(token),
+                    &mut verify,
+                );
+                (token.clone(), walk)
+            })
+            .collect();
+        Ok(Some((enumeration.index, groups)))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
@@ -6086,6 +6232,7 @@ impl Store {
                         task_id,
                         candidates: vec![node_id],
                         instance_id: None,
+                        volume_pin: None,
                     })
                     .collect()
             }
@@ -6590,6 +6737,30 @@ impl Store {
                         ));
                     }
                     continue;
+                }
+                // A volume-pinned placement goes only where its instance's
+                // data still is. The planner read the pin outside any
+                // epoch, so re-read it here: a pin that moved or vanished
+                // since (a forced volume delete) refuses the candidate, the
+                // plan is rejected, and the eval re-plans against the pins
+                // as they are now (candidates-and-indexes plan § 6.11).
+                if let Some(instance_id) = placement.volume_pin.as_deref() {
+                    let pinned = self.pinned_node_for_instance_tx(tx, instance_id)?;
+                    if pinned.as_deref() != Some(node_id.as_str()) {
+                        if first_skip_reason.is_none() {
+                            first_skip_reason = Some(match pinned {
+                                Some(moved) => format!(
+                                    "instance {instance_id}'s node-local volume is now on node \
+                                     {moved}, not {node_id} (it changed since the plan snapshot)"
+                                ),
+                                None => format!(
+                                    "instance {instance_id} no longer holds a node-local volume \
+                                     on node {node_id} (it was removed since the plan snapshot)"
+                                ),
+                            });
+                        }
+                        continue;
+                    }
                 }
                 if !state
                     .constraints
@@ -8207,6 +8378,7 @@ impl Store {
             autoscale: parse_json_column(35, row.get(35)?)?,
             run: parse_json_column(36, row.get(36)?)?,
             children: parse_json_column(37, row.get(37)?)?,
+            index_hint: row.get(38)?,
         };
 
         Ok(task_config)
@@ -12121,6 +12293,7 @@ impl Store {
                 ":autoscale": autoscale,
                 ":run": run,
                 ":children": children,
+                ":index_hint": t.index_hint,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -27171,6 +27344,7 @@ mod tests {
                     task_id,
                     candidates: vec!["node-a".to_string()],
                     instance_id: None,
+                    volume_pin: None,
                 }]),
                 expected_versions: versions,
                 evictions: Vec::new(),
@@ -28202,6 +28376,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28240,6 +28415,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
             &[PlanEviction {
@@ -28280,6 +28456,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28349,6 +28526,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28594,6 +28772,7 @@ mod tests {
                         task_id,
                         candidates: vec![node.clone()],
                         instance_id: None,
+                        volume_pin: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -28722,6 +28901,7 @@ mod tests {
                         task_id,
                         candidates: vec![node.clone()],
                         instance_id: None,
+                        volume_pin: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -28894,6 +29074,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28944,6 +29125,7 @@ mod tests {
                     task_id,
                     candidates: list.iter().map(|node| node.to_string()).collect(),
                     instance_id: None,
+                    volume_pin: None,
                 })
                 .collect();
             let submission = store.insert_plan_submission_with_candidates(
@@ -29026,6 +29208,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -29077,6 +29260,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -29115,6 +29299,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -29180,6 +29365,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -29217,6 +29403,7 @@ mod tests {
             task_id,
             candidates: vec!["node-a".to_string()],
             instance_id: None,
+            volume_pin: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -29276,6 +29463,7 @@ mod tests {
             task_id,
             candidates: vec!["node-a".to_string(), "node-b".to_string()],
             instance_id: None,
+            volume_pin: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -29324,6 +29512,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;

@@ -183,7 +183,8 @@ When one is required and what goes in it:
 | [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | in execution: Phases 0 to 8 built; hardware verification open (launch blocker: workers on other hosts lose exec, logs, and the mesh. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
-| [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
+| [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; the group path and the Phase 4 backlog shipped with candidates-and-indexes-plan.md) |
+| [candidates-and-indexes-plan.md](plans/candidates-and-indexes-plan.md) | shipped (2026-11-12): `fit` sees `maxAllocations`, the per-node permit flag, in-place allow-lists, truncation for every task shape but gangs (`distinct`, stateful, `count.per` by partition enumeration, co-placed groups), plugin index kinds, device dims, `indexHint`, the heap walk, and the volume-pin apply fence |
 | [security-gap-closure-plan.md](plans/security-gap-closure-plan.md) | shipped (2026-10-17): the README's and TODO's known security gaps plus an audit's findings — KV reads through jobspecs, root-worker path escapes, node credentials leaving the node, forged identities, plaintext raft; direct exec revocation push, fleet certificates, and git/OCI fetch judging deferred |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | v1 shipped; §8 mesh follow-on superseded by service-mesh-plan.md |
 | [service-discovery-plan.md](plans/service-discovery-plan.md) | superseded (rationale + full mesh design) |
@@ -338,6 +339,7 @@ by project impact. The full template and a worked example:
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
 - [placement-and-commit-cost-plan_calls.md](calls/placement-and-commit-cost-plan_calls.md)
 - [plan-apply-conflict-reduction-plan_calls.md](calls/plan-apply-conflict-reduction-plan_calls.md)
+- [candidates-and-indexes-plan_calls.md](calls/candidates-and-indexes-plan_calls.md)
 - [plan-path-fleet-scaling-plan_calls.md](calls/plan-path-fleet-scaling-plan_calls.md)
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)
 - [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
