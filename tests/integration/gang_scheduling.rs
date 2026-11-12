@@ -125,6 +125,18 @@ impl Cluster {
         Ok(())
     }
 
+    /// `legion job stop`: the job is marked stopped and its `job_stop` eval
+    /// queued, which the next [`Self::settle`] runs. Freed room stays free:
+    /// removing a running job's allocations alone leaves a job that still
+    /// wants them, and the capacity pass places them again.
+    fn stop(&self, name: &str) -> R<()> {
+        self.store().stop_job(name)?;
+        let config_id = self.store().get_job_config(name)?.id();
+        self.store()
+            .enqueue_eval("job_stop", Some(name), Some(&config_id), None, None)?;
+        Ok(())
+    }
+
     /// What worker registration does after inserting the node.
     fn join(&self, id: &str) -> R<()> {
         self.store().insert_node(NodeMsg::from(node(id)))?;
@@ -291,7 +303,7 @@ fn a_blocked_gang_wakes_only_when_its_shortfall_could_fit() -> R<()> {
 
     let skipped = || legion::telemetry::metrics().gang_wakes_skipped_total.get();
     let before = skipped();
-    cluster.store().remove_allocs_for_job("filler-a")?;
+    cluster.stop("filler-a")?;
     assert_eq!(
         cluster.settle()?,
         0,
@@ -300,7 +312,7 @@ fn a_blocked_gang_wakes_only_when_its_shortfall_could_fit() -> R<()> {
     assert!(skipped() > before, "the skipped wake is counted");
     assert_eq!(cluster.store().blocked_evals()?.len(), 1);
 
-    cluster.store().remove_allocs_for_job("filler-b")?;
+    cluster.stop("filler-b")?;
     assert_eq!(cluster.settle()?, 1, "room for all three wakes it");
     assert_eq!(cluster.running("trainer")?, 3);
     Ok(())
@@ -431,7 +443,7 @@ fn a_gang_wait_counts_from_its_first_block() -> R<()> {
     assert_eq!(again.since_unix, first.since_unix, "the clock was kept");
 
     // Room for both: the gang places and its wait ends.
-    cluster.store().remove_allocs_for_job("filler")?;
+    cluster.stop("filler")?;
     cluster.settle()?;
     assert_eq!(cluster.running("trainer")?, 2);
     assert!(cluster.store().gang_wait(&config_id)?.is_none());
