@@ -367,36 +367,10 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       liveness ping from desired-state sync (wire change; needs a plan).
 - [ ] **Per-pool heartbeat freshness.** `legion_heartbeat_freshness_ratio` is
       fleet-wide and blends fast and slow pools.
-
-### AWS comparative benchmark rig
-
-[plan](plans/aws-comparative-benchmark-plan.md) · [calls](calls/aws-comparative-benchmark-plan_calls.md) ·
-[`benchmarks/aws/`](../benchmarks/aws/README.md)
-
-- [ ] **Measure plan-apply conflicts under both `bin_pack` and `spread` on the
-      rig.** The rig now runs each scenario's own `scheduling_policy`
-      (`run-campaign.sh --scheduling-policy` overrides); no AWS run has used it yet.
-- [ ] **Bake a rig AMI.** Control plane, loadgen, and spot workers each pay
-      their own cloud-init (~10 min at bring-up, 6–8 min per ASG scale-up, which
-      stalled a whole session). `scripts/rig-toolchain.sh` is written; it needs
-      a `bake-rig-ami.sh` and a terraform lookup, like the operator AMI.
-- [ ] **Per-run sim node prefixes.** Now that `stop-sim-fleet.sh` forgets
-      its nodes, the per-campaign store reset and the one-scenario-per-campaign
-      rule could go; both are left as they were ([calls 43](calls/aws-comparative-benchmark-plan_calls.md)).
-- [ ] **Cache the built binary in S3, keyed on git rev.** `distfast` took 28
-      min against 24.5 for full LTO (the cost is ~900 crates, not linking);
-      `build-and-upload.sh` already fingerprints plugins, not the main binary.
-- [ ] **Legion's fixed-2s ablation never settled onto 2s** at 5k (freshness
-      0.46 with `adaptive = false`), so that row understates the cost. Find why.
-- [ ] **Nomad's Python placement follower misses 14–34 events** in 50k cells,
-      undercounting throughput. Use a compiled follower or Nomad's own count.
-- [ ] **K8s at 200,000 pods**: the scheduler's apiserver stopped completing TLS
-      handshakes. Point the driver at another apiserver and rerun the
-      40-per-node `dense_fleet` cell.
-- [ ] **Nomad can't run `mixed_heterogeneous`**: nodesim has no node `meta`.
-      Patch it if the report needs that row.
-- [ ] **K8s failover drill**: `failover-drill.sh` has no fault command for the
-      scheduler's lease holder.
+- [ ] **`heartbeat = { adaptive = false }` never settled onto its fixed 2s** at
+      5k nodes on the AWS rig (freshness 0.46), so the fixed-cadence ablation
+      row understates its cost. Find why the fixed cadence isn't held
+      ([cadence plan](plans/heartbeat-cadence-at-scale-plan.md)).
 
 ## Task runtimes
 
@@ -1367,8 +1341,6 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Re-measure the AWS campaign with heartbeats off raft: `heartbeat-commit-probe.sh` on gp3 at 250/1000/2500 nodes, `packing-density.sh`, all twelve `run-campaign.sh` cells, `storm.sh`, `soak-24h.sh`, `failover-drill.sh` with zero nodes lost, and the cadence phase-4 repro ([liveness plan §10.1](plans/liveness-off-the-raft-path-plan.md)).
 - [ ] Run the `heartbeat = { adaptive = false }` comparison at 10k and 20k nodes against the adaptive default ([cadence plan §13](plans/heartbeat-cadence-at-scale-plan.md)).
 - [ ] Re-run the ~3,000-node mass-loss storm: submissions keep landing while the reschedule backlog sits at priority 40; also confirm a job matching no node moves `evals_processed_total{kind="job_submit",status="error"}` by one ([node-loss-storm plan](plans/node-loss-storm-plan.md)).
-- [ ] Run the rest of the cross-system matrix: CLI control row (row 5) on the NVMe rig, 10k storm on all three, memory per cell (row 6), and `REPORT.md` ([plan](plans/aws-comparative-benchmark-plan.md)).
-- [ ] Run the Legion B (streaming) campaign and the 20k validation burst ([plan](plans/aws-comparative-benchmark-plan.md)).
 
 ### Task runtimes
 
@@ -1429,7 +1401,6 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Linux visual check of `/nodes/<id>` against `legion node usage <id>` with enforcement on, and the idle countdown reaching zero within one poll of the sweep ([plan](plans/suspend-resume-ui-plan.md)).
 - [ ] Browser check of the sessions UI against a live session cluster: Promote, End, paging, envelope and edge-nodes cards ([plan](plans/session-ui-plan.md)).
 - [ ] Re-verify on the rig: microVM clean stop (volume writes survive `instance stop`), image pulls after leader failover, two local managers with separate `~/.legion/tokens/` files, and `rig_install_cli_token` on a 3-manager rig ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
-- [ ] Bake the operator AMI against real AWS: console output survives the stop, bake finishes inside 90 minutes ([calls #29](calls/aws-comparative-benchmark-plan_calls.md)).
 
 
 ---
@@ -1843,6 +1814,7 @@ judgement calls in [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-
   - **The installation guide's cloud-hypervisor and guest-kernel versions were checked upstream**: the kernel tag it named did not exist; it now names the pair the sandbox-boot rig ran, and the arm64 asset ([docs](../docs/installation.md)).
 - **Removed, already done**: the `proto-breaking-ok` label exists; the rig's driver no longer reports `0.0` for a cell shorter than its warmup; Linux containers have had their own network namespace since gated became the default; the guest agent has had a vsock exec channel and a static musl build since sandbox exec Phase 1.
 - **Removed, duplicates** (the surviving item carries the detail): the rig's `schedulingPolicy`, TAP and loopback-only sandboxes' upstreams, pressure re-landing on the evicting node, `exec` network namespaces and the overlay controller (both "Unplanned datapath"), wake on connect and diff snapshots, the session lifecycle rate, "prove Legion scales", the ingress's catalog polling, the https CA default, two task-manager-lock items (audit W3), and three Verify runs listed twice.
+- **Moved to the rig's plan**: the AWS comparative benchmark rig's own work (rig AMI, binary cache, sim node prefixes, competitor follower and harness gaps, the rest of the cross-system matrix, the streaming campaign, the operator-AMI bake check) now lives in [its plan's Open work](plans/aws-comparative-benchmark-plan.md#open-work). Legion bugs the rig finds stay here, by area; the plan-apply `spread` run is the Verify item that already covered it.
 - **Removed, decided**: seventeen limitations and ideas, each with where its decision lives ([calls #10](calls/todo-closeout-2026-11-10_calls.md)).
 
 ## Spot checks, audits and security closures
