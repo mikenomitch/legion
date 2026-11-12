@@ -1157,11 +1157,16 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             node_identity: Some(node_identity.clone()),
             netd: Some(netd.clone()),
         });
+        // Health transitions go to the manager on the stream as they
+        // happen, not on the next heartbeat.
+        let (report_tx, report_rx) = crate::worker::work_stream::report_channel();
+        lock_manager(&task_manager).set_health_reports(report_tx);
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
             move |request| credentials.attach(request),
             name.clone(),
             WORK_MIRROR.clone(),
+            report_rx,
             move |applied| launch_streamed_work(&launcher, applied),
         ));
     }
@@ -1513,10 +1518,10 @@ async fn stop_worker_daemon(
         let counts = crate::worker::task_manager::session_sleep::checkpoint_sessions_on_stop(
             &manager, deadline,
         );
-        manager
-            .lock()
-            .expect("task manager")
-            .sync_session_log(Duration::from_secs(5));
+        let guard = manager.lock().expect("task manager");
+        guard.sync_session_log(Duration::from_secs(5));
+        guard.sync_state_file(Duration::from_secs(5));
+        drop(guard);
         counts
     });
     match tokio::time::timeout(timeout + Duration::from_secs(10), checkpointed).await {
@@ -2703,6 +2708,29 @@ fn failure_report(
     }
 }
 
+/// Run blocking work from async code: on a multi-threaded runtime the
+/// worker thread hands its other tasks to another thread first
+/// (`block_in_place`), so a wait for the task-manager lock, or the work done
+/// under it, never stalls the heartbeat, the work stream, or an RPC behind
+/// it. A current-thread runtime (tests) runs it directly.
+pub(crate) fn in_place<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
+/// Take the task-manager lock from async code without blocking a runtime
+/// worker while another thread holds it (see [`in_place`]). The task
+/// manager's lock is a std mutex because its holders are mostly blocking
+/// threads (launches, staging, reaps); `heartbeat_tick` takes it about ten
+/// times a beat.
+pub(crate) fn lock_manager(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+) -> std::sync::MutexGuard<'_, WorkerTaskManager> {
+    in_place(|| task_manager.lock().expect("task manager"))
+}
+
 /// One heartbeat round-trip: report running/failed allocations, then
 /// reconcile against the manager's desired set.
 // Same reason as `start_heartbeats`: each per-heartbeat subsystem is threaded
@@ -2736,7 +2764,7 @@ pub async fn heartbeat_tick(
             volume_reports,
             snapshot_reports,
         ) = {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = lock_manager(task_manager);
             let failures = manager
                 .drain_failures()
                 .into_iter()
@@ -2818,7 +2846,7 @@ pub async fn heartbeat_tick(
                 // the idle policy only (docs/session-mode.md#idle-sessions):
                 // their entries come back out before the report is sent.
                 let (targets, park_held) = {
-                    let manager = task_manager.lock().expect("task manager");
+                    let manager = lock_manager(task_manager);
                     let mut targets = manager.usage_targets();
                     targets.extend(manager.session_idle_targets());
                     (targets, manager.park_held())
@@ -2903,7 +2931,7 @@ pub async fn heartbeat_tick(
         // task that looks fine and cannot reach anything.
         // A capture that recovers puts the allocation's own health back.
         {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = lock_manager(task_manager);
             for status in &net_status {
                 if status.mode != crate::structs::netpolicy::MODE_GATED
                     || !manager.has_allocation(status.allocation_id)
@@ -2923,7 +2951,7 @@ pub async fn heartbeat_tick(
         // arrives, so a failed heartbeat needs no restore: the next diff
         // carries the same change.
         let content_report = {
-            let store = task_manager.lock().expect("task manager").content_store();
+            let store = lock_manager(task_manager).content_store();
             match crate::worker::content_report::advertised_set(store.as_deref()) {
                 Ok(current) => {
                     let mut pending = {
@@ -2992,12 +3020,12 @@ pub async fn heartbeat_tick(
         };
         // Starts refused for a disabled runtime since the last acknowledged
         // beat (docs/runtime-disable.md); put back if this one is lost.
-        let runtime_gate = task_manager.lock().expect("task manager").runtime_gate();
+        let runtime_gate = lock_manager(task_manager).runtime_gate();
         let runtime_refusals = runtime_gate.take_refusals();
         let runtime_refusals_for_redrive = runtime_refusals.clone();
         // One aggregate per isolate task, polled from the hosts now
         // (docs/task-runtime-isolate.md, "Observing").
-        let isolates = task_manager.lock().expect("task manager").isolates();
+        let isolates = lock_manager(task_manager).isolates();
         let (isolate_tasks, isolate_hosts) = match isolates {
             Some(isolates) => isolates.stats("", "").await,
             None => (Vec::new(), Vec::new()),
@@ -3049,7 +3077,7 @@ pub async fn heartbeat_tick(
                 // Drained failure reports must not be lost to a dead
                 // connection: put them back so the next successful
                 // heartbeat still tells the manager about them.
-                let mut manager = task_manager.lock().expect("task manager");
+                let mut manager = lock_manager(task_manager);
                 manager.requeue_failures(failures_for_redrive.into_iter().map(failure_report));
                 // Same for terminal outcomes: a batch task's completion lost
                 // to a dead connection would leave the job "running" forever.
@@ -3089,7 +3117,7 @@ pub async fn heartbeat_tick(
         // failure reports: nothing replaces a failed allocation until one is
         // recorded.
         {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = lock_manager(task_manager);
             manager.requeue_unrecorded_terminations(
                 terminations_for_redrive,
                 &reply.retry_terminated_allocations,
@@ -3170,7 +3198,7 @@ pub async fn heartbeat_tick(
             .acknowledge(session_report, reply.session_resync);
         // The later copy of a session id another node also runs.
         if !reply.stop_sessions.is_empty() {
-            task_manager.lock().expect("task manager").stop_sessions(
+            lock_manager(task_manager).stop_sessions(
                 &reply.stop_sessions,
                 "duplicate of a session on another node",
             );
@@ -3249,7 +3277,7 @@ pub async fn heartbeat_tick(
         // nobody's, and restore never learned about them.
         if netd.orphan_sweep_pending() {
             let held: std::collections::HashSet<i64> = {
-                let manager = task_manager.lock().expect("task manager");
+                let manager = lock_manager(task_manager);
                 manager
                     .allocations_snapshot()
                     .into_iter()
@@ -3303,7 +3331,7 @@ pub async fn heartbeat_tick(
             // send (a worker that cannot heartbeat self-fences its stateful
             // allocations — one stuck volume must not become an outage).
             // spawn_blocking because drivers shell out (umount, rm -rf).
-            let volumes = task_manager.lock().expect("task manager").volumes_handle();
+            let volumes = lock_manager(task_manager).volumes_handle();
             tokio::task::spawn_blocking(move || {
                 volumes.destroy_requested(&requests);
             });
@@ -3315,7 +3343,7 @@ pub async fn heartbeat_tick(
         // the manager still attaches the restore payload.
         {
             let fresh = {
-                let mut manager = task_manager.lock().expect("task manager");
+                let mut manager = lock_manager(task_manager);
                 // The manager applied (or ignored) the reports this beat
                 // carried before it built the reply, so finished work this
                 // reply leaves out can be forgotten now.
@@ -3395,7 +3423,7 @@ pub async fn heartbeat_tick(
                     // The task must not start without its identities;
                     // report the failure so the manager can reschedule.
                     failed_prepare.push(allocation.allocation_id);
-                    task_manager.lock().expect("task manager").record_failure(
+                    lock_manager(task_manager).record_failure(
                         allocation.allocation_id,
                         format!("Failed to deliver workload identities: {err}"),
                     );
@@ -3438,12 +3466,15 @@ pub async fn heartbeat_tick(
 
         // Gated namespaces already exist (created above, ahead of the
         // datapath listeners bound inside them).
-        let new_allocations = {
-            let mut manager = task_manager.lock().expect("task manager");
+        // The reconcile stops what the node no longer runs (signals, stop
+        // notices, a runtime's own stop), so it runs as blocking work, not on
+        // a runtime worker every other task on the node shares.
+        let new_allocations = in_place(|| {
+            let mut manager = lock_manager(task_manager);
             manager.set_stop_causes(stop_causes);
             manager.set_stop_preemptors(stop_preemptors);
             manager.reconcile_allocations(&desired)
-        };
+        });
         if !new_allocations.is_empty() {
             // Refresh loops are keyed by allocation id and start slightly
             // before the task process registers (the launch below is
@@ -4059,12 +4090,17 @@ fn launch_streamed_work(
             continue;
         }
         let launcher = launcher.clone();
+        let policy = applied
+            .net_policies
+            .iter()
+            .find(|policy| policy.allocation_id == allocation.allocation_id)
+            .cloned();
         tokio::spawn(async move {
             let allocation_id = allocation.allocation_id;
             // `accept_work`, not the `post_work` handler: the stream is
             // already authenticated, and an in-process request carries no
             // manager certificate for the worker-plane check to accept.
-            if let Err(status) = launcher.accept_work(allocation).await {
+            if let Err(status) = launcher.accept_work_with_policy(allocation, policy).await {
                 // Recorded as the allocation's failure by the launch path;
                 // the heartbeat reports it.
                 debug!(allocation_id, error = %status.message(), "Streamed allocation did not start");

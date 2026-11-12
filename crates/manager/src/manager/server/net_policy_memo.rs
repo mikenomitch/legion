@@ -247,9 +247,72 @@ fn assignment(
     Some(Arc::new(effective))
 }
 
+/// Everything a network-policy assignment reads, cloneable into a task that
+/// outlives a request: the `StreamWork` loop assigns policy to each
+/// message's upserts with it, so a pushed gated allocation gets its policy
+/// on the delta rather than on the next heartbeat.
+#[derive(Clone)]
+pub(super) struct NetPolicyAssigner {
+    pub(super) store: Store,
+    pub(super) memo: Arc<NetPolicyMemo>,
+    pub(super) cache: Arc<Mutex<HashMap<String, EffectivePolicy>>>,
+    pub(super) generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+}
+
 impl ManagerDaemonService {
+    /// The policy assigner over this service's memo, body cache, and
+    /// generation.
+    pub(super) fn net_policy_assigner(&self) -> NetPolicyAssigner {
+        NetPolicyAssigner {
+            store: self.store.clone(),
+            memo: Arc::clone(&self.net_policy_memo),
+            cache: Arc::clone(&self.net_policy_cache),
+            generation: Arc::clone(&self.net_policy_generation),
+        }
+    }
+
     /// [`Self::build_net_policies`] through the memo.
     pub(super) fn memoized_net_policies(
+        &self,
+        node_id: &str,
+        desired: &[crate::structs::TaskAllocation],
+    ) -> Vec<AllocNetPolicy> {
+        self.net_policy_assigner().assign(node_id, desired)
+    }
+}
+
+impl NetPolicyAssigner {
+    /// The policy generation, re-read from the store at most every
+    /// `NET_POLICY_GENERATION_TTL`.
+    pub(super) fn generation_cached(&self) -> u64 {
+        let now = std::time::Instant::now();
+        {
+            let cached = self.generation.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((read_at, generation)) = *cached {
+                if now.duration_since(read_at) < NET_POLICY_GENERATION_TTL {
+                    return generation;
+                }
+            }
+        }
+        let generation = self.store.net_policy_generation().unwrap_or(0);
+        *self.generation.lock().unwrap_or_else(|p| p.into_inner()) = Some((now, generation));
+        generation
+    }
+
+    /// Keep `policy`'s body for `FetchDatapathMaterial` (bounded).
+    pub(super) fn remember(&self, policy: &EffectivePolicy) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= NET_POLICY_CACHE_MAX && !cache.contains_key(&policy.hash) {
+            cache.clear();
+        }
+        cache
+            .entry(policy.hash.clone())
+            .or_insert_with(|| policy.clone());
+    }
+
+    /// The effective policy hash of each allocation in `desired` that has
+    /// one, memoized per input.
+    pub(super) fn assign(
         &self,
         node_id: &str,
         desired: &[crate::structs::TaskAllocation],
@@ -264,14 +327,14 @@ impl ManagerDaemonService {
                 && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
                     .is_ok_and(|placed| placed.is_gated())
         };
-        let generation = self.net_policy_generation_cached();
+        let generation = self.generation_cached();
         let any_inline = desired
             .iter()
             .any(|allocation| !allocation.task_network.trim().is_empty());
         if generation == 0 && !any_inline && !desired.iter().any(placed_gated) {
             return Vec::new();
         }
-        let listed = self.net_policy_memo.stored(generation, || {
+        let listed = self.memo.stored(generation, || {
             Ok(self
                 .store
                 .list_net_policies()?
@@ -296,12 +359,11 @@ impl ManagerDaemonService {
         for allocation in desired {
             let inputs = InputsRef::of(allocation, node_pool.as_deref());
             let hash = inputs.hash();
-            let result = match self.net_policy_memo.get(generation, hash, &inputs) {
+            let result = match self.memo.get(generation, hash, &inputs) {
                 Some(result) => result,
                 None => {
                     let result = assignment(allocation, &stored, node_pool.as_deref());
-                    self.net_policy_memo
-                        .put(generation, hash, &inputs, result.clone());
+                    self.memo.put(generation, hash, &inputs, result.clone());
                     result
                 }
             };
@@ -311,12 +373,12 @@ impl ManagerDaemonService {
             // `FetchDatapathMaterial` serves bodies from the cache, which is
             // bounded and may have dropped this one since it was merged.
             let cached = self
-                .net_policy_cache
+                .cache
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .contains_key(&effective.hash);
             if !cached {
-                self.remember_net_policy(&effective);
+                self.remember(&effective);
             }
             out.push(AllocNetPolicy {
                 allocation_id: allocation.allocation_id,

@@ -288,10 +288,13 @@ runtime's own boot or restore time for the end-to-end figure.
 - **A large node's boot rate is bound by its root disks, not its CPUs.**
   Small and mid-size nodes reach their CPU first. A 96-vCPU node sustains
   about 150 boots a second with worker state on EBS, where it runs out of
-  IOPS, and about 200 on fast local storage, where starts wait on cloning
+  IOPS, and about 200 on fast local storage, where starts waited on cloning
   the image's shared base disk and writing each sandbox's files into its
-  clone. Put the worker's state directory on local NVMe, and add nodes
-  rather than cores past that ([Measured on AWS](#measured-on-aws)).
+  clone. Such a node now spreads its clones over several full copies of
+  each base ([The root disk cache](task-runtime-sandbox.md#the-root-disk-cache)),
+  which takes the shared extents out of that path; its new ceiling has not
+  been measured. Put the worker's state directory on local NVMe, and add
+  nodes rather than cores past that ([Measured on AWS](#measured-on-aws)).
 - **Every keyed sandbox is a row.** A named one leaves a tombstone after
   destroy for the life of its job; a server-minted one leaves no row
   ([Id rules](stateful-workloads.md#id-rules)). A pending instance row is

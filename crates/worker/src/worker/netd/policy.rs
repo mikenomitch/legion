@@ -86,6 +86,29 @@ impl NetPolicyCache {
         missing.into_iter().collect()
     }
 
+    /// Add one allocation's assignment (a `StreamWork` delta's), leaving
+    /// every other in place: the next heartbeat's [`Self::apply_assignments`]
+    /// replaces the whole set as before. Returns the hash when its body is
+    /// not cached yet.
+    pub fn assign_one(&self, assignment: &AllocNetPolicy) -> Option<String> {
+        if assignment.policy_hash.is_empty() {
+            return None;
+        }
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        state
+            .by_alloc
+            .insert(assignment.allocation_id, assignment.policy_hash.clone());
+        (!state.bodies.contains_key(&assignment.policy_hash))
+            .then(|| assignment.policy_hash.clone())
+    }
+
+    /// Add attribution facts for allocations a delta brought, leaving the
+    /// rest (see [`Self::assign_one`]).
+    pub fn add_identities(&self, identities: HashMap<i64, AllocIdentity>) {
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        state.identities.extend(identities);
+    }
+
     /// Store a fetched body. A body whose own hash disagrees with the key is
     /// rejected — the manager and worker must agree on the content address.
     pub fn insert_body(&self, hash: &str, body: EffectivePolicy) -> R<()> {

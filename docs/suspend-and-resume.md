@@ -2501,9 +2501,14 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Gated restores have not run on a real VMM yet.** The vsock move on both
   VMMs is tested against fake VMM APIs that check the requests Legion sends,
   not against Firecracker or cloud-hypervisor themselves.
-- **The worker task-manager lock is held while the VMM writes guest memory.**
-  Heartbeats from that node wait for it. For a guest of a few GiB on slow disk
-  this can approach the heartbeat interval.
+- **A memory capture holds its own allocation, not the node.** The VMM
+  writes guest memory with the worker's task-manager lock released, so the
+  node's other starts, stops, and heartbeats go on meanwhile. The allocation
+  itself counts as starting until the write returns: a second capture of it
+  is refused (`allocation <id> is starting or already being captured`), and
+  a stop that lands meanwhile tears it down once the write returns, failing
+  the capture with `allocation <id> was stopped while its checkpoint was
+  taken`.
 - **A memory part is hashed twice**, once when captured and once when stored,
   which adds seconds for a multi-GiB guest after it has resumed.
 - **The resume handler needs a guest binary that runs on the image.** The

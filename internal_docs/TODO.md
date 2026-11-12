@@ -284,49 +284,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 ### Start path and node throughput
 
-- [ ] **Sandbox boot throughput, what is still open**
-      ([plan](plans/sandbox-boot-throughput-plan.md) ·
-      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
-      [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
-  - [ ] **A large node is bound by its root disks** (calls 13). Reflinked
-        clones plus `debugfs` writes contend in XFS locks (~150–200 boots/s on
-        96 vCPU). Write per-sandbox files without touching shared extents, or
-        spread clones over several base copies, then re-measure.
-  - [ ] **Parallel branches not stacked** (calls 1): `sandbox-warm-pool`,
-        `edge-prewarm`, `elastic-session-envelopes`, `edge-admission-backpressure`,
-        `edge-ratify-throughput`, `chunked-checkpoints`, `checkpoints-on-stream`,
-        `multi-eval-plans`, `scheduler-lane-entry-cost`, `flat-commit-cost`,
-        `web-fleet-throughput`; each needs its own measured case.
-  - [ ] **A memory-snapshot start for sessions**: restore from a per-node
-        template snapshot instead of booting (opt-in, falls back to a boot).
-- [ ] **Start reports wait for a heartbeat.** A health transition reaches the
-      manager on the next full heartbeat (~1 s, up to 21 s on adaptive cadence;
-      liveness pings carry no reports), so rollouts and discovery wait. Carry it on a `StreamWork` report frame
-      ([plan](plans/task-start-critical-path-plan.md) phases 4–5,
-      [calls 4](calls/task-start-critical-path-plan_calls.md)).
-- [ ] **A pushed gated task's policy and ingress wait for the heartbeat.** Its
-      namespace, proxy, resolver, and upstreams bind at launch (2026-11-08) but
-      fail closed until the heartbeat delivers the policy, and ingress listeners
-      bind on the heartbeat. Carry the policy assignment on the delta
-      ([docs](../docs/network-handlers.md)).
-- [ ] **The worker state file is rewritten whole on every start.**
-      `persist_state` serializes every allocation, reads `/proc`, and fsyncs
-      under the task-manager lock, so a burst on a dense node is quadratic.
-      Group-commit off the lock or keep a record per allocation
-      (`legion_task_start_stage_seconds{stage="register"}`).
-- [ ] **TAP sandboxes shell out to `ip` on the start path**
-      (`sandbox_checkpoint::HostTaps`, `sandbox::set_tap_link`). Use the
-      ioctls instead, if the `network` stage shows up on a real KVM node.
-- [ ] **Finish moving worker blocking work off the task-manager lock (audit
-      W3).** Still under it: `reap_terminating`, `record_failure`/self-fence,
-      `prepare`/`start` for `ratify_claim`, `restart_allocation`, edge-boot
-      starts, snapshot restores (an `eager` restore holds it for the whole
-      read), and `container stop` on reconcile. `heartbeat_tick` locks a std
-      mutex from async; teardown needs a "tearing down" state
-      ([calls #11](calls/architecture-audit-2026-10-09_calls.md)). Also under
-      it: a start's filesystem work (`prepare_instance`, log dir and sink), a
-      stop's fsync of the worker state file, and the runtime's memory
-      `checkpoint`.
+- [ ] **A memory-snapshot start for sessions**: restore from a per-node
+      template snapshot instead of booting (opt-in, falls back to a boot)
+      ([plan](plans/session-snapshot-start-plan.md) ·
+      [calls](calls/session-snapshot-start-plan_calls.md), PLANNED).
 
 ### Host runtimes (`exec`, `container`, new runtimes)
 
@@ -1299,6 +1260,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **Park, Phases 1–2** — `suspend.park` and `$LEGION_PARK_SOCKET` for exec, container and sandbox ([plan](plans/park-plan.md) · [calls](calls/park-plan_calls.md) · [docs](../docs/park.md))
 - **Health-check startup fixes** — startup probing between `every` ticks, a `boot` check's first-interval failure not counted, `net_capture_unavailable` no longer sticks ([plan](plans/task-start-critical-path-plan.md) · [calls](calls/task-start-critical-path-plan_calls.md) · [docs](../docs/jobs-tasks-and-scheduling.md#startup-probing))
 - **Gated namespaces exist before their listeners** — created before proxy/resolver binds ([plan](plans/task-start-critical-path-plan.md))
+- **Start reports and streamed policy off the heartbeat** — health transitions on a `StreamWork` `report` frame; a streamed placement's policy assignment on its delta, with ingress bound at launch ([plan](plans/task-start-critical-path-plan.md) phases 4–5 · [calls](calls/task-start-critical-path-plan_calls.md) 3, 5 · [docs](../docs/architecture-managers-workers.md#reports-between-heartbeats))
+- **The worker's blocking work off the task-manager lock (closes audit W3)** — teardowns and stop signals from the supervisor, with `reaping` as the tearing-down state; restarts, edge-boot starts, a `stage` claim's start at ratification, a start's directories, and a memory capture's write without the lock; the heartbeat takes it with `block_in_place` ([plan](plans/task-start-critical-path-plan.md#follow-up-2026-11-12) · [calls](calls/task-start-critical-path-plan_calls.md) 2, 6, 10 · [docs](../docs/suspend-and-resume.md))
+- **Worker state file off the lock** — one newest-snapshot writer per file, process start times cached; 24.5 → 3.8 ms of lock per persist at 1,000 allocations ([calls](calls/task-start-critical-path-plan_calls.md) 4 · [docs](../docs/state-store.md#worker-local-state-store))
+- **TAP devices without `ip`** — create, up/down, master, delete by ioctl and rtnetlink ([calls](calls/task-start-critical-path-plan_calls.md) 9 · [docs](../docs/task-runtime-sandbox.md))
+- **Root disk clones spread over copies of each base** — one full copy per 16 vCPUs (1 to 8), filled in the background ([plan](plans/sandbox-boot-throughput-plan.md) · [calls](calls/sandbox-boot-throughput-plan_calls.md) 15 · [docs](../docs/task-runtime-sandbox.md#the-root-disk-cache))
+- **The sandbox-boot parallel branches, reconciled** — most landed on their own plans; the rest's ideas are open in their areas ([calls](calls/sandbox-boot-throughput-plan_calls.md) 1)
 - **Worker lock under churn** — VMM reaps, cgroup leaf creation, dir removal, and log manifests moved off the task-manager lock (busy ~20% at 250 starts/s) ([plan](plans/sandbox-boot-throughput-plan.md) · [results](../benchmarks/aws/sandbox-boot/RESULTS.md#bare-metal-second-campaign-2026-10-14))
 - **Task process supervision** — child reaping, `restart` policy, exit-code task outcomes ([plan](plans/host-process-supervision-plan.md) · [calls](calls/host-process-supervision-plan_calls.md) · [docs](../docs/task-supervision.md))
 - **Worker-owned cgroups for `exec`** — superseded by node-wide resource enforcement for `exec` and `container` ([docs](../docs/resource-enforcement.md) · [calls 16](calls/container-runtime-exec-and-signals-plan_calls.md))
@@ -1332,7 +1299,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **`hint` idle signal as `suspend.park`** — workload says `busy`/`park` on the park socket ([plan](plans/park-plan.md) · [docs](../docs/park.md))
 - **Lazy memory restore, Phase 1** — on-demand restore on cloud-hypervisor v52+, `memory_restore = lazy|eager` ([plan](plans/lazy-memory-restore-plan.md) · [docs](../docs/task-runtime-sandbox.md#how-memory-comes-back))
 - **Sandbox `config.memory_mib` removed** — refused at submit; the guest boots at `resources.memoryMax`, else `memory`, else 512 MiB, read per unit at launch ([calls 26](calls/suspend-resume-and-oversubscription-plan_calls.md) · [docs](../docs/task-runtime-sandbox.md#guest-size))
-- **A smaller guest kernel, documented** — the options Legion needs and a build recipe ([docs](../docs/task-runtime-sandbox.md#a-smaller-guest-kernel) · [calls 18](calls/sandbox-boot-throughput-plan_calls.md))
+- **A smaller guest kernel, documented** — the options Legion needs and a build recipe ([docs](../docs/task-runtime-sandbox.md#a-smaller-guest-kernel) · [calls 19](calls/sandbox-boot-throughput-plan_calls.md))
 - **Container OCI stop tests drive `stop_with` then the hard stop**, and pass under runc 1.5.2
 
 ## Artifacts

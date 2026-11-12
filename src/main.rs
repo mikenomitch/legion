@@ -2,8 +2,25 @@ use legion::cmd;
 use legion::prelude::*;
 use legion::tracing_util::init_tracing_with_options;
 
-#[tokio::main]
-async fn main() -> R<()> {
+/// Stack size of the runtime's worker threads.
+///
+/// A worker's daemon is one long-lived async task whose poll frames, in a
+/// debug build, take most of tokio's 2 MiB default by themselves (about 1.3
+/// MiB measured under `start manager --run-worker`); the first sync call of
+/// any depth from it (restoring allocations at start) overflowed. Release
+/// builds use a fraction of that, and the larger reservation costs address
+/// space, not memory.
+const RUNTIME_THREAD_STACK: usize = 8 << 20;
+
+fn main() -> R<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(RUNTIME_THREAD_STACK)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> R<()> {
     let matches = cmd::cli().get_matches();
     // `--approval <ID>` (global): every request this process sends presents
     // the approval (docs/approvals-and-rate-limits.md).

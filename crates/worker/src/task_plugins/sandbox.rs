@@ -945,25 +945,16 @@ pub fn sandbox_usage_source(allocation_id: i64, instance: &TaskInstance) -> Sand
 /// failure here is a capability problem (`CAP_NET_ADMIN`) rather than a
 /// missing device.
 ///
-/// Deliberately shells out to `ip` rather than talking netlink: it is the same
-/// tool an operator debugging the gate would reach for, its failure text is
-/// the failure text they would see by hand, and the call happens twice per
-/// sandbox lifetime rather than on any hot path.
+/// Talks to the kernel directly (`SIOCSIFFLAGS`, see
+/// [`tap_link`](crate::task_plugins::tap_link)) rather than spawning `ip`, so a
+/// gated boot costs no subprocess; the error still names the `ip` command an
+/// operator would run by hand.
 fn set_tap_link(device: &str, open: bool) -> R<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("the `boot` network gate needs Linux TAP link control; this host is not Linux");
-    }
     let state = if open { "up" } else { "down" };
-    let output = Command::new("ip")
-        .args(["link", "set", "dev", device, state])
-        .output()
-        .with_context(|| format!("failed to run `ip link set dev {device} {state}`"))?;
-    if !output.status.success() {
-        bail!(
-            "`ip link set dev {device} {state}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    #[cfg(target_os = "linux")]
+    crate::task_plugins::tap_link::set_link_up(device, open)?;
+    #[cfg(not(target_os = "linux"))]
+    bail!("the `boot` network gate needs Linux TAP link control; this host is not Linux");
     debug!(device, state, "Set sandbox TAP link state");
     Ok(())
 }

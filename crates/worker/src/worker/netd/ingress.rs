@@ -303,6 +303,34 @@ impl IngressListeners {
         }
     }
 
+    /// Bind `specs`' listeners now, ahead of the next [`Self::sync`],
+    /// leaving every other listener alone (`Netd::bind_launch`, for a gated
+    /// task delivered by push or the work stream). One already serving
+    /// exactly its spec is kept, a stale one replaced; the next `sync` keeps
+    /// or stops it like any other.
+    pub async fn ensure(&self, specs: &[IngressSpec]) {
+        for spec in specs {
+            let key = (spec.allocation_id, spec.label.clone());
+            let stale = {
+                let mut listeners = lock(&self.listeners);
+                match listeners.get(&key) {
+                    Some(listener)
+                        if listener.spec == *spec
+                            && listener.task.as_ref().is_some_and(|t| !t.is_finished()) =>
+                    {
+                        continue
+                    }
+                    _ => listeners.remove(&key),
+                }
+            };
+            if let Some(task) = stale.and_then(|mut listener| listener.task.take()) {
+                task.abort();
+                let _ = task.await;
+            }
+            self.start(spec.clone()).await;
+        }
+    }
+
     /// (allocation, label) pairs whose listener is bound.
     pub fn active(&self) -> Vec<(i64, String)> {
         let listeners = lock(&self.listeners);

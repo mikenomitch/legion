@@ -319,6 +319,18 @@ How it behaves:
   `rootfs_headroom_mib`, and the Legion version that built it. A new guest
   binary, a task with different headroom, or a new Legion release gets its
   own base.
+- **A large node spreads its clones over copies of a base.** On a reflink
+  filesystem every clone of one base shares its extents, so on a node
+  starting hundreds of sandboxes a second their writes meet in the same
+  filesystem locks (the base's inode and its refcount records). A node keeps
+  one full copy of each base per 16 vCPUs, from 1 to 8 (a 96-vCPU node keeps
+  6), and starts take them in turn. A copy is made in the background from
+  the first, the first time a start would have used it, and a start never
+  waits for one: until it lands, that start clones the first copy. Each copy
+  takes the base's full size from the same budget, and is evicted like any
+  base. Nodes under 32 vCPUs, and filesystems without reflinks (where a
+  clone already shares nothing), keep one. The gain on the 96-vCPU node
+  this was found on has not been measured yet.
 - **Nothing per sandbox is in a base.** Env (which can hold secrets),
   hostname, instance id, and the generated init are written into each
   sandbox's own copy, after it is made. A base is read-only, and a copy
@@ -850,8 +862,10 @@ of that instance gets, so one instance always asks for one device:
   allocation id (`02:4c:...`), so guests on one bridge never collide.
 
 Any number of TAP sandboxes fit on a node, and each one can take memory
-checkpoints. Creating TAPs needs `CAP_NET_ADMIN` and the `ip` tool on the
-worker. A device of that name that already exists and is free (left by a
+checkpoints. Creating TAPs needs `CAP_NET_ADMIN` and `/dev/net/tun` on the
+worker; the worker makes the kernel calls itself, so no `ip` tool is needed,
+and an error names the `ip` command that does the same by hand (`` `ip link
+set dev lgf... master br0` failed: No such device``). A device of that name that already exists and is free (left by a
 worker crash) is reused and re-attached to `bridge`. One that another process
 holds fails the boot by name: `sandbox needs TAP device lgf...: it exists and
 another process holds it, so this instance already runs a guest on this

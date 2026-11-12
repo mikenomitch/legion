@@ -421,13 +421,28 @@ impl Netd {
     /// and any endpoint set the feed already holds is applied. Until a
     /// desired set lands the policy, the proxy and upstreams fail closed.
     ///
+    /// `policy` is the allocation's policy assignment when the delivery
+    /// carried one (`StreamWorkReply.net_policies`): it is applied first, so
+    /// the proxy and upstreams judge by it from their first connection
+    /// rather than failing closed until a heartbeat brings it, and the
+    /// allocation's ingress listeners bind here too. A body the node has not
+    /// cached is in [`Self::wants`] for the next material fetch.
+    ///
     /// `None` for an allocation that is not gated. Otherwise whether the
     /// egress proxy is serving: a bind that fails is logged, and the task
     /// starts fail-closed (a restore resumes fail-closed).
-    pub async fn bind_launch(&self, allocation: &TaskAllocation) -> Option<bool> {
+    pub async fn bind_launch(
+        &self,
+        allocation: &TaskAllocation,
+        policy: Option<&AllocNetPolicy>,
+    ) -> Option<bool> {
         let one = std::slice::from_ref(allocation);
         let root = self.alloc_root.as_path();
         let proxy = specs::proxy_specs(one, root).pop()?;
+        if let (Some(policy), Some(cache)) = (policy, self.forwarder.context().cache()) {
+            cache.add_identities(crate::worker::netd::policy::identities_from_desired(one));
+            cache.assign_one(policy);
+        }
         if let Some(allocation_id) = specs::gated_namespace_ids(one, root).pop() {
             if crate::worker::netd::netns::platform_supports_netns()
                 && !crate::worker::netd::netns::netns_exists(allocation_id)
@@ -463,6 +478,13 @@ impl Netd {
         self.forwarder
             .ensure(&specs::upstream_specs(one, root))
             .await;
+        // Ingress waits on the policy that judges it, so it binds here only
+        // when the delivery carried one; otherwise on the heartbeat.
+        if policy.is_some() {
+            if let Some(ingress) = self.forwarder.ingress() {
+                ingress.ensure(&specs::ingress_specs(one, root)).await;
+            }
+        }
         self.apply_endpoints();
         Some(serving)
     }
@@ -1254,9 +1276,10 @@ mod tests {
             ..Default::default()
         };
         let gated = allocation(9, "sandbox", "gated");
-        assert_eq!(netd.bind_launch(&gated).await, Some(true));
+        assert_eq!(netd.bind_launch(&gated, None).await, Some(true));
         assert_eq!(
-            netd.bind_launch(&allocation(8, "sandbox", "host")).await,
+            netd.bind_launch(&allocation(8, "sandbox", "host"), None)
+                .await,
             None
         );
         // A gated container's datapath binds at launch too, inside its
@@ -1264,7 +1287,7 @@ mod tests {
         // start refuses on its own namespace error).
         let container_id = 7_900_000 + i64::from(std::process::id() % 10_000);
         let container = netd
-            .bind_launch(&allocation(container_id, "container", "gated"))
+            .bind_launch(&allocation(container_id, "container", "gated"), None)
             .await;
         if crate::worker::netd::netns::can_manage_netns() {
             assert_eq!(container, Some(true));
@@ -1289,7 +1312,7 @@ mod tests {
             "the heartbeat keeps the launch path's listener"
         );
         std::fs::remove_file(&socket)?;
-        assert_eq!(netd.bind_launch(&gated).await, Some(true));
+        assert_eq!(netd.bind_launch(&gated, None).await, Some(true));
         assert!(
             socket.exists(),
             "the next launch binds a removed socket again"
@@ -1338,7 +1361,7 @@ mod tests {
             .to_string(),
             ..Default::default()
         };
-        assert_eq!(netd.bind_launch(&pushed).await, Some(true));
+        assert_eq!(netd.bind_launch(&pushed, None).await, Some(true));
 
         let dir = crate::task_plugins::sandbox_dir_for(&root.path().join("12"));
         let sockets = [
@@ -1367,6 +1390,64 @@ mod tests {
                 "the heartbeat keeps the launch path's {what}"
             );
         }
+        Ok(())
+    }
+
+    /// Phase 5 of the task-start plan: a work-stream delta carries the
+    /// pushed allocation's policy assignment, so its datapath judges by it
+    /// from launch (rather than failing closed until a heartbeat brings it),
+    /// and it is in the material wants when its body is not cached yet. A
+    /// delivery without one leaves the assignment to the heartbeat.
+    #[tokio::test]
+    async fn a_streamed_gated_task_opens_with_the_policy_its_delta_carried_test() -> R<()> {
+        let root = TempDir::new()?;
+        let cache = Arc::new(NetPolicyCache::new());
+        let context = Arc::new(ForwarderContext::new(
+            cache.clone(),
+            Arc::new(Denials::new()),
+        ));
+        let netd = Netd::new(
+            Arc::new(
+                UpstreamForwarder::with_context(context.clone()).with_proxies(Arc::new(
+                    crate::worker::netd::proxy::EgressProxies::new(context),
+                )),
+            ),
+            root.path().to_path_buf(),
+        );
+        let pushed = |allocation_id: i64| TaskAllocation {
+            allocation_id,
+            job_id: "web".into(),
+            task_name: "box".into(),
+            task_runtime: "sandbox".into(),
+            task_config: json!({ "image": "a" }).to_string(),
+            network: json!({ "mode": "gated" }).to_string(),
+            ..Default::default()
+        };
+        let policy = AllocNetPolicy {
+            allocation_id: 21,
+            policy_hash: "sha256:abc".into(),
+        };
+        assert_eq!(
+            netd.bind_launch(&pushed(21), Some(&policy)).await,
+            Some(true)
+        );
+        assert_eq!(cache.hash_for(21).as_deref(), Some("sha256:abc"));
+        assert!(
+            netd.wants()
+                .material
+                .iter()
+                .any(|wanted| wanted.kind == MATERIAL_POLICY && wanted.key == "sha256:abc"),
+            "a body the node has not seen is fetched"
+        );
+        assert!(cache.identities().contains_key(&21));
+
+        assert_eq!(netd.bind_launch(&pushed(22), None).await, Some(true));
+        assert!(!cache.has_assignment(22), "no delta assignment, none here");
+        assert_eq!(
+            cache.hash_for(21).as_deref(),
+            Some("sha256:abc"),
+            "one delta's assignment leaves the others"
+        );
         Ok(())
     }
 }

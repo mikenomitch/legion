@@ -281,6 +281,16 @@ Workers have a separate local JSON state file (`WorkerStateStore`):
 - default path root: `<data dir>/workers/<worker-id>/worker_state.json`
 - stores allocation, task, and PID records
 - used for restart recovery when a tracked PID is still running
+- written whole, atomically (a temp file renamed into place, fsynced), by
+  one writer thread per file: a start or stop hands it the newest snapshot
+  and moves on, and a burst of them is written as often as the disk takes
+  it, newest last, never once per change under the task manager's lock. A
+  gracefully stopping worker waits up to 5 seconds for the last write. A
+  worker that dies between a change and its write restarts from the
+  snapshot before it. A task it was stopping is then re-adopted and stopped
+  again. A task it had just started is not in the file, so the restarted
+  worker does not know its process, as when a worker died between a spawn
+  and its write before; the window is now up to one write longer.
 
 This store holds local worker runtime state. It is not shared cluster state.
 

@@ -31,9 +31,9 @@
 use crate::prelude::*;
 use crate::structs::worker_protocol::WorkDigest;
 use crate::structs::{
-    manager_client::ManagerClient, stream_work_request, CheckpointRequest, StopNotice,
-    StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkRequest, TaskAllocation,
-    WorkStreamState,
+    manager_client::ManagerClient, stream_work_request, AllocationHealth, CheckpointRequest,
+    StopNotice, StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkReport,
+    StreamWorkRequest, TaskAllocation, WorkStreamState,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -42,6 +42,25 @@ use tonic::transport::Channel;
 /// Reconnect backoff bounds for a dropped stream.
 const STREAM_RETRY_MIN: Duration = Duration::from_millis(250);
 const STREAM_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// How many health transitions wait for the stream before newer ones are
+/// dropped (the heartbeat carries them all anyway).
+const REPORT_QUEUE: usize = 1024;
+
+/// How many health transitions one `report` frame carries at most.
+const REPORT_BATCH: usize = 256;
+
+/// The task manager's end of the health reports the stream sends between
+/// heartbeats (`StreamWorkReport`).
+pub type ReportSender = tokio::sync::mpsc::Sender<AllocationHealth>;
+
+/// The stream's end of [`ReportSender`].
+pub type ReportReceiver = tokio::sync::mpsc::Receiver<AllocationHealth>;
+
+/// A channel for health transitions, from the task manager to the stream.
+pub fn report_channel() -> (ReportSender, ReportReceiver) {
+    tokio::sync::mpsc::channel(REPORT_QUEUE)
+}
 
 /// The worker's copy of its desired set, as the stream has delivered it.
 #[derive(Debug, Default)]
@@ -66,6 +85,9 @@ pub type SharedMirror = Arc<Mutex<WorkMirror>>;
 /// What one applied message changed, for the caller to act on.
 #[derive(Debug, Default)]
 pub struct Applied {
+    /// The policy assignments the message carried for its upserts
+    /// (`StreamWorkReply.net_policies`), for the launches of `added`.
+    pub net_policies: Vec<crate::structs::AllocNetPolicy>,
     /// Allocations the mirror did not hold before this message.
     pub added: Vec<TaskAllocation>,
     /// The message was a full resync.
@@ -103,6 +125,7 @@ impl WorkMirror {
             resync: message.resync,
             reconcile: message.resync,
             checkpoint_requests: message.checkpoint_requests.clone(),
+            net_policies: message.net_policies.clone(),
             ..Default::default()
         };
         if message.resync {
@@ -217,11 +240,16 @@ impl WorkMirror {
 /// reconnecting with backoff. Each applied message updates `mirror`, and
 /// `on_applied` runs with what it changed (launching new allocations,
 /// waking the heartbeat).
+///
+/// Health transitions on `reports` go to the manager as `report` frames
+/// while the stream is up. Ones queued while it was down are dropped when it
+/// reopens: the heartbeat has carried them since.
 pub async fn run_work_stream<F, A>(
     client: ManagerClient<Channel>,
     attach: A,
     node_id: String,
     mirror: SharedMirror,
+    mut reports: ReportReceiver,
     on_applied: F,
 ) where
     F: Fn(Applied) + Send + Sync + 'static,
@@ -229,7 +257,16 @@ pub async fn run_work_stream<F, A>(
 {
     let mut backoff = STREAM_RETRY_MIN;
     loop {
-        match stream_once(&client, &attach, &node_id, &mirror, &on_applied).await {
+        match stream_once(
+            &client,
+            &attach,
+            &node_id,
+            &mirror,
+            &mut reports,
+            &on_applied,
+        )
+        .await
+        {
             Ok(()) => {
                 debug!(node_id = %node_id, "Work stream ended; reconnecting");
                 backoff = STREAM_RETRY_MIN;
@@ -258,6 +295,7 @@ async fn stream_once<F, A>(
     attach: &A,
     node_id: &str,
     mirror: &SharedMirror,
+    reports: &mut ReportReceiver,
     on_applied: &F,
 ) -> Result<(), tonic::Status>
 where
@@ -283,7 +321,32 @@ where
         tokio_stream::wrappers::ReceiverStream::new(rx),
     ));
     let mut inbound = client.clone().stream_work(request).await?.into_inner();
-    while let Some(message) = inbound.message().await? {
+    // Transitions queued while no stream was up are already on a heartbeat.
+    while reports.try_recv().is_ok() {}
+    loop {
+        let message = tokio::select! {
+            message = inbound.message() => match message? {
+                Some(message) => message,
+                None => break,
+            },
+            Some(first) = reports.recv() => {
+                let mut allocation_health = vec![first];
+                while allocation_health.len() < REPORT_BATCH {
+                    match reports.try_recv() {
+                        Ok(more) => allocation_health.push(more),
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx
+                    .send(StreamWorkRequest {
+                        frame: Some(stream_work_request::Frame::Report(StreamWorkReport {
+                            allocation_health,
+                        })),
+                    })
+                    .await;
+                continue;
+            }
+        };
         // A push-only message has no position: hand its pushes on, and
         // neither apply it to the mirror nor acknowledge it.
         if message.push_only {

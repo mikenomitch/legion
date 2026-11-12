@@ -469,12 +469,16 @@ pub fn apply_verdict(
     // how long this claim waited.
     guard.claim_window().settle(claim_id, feedback);
     let mut start_health_monitor = None;
+    let mut held_start = None;
     match confirmed {
         Some(payload) => match guard.ratify_claim(claim_id, payload) {
             // A `stage`-gated claim starts its workload at ratification, and
             // nothing else gives it a health monitor: without one it would
             // never be reported healthy.
-            Ok(ratified) => start_health_monitor = ratified.start_health_monitor,
+            Ok(ratified) => {
+                start_health_monitor = ratified.start_health_monitor;
+                held_start = ratified.start;
+            }
             Err(err) => {
                 // The gate could not be opened, or the held start could not be
                 // started. Killing is the only safe answer: the cluster now
@@ -498,6 +502,18 @@ pub fn apply_verdict(
         .set(guard.unratified_claims().len() as i64);
     // Off the lock: the monitor takes it to register itself.
     drop(guard);
+    // A held start runs with the lock released, like any launch. Its
+    // failure is the ratified allocation's, already recorded.
+    if let Some(launch) = held_start {
+        let started = crate::worker::daemon::in_place(|| {
+            crate::worker::task_manager::complete_unlocked_launch(task_manager, *launch, "")
+        });
+        match started {
+            Ok(Some(started)) => start_health_monitor = Some(started),
+            Ok(None) => {}
+            Err(err) => warn!(claim_id, error = %err, "Ratified start failed"),
+        }
+    }
     if let Some((allocation, task)) = start_health_monitor {
         crate::worker::task_health::spawn_health_monitor(task_manager.clone(), allocation, task);
     }

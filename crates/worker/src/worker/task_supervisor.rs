@@ -13,7 +13,7 @@
 
 use crate::prelude::*;
 use crate::structs::{RestartPolicy, TaskConfig};
-use crate::worker::task_manager::{Reap, TaskExit, WorkerTaskManager};
+use crate::worker::task_manager::{Reap, RestartFinish, TaskExit, WorkerTaskManager};
 use std::time::Duration;
 
 /// How often the supervisor polls tracked task processes. A second is well
@@ -78,11 +78,21 @@ pub fn decide(task: &TaskConfig, exit: &TaskExit, budget_available: bool) -> Exi
 /// whole reason graceful stop needed a terminating set instead of a blocking
 /// `stop()` (see `docs/graceful-stop.md`).
 #[instrument(skip_all)]
+///
+/// Teardowns a stop, a failure, or a self-fence queues under the lock wake
+/// the loop at once rather than on the next tick
+/// ([`WorkerTaskManager::enable_off_lock_teardown`]), so the node's room
+/// comes back as soon as the destroy is done.
 pub async fn start_task_supervisor(task_manager: Arc<Mutex<WorkerTaskManager>>) -> R<()> {
+    let wake = Arc::new(tokio::sync::Notify::new());
+    crate::worker::daemon::lock_manager(&task_manager).enable_off_lock_teardown(wake.clone());
     loop {
-        tokio::time::sleep(SUPERVISOR_TICK).await;
+        tokio::select! {
+            _ = tokio::time::sleep(SUPERVISOR_TICK) => {}
+            _ = wake.notified() => {}
+        }
         let (exits, reaps) = {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = crate::worker::daemon::lock_manager(&task_manager);
             // Reap first: an allocation that just exited inside its grace
             // window is not a supervised exit to restart, and clearing it
             // here is what releases the node for allocations the reconcile
@@ -98,8 +108,8 @@ pub async fn start_task_supervisor(task_manager: Arc<Mutex<WorkerTaskManager>>) 
     }
 }
 
-/// Destroy session stops with the lock released, all at once on the
-/// blocking pool, then release them under one lock.
+/// Destroy stops with the lock released, all at once on the blocking pool,
+/// then release them under one lock.
 async fn reap_unlocked(task_manager: &Arc<Mutex<WorkerTaskManager>>, reaps: Vec<Reap>) {
     if reaps.is_empty() {
         return;
@@ -119,10 +129,10 @@ async fn reap_unlocked(task_manager: &Arc<Mutex<WorkerTaskManager>>, reaps: Vec<
             Ok(reap) => destroyed.push(reap),
             // A panicking destroy leaves its id in the reaping set, so it
             // stays stopping rather than being released under a live VMM.
-            Err(err) => error!(error = ?err, "Session teardown panicked"),
+            Err(err) => error!(error = ?err, "Allocation teardown panicked"),
         }
     }
-    let mut manager = task_manager.lock().expect("task manager");
+    let mut manager = crate::worker::daemon::lock_manager(task_manager);
     for reap in destroyed {
         manager.finish_reap(reap);
     }
@@ -133,7 +143,7 @@ async fn reap_unlocked(task_manager: &Arc<Mutex<WorkerTaskManager>>, reaps: Vec<
 /// holding the task-manager lock, which the heartbeat path also needs.
 pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: TaskExit) {
     let (task, budget_available) = {
-        let mut manager = task_manager.lock().expect("task manager");
+        let mut manager = crate::worker::daemon::lock_manager(task_manager);
         let Some(task) = manager.task_config(exit.allocation_id).cloned() else {
             // Already torn down (stopped, or failed by another path) — the
             // exit is expected and there is nothing left to decide.
@@ -158,7 +168,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 "Task process exited; restarting"
             );
             {
-                let mut manager = task_manager.lock().expect("task manager");
+                let mut manager = crate::worker::daemon::lock_manager(task_manager);
                 manager.record_restart_attempt(exit.allocation_id);
                 manager.set_allocation_health(
                     exit.allocation_id,
@@ -167,13 +177,54 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 );
             }
             tokio::time::sleep(delay).await;
-            let result = {
-                let mut manager = task_manager.lock().expect("task manager");
+            let begun = {
+                let mut manager = crate::worker::daemon::lock_manager(task_manager);
                 // The allocation can have been stopped while we slept.
                 if !manager.is_allocation_active(exit.allocation_id) {
                     return;
                 }
-                manager.restart_allocation(exit.allocation_id)
+                manager.begin_restart(exit.allocation_id)
+            };
+            // The runtime's `stop` and `start` run with the lock released:
+            // a container or a VMM restart holds up no other start, stop, or
+            // heartbeat on the node.
+            let result = match begun {
+                Err(err) => Err(err),
+                Ok(mut restart) => {
+                    let ran = tokio::task::spawn_blocking(move || {
+                        let result = restart.run();
+                        (restart, result)
+                    })
+                    .await;
+                    let Ok((restart, result)) = ran else {
+                        error!(
+                            allocation_id = exit.allocation_id,
+                            "Restart panicked; the allocation stays starting until it is stopped"
+                        );
+                        return;
+                    };
+                    let finish = crate::worker::daemon::lock_manager(task_manager)
+                        .finish_restart(restart, result);
+                    match finish {
+                        RestartFinish::Started => Ok(()),
+                        RestartFinish::Failed(err) => Err(err),
+                        RestartFinish::Cancelled(mut restart) => {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                restart.destroy();
+                                restart
+                            })
+                            .await
+                            .map(|restart| {
+                                crate::worker::daemon::lock_manager(task_manager)
+                                    .finish_cancelled_launch(
+                                        restart.allocation_id(),
+                                        restart.resource_assignment(),
+                                    );
+                            });
+                            return;
+                        }
+                    }
+                }
             };
             if let Err(err) = result {
                 warn!(
@@ -182,7 +233,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                     error = ?err,
                     "Failed to restart exited task"
                 );
-                let mut manager = task_manager.lock().expect("task manager");
+                let mut manager = crate::worker::daemon::lock_manager(task_manager);
                 manager.record_failure(
                     exit.allocation_id,
                     format!("{}; restart failed: {err}", exit.describe_with_output()),
@@ -196,7 +247,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 status = %exit.describe(),
                 "Task completed"
             );
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = crate::worker::daemon::lock_manager(task_manager);
             manager.record_termination(exit.allocation_id, &exit, true);
         }
         ExitDecision::TerminalFailure => {
@@ -206,7 +257,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 status = %exit.describe(),
                 "Task failed; restart policy `never`, so it is not moved"
             );
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = crate::worker::daemon::lock_manager(task_manager);
             manager.record_termination(exit.allocation_id, &exit, false);
         }
         ExitDecision::Fail => {
@@ -216,7 +267,7 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
                 status = %exit.describe(),
                 "Task failed"
             );
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = crate::worker::daemon::lock_manager(task_manager);
             // The reason the user reads (`allocation.failed`), so it carries
             // the task's own last words; the log line above does not.
             manager.record_failure(exit.allocation_id, exit.describe_with_output());

@@ -106,6 +106,31 @@ pub(crate) struct BaseInputs {
     pub guest_binary: String,
     /// The task's `rootfs_headroom_mib`, which sizes the disk.
     pub headroom_mib: u64,
+    /// Which full copy of the base this is ([`base_copies`]): 0 is the base
+    /// as built, and copy `n` holds the same bytes in blocks of its own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub copy: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// How many full copies of each base a node keeps, by its CPU count: one
+/// per 16 vCPUs, from 1 to 8.
+///
+/// On a reflink filesystem every clone of a base shares its extents, so a
+/// burst of starts on a large node meets in the same locks: the base inode's
+/// and its refcount records, as each start's own files copy-on-write a block
+/// the base still holds (measured on a 96-vCPU node, `RESULTS.md`: about 200
+/// boots a second with a quarter of the CPU idle, every start waiting in
+/// `root_disk`). Clones of different copies share nothing, so starts
+/// spread over the copies spread over the locks. A node of 31 vCPUs or
+/// fewer reaches its CPU first and keeps one, as before. Copies are made in
+/// the background from copy 0 on first use, never on a start's critical
+/// path, and count toward the derived budget like any base.
+pub(crate) fn base_copies(cpus: usize) -> u32 {
+    (cpus / 16).clamp(1, 8) as u32
 }
 
 impl BaseInputs {
@@ -117,9 +142,23 @@ impl BaseInputs {
         for (index, layer) in self.layers.iter().enumerate() {
             recipe = recipe.listed("layer", index, layer);
         }
-        recipe
+        let recipe = recipe
             .fingerprint("guestBinary", self.guest_binary.as_bytes())
-            .number("headroomMib", self.headroom_mib)
+            .number("headroomMib", self.headroom_mib);
+        // Copy 0 keeps the key it always had.
+        if self.copy == 0 {
+            recipe
+        } else {
+            recipe.number("copy", u64::from(self.copy))
+        }
+    }
+
+    /// The same base's copy `copy`.
+    pub(crate) fn with_copy(&self, copy: u32) -> BaseInputs {
+        BaseInputs {
+            copy,
+            ..self.clone()
+        }
     }
 
     /// The cache key: the recipe's.
@@ -164,6 +203,7 @@ impl ImageBase {
             layers: image.layer_digests(),
             guest_binary: self.guest_binary.fingerprint.clone(),
             headroom_mib: self.headroom_mib,
+            copy: 0,
         }
     }
 }
@@ -240,6 +280,14 @@ pub(crate) struct RootfsCache {
     /// Try reflinks. Always on outside tests, which turn it off to take the
     /// path a filesystem without them takes, wherever they run.
     reflinks: bool,
+    /// How many full copies of each base starts spread over
+    /// ([`base_copies`]).
+    copies: u32,
+    /// The next copy a start clones, round robin.
+    next_copy: std::sync::atomic::AtomicU32,
+    /// Copies being filled in the background, by key, so a burst of starts
+    /// spawns one fill per copy.
+    copy_fills: Mutex<BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for RootfsCache {
@@ -396,10 +444,18 @@ impl RootfsCache {
     }
 
     fn on_with(store: Arc<ContentStore>, reflinks: bool) -> Arc<Self> {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self::with_copies(store, reflinks, base_copies(cpus))
+    }
+
+    fn with_copies(store: Arc<ContentStore>, reflinks: bool, copies: u32) -> Arc<Self> {
         Arc::new(RootfsCache {
             store,
             oversized: Mutex::new(BTreeSet::new()),
             reflinks,
+            copies: copies.max(1),
+            next_copy: std::sync::atomic::AtomicU32::new(0),
+            copy_fills: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -412,6 +468,17 @@ impl RootfsCache {
 
     #[cfg(test)]
     fn open_with(root: &Path, budget: u64, min_free: u64, reflinks: bool) -> R<Arc<Self>> {
+        Self::open_with_copies(root, budget, min_free, reflinks, 1)
+    }
+
+    #[cfg(test)]
+    fn open_with_copies(
+        root: &Path,
+        budget: u64,
+        min_free: u64,
+        reflinks: bool,
+        copies: u32,
+    ) -> R<Arc<Self>> {
         use crate::content_store::{ContentBudgets, ContentStoreConfig};
         let store = ContentStore::open(
             root,
@@ -425,7 +492,7 @@ impl RootfsCache {
                 min_free_disk: min_free,
             },
         )?;
-        Ok(Self::on_with(Arc::new(store), reflinks))
+        Ok(Self::with_copies(Arc::new(store), reflinks, copies))
     }
 
     fn budget(&self) -> u64 {
@@ -507,6 +574,32 @@ impl RootfsCache {
         tree: &Path,
     ) -> R<(BaseFacts, Outcome)> {
         let key = inputs.key();
+        // Spread over the base's copies (see `base_copies`). A copy that is
+        // not there yet is filled in the background, and this start clones
+        // copy 0 meanwhile.
+        if self.copies > 1 && self.reflinks {
+            let copy = self
+                .next_copy
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.copies;
+            if copy > 0 {
+                let spread = inputs.with_copy(copy);
+                if let Some(entry) = self.lookup(&spread.key()) {
+                    if let Ok(method) = self.clone_entry(&entry, dest) {
+                        return Ok((entry.meta.facts, Outcome::Hit(method)));
+                    }
+                    let _ = std::fs::remove_file(dest);
+                } else if let Some(base) = self.lookup(&key) {
+                    if let Ok(method) = self.clone_entry(&base, dest) {
+                        if method == CopyMethod::Reflink {
+                            self.fill_copy_later(&base, spread);
+                        }
+                        return Ok((base.meta.facts, Outcome::Hit(method)));
+                    }
+                    let _ = std::fs::remove_file(dest);
+                }
+            }
+        }
         let mut waited = false;
         loop {
             if let Some(entry) = self.lookup(&key) {
@@ -538,6 +631,65 @@ impl RootfsCache {
             "the concurrent fill did not keep it"
         };
         Ok((facts?, Outcome::Built(Fill::Skipped(reason))))
+    }
+
+    /// Make copy `spread.copy` of `base` on a background thread: a full byte
+    /// copy (not a reflink, which would share the very extents the copy is
+    /// for), committed under its own key. One fill per copy at a time; a
+    /// failure leaves starts cloning copy 0.
+    fn fill_copy_later(self: &Arc<Self>, base: &Entry, spread: BaseInputs) {
+        let key = spread.key();
+        if !self
+            .copy_fills
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone())
+        {
+            return;
+        }
+        let cache = self.clone();
+        let source = base.image.clone();
+        let facts = base.meta.facts;
+        let fill_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rootfs-cache-copy".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let filled = (|| -> Result<(), String> {
+                    let guard = cache.claim(&key).ok_or("filled meanwhile")?;
+                    let staged = cache.stage().map_err(|err| format!("{err:#}"))?;
+                    let image = staged.join(IMAGE_FILE);
+                    if let Err(err) = copy::clone_file_with(&source, &image, false) {
+                        let _ = std::fs::remove_dir_all(&staged);
+                        return Err(format!("{err:#}"));
+                    }
+                    let committed = cache.commit(&staged, &spread, facts);
+                    drop(guard);
+                    committed.map_err(str::to_string)
+                })();
+                match filled {
+                    Ok(()) => info!(
+                        key = %key,
+                        copy = spread.copy,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Cached a copy of a sandbox root disk base"
+                    ),
+                    Err(reason) => {
+                        debug!(key = %key, reason, "Root disk base copy not cached")
+                    }
+                }
+                cache
+                    .copy_fills
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
+            });
+        if spawned.is_err() {
+            self.copy_fills
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&fill_key);
+        }
     }
 
     /// The miss path of a start: build at `dest` exactly as an uncached
@@ -790,6 +942,7 @@ mod tests {
             layers: vec![format!("sha256:{layer}")],
             guest_binary: "/opt/legion-guest:100:1".into(),
             headroom_mib: 256,
+            copy: 0,
         }
     }
 
@@ -803,6 +956,65 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn a_node_keeps_one_copy_per_16_cpus_from_1_to_8() {
+        assert_eq!(base_copies(1), 1);
+        assert_eq!(base_copies(31), 1);
+        assert_eq!(base_copies(32), 2);
+        assert_eq!(base_copies(96), 6);
+        assert_eq!(base_copies(512), 8);
+        assert_eq!(inputs("aaa").with_copy(0).key(), inputs("aaa").key());
+        assert_ne!(inputs("aaa").with_copy(1).key(), inputs("aaa").key());
+        assert_ne!(
+            inputs("aaa").with_copy(1).key(),
+            inputs("aaa").with_copy(2).key()
+        );
+    }
+
+    /// Starts round-robin over the base's copies. A copy that is not there
+    /// yet is filled in the background, as a full copy in blocks of its own,
+    /// while the start clones copy 0; later starts on that copy clone it. On
+    /// a filesystem without reflinks, where clones share nothing anyway, no
+    /// copy is made.
+    #[test]
+    fn starts_spread_over_full_copies_of_a_base_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = RootfsCache::open_with_copies(&dir.path().join("cache"), 64 << 20, 0, true, 2)?;
+        let base = FakeBase::new(b"image bytes", 4096);
+        let key_inputs = inputs("aaa");
+        let start = |n: usize| -> R<(PathBuf, Outcome)> {
+            let disk = dir.path().join(format!("alloc-{n}/rootfs.img"));
+            std::fs::create_dir_all(disk.parent().unwrap())?;
+            let tree = dir.path().join(format!("alloc-{n}/tree"));
+            let (_, outcome) = cache.materialize(base.clone(), &key_inputs, &disk, &tree)?;
+            Ok((disk, outcome))
+        };
+        start(1)?;
+        wait_for_entry(&cache, &key_inputs.key());
+        let (second, outcome) = start(2)?;
+        assert!(matches!(outcome, Outcome::Hit(_)), "{outcome:?}");
+        assert_eq!(std::fs::read(&second)?.len(), 4096);
+        let copy = key_inputs.with_copy(1).key();
+        if outcome == Outcome::Hit(CopyMethod::Reflink) {
+            wait_for_entry(&cache, &copy);
+            let copied = cache.lookup(&copy).expect("copy 1");
+            let original = cache.lookup(&key_inputs.key()).expect("copy 0");
+            assert_eq!(
+                std::fs::read(&copied.image)?,
+                std::fs::read(&original.image)?
+            );
+            start(3)?;
+            let (fourth, outcome) = start(4)?;
+            assert!(matches!(outcome, Outcome::Hit(_)), "{outcome:?}");
+            assert_eq!(std::fs::read(&fourth)?, std::fs::read(&copied.image)?);
+        } else {
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(cache.lookup(&copy).is_none(), "no copy without reflinks");
+        }
+        assert_eq!(base.builds.load(Ordering::SeqCst), 1, "one build");
+        Ok(())
     }
 
     #[test]

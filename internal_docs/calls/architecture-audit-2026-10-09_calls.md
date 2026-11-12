@@ -256,6 +256,14 @@ heartbeat-starving cases. Moving teardown needs a new "tearing down" state to
 keep the rule that starts wait behind stops, which is a bigger change. The rest
 is in TODO.md.
 
+*Follow-up, 2026-11-12: done.* The rest moved off the lock, with the
+`reaping` set as the "tearing down" state: teardowns and the stop signal run
+from the supervisor, and restarts, edge-boot starts, a `stage` claim's start
+at ratification, a start's directories, and a memory capture's write run
+with the lock released. The calls are in
+[task-start-critical-path-plan_calls.md](task-start-critical-path-plan_calls.md),
+entries 2, 6, and 10.
+
 ## 12. Worker self-fencing survives restarts through a boot fence (W6)
 
 **Call.** The wall-clock time of the last manager contact is persisted beside

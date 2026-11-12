@@ -93,7 +93,10 @@ cannot raise a jobspec's.
 
 - **`stage`**: pull the image, but don't boot until the claim is confirmed.
   Nothing outside the node can see it. Losing the race only wastes local
-  work.
+  work. The held start runs once the claim is ratified, off the worker's
+  task-manager lock, so a slow start holds up no other work on the node. A
+  start that fails then is the ratified allocation's failure, reported to
+  the manager and rescheduled like any failed start, not a killed claim.
 - **`boot`**: boot it, but allow no ingress or egress until the claim is
   confirmed. The workload runs and warms up. Nothing it does reaches the
   outside world, so a loser leaves nothing behind except its own disk.
