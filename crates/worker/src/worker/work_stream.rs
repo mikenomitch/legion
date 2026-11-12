@@ -85,6 +85,9 @@ pub type SharedMirror = Arc<Mutex<WorkMirror>>;
 /// What one applied message changed, for the caller to act on.
 #[derive(Debug, Default)]
 pub struct Applied {
+    /// The policy assignments the message carried for its upserts
+    /// (`StreamWorkReply.net_policies`), for the launches of `added`.
+    pub net_policies: Vec<crate::structs::AllocNetPolicy>,
     /// Allocations the mirror did not hold before this message.
     pub added: Vec<TaskAllocation>,
     /// The message was a full resync.
@@ -122,6 +125,7 @@ impl WorkMirror {
             resync: message.resync,
             reconcile: message.resync,
             checkpoint_requests: message.checkpoint_requests.clone(),
+            net_policies: message.net_policies.clone(),
             ..Default::default()
         };
         if message.resync {
@@ -253,7 +257,16 @@ pub async fn run_work_stream<F, A>(
 {
     let mut backoff = STREAM_RETRY_MIN;
     loop {
-        match stream_once(&client, &attach, &node_id, &mirror, &mut reports, &on_applied).await {
+        match stream_once(
+            &client,
+            &attach,
+            &node_id,
+            &mirror,
+            &mut reports,
+            &on_applied,
+        )
+        .await
+        {
             Ok(()) => {
                 debug!(node_id = %node_id, "Work stream ended; reconnecting");
                 backoff = STREAM_RETRY_MIN;

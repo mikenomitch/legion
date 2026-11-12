@@ -10796,6 +10796,18 @@ message StreamWorkReply {
   // `HeartbeatReply.owner_notices`, which repeats them). Push-only: outside
   // the sequence and never replayed.
   repeated OwnerNotice owner_notices = 11;
+
+  // The network policy each allocation in `upserts` runs under, as content
+  // hashes, in the form `HeartbeatReply.net_policies` uses (an allocation
+  // absent from the list has no policy). A gated allocation pushed on the
+  // stream opens its datapath from this assignment the moment it launches,
+  // fetching a body it has not seen with `FetchDatapathMaterial`, instead of
+  // failing closed until the next heartbeat brings the assignment.
+  //
+  // A hint, like `endpoint_feed`: unset on a replayed message, and not
+  // counted in `digest`. The heartbeat's `net_policies` stays the record
+  // and replaces whatever this set.
+  repeated AllocNetPolicy net_policies = 12;
 }
 
 // One finished (or refused-after-verification) direct exec session.

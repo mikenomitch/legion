@@ -203,9 +203,17 @@ impl WorkerDaemonService {
     /// call fails the manager-certificate check, because a request built in
     /// process carries no peer certificate at all.
     #[instrument(skip_all, fields(allocation_id = allocation.allocation_id))]
-    pub async fn accept_work(
+    pub async fn accept_work(&self, allocation: TaskAllocation) -> Result<PostWorkReply, Status> {
+        self.accept_work_with_policy(allocation, None).await
+    }
+
+    /// [`Self::accept_work`] for a `StreamWork` delta, which carries the
+    /// allocation's network policy assignment (`StreamWorkReply.net_policies`)
+    /// so a gated task's datapath opens at launch.
+    pub async fn accept_work_with_policy(
         &self,
         mut allocation: TaskAllocation,
+        policy: Option<crate::structs::AllocNetPolicy>,
     ) -> Result<PostWorkReply, Status> {
         // Every payload this node is handed teaches it a job config it may
         // later be asked to start from a boot ticket (docs/edge-boot.md). A
@@ -327,15 +335,24 @@ impl WorkerDaemonService {
 
         // A gated sandbox's egress proxy, bound before the launch: a restore
         // resumes its guest only once the socket exists, and no heartbeat
-        // has bound this delivery's datapath yet. It also wakes the
-        // heartbeat, which brings the policy, resolver, and upstream sockets.
-        // A gated container or exec task gets its namespace here too, with
-        // its listeners bound inside it.
+        // has bound this delivery's datapath yet. A gated container or exec
+        // task gets its namespace here too, with its listeners bound inside
+        // it. A stream delta also carries the policy assignment, so the
+        // datapath opens now and the ingress listeners bind; the heartbeat
+        // is woken only for what is still missing (no assignment, or a
+        // policy body this node has not cached, which its material fetch
+        // brings).
         let mut datapath_bound = false;
         if let Some(netd) = self.netd.as_ref() {
-            if netd.bind_launch(&allocation).await.is_some() {
+            if netd
+                .bind_launch(&allocation, policy.as_ref())
+                .await
+                .is_some()
+            {
                 datapath_bound = true;
-                crate::worker::daemon::wake_heartbeat();
+                if policy.is_none() || !netd.wants().material.is_empty() {
+                    crate::worker::daemon::wake_heartbeat();
+                }
             }
         }
 

@@ -3242,7 +3242,7 @@ mod tests {
             network: json!({ "mode": "gated" }).to_string(),
             ..Default::default()
         };
-        assert_eq!(netd.bind_launch(&delivered).await, Some(true));
+        assert_eq!(netd.bind_launch(&delivered, None).await, Some(true));
 
         let ch = Backend::CloudHypervisor {
             binary: "/usr/bin/true".into(),

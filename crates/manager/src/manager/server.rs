@@ -2343,46 +2343,12 @@ impl ManagerDaemonService {
     /// The store's network-policy generation, cached for
     /// `NET_POLICY_GENERATION_TTL`. Zero means no policy has ever been
     /// written on this cluster.
-    fn net_policy_generation_cached(&self) -> u64 {
-        let now = std::time::Instant::now();
-        {
-            let cached = self
-                .net_policy_generation
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Some((read_at, generation)) = *cached {
-                if now.duration_since(read_at) < NET_POLICY_GENERATION_TTL {
-                    return generation;
-                }
-            }
-        }
-        let generation = self.store.net_policy_generation().unwrap_or(0);
-        *self
-            .net_policy_generation
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some((now, generation));
-        generation
-    }
-
     /// Forget the cached generation (after a write on this manager).
     fn bump_net_policy_generation(&self) {
         *self
             .net_policy_generation
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
-    }
-
-    fn remember_net_policy(&self, policy: &crate::structs::netpolicy::EffectivePolicy) {
-        let mut cache = self
-            .net_policy_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if cache.len() >= NET_POLICY_CACHE_MAX && !cache.contains_key(&policy.hash) {
-            cache.clear();
-        }
-        cache
-            .entry(policy.hash.clone())
-            .or_insert_with(|| policy.clone());
     }
 
     /// Attach the manager's heartbeat-cadence settings (`run_manager` always

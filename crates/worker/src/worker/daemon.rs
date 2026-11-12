@@ -4090,12 +4090,17 @@ fn launch_streamed_work(
             continue;
         }
         let launcher = launcher.clone();
+        let policy = applied
+            .net_policies
+            .iter()
+            .find(|policy| policy.allocation_id == allocation.allocation_id)
+            .cloned();
         tokio::spawn(async move {
             let allocation_id = allocation.allocation_id;
             // `accept_work`, not the `post_work` handler: the stream is
             // already authenticated, and an in-process request carries no
             // manager certificate for the worker-plane check to accept.
-            if let Err(status) = launcher.accept_work(allocation).await {
+            if let Err(status) = launcher.accept_work_with_policy(allocation, policy).await {
                 // Recorded as the allocation's failure by the launch path;
                 // the heartbeat reports it.
                 debug!(allocation_id, error = %status.message(), "Streamed allocation did not start");

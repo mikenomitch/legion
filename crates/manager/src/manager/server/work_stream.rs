@@ -300,6 +300,9 @@ impl ManagerDaemonService {
         );
 
         let endpoint_wake = store.endpoint_index().node_wake(&node_id);
+        // Each message's upserts carry their policy assignment, so a gated
+        // allocation's datapath opens on the delta, not the next heartbeat.
+        let policies = self.net_policy_assigner();
         // The runtime disables (docs/runtime-disable.md): pushed when the
         // stream opens while any is in force, and again whenever this
         // replica's set changes. A stream that opens with nothing disabled
@@ -410,8 +413,14 @@ impl ManagerDaemonService {
                     let work_log = work_log.clone();
                     let log = log.clone();
                     let node_id = node_id.clone();
+                    let policies = policies.clone();
                     tokio::task::spawn_blocking(move || {
-                        next_work_message(&store, &work_log, &log, session, &node_id)
+                        let mut message =
+                            next_work_message(&store, &work_log, &log, session, &node_id)?;
+                        if let Some(message) = message.as_mut() {
+                            message.net_policies = policies.assign(&node_id, &message.upserts);
+                        }
+                        Ok::<_, anyhow::Error>(message)
                     })
                     .await
                 };
