@@ -1040,6 +1040,14 @@ A session isolate hibernates when:
 - the worker stops (every session isolate is hibernated after a 5-second
   grace for running calls, which is why `suspend.onWorkerStop` is refused).
 
+A session with a call running or waiting for it does not hibernate; the
+idle sweep and pressure skip it, and `instance suspend` answers
+`FAILED_PRECONDITION`. A call that arrives while a hibernation is already
+under way waits for its checkpoint to be kept, then wakes the session from
+it (`start` is `hibernated`); if the call's queue timeout passes first it is
+refused with `RESOURCE_EXHAUSTED` (`session … was still hibernating past
+the queue timeout`).
+
 Checkpoints are kept on the node, in its content store, pinned to the
 session, and deleted when the session stops or after `suspend.keepFor`,
 which also ends the session. A session isolate that was resident and never

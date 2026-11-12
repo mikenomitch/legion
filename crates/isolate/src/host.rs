@@ -779,7 +779,7 @@ impl Host {
             spec,
             module,
             holder,
-            _claim: claim,
+            claim: Mutex::new(claim),
             call,
             inv: inv.clone(),
             t0,
@@ -1260,10 +1260,12 @@ impl Host {
                 s.remove(&h.key);
             }
         }
-        drop(guard);
+        // Counted before the unlock, so a call that wakes the session sees
+        // the hibernation it woke from.
         if let Some(t) = task {
             t.counters.hibernations.fetch_add(1, Ordering::Relaxed);
         }
+        drop(guard);
         debug!(session_id = %h.key, freed, "session hibernated");
         Ok(Some(freed))
     }
@@ -1516,8 +1518,9 @@ struct Job {
     spec: Arc<TaskSpec>,
     module: Arc<LoadedModule>,
     holder: Option<Arc<Holder>>,
-    /// A session call's claim on `holder`, held until the call ends.
-    _claim: Option<PendingCall>,
+    /// A session call's claim on `holder`, from lookup until the call holds
+    /// the instance (whose lock then keeps hibernation off).
+    claim: Mutex<Option<PendingCall>>,
     call: invoke_request::Call,
     inv: Arc<Invocation>,
     t0: Instant,
@@ -1795,6 +1798,10 @@ impl Job {
             m.active = true;
             m.running = Some(running.clone());
         }
+        // The instance lock now keeps hibernation off; the claim covered
+        // only the wait for it. Released here rather than when the call
+        // ends, so a `park` hibernation spawned below can run.
+        drop(self.claim.lock().unwrap().take());
         let queue_us = self.t0.elapsed().as_micros() as u64;
 
         // An instance: reuse, or make one.
