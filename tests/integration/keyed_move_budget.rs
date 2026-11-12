@@ -106,7 +106,11 @@ fn fail(store: &Store, id: &str) -> R<MoveVerdict> {
             None,
             FailedMove {
                 policy: MovePolicy {
-                    move_delay_ms: 1_000,
+                    // Holds are kept in whole seconds: a 1 s delay could
+                    // expire before `replace` lifts it (a second boundary
+                    // crossed on a loaded machine), and the start would
+                    // answer `AlreadyRunning`. A minute cannot.
+                    move_delay_ms: 60_000,
                     move_count: Some(1),
                     move_period_ms: 3_600_000,
                 },
