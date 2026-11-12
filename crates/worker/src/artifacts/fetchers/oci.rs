@@ -179,8 +179,9 @@ fn oci_client(
     /// (plain http, platform selection, credential fingerprint, guarded
     /// proxy address).
     type ClientKey = (bool, bool, [u8; 32], Option<std::net::SocketAddr>);
-    static CLIENTS: OnceLock<Mutex<HashMap<ClientKey, (Client, Option<ProxyUser>)>>> =
-        OnceLock::new();
+    /// A cached client and the proxy user it connects as.
+    type ClientEntry = (Client, Option<ProxyUser>);
+    static CLIENTS: OnceLock<Mutex<HashMap<ClientKey, ClientEntry>>> = OnceLock::new();
 
     let proxy = match guard {
         Some(guard) if !guard_proxy::system_proxy_configured() => {

@@ -2077,6 +2077,9 @@ struct KvDebounceState {
 /// The trust bundle's pins and when they were read (see
 /// `ManagerDaemonService::cluster_ca_pins`).
 type CachedCaPins = (Vec<String>, std::time::Instant);
+/// [`ManagerDaemonService::worker_manager_addresses`]'s answer and when it
+/// was computed.
+type CachedManagerAddresses = (std::time::Instant, Vec<String>);
 
 #[derive(Debug)]
 pub struct ManagerDaemonService {
@@ -2086,7 +2089,7 @@ pub struct ManagerDaemonService {
     pub advertise_addr: String,
     /// [`Self::worker_manager_addresses`]'s last answer and when it was
     /// computed.
-    worker_manager_addresses: Arc<Mutex<Option<(std::time::Instant, Vec<String>)>>>,
+    worker_manager_addresses: Arc<Mutex<Option<CachedManagerAddresses>>>,
     /// Set when `advertise_addr` is a loopback address derived from a
     /// wildcard bind, so remote workers cannot use the join tokens it mints
     /// (`ServerConfigFull::loopback_join_address_warning`). Returned with
