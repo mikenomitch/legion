@@ -2765,11 +2765,11 @@ fn migration_list() -> Vec<M<'static>> {
         // reservation. Scheduler lane, like `gang_wait`.
         M::up(
             "CREATE TABLE IF NOT EXISTS gang_reservation (
-            job_config_id STRING PRIMARY KEY,
-            job_id STRING NOT NULL,
+            job_config_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
             task_config_id INTEGER NOT NULL,
-            task_name STRING NOT NULL,
-            band STRING NOT NULL,
+            task_name TEXT NOT NULL,
+            band TEXT NOT NULL,
             request TEXT NOT NULL,
             nodes TEXT NOT NULL,
             created_unix INTEGER NOT NULL,
