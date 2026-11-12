@@ -7,21 +7,6 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 - Keep items short: what is wrong, where in the code or plan, and a link. History belongs in the plan or calls doc.
 - Deferred work found along the way becomes a new open item in its area.
 
-## In flight (open PRs)
-
-| PR | What it lands |
-| --- | --- |
-| [#75](https://github.com/mikenomitch/legion/pull/75) | The `isolate` runtime, Phases 1–5: `legion-isolate`, the `js` and `python` images, the worker's isolate supervisor and datapath, tiers and burst, `legion isolate stats`/`get` ([plan](plans/isolate-runtime-plan.md) · [calls](calls/isolate-runtime-plan_calls.md) · [docs](../docs/task-runtime-isolate.md)) |
-| [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
-| [#37](https://github.com/mikenomitch/legion/pull/37) | UI appearance picker: built-in themes and custom colors |
-
-[#41](https://github.com/mikenomitch/legion/pull/41) (keep plugins out of the
-workspace) is superseded: the crate split ([#71](https://github.com/mikenomitch/legion/pull/71))
-landed the same `members` fix and the plugin build's exit-status check, so it
-can be closed.
-
----
-
 ## Launch blockers
 
 Worker-plane auth Phases 0–8 shipped ([plan](plans/worker-plane-auth-plan.md) ·
