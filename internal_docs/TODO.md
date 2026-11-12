@@ -1066,10 +1066,24 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 
 ## Templates, registry & packaging
 
-Job templates shipped ([plan](plans/job-templates-plan.md)); the registry is untouched.
+Job templates shipped ([plan](plans/job-templates-plan.md)); the registry is planned, not built
+([plan](plans/registry-plan.md) · [calls](calls/registry-plan_calls.md)).
 
-- [ ] **A job registry**: default + added registries, `@<registry>/<job>`, inspect
-      metadata, a UI to fill in variables; plugins by URL or registry.
+- [ ] **A package registry** for jobs, templates, apps, and plugins
+      ([plan](plans/registry-plan.md)), in the plan's phases:
+  - [ ] Phase 1: packages, semver versions, and git registries; cluster registry
+        list; `job run`/`template install` from a reference; `legion registry outdated`.
+  - [ ] Phase 2: the hosted registry (Rust, Postgres, R2, on Legion): protocol,
+        publish, search and filters, the web UI, moderation minimum.
+  - [ ] Phase 3: publish on tag from a linked GitHub repo; trusted publishing;
+        version diffs; breaking-change checks.
+  - [ ] Phase 4: apps from registries (`app install <ref>`, semver app versions, `app rollback`).
+  - [ ] Phase 5: plugins: hash-pinned `plugins.install` in node configs (5a), cluster
+        installs the managers hand to every matching node (5b), `pkg:` artifact sources (5c).
+  - [ ] Phase 6: the registry admin panel and analytics.
+  - [ ] Phase 7: registry-signed version documents, cluster registry policy,
+        verified publishers, advisories.
+  - [ ] Phase 8: a Catalog page in the cluster UI; offline plugin upload; `legion registry mirror`.
 - [ ] **Build & push images** (`legion build`/`prep`); a buildpack runner.
 - [ ] **Publish the next `legion-rs` to crates.io**; **release binaries and a Homebrew formula.**
       0.1.0 is published as one crate. A release now publishes six in order
@@ -1119,7 +1133,8 @@ Each runs as a Legion app ([plan](plans/legion-apps-plan.md) · [calls](calls/le
   - [ ] Smaller: KV-reading manifests need `kv:read`; union-of-rules grant coverage;
         held upgrades don't hold the binary; git errors classified by stderr; app
         jobs can't autoscale; non-atomic stopped-status clear.
-  - [ ] Deferred: registry installs, tenant-owned apps, per-namespace grants.
+  - [ ] Deferred: registry installs (now [registry plan](plans/registry-plan.md) Phase 4),
+        tenant-owned apps, per-namespace grants.
 - [ ] **App security follow-ups** ([calls 99-110](calls/legion-apps-plan_calls.md)):
       coarse, replayable 60 s delegations; JWT viewers not re-checked; views default
       to the app's grant; grants outlive granters; `identities` and autoscaler
@@ -1159,7 +1174,8 @@ docs: [plugin-system.md](../docs/plugin-system.md)
 - [ ] **A stable plugin ABI (audit M6)** ([calls #8](calls/architecture-audit-2026-10-09_calls.md)).
 - [ ] **Panic containment for task runtime dylibs** ([review PLG1](architecture-review-2026-11-07.md)).
 - [ ] **In-manager plugin hooks on the WASM layer** (`crates/worker/src/wasm/`); needs a plan.
-- [ ] **Lift a plugin quarantine without a restart**; a `legion plugin status`.
+- [ ] **Lift a plugin quarantine without a restart**; a `legion plugin status`
+      (planned for installed plugins in [registry plan](plans/registry-plan.md) Phase 5a).
 - [ ] **Devices follow-ups** ([docs](../docs/devices.md)): sandbox VFIO; MIG/MPS/DRA;
       an `exec` device cgroup; preemption and node groups ignore devices; NVLink
       topology across nodes; usage reporting; YAML CDI; streaming health; edge starts;
@@ -1175,7 +1191,8 @@ docs: [plugin-system.md](../docs/plugin-system.md)
 
 docs: [agent-readiness.md](../docs/agent-readiness.md)
 
-- [ ] **Agent ergonomics:** writing a plugin, joining a worker, searching the registry.
+- [ ] **Agent ergonomics:** writing a plugin, joining a worker, searching the registry
+      (MCP search and info tools planned in [registry plan](plans/registry-plan.md) §6.19).
 - [ ] **External audit sink** (syslog/webhook/S3).
 - [ ] **Inline narrowing for child tokens**; **multi-party approvals**.
 - [ ] **Cluster-wide rate limits and budgets** (per manager, in memory today).
