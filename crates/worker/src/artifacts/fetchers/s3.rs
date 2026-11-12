@@ -107,7 +107,7 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
     let proxy = match req.limits.egress.as_ref() {
         Some(guard)
             if !guard_proxy::system_proxy_configured()
-                && std::env::var("AWS_PROXY_URL").map_or(true, |v| v.trim().is_empty()) =>
+                && !std::env::var("AWS_PROXY_URL").is_ok_and(|v| !v.trim().is_empty()) =>
         {
             let user = format!("s3-{:016x}", rand::random::<u64>());
             Some((GuardProxy::for_guard(guard)?, user))
