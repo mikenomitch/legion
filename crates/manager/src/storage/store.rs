@@ -29125,6 +29125,7 @@ mod tests {
                     task_id,
                     candidates: list.iter().map(|node| node.to_string()).collect(),
                     instance_id: None,
+                    volume_pin: None,
                 })
                 .collect();
             let submission = store.insert_plan_submission_with_candidates(
