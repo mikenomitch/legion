@@ -1513,10 +1513,10 @@ async fn stop_worker_daemon(
         let counts = crate::worker::task_manager::session_sleep::checkpoint_sessions_on_stop(
             &manager, deadline,
         );
-        manager
-            .lock()
-            .expect("task manager")
-            .sync_session_log(Duration::from_secs(5));
+        let guard = manager.lock().expect("task manager");
+        guard.sync_session_log(Duration::from_secs(5));
+        guard.sync_state_file(Duration::from_secs(5));
+        drop(guard);
         counts
     });
     match tokio::time::timeout(timeout + Duration::from_secs(10), checkpointed).await {

@@ -192,11 +192,193 @@ const STATE_ALLOCS_SUBDIR: &str = "allocs";
 #[derive(Debug, Clone)]
 pub struct WorkerStateStore {
     path: PathBuf,
+    writer: std::sync::Arc<StateFileWriter>,
+}
+
+/// The state file's group-committing writer.
+///
+/// Every start, stop, and restart used to serialize every record, write the
+/// file, and fsync it under the task-manager lock, so a burst of `n` starts on
+/// a dense node cost `n` whole-file writes, each one bigger than the last,
+/// with every other start, stop, and heartbeat waiting on the lock. Now the
+/// lock only hands the writer the newest snapshot ([`WorkerStateStore::submit`])
+/// and returns. One thread per state file serializes and fsyncs whatever is
+/// newest when it gets to it, so a burst costs as many writes as the disk can
+/// take, not one per start, and none of them under the lock. Each snapshot is
+/// the whole state, so skipping an older one loses nothing.
+///
+/// Every `WorkerStateStore` for one path in a process shares one writer, so a
+/// second store (a restarted task manager in a test, a status reader) never
+/// races the first's pending write, and a load waits for what was submitted.
+#[derive(Debug)]
+struct StateFileWriter {
+    shared: std::sync::Arc<WriterShared>,
+}
+
+#[derive(Debug, Default)]
+struct WriterShared {
+    slot: std::sync::Mutex<WriterSlot>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct WriterSlot {
+    /// The newest snapshot not yet taken by the writer, with its number.
+    pending: Option<(u64, Vec<PersistedAllocation>)>,
+    /// The number of the newest snapshot submitted.
+    submitted: u64,
+    /// The number of the newest snapshot written (or that failed to write).
+    written: u64,
+    /// The error of the write that settled `written`, if it failed.
+    last_error: Option<String>,
+    /// Whether a writer thread is running for this path.
+    running: bool,
+}
+
+/// The writer for each state file path in this process.
+fn writers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<StateFileWriter>>>
+{
+    static WRITERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<StateFileWriter>>>,
+    > = std::sync::OnceLock::new();
+    WRITERS.get_or_init(Default::default)
+}
+
+impl StateFileWriter {
+    fn for_path(path: &Path) -> std::sync::Arc<StateFileWriter> {
+        let mut writers = writers().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(writer) = writers.get(path).and_then(std::sync::Weak::upgrade) {
+            return writer;
+        }
+        writers.retain(|_, writer| writer.strong_count() > 0);
+        let writer = std::sync::Arc::new(StateFileWriter {
+            shared: std::sync::Arc::default(),
+        });
+        writers.insert(path.to_path_buf(), std::sync::Arc::downgrade(&writer));
+        writer
+    }
+
+    /// Hand the writer a snapshot; returns its number.
+    fn submit(&self, store: &WorkerStateStore, records: Vec<PersistedAllocation>) -> u64 {
+        let mut slot = self.shared.slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.submitted += 1;
+        let generation = slot.submitted;
+        slot.pending = Some((generation, records));
+        if !slot.running {
+            let shared = self.shared.clone();
+            // The thread holds the shared slot, not the writer handle, so the
+            // last store going away still ends it (see `Drop`).
+            let path = store.path.clone();
+            match std::thread::Builder::new()
+                .name("worker-state".into())
+                .spawn(move || write_loop(&shared, &path))
+            {
+                Ok(_) => slot.running = true,
+                Err(err) => {
+                    // No thread: write inline rather than lose the state.
+                    let (generation, records) = slot.pending.take().expect("just set");
+                    let result = write_snapshot(&store.path, &records);
+                    settle(&mut slot, generation, result);
+                    warn!(error = ?err, "Cannot start the worker state writer; wrote inline");
+                }
+            }
+        }
+        self.shared.changed.notify_all();
+        generation
+    }
+
+    /// Wait until snapshot `generation` (or a newer one) is on disk.
+    fn wait_for(&self, generation: u64, timeout: std::time::Duration) -> R<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut slot = self.shared.slot.lock().unwrap_or_else(|e| e.into_inner());
+        while slot.written < generation {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                bail!("the worker state file was not written within {timeout:?}");
+            }
+            slot = self
+                .shared
+                .changed
+                .wait_timeout(slot, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        match &slot.last_error {
+            Some(err) if slot.written == generation => bail!("{err}"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Wait until everything submitted so far is on disk.
+    fn flush(&self, timeout: std::time::Duration) -> R<()> {
+        let generation = self
+            .shared
+            .slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submitted;
+        self.wait_for(generation, timeout)
+    }
+}
+
+impl Drop for StateFileWriter {
+    /// The last store for a path is gone: write what it submitted, then let
+    /// the thread end.
+    fn drop(&mut self) {
+        if let Err(err) = self.flush(std::time::Duration::from_secs(10)) {
+            warn!(error = ?err, "Worker state was not written before its store closed");
+        }
+        let mut slot = self.shared.slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.running = false;
+        self.shared.changed.notify_all();
+    }
+}
+
+fn settle(slot: &mut WriterSlot, generation: u64, result: R<()>) {
+    slot.written = slot.written.max(generation);
+    slot.last_error = result.err().map(|err| format!("{err:#}"));
+    if let Some(err) = &slot.last_error {
+        warn!(error = %err, "Failed to persist worker allocation state");
+    }
+}
+
+fn write_loop(shared: &WriterShared, path: &Path) {
+    let mut slot = shared.slot.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some((generation, records)) = slot.pending.take() {
+            drop(slot);
+            let result = write_snapshot(path, &records);
+            drop(records);
+            slot = shared.slot.lock().unwrap_or_else(|e| e.into_inner());
+            settle(&mut slot, generation, result);
+            shared.changed.notify_all();
+            continue;
+        }
+        if !slot.running {
+            return;
+        }
+        slot = shared.changed.wait(slot).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+fn write_snapshot(path: &Path, records: &[PersistedAllocation]) -> R<()> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        ensure_dir(dir)?;
+        crate::util::restrict_dir_to_traverse_only(dir)?;
+    }
+    // The state file embeds each task's full env, including any
+    // env-delivered workload-identity token. The state dir is traverse-only
+    // (see `prepare_layout`), so the file's own 0600 mode, set atomically by
+    // the write, is what keeps it private.
+    let contents = serde_json::to_string_pretty(records)?;
+    write_owner_only(path, contents.as_bytes(), true)
 }
 
 impl WorkerStateStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        let writer = StateFileWriter::for_path(&path);
+        Self { path, writer }
     }
 
     /// Location of the worker state file; per-allocation directories live
@@ -277,6 +459,10 @@ impl WorkerStateStore {
     /// returned, and every other one comes back as an
     /// [`UnreadableRecord`] carrying what is needed to stop its process.
     pub fn load_records(&self) -> R<LoadedState> {
+        // A snapshot this process submitted is part of the file.
+        if let Err(err) = self.flush(std::time::Duration::from_secs(30)) {
+            warn!(error = ?err, "Reading the worker state file before its last write finished");
+        }
         if !self.path.exists() {
             return Ok(LoadedState::default());
         }
@@ -334,15 +520,26 @@ impl WorkerStateStore {
         Ok(copy)
     }
 
+    /// Write `allocations` as the whole state file and wait until it is on
+    /// disk. The task manager uses [`Self::submit`], which does not wait.
     pub fn save(&self, allocations: &[PersistedAllocation]) -> R<()> {
-        self.ensure_state_dir()?;
-        // The state file embeds each task's full env, including any
-        // env-delivered workload-identity token. The state dir is
-        // traverse-only (see `prepare_layout`), so the file's own 0600 mode,
-        // set atomically by the write, is what keeps it private.
-        let contents = serde_json::to_string_pretty(allocations)?;
-        write_owner_only(&self.path, contents.as_bytes(), true)?;
-        Ok(())
+        let generation = self.writer.submit(self, allocations.to_vec());
+        self.writer
+            .wait_for(generation, std::time::Duration::from_secs(60))
+    }
+
+    /// Hand the writer a new whole-state snapshot and return at once. It is
+    /// written, and fsynced, off the caller's thread; when snapshots arrive
+    /// faster than the disk takes them, only the newest is written. A write
+    /// failure is logged by the writer.
+    pub fn submit(&self, allocations: Vec<PersistedAllocation>) {
+        self.writer.submit(self, allocations);
+    }
+
+    /// Wait until every snapshot submitted so far is on disk. A worker
+    /// stopping gracefully calls this last; a load calls it first.
+    pub fn flush(&self, timeout: std::time::Duration) -> R<()> {
+        self.writer.flush(timeout)
     }
 
     /// Lay out the worker state directory with each entry's guard, before
@@ -996,6 +1193,53 @@ mod tests {
         Ok(())
     }
 
+    /// A burst of snapshots returns at once, ends with the newest on disk,
+    /// and another store for the same file reads that newest one.
+    #[test]
+    fn submitted_snapshots_coalesce_and_the_newest_wins_test() -> R<()> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("worker_state.json");
+        let store = WorkerStateStore::new(path.clone());
+        let parsed = |id: i64| -> PersistedAllocation {
+            serde_json::from_value(record(id, 1, Some(1))).expect("record")
+        };
+        for n in 1..=200i64 {
+            store.submit((1..=n).map(parsed).collect());
+        }
+        // A second store for the same path shares the writer, so its load
+        // waits for what the first submitted.
+        let reader = WorkerStateStore::new(path.clone());
+        let loaded = reader.load()?;
+        assert_eq!(loaded.len(), 200);
+        assert_eq!(loaded.last().map(|r| r.allocation.id), Some(200));
+
+        // `save` waits, and reports a failed write.
+        store.save(&[parsed(7)])?;
+        assert_eq!(WorkerStateStore::new(path).load()?.len(), 1);
+        let blocked = temp.path().join("not-a-dir");
+        std::fs::write(&blocked, b"file")?;
+        let broken = WorkerStateStore::new(blocked.join("worker_state.json"));
+        assert!(broken.save(&[parsed(1)]).is_err());
+        Ok(())
+    }
+
+    /// The last store for a path going away writes what it submitted.
+    #[test]
+    fn dropping_the_last_store_writes_its_pending_snapshot_test() -> R<()> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("worker_state.json");
+        {
+            let store = WorkerStateStore::new(path.clone());
+            let record: PersistedAllocation = serde_json::from_value(record(9, 1, Some(1)))?;
+            store.submit(vec![record]);
+        }
+        let contents: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["allocation"]["id"], serde_json::json!(9));
+        Ok(())
+    }
+
     #[test]
     fn known_managers_round_trip() -> R<()> {
         let temp_dir = TempDir::new()?;
@@ -1045,7 +1289,12 @@ mod tests {
 
 #[cfg(test)]
 mod persist_cost_probe {
-    // TEMPORARY measurement, removed before commit.
+    //! What one state-file persist costs by allocation count: the write
+    //! (`save`, which waits for the disk), and the parts the task-manager
+    //! lock used to pay for before the writer took the write off it. Run
+    //! with `cargo test -p legion-worker --release --lib -- persist_cost_probe
+    //! --ignored --nocapture`; the numbers are in
+    //! `internal_docs/calls/task-start-critical-path-plan_calls.md`.
     use super::*;
     use crate::structs::{Allocation, TaskConfig};
 
@@ -1121,8 +1370,14 @@ mod persist_cost_probe {
                 let _ = records.clone();
             }
             let clones = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                store.submit(records.clone());
+            }
+            let submit = started.elapsed() / rounds;
+            store.flush(std::time::Duration::from_secs(60))?;
             eprintln!(
-                "n={n} bytes={bytes} save={per:?} serialize={ser:?} start_time_reads={proc_reads:?} clone={clones:?}"
+                "n={n} bytes={bytes} save={per:?} serialize={ser:?} start_time_reads={proc_reads:?} clone={clones:?} submit={submit:?}"
             );
         }
         Ok(())

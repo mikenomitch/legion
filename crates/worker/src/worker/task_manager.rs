@@ -1012,6 +1012,12 @@ pub struct WorkerTaskManager {
     /// id, read off the lock as its launch finished (see
     /// [`UnlockedLaunch::run`]), for its row in the session log.
     session_pid_starts: HashMap<String, (u32, u64)>,
+    /// Each persisted allocation's pid and when that process started, by
+    /// allocation id, so a state-file snapshot reads `/proc` once per
+    /// process rather than once per process per snapshot. A process's start
+    /// time never changes, and keeping the first read is what identifies
+    /// *this* process should its pid be reused.
+    pid_start_times: std::sync::Mutex<HashMap<i64, (u32, u64)>>,
     /// The latest live checkpoint of each running session (periodic or
     /// worker-stop), by session id. Its parts stay pinned until it is
     /// replaced, the session suspends or ends.
@@ -1171,6 +1177,7 @@ impl WorkerTaskManager {
             isolate_owners: HashMap::new(),
             runtime_gate,
             session_pid_starts: HashMap::new(),
+            pid_start_times: std::sync::Mutex::new(HashMap::new()),
             session_checkpoints: HashMap::new(),
             session_captures: Default::default(),
             resuming_sessions: HashMap::new(),
@@ -6102,7 +6109,7 @@ impl WorkerTaskManager {
                     .iter()
                     .any(|(allocation, ..)| allocation.id == allocation_id)
         });
-        self.persist_state_with(&active);
+        self.state_store.submit(active);
 
         // After the whole set is persisted, because these persist again as
         // they move along the ladder.
@@ -6454,6 +6461,31 @@ impl WorkerTaskManager {
             .unwrap_or(true)
     }
 
+    /// When `pid` (the process of allocation `allocation_id`) started, read
+    /// from `/proc` once and cached (see `pid_start_times`).
+    fn cached_pid_start_time(&self, allocation_id: i64, pid: u32) -> Option<u64> {
+        let mut cache = self
+            .pid_start_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((known, started)) = cache.get(&allocation_id) {
+            if *known == pid {
+                return Some(*started);
+            }
+        }
+        let started = process_start_time(pid)?;
+        cache.insert(allocation_id, (pid, started));
+        Some(started)
+    }
+
+    /// Snapshot every allocation a restarted worker must know about and hand
+    /// it to the state file's writer.
+    ///
+    /// Only the snapshot is built here, under the task-manager lock: the
+    /// serialization, the write, and the fsync run on the writer's thread,
+    /// which coalesces a burst into as few writes as the disk takes
+    /// ([`WorkerStateStore::submit`]). Process start times come from a cache,
+    /// so the snapshot reads `/proc` only for a process it has not seen.
     fn persist_state(&self) {
         let mut records = Vec::new();
         for (allocation_id, allocation) in &self.allocations {
@@ -6499,7 +6531,7 @@ impl WorkerTaskManager {
                 allocation: allocation.clone(),
                 task: task.clone(),
                 pid,
-                pid_start_time: pid.and_then(process_start_time),
+                pid_start_time: pid.and_then(|pid| self.cached_pid_start_time(*allocation_id, pid)),
                 resource_assignment: self
                     .instances
                     .get(allocation_id)
@@ -6563,7 +6595,7 @@ impl WorkerTaskManager {
                 allocation: allocation.clone(),
                 task: task.clone(),
                 pid: Some(pid),
-                pid_start_time: process_start_time(pid),
+                pid_start_time: self.cached_pid_start_time(allocation_id, pid),
                 resource_assignment: instance.resource_assignment.clone(),
                 self_terminate_after_secs: None,
                 volumes: self
@@ -6578,12 +6610,30 @@ impl WorkerTaskManager {
             });
         }
 
-        self.persist_state_with(&records);
+        {
+            let mut cache = self
+                .pid_start_times
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.len() > records.len() {
+                let live: std::collections::HashSet<i64> =
+                    records.iter().map(|record| record.allocation.id).collect();
+                cache.retain(|id, _| live.contains(id));
+            }
+        }
+        self.state_store.submit(records);
     }
 
-    fn persist_state_with(&self, records: &[PersistedAllocation]) {
-        if let Err(err) = self.state_store.save(records) {
-            warn!(error = ?err, "Failed to persist worker allocation state");
+    /// Wait until the state file holds every snapshot handed to its writer.
+    /// A gracefully stopping worker calls this last, beside
+    /// [`Self::sync_session_log`].
+    pub fn sync_state_file(&self, timeout: std::time::Duration) -> bool {
+        match self.state_store.flush(timeout) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(error = ?err, "The worker state file is not up to date");
+                false
+            }
         }
     }
 }
@@ -9231,6 +9281,13 @@ mod tests {
             .expect("task manager")
             .begin_task_allocation(&envelope_payload(100))?;
         let state_file = temp_dir.path().join("worker_state.json");
+        let flushed = || {
+            assert!(manager
+                .lock()
+                .expect("task manager")
+                .sync_state_file(std::time::Duration::from_secs(5)));
+        };
+        flushed();
         let before = std::fs::read(&state_file).ok();
 
         // Begin two sessions under the lock: both register and come back to
@@ -9278,6 +9335,7 @@ mod tests {
             }
             assert_eq!(guard.session_statuses().len(), 2);
         }
+        flushed();
         assert_eq!(
             std::fs::read(&state_file).ok(),
             before,
@@ -9290,6 +9348,7 @@ mod tests {
                 guard.kill_claim(&claim.claim_id, "test over");
             }
         }
+        flushed();
         assert_eq!(
             std::fs::read(&state_file).ok(),
             before,
@@ -12606,6 +12665,7 @@ mod tests {
         manager.run_allocation(&Allocation { id: 2, ..alloc() }, &task)?;
         let unreadable_pid = manager.allocation_pid(1).expect("pid");
         let readable_pid = manager.allocation_pid(2).expect("pid");
+        assert!(manager.sync_state_file(std::time::Duration::from_secs(5)));
 
         // Another release wrote record 1 in a shape this build cannot read.
         let mut records: Vec<serde_json::Value> =

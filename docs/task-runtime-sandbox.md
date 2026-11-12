@@ -850,8 +850,10 @@ of that instance gets, so one instance always asks for one device:
   allocation id (`02:4c:...`), so guests on one bridge never collide.
 
 Any number of TAP sandboxes fit on a node, and each one can take memory
-checkpoints. Creating TAPs needs `CAP_NET_ADMIN` and the `ip` tool on the
-worker. A device of that name that already exists and is free (left by a
+checkpoints. Creating TAPs needs `CAP_NET_ADMIN` and `/dev/net/tun` on the
+worker; the worker makes the kernel calls itself, so no `ip` tool is needed,
+and an error names the `ip` command that does the same by hand (`` `ip link
+set dev lgf... master br0` failed: No such device``). A device of that name that already exists and is free (left by a
 worker crash) is reused and re-attached to `bridge`. One that another process
 holds fails the boot by name: `sandbox needs TAP device lgf...: it exists and
 another process holds it, so this instance already runs a guest on this

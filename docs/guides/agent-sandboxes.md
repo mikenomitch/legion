@@ -368,7 +368,8 @@ your platform reads it from `legion instance get user-42 -j`
 The bridge is yours: create `br0` on each sandbox node with the gateway
 address, and route or NAT it. Each guest gets a MAC derived from its
 allocation id, so guests on one bridge never collide. The worker needs
-`CAP_NET_ADMIN` and the `ip` tool. Whatever filtering you want between
+`CAP_NET_ADMIN` and `/dev/net/tun`; it makes the TAP calls itself, with no
+`ip` tool. Whatever filtering you want between
 sandboxes and the outside goes on the bridge.
 
 The options, side by side:
