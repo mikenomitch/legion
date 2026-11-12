@@ -14587,12 +14587,7 @@ pub(crate) fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
 }
 
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(work)
-        }
-        _ => work(),
-    }
+    crate::storage::block_off_runtime(work)
 }
 
 /// Lines describing artifacts whose pinned source changed between the stored

@@ -826,6 +826,10 @@ pub struct Metrics {
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_scheduler_plan_bind_pass{pass}`
     pub scheduler_plan_bind_pass: Arc<CounterVec>,
+    /// `legion_scheduler_plan_node_rows_total{source}`
+    pub scheduler_plan_node_rows_total: Arc<CounterVec>,
+    /// `legion_scheduler_keyed_binds_total{query}`
+    pub scheduler_keyed_binds_total: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_eval_handler_timeouts_total{kind}`
@@ -1194,6 +1198,22 @@ impl Metrics {
                 name: "legion_scheduler_plan_bind_pass",
                 help: "Placements bound by the apply walk, by pass: `clean` (the candidate's node epoch was unchanged since the plan snapshot) or `revalidated` (its epoch had moved, and the in-transaction recheck admitted it anyway).",
                 labels: &["pass"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_plan_node_rows_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_node_rows_total",
+                help: "Node rows the plan-apply walk checked, by where the node it used came from: `read_model` (the row's bytes matched the read model's node, so the row was not parsed) or `parsed` (no match, or no read-model entry, so the row was parsed).",
+                labels: &["source"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_keyed_binds_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_keyed_binds_total",
+                help: "Keyed placements the plan apply bound to an instance, by the query that searched for it: `target` (a ratification's named instance, by key), `unbound` (only live instances with no current allocation), or `live` (every live instance of the task, when `unbound` found none: a rollout rebinding instances bound under an older config). A steady `live` rate means binds are paying for the whole live population.",
+                labels: &["query"],
             },
             series: Series::new(),
         });
@@ -2288,6 +2308,8 @@ impl Metrics {
             Arc::clone(&scheduler_locality_placements_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_node_rows_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_keyed_binds_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_node_list_rebuilds_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_phase_seconds) as Arc<dyn RenderMetric>,
@@ -2314,6 +2336,8 @@ impl Metrics {
             eval_handle_seconds,
             dispatch_send_seconds,
             scheduler_plan_bind_pass,
+            scheduler_plan_node_rows_total,
+            scheduler_keyed_binds_total,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             eval_handler_timeouts_total,

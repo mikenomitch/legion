@@ -555,6 +555,16 @@ inserting it:
   allocation rows the transaction can see, excluding a Fresh plan's own
   replaced job. This is the same arithmetic as the planner's ledger.
 
+The fresh node row is always read, but it is not always parsed. When the
+row's bytes are exactly what the read model's copy of the node serializes
+to, the walk uses that copy; equal bytes parse to an equal node, so the
+checks above see the same values either way. When they differ — a cordon
+or re-registration whose read-model projection has not landed yet, or a
+row written in a different JSON form — the row is parsed and wins. The
+read model is never trusted, only compared against.
+`legion_scheduler_plan_node_rows_total{source}` counts which happened
+([metrics](metrics.md)).
+
 #### The per-node usage cache
 
 Rebuilding that free pool means reading every allocation row on the node

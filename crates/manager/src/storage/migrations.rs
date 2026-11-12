@@ -2670,13 +2670,612 @@ fn migration_list() -> Vec<M<'static>> {
              CREATE INDEX IF NOT EXISTS instance_resources_override ON instance (job_id, task_name) WHERE resources_override IS NOT NULL;",
         )
         .down(""),
+        // Keyed binding independent of the live population
+        // (scheduler-lane-entry-cost plan §11): a live keyed instance with
+        // no current allocation is the common thing a keyed placement binds
+        // (a new instance, a resume, a replacement after a lost node), and
+        // this index holds only those, so the bind seeks them instead of
+        // probing every live instance of the task. The full live-index
+        // query stays as the fallback for the rest (an instance bound under
+        // an older config, mid-rollout). Index only: no changeset change.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_instance_keyed_unbound
+            ON instance(job_id, group_name, task_name)
+            WHERE mode = 'keyed' AND state NOT IN ('terminated', 'stopped', 'suspended')
+            AND current_alloc_id IS NULL;",
+        )
+        .down("DROP INDEX IF EXISTS idx_instance_keyed_unbound;"),
+        // Job stop/destroy at scale (the AWS 10k cleanup drained `job_stop`
+        // at ~4 evals/s): every statement keyed by one job must seek, and
+        // every foreign key must be indexed on its child side, because
+        // deleting a parent row makes SQLite look up its children (to
+        // cascade or to refuse) and without an index that is a scan of the
+        // child table per deleted parent. Destroying N jobs paid N scans of
+        // `job_update`, `job_config_submission`, `job_kv_reference` and
+        // `task_status`, tables that grow with every submit; and `job.name`,
+        // which every by-name job lookup filters on, had no index at all.
+        // Pinned by `every_foreign_key_is_indexed_on_its_child_side` and
+        // `job_stop_and_destroy_statements_seek_by_job`. Indexes only: no
+        // changeset change.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_job_name ON job(name);
+        CREATE INDEX IF NOT EXISTS idx_task_status_job_id ON task_status(job_id);
+        CREATE INDEX IF NOT EXISTS idx_job_config_submission_config
+            ON job_config_submission(job_config_id);
+        CREATE INDEX IF NOT EXISTS idx_job_config_submission_hash
+            ON job_config_submission(submission_hash);
+        CREATE INDEX IF NOT EXISTS idx_job_kv_reference_config ON job_kv_reference(job_config_id);
+        CREATE INDEX IF NOT EXISTS idx_job_update_job_id ON job_update(job_id);
+        CREATE INDEX IF NOT EXISTS idx_job_update_from_config ON job_update(from_job_config_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_job_name;
+        DROP INDEX IF EXISTS idx_task_status_job_id;
+        DROP INDEX IF EXISTS idx_job_config_submission_config;
+        DROP INDEX IF EXISTS idx_job_config_submission_hash;
+        DROP INDEX IF EXISTS idx_job_kv_reference_config;
+        DROP INDEX IF EXISTS idx_job_update_job_id;
+        DROP INDEX IF EXISTS idx_job_update_from_config;",
+        ),
+        // `STRING` and `TIMESTAMP` -> honest types (jsonb-text-affinity calls
+        // #2, the deferred half). Neither name matches an affinity keyword, so
+        // every such column had NUMERIC affinity: each write first tried to
+        // parse the bound text as a number, and a numeric-looking value (a
+        // job named `2026`, an id of digits) was stored as an INTEGER that
+        // a `String` read then refused. Every one becomes TEXT except
+        // `job.created_at`, which has always stored unix seconds and is read
+        // as `i64` (its sibling `job.updated_at` is already INTEGER). The
+        // per-column choice comes from an audit of what the test suite's
+        // databases actually store (jsonb-text-affinity calls #7-#9).
+        //
+        // Declared types are rewritten in place (`retype_string_and_timestamp_columns`),
+        // not by rebuilding tables: column order, rowids, indexes and foreign
+        // keys are untouched, so raft changesets (positional) and every FK
+        // stay exactly as they were. Values already stored as numbers in a
+        // TEXT column are rewritten to text in the same transaction, which
+        // the store runs with foreign-key enforcement off
+        // (`migrate_to_latest`).
+        M::up_with_hook("", retype_string_and_timestamp_columns).down(""),
     ]
+}
+
+/// The schema version whose migration re-declares `STRING`/`TIMESTAMP`
+/// columns ([`retype_string_and_timestamp_columns`]), which
+/// [`migrate_to_latest`] runs with foreign-key enforcement off. Pinned by
+/// `text_retype_schema_version_matches_the_migration`.
+pub const TEXT_RETYPE_SCHEMA_VERSION: u32 = 192;
+
+/// Migrate `conn` to the latest schema the way a store does. The one
+/// migration that rewrites stored values in key columns
+/// ([`TEXT_RETYPE_SCHEMA_VERSION`]) runs with foreign-key enforcement off
+/// and checks every key itself before it commits (see
+/// [`retype_string_and_timestamp_columns`]); every other migration runs with
+/// it on, as always.
+pub(crate) fn migrate_to_latest(
+    migrations: &Migrations<'_>,
+    conn: &mut rusqlite::Connection,
+) -> anyhow::Result<()> {
+    let current: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+    if current > 0 && current < TEXT_RETYPE_SCHEMA_VERSION {
+        migrations.to_version(conn, TEXT_RETYPE_SCHEMA_VERSION as usize - 1)?;
+        let enforced: bool = conn.query_row("PRAGMA foreign_keys;", [], |row| row.get(0))?;
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let retyped = migrations.to_version(conn, TEXT_RETYPE_SCHEMA_VERSION as usize);
+        conn.pragma_update(None, "foreign_keys", if enforced { "ON" } else { "OFF" })?;
+        retyped?;
+    }
+    migrations.to_latest(conn)?;
+    Ok(())
+}
+
+/// The type a column declared `STRING` or `TIMESTAMP` is re-declared as:
+/// `TEXT`, except the one column that stores numbers.
+fn honest_column_type(table: &str, column: &str) -> &'static str {
+    match (table, column) {
+        ("job", "created_at") => "INTEGER",
+        _ => "TEXT",
+    }
+}
+
+/// `sql` (one table's `CREATE TABLE` text from `sqlite_schema`) with every
+/// column whose declared type is `STRING` or `TIMESTAMP` re-declared by
+/// [`honest_column_type`], and the columns it changed. A small scanner, not
+/// a substring replace: only the token right after a column name is a type,
+/// and quoted text (a default, a check) is never touched.
+pub(crate) fn retyped_table_sql(table: &str, sql: &str) -> (String, Vec<(String, &'static str)>) {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut changed = Vec::new();
+    let mut depth = 0usize;
+    // Inside the column list: 0 = expecting a column name, 1 = expecting
+    // its type, 2 = past the type (constraints) until the next `,`.
+    let mut slot = 2u8;
+    let mut column = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '\'' | '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] as char != close {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+                let quoted = &sql[start..i];
+                if depth == 1 && slot == 0 && c != '\'' {
+                    column = quoted[1..quoted.len().saturating_sub(1)].to_string();
+                    slot = 1;
+                } else if depth == 1 && slot == 1 {
+                    slot = 2;
+                }
+                out.push_str(quoted);
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                if depth == 1 {
+                    slot = 0;
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 1 => slot = 0,
+            _ if c.is_ascii_alphanumeric() || c == '_' => {
+                let start = i;
+                while i < bytes.len()
+                    && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if depth == 1 && slot == 0 {
+                    column = word.to_string();
+                    slot = 1;
+                    out.push_str(word);
+                } else if depth == 1 && slot == 1 {
+                    slot = 2;
+                    if word.eq_ignore_ascii_case("STRING") || word.eq_ignore_ascii_case("TIMESTAMP")
+                    {
+                        let honest = honest_column_type(table, &column);
+                        changed.push((column.clone(), honest));
+                        out.push_str(honest);
+                    } else {
+                        out.push_str(word);
+                    }
+                } else {
+                    out.push_str(word);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, changed)
+}
+
+/// The migration hook behind the `STRING`/`TIMESTAMP` re-type, in one
+/// transaction:
+///
+/// 1. rewrite each affected table's declared SQL (`writable_schema`, the
+///    procedure SQLite documents for schema changes that do not touch stored
+///    records) and bump the schema cookie so every connection reloads it;
+/// 2. turn every number a now-TEXT column stored (NUMERIC affinity made one
+///    of numeric-looking text) back into the text it was written as;
+/// 3. rebuild the indexes of the tables step 2 touched: an UPDATE finds a
+///    row's old index entries by computing their keys with the column's NEW
+///    affinity, so it misses the numeric entries and leaves them behind;
+/// 4. check every foreign key (`foreign_key_check`).
+///
+/// Step 2 needs foreign-key enforcement off ([`migrate_to_latest`] turns it
+/// off for this migration): a key and the keys naming it are rewritten one
+/// statement at a time, and SQLite's deferred-constraint counter miscounts
+/// keys whose comparison changed under it, failing a commit that step 4
+/// finds consistent. With enforcement on (a caller that migrated some other
+/// way), the hook refuses rather than rewrite keys unchecked, unless there
+/// is nothing to rewrite.
+fn retype_string_and_timestamp_columns(
+    tx: &rusqlite::Transaction,
+) -> rusqlite_migration::HookResult {
+    let tables: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name;",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut retyped = Vec::new();
+    for (table, sql) in tables {
+        let (new_sql, changed) = retyped_table_sql(&table, &sql);
+        if !changed.is_empty() {
+            retyped.push((table, new_sql, changed));
+        }
+    }
+    if retyped.is_empty() {
+        return Ok(());
+    }
+    let cookie: i64 = tx.query_row("PRAGMA schema_version;", [], |row| row.get(0))?;
+    tx.execute_batch("PRAGMA writable_schema = ON;")?;
+    for (table, sql, _) in &retyped {
+        tx.execute(
+            "UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = ?2;",
+            rusqlite::params![sql, table],
+        )?;
+    }
+    tx.execute_batch(&format!(
+        "PRAGMA schema_version = {}; PRAGMA writable_schema = RESET;",
+        cookie + 1
+    ))?;
+
+    let enforced: bool = tx.query_row("PRAGMA foreign_keys;", [], |row| row.get(0))?;
+    let mut touched: Vec<&str> = Vec::new();
+    for (table, _, columns) in &retyped {
+        let mut rows = 0;
+        for (column, honest) in columns {
+            if *honest != "TEXT" {
+                continue;
+            }
+            let numbers = format!("typeof(\"{column}\") IN ('integer', 'real')");
+            if enforced {
+                let found: bool = tx.query_row(
+                    &format!("SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE {numbers});"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                if found {
+                    return Err(rusqlite_migration::HookError::Hook(format!(
+                        "{table}.{column} holds numbers to rewrite as text; run this migration \
+                         with foreign keys off (storage::migrations::migrate_to_latest)"
+                    )));
+                }
+                continue;
+            }
+            rows += tx.execute(
+                &format!(
+                    "UPDATE \"{table}\" SET \"{column}\" = CAST(\"{column}\" AS TEXT) \
+                     WHERE {numbers};"
+                ),
+                [],
+            )?;
+        }
+        if rows > 0 {
+            touched.push(table);
+        }
+    }
+    for table in &touched {
+        tx.execute_batch(&format!("REINDEX \"{table}\";"))?;
+    }
+    let violations: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_foreign_key_check;",
+        [],
+        |row| row.get(0),
+    )?;
+    if violations > 0 {
+        return Err(rusqlite_migration::HookError::Hook(format!(
+            "re-typing STRING/TIMESTAMP columns left {violations} foreign-key violations"
+        )));
+    }
+    if !touched.is_empty() {
+        tracing::info!(tables = ?touched, "Rewrote numeric values in re-typed TEXT columns");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod migrations_test {
     use super::*;
     use rusqlite::Connection;
+
+    /// One foreign key: child table, child columns, parent table, and whether
+    /// the child side is indexed.
+    type ForeignKeyIndexing = (String, Vec<String>, String, bool);
+
+    /// The foreign keys of the latest schema, each as `(child table, child
+    /// columns, parent table)`, with whether some index of the child leads
+    /// with exactly those columns (in any order) or they are the child's
+    /// rowid. SQLite's `.lint fkey-indexes`, as code.
+    fn foreign_keys_and_their_indexes(
+        conn: &Connection,
+    ) -> anyhow::Result<Vec<ForeignKeyIndexing>> {
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name;",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::new();
+        for table in tables {
+            // Leading columns of every index on the table.
+            let mut indexes: Vec<Vec<String>> = Vec::new();
+            let index_names: Vec<String> = conn
+                .prepare(&format!("PRAGMA index_list(\"{table}\");"))?
+                .query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?;
+            for index in index_names {
+                let columns: Vec<String> = conn
+                    .prepare(&format!("PRAGMA index_info(\"{index}\");"))?
+                    .query_map([], |row| row.get::<_, Option<String>>(2))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|column| column.unwrap_or_default())
+                    .collect();
+                indexes.push(columns);
+            }
+            // An `INTEGER PRIMARY KEY` is the rowid: indexed by definition.
+            let rowid: Option<String> = {
+                let pk: Vec<(String, String)> = conn
+                    .prepare(&format!("PRAGMA table_info(\"{table}\");"))?
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|(_, _, pk)| *pk > 0)
+                    .map(|(name, decl, _)| (name, decl))
+                    .collect();
+                match pk.as_slice() {
+                    [(name, decl)] if decl.eq_ignore_ascii_case("INTEGER") => Some(name.clone()),
+                    _ => None,
+                }
+            };
+            let mut keys: std::collections::BTreeMap<i64, (String, Vec<String>)> =
+                std::collections::BTreeMap::new();
+            let rows: Vec<(i64, String, String)> = conn
+                .prepare(&format!("PRAGMA foreign_key_list(\"{table}\");"))?
+                .query_map([], |row| Ok((row.get(0)?, row.get(2)?, row.get(3)?)))?
+                .collect::<Result<_, _>>()?;
+            for (id, parent, from) in rows {
+                keys.entry(id)
+                    .or_insert_with(|| (parent, Vec::new()))
+                    .1
+                    .push(from);
+            }
+            for (parent, columns) in keys.into_values() {
+                let wanted: std::collections::BTreeSet<&String> = columns.iter().collect();
+                let indexed = (columns.len() == 1 && rowid.as_ref() == Some(&columns[0]))
+                    || indexes.iter().any(|index| {
+                        index.len() >= columns.len()
+                            && index[..columns.len()]
+                                .iter()
+                                .collect::<std::collections::BTreeSet<_>>()
+                                == wanted
+                    });
+                out.push((table.clone(), columns, parent, indexed));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The statements a job stop and a job destroy run, each keyed by one
+    /// job: none may scan a whole table. A scan here is paid once per
+    /// stopped or destroyed job, so a cleanup of N jobs costs N scans of
+    /// tables that grow with the cluster (the AWS 10k cleanup drained at
+    /// ~4 jobs a second).
+    #[test]
+    fn job_stop_and_destroy_statements_seek_by_job() -> anyhow::Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        get_migrations().to_latest(&mut conn)?;
+        let statements = [
+            "DELETE FROM allocation WHERE job_config_id IN (SELECT id FROM job_config WHERE job_id = ?1)",
+            "DELETE FROM allocation_health WHERE allocation_id IN (SELECT a.id FROM allocation a \
+             INNER JOIN job_config jc ON jc.id = a.job_config_id WHERE jc.job_id = ?1)",
+            "SELECT allocation.id FROM allocation INNER JOIN task_config \
+             ON task_config.id = allocation.task_config_id WHERE task_config.job_id = ?1",
+            "DELETE FROM task_status WHERE job_id = ?1",
+            "DELETE FROM instance WHERE job_id = ?1",
+            "DELETE FROM reschedule_hold WHERE job_id = ?1",
+            "DELETE FROM gang_wait WHERE job_id = ?1",
+            "DELETE FROM gang_member WHERE job_id = ?1",
+            "UPDATE snapshot SET state = 'deleting' WHERE job_id = ?1 AND state IN ('capturing', 'local', 'published')",
+            "DELETE FROM snapshot WHERE job_id = ?1 AND state IN ('failed', 'lost')",
+            "DELETE FROM snapshot_alias WHERE job_id = ?1",
+            "DELETE FROM rollout_event WHERE job_id = ?1",
+            "DELETE FROM rollout WHERE job_id = ?1",
+            "DELETE FROM task_scale WHERE job_id = ?1",
+            "DELETE FROM task_resize WHERE job_id = ?1",
+            "DELETE FROM scale_history WHERE job_id = ?1",
+            "DELETE FROM scaling_pause WHERE job_id = ?1",
+            "SELECT COUNT(*) FROM job_config_submission WHERE submission_hash = ?1",
+            "SELECT DISTINCT jcs.submission_hash FROM job_config_submission jcs \
+             INNER JOIN job_config jc ON jc.id = jcs.job_config_id WHERE jc.job_id = ?1",
+            "DELETE FROM job WHERE name = ?1 AND status = 'stopped'",
+        ];
+        let mut scans = Vec::new();
+        for sql in statements {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                .query_map(["x"], |row| row.get(3))?
+                .collect::<Result<_, _>>()?;
+            for line in plan {
+                if line.starts_with("SCAN ") {
+                    scans.push(format!("{sql}\n    {line}"));
+                }
+            }
+        }
+        assert!(
+            scans.is_empty(),
+            "full scans on the stop/destroy path:\n{}",
+            scans.join("\n")
+        );
+        Ok(())
+    }
+
+    /// Migrated with foreign keys enforced, the re-type refuses to rewrite
+    /// keys it cannot check rather than commit them unchecked.
+    #[test]
+    fn retype_refuses_to_rewrite_numbers_with_foreign_keys_enforced() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_version(&mut conn, TEXT_RETYPE_SCHEMA_VERSION as usize - 1)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) VALUES ('99', '99', 'running', 1);",
+            [],
+        )?;
+        let err = migrations
+            .to_latest(&mut conn)
+            .expect_err("numbers to rewrite with enforcement on");
+        assert!(format!("{err}").contains("foreign keys off"), "{err}");
+        // Nothing committed: still the old schema, still the number.
+        let version: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+        assert_eq!(version, TEXT_RETYPE_SCHEMA_VERSION - 1);
+        migrate_to_latest(&migrations, &mut conn)?;
+        let stored: String = conn.query_row("SELECT typeof(id) FROM job;", [], |row| row.get(0))?;
+        assert_eq!(stored, "text");
+        Ok(())
+    }
+
+    #[test]
+    fn text_retype_schema_version_matches_the_migration() -> anyhow::Result<()> {
+        let declared = |version: u32| -> anyhow::Result<i64> {
+            let mut conn = Connection::open_in_memory()?;
+            get_migrations().to_version(&mut conn, version as usize)?;
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema AS m, pragma_table_info(m.name) AS col \
+                 WHERE m.type = 'table' AND upper(col.type) IN ('STRING', 'TIMESTAMP');",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        assert!(declared(TEXT_RETYPE_SCHEMA_VERSION - 1)? > 0);
+        assert_eq!(declared(TEXT_RETYPE_SCHEMA_VERSION)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn retyping_rewrites_only_column_types() {
+        let (sql, changed) = retyped_table_sql(
+            "job",
+            "CREATE TABLE job (id STRING PRIMARY KEY, name STRING NOT NULL, \
+             note STRING DEFAULT 'STRING', \"timestamp\" TIMESTAMP, created_at TIMESTAMP NOT NULL, \
+             blob TEXT CHECK (blob != 'TIMESTAMP'), parent STRING REFERENCES other(id), \
+             PRIMARY KEY (id), FOREIGN KEY(parent) REFERENCES other(id))",
+        );
+        assert_eq!(
+            sql,
+            "CREATE TABLE job (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+             note TEXT DEFAULT 'STRING', \"timestamp\" TEXT, created_at INTEGER NOT NULL, \
+             blob TEXT CHECK (blob != 'TIMESTAMP'), parent TEXT REFERENCES other(id), \
+             PRIMARY KEY (id), FOREIGN KEY(parent) REFERENCES other(id))"
+        );
+        let names: Vec<&str> = changed.iter().map(|(column, _)| column.as_str()).collect();
+        assert_eq!(
+            names,
+            ["id", "name", "note", "timestamp", "created_at", "parent"]
+        );
+        assert_eq!(
+            retyped_table_sql("t", "CREATE TABLE t (a TEXT, b INTEGER)").1,
+            []
+        );
+    }
+
+    /// The re-type leaves no column declared `STRING` or `TIMESTAMP`, turns
+    /// numbers a NUMERIC column had stored back into the text they were
+    /// written as, keeps `job.created_at` a number, and leaves the database
+    /// consistent: integrity, foreign keys, and index lookups by text.
+    #[test]
+    fn string_and_timestamp_columns_become_text_with_their_values() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_version(&mut conn, TEXT_RETYPE_SCHEMA_VERSION as usize - 1)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.execute_batch(
+            "INSERT INTO job (id, name, status, created_at) VALUES ('2026', '2026', 'running', 1735689600);
+             INSERT INTO job_config (id, name, type, meta, version, created_at, job_id)
+                 VALUES ('42', '2026', 'service', '{}', 1, '2026-01-01T00:00:00Z', '2026');",
+        )?;
+        let stored: String = conn.query_row("SELECT typeof(id) FROM job;", [], |row| row.get(0))?;
+        assert_eq!(
+            stored, "integer",
+            "NUMERIC affinity stored the id as a number"
+        );
+
+        migrate_to_latest(&migrations, &mut conn)?;
+        let enforced: bool = conn.query_row("PRAGMA foreign_keys;", [], |row| row.get(0))?;
+        assert!(enforced, "enforcement is back on after the re-type");
+        let declared: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema, pragma_table_info(sqlite_schema.name) AS col \
+             WHERE sqlite_schema.type = 'table' AND upper(col.type) IN ('STRING', 'TIMESTAMP');",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(declared, 0, "a table still declares STRING or TIMESTAMP");
+        let types: (String, String, String, String) = conn.query_row(
+            "SELECT typeof(job.id), typeof(job.name), typeof(job.created_at), \
+             typeof(job_config.job_id) FROM job JOIN job_config ON job_config.job_id = job.id;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            types,
+            (
+                "text".into(),
+                "text".into(),
+                "integer".into(),
+                "text".into()
+            )
+        );
+        let by_name: String =
+            conn.query_row("SELECT id FROM job WHERE name = ?1;", ["2026"], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            by_name, "2026",
+            "a text lookup finds the rewritten row through its index"
+        );
+        let integrity: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
+        assert_eq!(integrity, "ok");
+        let fk_violations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(fk_violations, 0);
+        // A new write of digits stays text.
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) VALUES ('7', '7', 'running', 1);",
+            [],
+        )?;
+        let stored: String =
+            conn.query_row("SELECT typeof(id) FROM job WHERE name = '7';", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(stored, "text");
+        Ok(())
+    }
+
+    /// Every foreign key is indexed on its child side. Deleting a parent row
+    /// makes SQLite find the children (to cascade, or to refuse); without an
+    /// index on the child's columns that is a scan of the whole child table
+    /// per deleted parent, so destroying N jobs cost N full scans of
+    /// `task_status`, and every allocation deleted by a job stop scanned the
+    /// tables that reference allocations.
+    #[test]
+    fn every_foreign_key_is_indexed_on_its_child_side() -> anyhow::Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        get_migrations().to_latest(&mut conn)?;
+        let unindexed: Vec<String> = foreign_keys_and_their_indexes(&conn)?
+            .into_iter()
+            .filter(|(_, _, _, indexed)| !indexed)
+            .map(|(table, columns, parent, _)| {
+                format!("{table}({}) -> {parent}", columns.join(", "))
+            })
+            .collect();
+        assert!(
+            unindexed.is_empty(),
+            "foreign keys with no index on the child side (each parent delete scans the \
+             child table):\n{}",
+            unindexed.join("\n")
+        );
+        Ok(())
+    }
 
     /// `KEYRING_SCHEMA_VERSION` is what the raft upgrade gate compares peer
     /// versions against, so it must be exactly the migration that creates

@@ -147,6 +147,24 @@ neighbor rules a cause in or out, and which knob to turn), see
   with load means contention is being absorbed instead of rejected. Read it
   next to `legion_plan_apply_total{outcome="rejected"}`. The healthy shape is
   `revalidated` climbing while `rejected` stays flat.
+- **`legion_scheduler_plan_node_rows_total{source}`** (counter): node rows
+  the apply walk read inside the plan's transaction, by where the node it
+  then used came from. The row is always read (it is the apply-time fence
+  against cordons and capacity changes). `read_model` means its bytes were
+  exactly what the read model's node serializes to, so the walk used that
+  node without parsing the row; `parsed` means they differed (a cordon or
+  re-registration whose projection had not landed yet, or a row written in
+  another JSON form) and the row was parsed. A steady `parsed` share on a
+  quiet cluster means rows and read model disagree in form, and every
+  apply is paying the parse.
+- **`legion_scheduler_keyed_binds_total{query}`** (counter): keyed
+  placements bound to an instance, by the query that found it. `target` is
+  a ratification's named instance (a point lookup); `unbound` searched only
+  live instances with no current allocation (cost follows the instances
+  waiting for a placement); `live` searched every live instance of the
+  task, because `unbound` found none (a rollout rebinding instances bound
+  under an older config). A steady `live` rate outside rollouts means binds
+  are paying for the whole live population.
 - **`legion_eval_conflict_requeues_total`** (counter): evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
@@ -1280,6 +1298,11 @@ these in order. Each step rules out a layer.
    with spawn delay in the milliseconds, means blocking handlers have
    saturated the runtime. To tell saturation from load, check whether a
    trivial endpoint (`HealthCheck`) shows the same latency as an expensive one.
+   Every replicated store write waits for its quorum commit off the async
+   worker (`block_in_place`), whichever handler made it, so a burst of
+   `StopJob`, `DestroyJob` or KV writes no longer pins workers for the
+   round trip. A runtime that still saturates is held by something other
+   than a store write: a registry fetch, a slow read, a lock.
 2. **Is the group commit batching?** Compare the `le="1"` bucket of
    `legion_store_coalesce_batch_size` with its `_count`. If nearly all
    batches are size 1, batching never engages, and the path pays a full

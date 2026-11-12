@@ -4551,7 +4551,13 @@ impl PersistenceDriver for MultiRaftDriver {
                         group.wire_name()
                     )
                 })?;
-            reply_rx.recv().map_err(|_| {
+            // The quorum wait is the long part of every replicated write.
+            // A gRPC handler that calls the store inline would otherwise
+            // park its tokio worker for the whole round trip, and a burst of
+            // StopJob/DestroyJob/KV writes then starves eval resumes and
+            // heartbeats. Stepping off the runtime here covers every
+            // mutating handler at once, not one wrapper per handler.
+            crate::storage::block_off_runtime(|| reply_rx.recv()).map_err(|_| {
                 anyhow!("raft replication pipeline dropped op {op} without replying")
             })?
         };

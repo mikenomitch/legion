@@ -5,6 +5,9 @@
 number first". Scope is deliberately the JSON columns only; `STRING` and
 `TIMESTAMP` columns share the defect and are recorded as an explicit
 non-goal (see below and the calls doc).
+**Follow-up (2026-11-12):** the `STRING`/`TIMESTAMP` half shipped as a
+later migration (`TEXT_RETYPE_SCHEMA_VERSION`; calls #7–#9, public doc
+[state-store.md](../../docs/state-store.md#column-affinity)).
 
 > **Judgement calls:** [`../calls/jsonb-text-affinity-plan_calls.md`](../calls/jsonb-text-affinity-plan_calls.md)
 
