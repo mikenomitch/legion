@@ -11305,8 +11305,8 @@ message HeartbeatReply {
   // worker can dial, so a worker is not tied to the one manager its join
   // token names.
   //
-  // Populated from the replicated raft membership (voters and learners): each
-  // entry is a member's raft `advertiseAddr`, which is the same listener as
+  // Populated from the replicated raft membership (voters and learners): by
+  // default each entry is a member's raft `advertiseAddr`, which is the same listener as
   // its Manager API (the raft transport shares it), prefixed with the scheme
   // of the answering manager's own API listener (`https` when `server.tls`
   // is enabled, `http` otherwise). The
