@@ -93,8 +93,8 @@ there:
   [adaptive cadence](docs/heartbeat-cadence-and-scale.md), on by default,
   the manager stretches each worker's full heartbeat as the fleet grows,
   while workers prove they are alive in between with a ping the manager
-  answers from memory, so a 20,000-node fleet still notices a dead machine
-  in 10 seconds. A circuit breaker refuses to mark half the fleet lost in
+  answers from memory, so a 20,000-node fleet notices a dead machine in 25
+  seconds instead of 105. A circuit breaker refuses to mark half the fleet lost in
   one tick.
 
 Legion can boot a sandbox in 0.2 seconds and sustain ~150 boots per second

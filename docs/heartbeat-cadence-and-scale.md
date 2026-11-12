@@ -30,8 +30,10 @@ that only proves the worker is alive. A cluster that sets nothing runs
 [adaptive cadence](#adaptive-cadence): up to 2,500 nodes every check-in is a
 full heartbeat every 2 seconds, as in earlier releases. Past that, the
 manager slows the full heartbeat down and workers ping in between, so the
-2-second interval and the 10-second window hold up to 25,000 nodes. Past
-25,000 the manager slows the pings too and widens each window to match.
+2-second interval and the 10-second window hold up to 10,000 nodes. Past
+10,000 the manager slows the pings too, more gently than the full
+heartbeat, and widens each window to match: 25 seconds at 20,000 nodes,
+where it would be 105 without pings.
 
 The window is per node. It is stored on the node's own record instead of
 being one global constant. A cluster with a 2-second latency-sensitive pool
@@ -95,16 +97,16 @@ the reply but the two intervals. So the manager serves two intervals:
 
 | Interval | Sized from | What it governs |
 | --- | --- | --- |
-| **Liveness** | `pingRatePerSecond` (25,000/s) | How often a worker checks in, with a ping or a full heartbeat. Every lost window derives from it. |
+| **Liveness** | `pingRatePerSecond` (10,000/s) | How often a worker checks in, with a ping or a full heartbeat. Every lost window derives from it. |
 | **Sync** | `targetRatePerSecond` (2,500/s) | How often a worker sends a full heartbeat. Never shorter than the liveness interval. |
 
 The worker runs one loop on the liveness interval. On each tick it sends a
 full heartbeat if one is due (the sync interval has passed since the last
 one) and a ping otherwise. While the two intervals are equal, which at the
 defaults is every fleet up to 2,500 nodes, every tick is a full heartbeat
-and the worker sends no pings at all. At 20,000 nodes it beats every 2
-seconds and sends one full heartbeat about every 21 seconds, so nine beats in
-ten are pings.
+and the worker sends no pings at all. At 10,000 nodes it beats every 2
+seconds and sends one full heartbeat about every 8 seconds, so three beats in
+four are pings.
 
 A worker still sends a full heartbeat early when it has something the
 manager is waiting on (a stream message that stopped an allocation, a
@@ -134,14 +136,29 @@ is detected as it would be without pings.
 ### What a ping costs
 
 Measured with `tests/integration/heartbeat_ping_measure.rs` (release build,
-one process on a 4-vCPU container, an idle node, so the full heartbeat is
-the cheapest one there is):
+one process on a 4-vCPU container, a node with no allocations, so the full
+heartbeat is the cheapest one there is):
 
-PING_COST_TABLE
+| Per call | Ping | Full heartbeat |
+| --- | ---: | ---: |
+| Manager handler CPU, in-process | 0.6 µs | 45 µs |
+| Client + server CPU over loopback gRPC | 116 µs | 199 µs |
+| Calls/s over loopback, 16 callers | 19,500 | 13,100 |
 
-The default `pingRatePerSecond` is ten times `targetRatePerSecond`, which
-the measurement leaves room for: at its ceiling the ping load costs about
-PING_BUDGET_SENTENCE
+The handler is about 70 times cheaper, but transport is most of what a ping
+costs: HTTP/2 framing, protobuf on both ends, and the credential check are
+paid per call whatever the call does. End to end a ping is about 1.7 times
+cheaper than the cheapest full heartbeat, and the gap grows with what the
+node runs, since a full heartbeat's handler work does and a ping's does not.
+Roughly half of the loopback figure is the server's, so a manager spends on
+the order of 60 µs per ping against about 100 µs per idle full heartbeat,
+which matches the rig's ~10,000 full heartbeats a second for a little over a
+core.
+
+That is why the default `pingRatePerSecond` is four times
+`targetRatePerSecond` and not more. At its ceiling (5,000 pings a second) the
+ping load is about a third of a core, spread over the managers the workers
+dial, against about an eighth of a core for the full-heartbeat ceiling.
 
 To turn pings off, set `pingRatePerSecond` equal to `targetRatePerSecond`.
 The two intervals are then always equal, every beat is a full heartbeat,
@@ -271,17 +288,17 @@ reported per node pool:
 
 ```console
 $ legion node cadence
-Fleet             20000 nodes
+Fleet             10000 nodes
 Liveness interval 2s  (adaptive)
-Full heartbeat    every 21s  (pings in between)
+Full heartbeat    every 8s  (pings in between)
 Lost window       10s  (5 missed beats)
 Freshness         0.99  (false loss below 0.20)
-Sustainable       ~19800 nodes at 2s on this control plane
-Suggested         heartbeatSeconds: 3   (lost window 15s)
+Sustainable       ~9900 nodes at 2s on this control plane
+Suggested         heartbeatSeconds: 5   (lost window 25s)
 
 POOL                   NODES  INTERVAL  LOST WINDOW  FRESHNESS
-batch                   4000       60s         300s       1.00
-default                15960        2s          10s       0.99
+batch                   2000       60s         300s       1.00
+default                 7960        2s          10s       0.99
 latency                   40        2s          10s       0.30
 ```
 
@@ -325,7 +342,7 @@ When one pool is behind a fleet that is otherwise keeping up, the warning
 names it:
 
 ```
-WARN nodes=20000 served_interval_secs=2 freshness=0.3 lost_window_secs=10
+WARN nodes=10000 served_interval_secs=2 freshness=0.3 lost_window_secs=10
   Heartbeat cadence is not being sustained: 30% of pool latency (40 nodes, 2s
   interval) checked in within one interval (99% of the whole fleet). ...
 ```
@@ -365,7 +382,7 @@ heartbeat = {
   # Aggregate liveness-PING rate the liveness interval, and so every lost
   # window, is sized for. Set it equal to targetRatePerSecond to turn pings
   # off.
-  pingRatePerSecond = 25000,
+  pingRatePerSecond = 10000,
 
   # Floor and ceiling on both served intervals. The floor is never crossed
   # however small the fleet; the ceiling is where the manager gives up
@@ -387,7 +404,7 @@ heartbeat = {
 ### What the defaults serve
 
 ```
-liveness = ceil(2 x N / 25000) = ceil(N / 12500) seconds, snapped to the ladder
+liveness = ceil(2 x N / 10000) = ceil(N / 5000)  seconds, snapped to the ladder
 sync     = ceil(2 x N / 2500)  = ceil(N / 1250)  seconds, snapped, never below liveness
 ```
 
@@ -397,21 +414,23 @@ sync     = ceil(2 x N / 2500)  = ceil(N / 1250)  seconds, snapped, never below l
 | 2,500 | 2s | 10s | 2s | 1,250 | 0 |
 | 5,000 | 2s | 10s | 5s | 1,000 | 1,500 |
 | 10,000 | 2s | 10s | 8s | 1,250 | 3,750 |
-| 20,000 | 2s | 10s | 21s | ~950 | ~9,050 |
-| 50,000 | 5s | 25s | 55s | ~910 | ~9,090 |
+| 20,000 | 5s | 25s | 21s | ~950 | ~3,050 |
+| 50,000 | 13s | 65s | 55s | ~910 | ~2,940 |
 
 Every fleet up to 2,500 nodes keeps the 2-second full heartbeat of earlier
-releases and sends no pings. Every fleet up to 25,000 nodes keeps the
+releases and sends no pings. Every fleet up to 10,000 nodes keeps the
 10-second lost window. The steady full-heartbeat load never exceeds
 `targetRatePerSecond / headroom` (1,250 a second), about an eighth of what
 took a core at 20k nodes, and the ping load never exceeds
-`pingRatePerSecond / headroom` (12,500 a second).
+`pingRatePerSecond / headroom` (5,000 a second). Without pings the 20,000
+and 50,000 rows would have 105-second and 275-second windows.
 
 The default rates are deliberately below what a current control plane can
 answer. They buy back CPU for scheduling rather than chasing the ceiling.
 Raise `targetRatePerSecond` if you want reports (health, failures) to reach
 the manager sooner on a large fleet and have measured the headroom; raise
-`pingRatePerSecond` for faster detection past 25,000 nodes. Lower both if
+`pingRatePerSecond` for faster detection past 10,000 nodes (25,000 keeps the
+10-second window to 25,000 nodes, at up to 12,500 pings a second). Lower both if
 your control plane is smaller than a 4-vCPU leader, or if it still commits
 heartbeats to raft (see [the measured table](#the-measured-table)): a ping
 from a cluster in that fallback commits like a heartbeat, so set the two
@@ -617,10 +636,10 @@ liveness reports zero. See [Metrics](metrics.md).
 - **`missedBeatsBeforeLost` is cluster-wide**, not per worker type. Per-type
   cadence already gives per-type windows, and a second per-type setting would
   make the window arithmetic hard to follow.
-- **Detection slows past 25,000 nodes.** Pings keep the 10-second window up
-  to 25,000 nodes at the default `pingRatePerSecond`. Past that the liveness
-  interval backs off too: 50,000 nodes get a 5-second interval and a
-  25-second window. With pings turned off (the two rates equal), detection
+- **Detection slows past 10,000 nodes.** Pings keep the 10-second window up
+  to 10,000 nodes at the default `pingRatePerSecond`. Past that the liveness
+  interval backs off too, a rung or two behind the full heartbeat: 20,000
+  nodes get a 25-second window, 50,000 nodes 65 seconds. With pings turned off (the two rates equal), detection
   slows with the full heartbeat: 105 seconds at 20,000 nodes and the default
   `targetRatePerSecond`. Nomad pays 100–200s at 5k nodes.
 - **A ping is still an RPC.** It skips the manager's handler work, not the
@@ -639,7 +658,7 @@ liveness reports zero. See [Metrics](metrics.md).
   roughly 30 seconds of retries before it fences. The full heartbeat reaches
   that rung past about 42,500 nodes at the default `targetRatePerSecond`, and
   past about 68,750 the fleet sends full heartbeats faster than that rate.
-  The liveness interval reaches it only past about 425,000 nodes at the
+  The liveness interval reaches it only past about 170,000 nodes at the
   default `pingRatePerSecond`, and that is when the manager reports it is at
   the ceiling (`at_max_interval`). Raising `maxInterval` to 90s or more is accepted, with a startup
   warning, because a jittered interval that long lets a healthy worker

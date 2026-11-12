@@ -800,7 +800,7 @@ impl From<EncryptionConfigFull> for EncryptionConfig {
 ///
 /// Omitting the whole block gives adaptive cadence at the defaults: the
 /// liveness interval (which sets each node's lost window) is sized from
-/// `pingRatePerSecond` (25,000/s), so fleets up to 25,000 nodes keep the 2s
+/// `pingRatePerSecond` (10,000/s), so fleets up to 10,000 nodes keep the 2s
 /// floor and the historical 10s lost window; the full heartbeat is sized
 /// from `targetRatePerSecond` (2,500/s) and backs off past 2,500 nodes, with
 /// workers proving liveness by ping in between. `adaptive: false` restores
@@ -834,8 +834,8 @@ pub struct HeartbeatConfig {
     /// the full heartbeat: `headroom x nodes / rate`, on the same ladder.
     /// Each node's lost window is derived from the liveness interval, and
     /// between full heartbeats a worker proves it is alive with a ping the
-    /// manager answers from memory. Default 25,000, which keeps every fleet
-    /// up to 25,000 nodes on the 2s floor and its 10s lost window. Setting it
+    /// manager answers from memory. Default 10,000, which keeps every fleet
+    /// up to 10,000 nodes on the 2s floor and its 10s lost window. Setting it
     /// equal to `targetRatePerSecond` turns pings off (the two intervals are
     /// then always equal).
     #[serde(default)]

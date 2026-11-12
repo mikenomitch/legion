@@ -358,7 +358,8 @@ heartbeat RPCs per second. Adaptive cadence, on by default, sizes the
 full-heartbeat interval from fleet size so the steady load stays at or below
 1,250 a second (8s at 10k nodes), while workers prove liveness every 2s in
 between with a ping the manager answers from memory, so the 10s lost window
-holds up to 25,000 nodes. `heartbeat.adaptive = false` turns it off.
+holds up to 10,000 nodes (25s at 20,000, against 105s without pings).
+`heartbeat.adaptive = false` turns it off.
 
 - `heartbeatSeconds` in a worker-type config sets that worker type's
   cadence. Workers receive it at pre-registration. The lost-node window

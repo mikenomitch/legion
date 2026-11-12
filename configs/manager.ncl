@@ -351,7 +351,7 @@
   },
   # Heartbeat cadence and the lost-node window derived from it
   # (docs/heartbeat-cadence-and-scale.md). Omitting the whole block gives
-  # adaptive cadence: every fleet up to 25,000 nodes keeps the 2s liveness
+  # adaptive cadence: every fleet up to 10,000 nodes keeps the 2s liveness
   # interval and the historical 10s lost window (5 x 2s), and past 2,500
   # nodes the full heartbeat backs off along the ladder while workers prove
   # liveness in between with a ping the manager answers from memory.
@@ -379,7 +379,7 @@
     # same way. Every node's lost window comes from the liveness interval,
     # so this is the detection knob. Set it equal to targetRatePerSecond to
     # turn pings off (every beat is then a full heartbeat).
-    pingRatePerSecond = 25000,
+    pingRatePerSecond = 10000,
 
     # Floor and ceiling on a served interval. Past the ceiling the manager
     # stops backing off and warns instead: the answer is more control plane.

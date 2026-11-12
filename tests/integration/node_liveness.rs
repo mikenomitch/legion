@@ -747,6 +747,8 @@ fn register_in(store: &Store, id: &str, pool: &str, heartbeat_seconds: u64) -> R
     Ok(())
 }
 
+// The tests read the gRPC status, so it is returned as is.
+#[allow(clippy::result_large_err)]
 fn ping(
     rt: &tokio::runtime::Runtime,
     svc: &legion::manager::server::ManagerDaemonService,

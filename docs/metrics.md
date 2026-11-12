@@ -673,8 +673,8 @@ Reported on the status-lane leader (the manager that owns node liveness), and
 - **`legion_heartbeat_served_interval_seconds`** (gauge): the liveness
   interval this manager is telling workers to use: how often each proves it
   is alive. Every lost window derives from it. Adaptive cadence is on by
-  default, so this grows with fleet size, but slowly: 2 up to 25,000 nodes,
-  5 at 50,000, at the default `pingRatePerSecond`. With
+  default, so this grows with fleet size, but slowly: 2 up to 10,000 nodes,
+  5 at 20,000, at the default `pingRatePerSecond`. With
   `heartbeat.adaptive = false` it reads `minInterval`. Record it with every
   benchmark result.
 - **`legion_heartbeat_sync_interval_seconds`** (gauge): the full-heartbeat

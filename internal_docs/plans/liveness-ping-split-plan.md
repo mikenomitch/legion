@@ -9,16 +9,19 @@ page is [`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cadence-and
 **Deliberately not done, and open:**
 
 - **The AWS rig rerun.** The ping and heartbeat costs are measured in-process
-  and over loopback (§9); the fleet-level claim (a 20,000-node fleet keeps a
-  10s window at a fraction of a leader core) is argued from those numbers, not
-  measured on the rig. Filed under Verify in `internal_docs/TODO.md`.
+  and over loopback (§9); the fleet-level claim (a 20,000-node fleet gets a
+  25s window for about a third of a core of pings at most) is argued from
+  those numbers, not measured on the rig. Filed under Verify in `internal_docs/TODO.md`.
 - **Raising `targetRatePerSecond`.** The TODO item this plan closes proposed
   rerunning 20k nodes at 5,000 and 10,000 and raising the default. With
   detection split off, the full-heartbeat rate governs report latency and
   load, not detection, so the default stays at 2,500 until that rerun says
   otherwise ([calls #4](../calls/liveness-ping-split-plan_calls.md)).
 - **Pings as `StreamWork` frames.** A ping is a unary RPC and pays per-call
-  transport cost; a frame on the already-open stream would not
+  transport cost, which the measurement shows is most of its cost (116 µs
+  client and server on loopback, against a 0.6 µs handler); a frame on the
+  already-open stream would not. It is what would let the default ping rate
+  rise far enough for a 10s window at 20,000 nodes
   ([calls #1](../calls/liveness-ping-split-plan_calls.md)).
 
 Follows [`heartbeat-cadence-at-scale-plan.md`](heartbeat-cadence-at-scale-plan.md)
@@ -99,8 +102,8 @@ same lost-node behavior, only sooner.
 ### User scenarios
 
 1. A 20,000-node fleet at the defaults loses a machine. Before: up to 105s
-   to mark it lost. After: up to 10s, while the leader answers no more full
-   heartbeats than before.
+   to mark it lost. After: up to 25s, while the leader answers no more full
+   heartbeats than before. A 10,000-node fleet goes from 40s to 10s.
 2. A cluster has 4,000 nodes in a `batch` pool beating every 60s and 40 in a
    `latency` pool where 28 are falling behind. Before: the freshness ratio
    reads 0.99 (or, worse, the batch pool reads as late). After: `legion node
@@ -150,7 +153,7 @@ same lost-node behavior, only sooner.
 
 | Interval | Sized from | Governs |
 | --- | --- | --- |
-| Liveness | `heartbeat.pingRatePerSecond` (new, default 25,000) | How often a worker checks in. Every lost window. |
+| Liveness | `heartbeat.pingRatePerSecond` (new, default 10,000) | How often a worker checks in. Every lost window. |
 | Sync | `heartbeat.targetRatePerSecond` (unchanged, 2,500) | How often a worker sends a full heartbeat. Raised to the liveness interval when below it. |
 
 Same formula, same ladder, same `minInterval`/`maxInterval`, two rates:
@@ -168,7 +171,7 @@ about the liveness interval (it is the one the self-fence cares about).
 ```nickel
 heartbeat = {
   targetRatePerSecond = 2500,    # full heartbeats
-  pingRatePerSecond   = 25000,   # liveness; set equal to the above to turn pings off
+  pingRatePerSecond   = 10000,   # liveness; set equal to the above to turn pings off
 }
 ```
 
@@ -189,9 +192,9 @@ message PingReply {
 
 ```console
 $ legion node cadence
-Fleet             20000 nodes
+Fleet             10000 nodes
 Liveness interval 2s  (adaptive)
-Full heartbeat    every 21s  (pings in between)
+Full heartbeat    every 8s  (pings in between)
 Lost window       10s  (5 missed beats)
 ...
 POOL                   NODES  INTERVAL  LOST WINDOW  FRESHNESS
@@ -268,7 +271,10 @@ All three shipped together.
   refused without a node token and with a foreign one.
 - Measurement (`tests/integration/heartbeat_ping_measure.rs`, ignored): ping
   vs. an idle node's full heartbeat, handler-only and over loopback gRPC.
-  Numbers are in the public page.
+  Release build, 4 vCPU: handler 0.6 µs per ping against 45 µs per idle full
+  heartbeat; over loopback, 116 µs against 199 µs client and server. The
+  public page carries the table, and the default ping rate follows from the
+  loopback figure (calls #4).
 
 ## 10. Rollout
 
@@ -289,10 +295,10 @@ heartbeats; the public page says to set the two rates equal there.
 ## 11. Acceptance criteria
 
 - At the defaults, the served liveness interval stays 2s and the lost window
-  10s up to 25,000 nodes (unit test), while the sync interval follows the old
-  table.
-- A worker served 2s/21s sends nine pings to one full heartbeat, and either
-  resets its self-fence clock.
+  10s up to 10,000 nodes, and 20,000 nodes get 25s (unit test), while the sync
+  interval follows the old table.
+- A worker served 2s/21s sends nine pings to one full heartbeat (2s/8s: three
+  to one), and either resets its self-fence clock.
 - `legion node cadence` and `GetHeartbeatCadence` show per-pool rows;
   `legion_heartbeat_pool_freshness_ratio{pool}` is published for pools of 20+.
 - Under 2,500 nodes, `legion_pings_total` stays zero.

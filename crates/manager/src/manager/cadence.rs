@@ -820,10 +820,9 @@ mod cadence_test {
             (2_500, 2, 10, 2),
             (5_000, 2, 10, 5),
             (10_000, 2, 10, 8),
-            (20_000, 2, 10, 21),
-            (25_000, 2, 10, 21),
-            (25_001, 3, 15, 21),
-            (50_000, 5, 25, 55),
+            (10_001, 3, 15, 13),
+            (20_000, 5, 25, 21),
+            (50_000, 13, 65, 55),
         ];
         for (nodes, liveness, window, sync) in table {
             let ping = served(nodes, DEF_HEARTBEAT_PING_RATE_PER_SECOND);

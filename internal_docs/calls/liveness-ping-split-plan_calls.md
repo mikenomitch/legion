@@ -25,11 +25,12 @@ rpc Ping (PingRequest) returns (PingReply);
   stack, and credential check. It is the cheapest transport there is.
 - **HTTP/2 PING / TCP keepalive.** Free, and already on.
 
-**Trade-off.** A ping pays the per-call transport cost a frame would not: on
-loopback, client and server CPU per ping is several times the handler cost
-(see the measurement in the public page). That caps how far
-`pingRatePerSecond` can go before the transport, not the handler, is the
-ceiling.
+**Trade-off.** A ping pays the per-call transport cost a frame would not, and
+measured, that is most of it: 116 µs of client and server CPU per ping over
+loopback against a 0.6 µs handler (an idle full heartbeat: 199 µs and 45 µs).
+End to end a ping is only ~1.7x cheaper than the cheapest full heartbeat. That
+is what holds the default `pingRatePerSecond` at 10,000 (#4), and so a 25s
+window at 20,000 nodes instead of 10s.
 
 **Why.** *Simplicity, then correctness.* A stream frame ties liveness to the
 stream being up: a worker whose stream is down (a manager restart, a network
@@ -85,34 +86,40 @@ ping loop vouching for it. And one loop owns the self-fence clock, the
 re-phase, and the failover bookkeeping, so there is no race between two
 writers.
 
-## 4. `targetRatePerSecond` stays at 2,500; detection moves to a new `pingRatePerSecond` (25,000)
+## 4. `targetRatePerSecond` stays at 2,500; detection moves to a new `pingRatePerSecond` (10,000)
 
 **Call.** The TODO this closes proposed rerunning 20k nodes at 5,000 and
 10,000 and raising the default `targetRatePerSecond`. Instead the default
-stays, and detection is sized from a separate rate defaulting to ten times it.
+stays, and detection is sized from a separate rate defaulting to four times it.
 
 ```nickel
 heartbeat = {
   targetRatePerSecond = 2500,    # full heartbeats: unchanged
-  pingRatePerSecond   = 25000,   # liveness: new
+  pingRatePerSecond   = 10000,   # liveness: new
 }
 ```
 
 **Alternatives.** Raise `targetRatePerSecond` to 5,000 (20k nodes: 8s, 40s
-window) or 10,000 (5s, 25s window), as the TODO planned.
+window) or 10,000 (5s, 25s window), as the TODO planned. And, for the ping
+rate itself, 25,000 (ten times the target): the first default written, which
+keeps the 10s window to 25,000 nodes.
 
-**Trade-off.** Reports (health transitions, failures) still reach the manager
-at the 21s sync interval on a 20k-node fleet; raising the target would have
-brought that to 8s or 5s. And the 25,000 default rests on the in-process and
-loopback measurement, not on a rig run.
+**Trade-off.** At 10,000 a 20k-node fleet gets a 25s window, not 10s. Reports
+(health transitions, failures) still reach the manager at the 21s sync
+interval there; raising the target would have brought that to 8s or 5s. And
+the default rests on the in-process and loopback measurement, not a rig run.
 
-**Why.** *Performance where it is cheap.* Raising the full-heartbeat rate buys
-detection at full-heartbeat prices — 10,000 full heartbeats a second was a
-core of the rig's leader. Pings buy a 10s window at 20k nodes for a fraction of
-that. Report latency is the "start reports wait for a heartbeat" TODO's
-problem, and it is better solved by moving reports onto the stream than by
-heartbeating harder. The rig rerun is still owed and is filed under Verify; it
-can raise either rate.
+**Why.** *Performance, by measurement.* Raising the full-heartbeat rate buys
+detection at full-heartbeat prices: ~100 µs of manager CPU per idle beat
+(10,000 a second was a core of the rig's leader), more on a busy node. A ping
+costs about 60 µs of it, nearly all transport, so 25,000 (up to 12,500 pings a
+second, ~0.75 core) would have spent six times the CPU the full-heartbeat
+default deliberately budgets. 10,000 caps pings at 5,000 a second, about a
+third of a core spread over the managers workers dial, and still cuts the
+20k-node window from 105s to 25s and holds 10s to 10,000 nodes. Report latency
+is the "start reports wait for a heartbeat" TODO's problem, better solved by
+moving reports onto the stream than by heartbeating harder. The rig rerun is
+filed under Verify; it, or pings on `StreamWork` (#1), can raise either rate.
 
 ## 5. A ping recovers a lost node and asks for a full heartbeat (`sync_now`)
 

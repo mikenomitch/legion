@@ -21484,7 +21484,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    * Present whenever the manager runs adaptive cadence, which is the default
    * (`heartbeat.adaptive`, `heartbeat.pingRatePerSecond` in the manager
    * config). The manager derives it from fleet size alone; at the defaults
-   * every fleet up to 25,000 nodes is served the 2s floor. Absent when the
+   * every fleet up to 10,000 nodes is served the 2s floor. Absent when the
    * operator turned adaptive cadence off (`heartbeat.adaptive = false`) or
    * the manager predates it, and absent means "use your worker-type
    * `heartbeatSeconds`".

@@ -233,8 +233,8 @@ Validation rules (enforced at `job validate` and submit time):
 
   Adaptive cadence (on by default) is not covered by that startup check.
   The window follows the liveness interval, which liveness pings keep at 2s
-  up to 25,000 nodes at the default `pingRatePerSecond`; a fleet past about
-  162,500 nodes is served 21s, so its window (105s) passes the 90s fence. A
+  up to 10,000 nodes at the default `pingRatePerSecond`; a fleet past about
+  65,000 nodes is served 21s, so its window (105s) passes the 90s fence. A
   healthy worker still beats every 21s, and a ping resets the fence clock
   as a full heartbeat does, so it only fences after about 70 seconds of
   failed retries. With pings off (`pingRatePerSecond` equal to
