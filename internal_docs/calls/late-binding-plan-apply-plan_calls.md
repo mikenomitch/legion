@@ -78,6 +78,22 @@ because the planner filtered that zone out of its list. Such a plan is
 rejected and replanned, which is what every `distinct` race cost before.
 Pinned by `plan_walk_enforces_distinct_across_fallbacks`.
 
+The uncontended cost, from `cargo bench --bench scheduler_bench` on
+`main` (`11fc82cb`) and on the change, same 4-core box:
+
+| Cell | `main` | Change | Criterion verdict |
+| --- | ---: | ---: | --- |
+| `distinct_fallback_lists/spread/nodes_1000_replicas_10` | 45.67 ms | 44.49 ms | no change (p = 0.29) |
+| `distinct_fallback_lists/spread/nodes_1000_replicas_100` | 258.77 ms | 277.58 ms | +7.3% (p < 0.05) |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_1000` | 172.34 ms | 173.11 ms | no change (p = 0.82) |
+
+The 100-replica cell pays for lists of up to 8 candidates per replica
+instead of 1: a wider epoch sample over their union, and a larger
+submission. That is the same per-placement cost every non-`distinct` plan
+already pays for its fallback lists. Accepted: it buys the fallback that
+turns a race into a rank instead of a full replan, which costs far more
+than 7% of an uncontended plan.
+
 **Trade-off.** A count-N service on one pool is one coupled component
 and gains nothing from this plan until Phase 4 (striped disjoint lists,
 partial commit). Accepted: those plans are exactly where intra-plan
