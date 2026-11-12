@@ -96,7 +96,10 @@ fn current_alloc(store: &Store, id: &str) -> R<Option<i64>> {
 }
 
 /// Fail the instance's current allocation with a budget of one move per
-/// hour, as a worker failure report does.
+/// hour, as a worker failure report does. The move delay is long enough
+/// that the hold is still in force when `replace` lifts it: holds are kept
+/// in whole seconds, so a one-second delay expires as soon as the clock
+/// ticks over between the failure and the start.
 fn fail(store: &Store, id: &str) -> R<MoveVerdict> {
     let allocation_id = current_alloc(store, id)?.context("the instance is placed")?;
     let removal = store
@@ -106,7 +109,7 @@ fn fail(store: &Store, id: &str) -> R<MoveVerdict> {
             None,
             FailedMove {
                 policy: MovePolicy {
-                    move_delay_ms: 1_000,
+                    move_delay_ms: 60_000,
                     move_count: Some(1),
                     move_period_ms: 3_600_000,
                 },
