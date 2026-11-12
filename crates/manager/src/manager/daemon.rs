@@ -1860,16 +1860,30 @@ pub struct IdleSweepConfig {
 /// One indexed read when nothing is resuming.
 const MAKE_ROOM_EVERY: Duration = Duration::from_secs(5);
 
-/// The interval this manager currently serves, and the ladder state behind it.
+/// The intervals this manager currently serves, and the ladder state behind
+/// each.
 ///
-/// With adaptive cadence off (`heartbeat.adaptive = false`) the served
-/// interval is just the floor — the manager tells workers nothing and they
-/// keep their worker-type `heartbeatSeconds`. The value is still tracked
-/// because the freshness ratio and the sizing arithmetic need an interval to
-/// be "on time" relative to.
-struct ServedCadence {
+/// `ladder` is the LIVENESS interval (sized from `pingRatePerSecond`), which
+/// every lost window derives from; `sync_ladder` is the full-heartbeat
+/// interval (sized from `targetRatePerSecond`), served no lower than the
+/// liveness interval. With adaptive cadence off (`heartbeat.adaptive =
+/// false`) both are just the floor — the manager tells workers nothing and
+/// they keep their worker-type `heartbeatSeconds`. The value is still tracked
+/// because the sizing arithmetic needs an interval to be "on time" relative
+/// to.
+struct CadenceControl {
     ladder: crate::manager::cadence::LadderState,
+    sync_ladder: crate::manager::cadence::LadderState,
     at_max: bool,
+}
+
+impl CadenceControl {
+    fn served(&self) -> crate::manager::cadence::ServedCadence {
+        crate::manager::cadence::ServedCadence {
+            liveness: self.ladder.served,
+            sync: self.sync_ladder.served.max(self.ladder.served),
+        }
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -1885,8 +1899,9 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     let liveness_settings = config.liveness.settings();
     store.liveness().configure(liveness_settings.clone());
 
-    let mut cadence_state = ServedCadence {
+    let mut cadence_state = CadenceControl {
         ladder: LadderState::new(min_interval),
+        sync_ladder: LadderState::new(min_interval),
         at_max: false,
     };
     // Freshness warning debounce: 3 consecutive sub-threshold ticks, then at
@@ -1970,15 +1985,18 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     ..cadence::LossContext::default()
                 },
             );
-            report_liveness_metrics(
-                &store,
+            // The cadence report for this tick, from the intervals served
+            // going into it: what the metrics publish and the warning reads.
+            let report = cadence::cadence_report(
                 &snapshot,
-                &decision,
-                &peer_gap,
-                cadence_state.ladder.served,
+                cadence_state.served(),
                 missed_beats,
-                now,
+                config.heartbeat.headroom,
+                HEARTBEAT_FRESHNESS_MIN_FLEET,
+                adaptive,
+                cadence_state.at_max,
             );
+            report_liveness_metrics(&store, &report, &decision, &peer_gap, now);
             for (reason, count) in &decision.suppressed {
                 match reason {
                     cadence::SuppressionReason::MassDisruption => error!(
@@ -2059,19 +2077,13 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
 
             // Cadence: recompute what to serve, warn when the fleet is not
             // sustaining it, and keep the per-node windows honest.
-            let report = cadence::cadence_report(
-                &snapshot,
-                cadence_state.ladder.served,
-                missed_beats,
-                config.heartbeat.headroom,
-                HEARTBEAT_FRESHNESS_MIN_FLEET,
-                adaptive,
-                cadence_state.at_max,
-            );
             if adaptive {
+                // The liveness interval, sized from the PING rate: it is what
+                // every lost window derives from, so it is the ladder that
+                // widens and narrows windows.
                 let target = cadence::target_interval(
                     snapshot.len(),
-                    config.heartbeat.target_rate_per_second,
+                    config.heartbeat.ping_rate_per_second,
                     config.heartbeat.headroom,
                     min_interval,
                     max_interval,
@@ -2089,7 +2101,7 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                         active_nodes = snapshot.len(),
                         from_seconds = cadence_state.ladder.served.as_secs(),
                         to_seconds = next.served.as_secs(),
-                        "Serving a new heartbeat interval for this fleet size"
+                        "Serving a new liveness interval for this fleet size"
                     );
                     if next.served < cadence_state.ladder.served {
                         narrow_windows_on_confirmation(
@@ -2114,13 +2126,43 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     cadence_state.ladder.served,
                     missed_beats,
                 );
-                // Only a manager running adaptive cadence puts an interval on
+                // The full-heartbeat interval, sized from the TARGET rate on
+                // its own ladder. It moves no window (a missed full heartbeat
+                // is covered by the pings between), so its dwell only keeps
+                // it from flapping.
+                let sync_target = cadence::target_interval(
+                    snapshot.len(),
+                    config.heartbeat.target_rate_per_second,
+                    config.heartbeat.headroom,
+                    min_interval,
+                    max_interval,
+                );
+                let next_sync = cadence::advance_ladder(
+                    &cadence_state.sync_ladder,
+                    sync_target,
+                    check_interval,
+                    min_interval,
+                    max_interval,
+                );
+                if next_sync.served != cadence_state.sync_ladder.served {
+                    info!(
+                        active_nodes = snapshot.len(),
+                        from_seconds = cadence_state.sync_ladder.served.as_secs(),
+                        to_seconds = next_sync.served.as_secs(),
+                        liveness_seconds = cadence_state.ladder.served.as_secs(),
+                        "Serving a new full-heartbeat interval for this fleet size"
+                    );
+                }
+                cadence_state.sync_ladder = next_sync;
+                // Only a manager running adaptive cadence puts intervals on
                 // the reply. With it off (`heartbeat.adaptive = false`),
-                // workers keep their worker-type value and the wire field
-                // stays absent, exactly as before adaptive cadence existed.
+                // workers keep their worker-type value, send a full heartbeat
+                // every beat, and the wire fields stay absent, exactly as
+                // before adaptive cadence existed.
+                let served = cadence_state.served();
                 store
                     .liveness()
-                    .set_served_interval(Some(cadence_state.ladder.served));
+                    .set_served_intervals(Some(served.liveness), Some(served.sync));
             }
             warn_on_stale_cadence(
                 &report,
@@ -2556,6 +2598,7 @@ pub fn liveness_snapshot(
             let window = row.window();
             crate::manager::cadence::NodeLiveness {
                 id: row.id,
+                pool: row.pool,
                 age: now.saturating_duration_since(beat.at),
                 window,
             }
@@ -2587,13 +2630,18 @@ async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
         .inc(&[outcome.metric_label()]);
     telemetry.liveness_digest_nodes.observe(count as f64);
     match &outcome {
-        DigestOutcome::Accepted { served_interval } => {
+        DigestOutcome::Accepted {
+            served_interval,
+            served_sync_interval,
+        } => {
             store.liveness().set_digest_fallback(false);
             // Serve the leader's cadence to the workers talking to THIS
             // manager. Without the relay, adaptive cadence only reached the
             // leader's own workers, and a fleet spread over three managers
             // kept two thirds of its beats at the floor.
-            store.liveness().set_served_interval(*served_interval);
+            store
+                .liveness()
+                .set_served_intervals(*served_interval, *served_sync_interval);
             debug!(
                 nodes = count,
                 "Reported node liveness to the status-lane leader"
@@ -2625,11 +2673,9 @@ async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
 /// Publish the liveness and cadence gauges for one tick.
 fn report_liveness_metrics(
     store: &Store,
-    snapshot: &[crate::manager::cadence::NodeLiveness],
+    report: &crate::manager::cadence::CadenceReport,
     decision: &crate::manager::cadence::LossDecision,
     peer_gap: &crate::storage::liveness::PeerGap,
-    served_interval: Duration,
-    missed_beats: u32,
     now: std::time::Instant,
 ) {
     let telemetry = crate::manager::telemetry::metrics();
@@ -2641,23 +2687,35 @@ fn report_liveness_metrics(
         .set(store.liveness().responsible_for_at(now).as_secs() as i64);
     telemetry
         .heartbeat_served_interval_seconds
-        .set(served_interval.as_secs() as i64);
+        .set(report.served_interval.as_secs() as i64);
+    telemetry
+        .heartbeat_sync_interval_seconds
+        .set(report.sync_interval.as_secs() as i64);
     telemetry
         .heartbeat_lost_window_seconds
-        .set((served_interval * missed_beats).as_secs() as i64);
-    let ratio = crate::manager::cadence::freshness_ratio(
-        snapshot,
-        served_interval,
-        HEARTBEAT_FRESHNESS_MIN_FLEET,
-    );
+        .set(report.lost_window.as_secs() as i64);
+    let ratio = report.freshness_ratio;
     telemetry
         .heartbeat_freshness_ratio
         .set(ratio.unwrap_or(0.0));
     telemetry.heartbeat_sustainable_nodes.set(
         ratio
-            .map(|ratio| (snapshot.len() as f64 * ratio).round() as i64)
+            .map(|ratio| (report.active_nodes as f64 * ratio).round() as i64)
             .unwrap_or(0),
     );
+    // Per pool: only measurable pools get a series, so a pool too small to
+    // mean anything never reads as 0 ("nobody is on time").
+    let pool_series: Vec<(Vec<String>, f64)> = report
+        .pools
+        .iter()
+        .filter_map(|pool| {
+            pool.freshness_ratio
+                .map(|ratio| (vec![pool.pool.clone()], ratio))
+        })
+        .collect();
+    telemetry
+        .heartbeat_pool_freshness_ratio
+        .replace_all(&pool_series);
     for (reason, count) in &decision.suppressed {
         telemetry
             .liveness_loss_suppressed_total
@@ -2688,7 +2746,10 @@ fn warn_on_stale_cadence(
     last_warn: &mut Option<std::time::Instant>,
     active_nodes: usize,
 ) {
-    let Some(ratio) = report.freshness_ratio else {
+    // The lowest measurable ratio, fleet-wide or in any one pool: a pool
+    // falling behind inside a fleet that is keeping up is exactly what the
+    // blended figure hides.
+    let Some(ratio) = report.lowest_freshness() else {
         *low_ticks = 0;
         return;
     };

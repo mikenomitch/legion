@@ -378,6 +378,12 @@ instrument.
   manager. Refreshed on the same tick.
 - **`legion_heartbeats_total`** (counter): worker heartbeat RPCs accepted
   (past authentication) by the manager.
+- **`legion_pings_total`** (counter): worker liveness pings accepted by the
+  manager. Workers ping between full heartbeats once the full heartbeat backs
+  off past the liveness interval, so this stays at zero on a fleet small
+  enough that every beat is a full heartbeat (under 2,500 nodes at the
+  defaults). See
+  [Pings and heartbeats](heartbeat-cadence-and-scale.md#pings-and-heartbeats).
 - **`legion_nodes_marked_lost_total`** (counter): nodes marked lost after
   missed heartbeats. This tells you nodes went away, while
   `legion_nodes{status="lost"}` tells you nodes are currently away.
@@ -653,19 +659,30 @@ Reported on the status-lane leader (the manager that owns node liveness), and
 [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md).
 
 - **`legion_heartbeat_freshness_ratio`** (gauge): alert on this one. It is the
-  fraction of active nodes that checked in within one interval. `1.0` means
-  the fleet is keeping up. False node loss begins at
-  `served_interval / lost_window`, which is `0.20` at the defaults. Reads
-  `0` on a fleet under 20 nodes, where the ratio is noise. Check
-  `legion_heartbeat_sustainable_nodes` to see whether it is measurable at all.
-- **`legion_heartbeat_served_interval_seconds`** (gauge): the interval this
-  manager is telling workers to use. Adaptive cadence is on by default, so
-  this grows with fleet size: 2 up to 2,500 nodes, 21 at 20,000 at the
-  default `targetRatePerSecond`. With `heartbeat.adaptive = false` it reads
-  `minInterval`, the interval freshness is measured against. Record it with
-  every benchmark result.
+  fraction of active nodes that checked in (with a ping or a full heartbeat)
+  within 1.2x their own liveness interval. `1.0` means the fleet is keeping
+  up. False node loss begins at `served_interval / lost_window`, which is
+  `0.20` at the defaults. Reads `0` on a fleet under 20 nodes, where the
+  ratio is noise. Check `legion_heartbeat_sustainable_nodes` to see whether
+  it is measurable at all.
+- **`legion_heartbeat_pool_freshness_ratio{pool}`** (gauge): the same ratio
+  for one node pool. A fleet-wide ratio blends pools, so a small pool falling
+  behind can hide inside a large one keeping up; alert on the minimum over
+  pools as well. Only pools with 20 or more active nodes have a series, and a
+  pool's series disappears when it drops under that.
+- **`legion_heartbeat_served_interval_seconds`** (gauge): the liveness
+  interval this manager is telling workers to use: how often each proves it
+  is alive. Every lost window derives from it. Adaptive cadence is on by
+  default, so this grows with fleet size, but slowly: 2 up to 25,000 nodes,
+  5 at 50,000, at the default `pingRatePerSecond`. With
+  `heartbeat.adaptive = false` it reads `minInterval`. Record it with every
+  benchmark result.
+- **`legion_heartbeat_sync_interval_seconds`** (gauge): the full-heartbeat
+  interval. 2 up to 2,500 nodes, 21 at 20,000, at the default
+  `targetRatePerSecond`. Workers ping between full heartbeats whenever this
+  is above the liveness interval. Reads `0` with adaptive cadence off.
 - **`legion_heartbeat_lost_window_seconds`** (gauge): the window derived
-  from it (`missedBeatsBeforeLost x interval`).
+  from the liveness interval (`missedBeatsBeforeLost x interval`).
 - **`legion_heartbeat_sustainable_nodes`** (gauge): nodes this control plane
   is observed to sustain at the current interval. While the fleet is keeping
   up, this is a lower bound. An unsaturated control plane never reveals its
@@ -1035,6 +1052,10 @@ of worker readiness. Default: disabled.
   A rising `error` rate is the worker-side view of manager unreachability.
   `unauthenticated` means the node credential was revoked or rotated and the
   worker is re-registering.
+- **`legion_worker_pings_total{outcome}`** (counter): liveness pings sent
+  between full heartbeats, by the same outcomes. Zero while the manager
+  serves equal liveness and sync intervals. Either a ping or a full
+  heartbeat resets the stateful self-fence clock.
 - **`legion_net_conns_total{direction,protocol,verdict}`** (counter):
   connections the node datapath decided ([network handlers](network-handlers.md)),
   by direction (`egress` | `ingress`), protocol (`tcp` | `http` | `dns`), and

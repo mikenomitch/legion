@@ -45,10 +45,28 @@ pub const FRESHNESS_SLACK: f64 = 1.2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeLiveness {
     pub id: String,
-    /// How long since this manager last observed a beat from the node.
+    /// The node's pool, for the per-pool freshness breakdown.
+    pub pool: String,
+    /// How long since this manager last observed a beat (a ping or a full
+    /// heartbeat) from the node.
     pub age: Duration,
     /// This node's own lost window: `missedBeatsBeforeLost x its interval`.
     pub window: Duration,
+}
+
+impl NodeLiveness {
+    /// The liveness interval this node is on, recovered from its window:
+    /// the window is `missed x interval`, so this is exact for every window
+    /// the manager wrote and rounds a hand-made one down to whole seconds.
+    pub fn interval(&self, missed_beats: u32) -> Duration {
+        let seconds = self.window.as_secs() / u64::from(missed_beats.max(1));
+        Duration::from_secs(seconds.max(1))
+    }
+
+    /// Whether the node beat within `FRESHNESS_SLACK` of its OWN interval.
+    fn is_fresh(&self, missed_beats: u32) -> bool {
+        self.age <= self.interval(missed_beats).mul_f64(FRESHNESS_SLACK)
+    }
 }
 
 /// Why a would-be loss was not acted on. Every suppression is counted
@@ -179,23 +197,78 @@ pub fn decide_lost_nodes(nodes: &[NodeLiveness], ctx: &LossContext) -> LossDecis
     }
 }
 
-/// Fraction of the active fleet that checked in within one interval.
+/// Fraction of `nodes` that checked in within one interval, each node judged
+/// against its OWN liveness interval.
 ///
-/// `None` below `min_fleet` nodes: the ratio is pure noise on a handful of
-/// nodes and would fire the warning on a laptop cluster. `1.0` means everyone
-/// is on time; false loss begins at `served_interval / lost_window`, which at
-/// the defaults is `2s / 10s = 0.20`.
-pub fn freshness_ratio(
-    nodes: &[NodeLiveness],
-    served_interval: Duration,
-    min_fleet: usize,
-) -> Option<f64> {
-    if nodes.len() < min_fleet {
+/// Per node, not against one served interval: a 60s batch pool beside a 2s
+/// latency pool is on time at 50s of silence, and judging it against 2s
+/// would read a healthy fleet as falling behind. `None` below `min_fleet`
+/// nodes: the ratio is pure noise on a handful of nodes and would fire the
+/// warning on a laptop cluster. `1.0` means everyone is on time; false loss
+/// begins at `interval / lost_window`, which at the defaults is
+/// `2s / 10s = 0.20`.
+pub fn freshness_ratio(nodes: &[NodeLiveness], missed_beats: u32, min_fleet: usize) -> Option<f64> {
+    if nodes.is_empty() || nodes.len() < min_fleet {
         return None;
     }
-    let cutoff = served_interval.mul_f64(FRESHNESS_SLACK);
-    let fresh = nodes.iter().filter(|node| node.age <= cutoff).count();
+    let fresh = nodes
+        .iter()
+        .filter(|node| node.is_fresh(missed_beats))
+        .count();
     Some(fresh as f64 / nodes.len() as f64)
+}
+
+/// One pool's line in the cadence report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolCadence {
+    pub pool: String,
+    pub active_nodes: usize,
+    /// The median liveness interval of the pool's nodes.
+    pub interval: Duration,
+    pub lost_window: Duration,
+    /// `None` on a pool below `min_fleet` nodes.
+    pub freshness_ratio: Option<f64>,
+}
+
+/// The cadence report broken down by pool, sorted by pool name.
+///
+/// A fleet-wide ratio blends populations: a 5,000-node batch pool keeping up
+/// can hide a 200-node latency pool that is falling behind, because the
+/// blended figure stays above the warning line while every node in the small
+/// pool is a few beats from being marked lost.
+pub fn pool_cadence(
+    nodes: &[NodeLiveness],
+    missed_beats: u32,
+    min_fleet: usize,
+) -> Vec<PoolCadence> {
+    let mut by_pool: std::collections::BTreeMap<&str, Vec<&NodeLiveness>> =
+        std::collections::BTreeMap::new();
+    for node in nodes {
+        by_pool.entry(node.pool.as_str()).or_default().push(node);
+    }
+    by_pool
+        .into_iter()
+        .map(|(pool, members)| {
+            let mut intervals: Vec<Duration> = members
+                .iter()
+                .map(|node| node.interval(missed_beats))
+                .collect();
+            intervals.sort();
+            let interval = intervals[intervals.len() / 2];
+            let fresh = members
+                .iter()
+                .filter(|node| node.is_fresh(missed_beats))
+                .count();
+            PoolCadence {
+                pool: pool.to_string(),
+                active_nodes: members.len(),
+                interval,
+                lost_window: lost_window_for(interval, missed_beats),
+                freshness_ratio: (members.len() >= min_fleet)
+                    .then(|| fresh as f64 / members.len() as f64),
+            }
+        })
+        .collect()
 }
 
 /// The fleet's cadence report — what `legion node cadence`, the
@@ -203,7 +276,12 @@ pub fn freshness_ratio(
 #[derive(Debug, Clone, PartialEq)]
 pub struct CadenceReport {
     pub active_nodes: usize,
+    /// The liveness interval: how often a node proves it is alive, with a
+    /// ping or a full heartbeat. Lost windows derive from it.
     pub served_interval: Duration,
+    /// The full-heartbeat interval. Never below `served_interval`; equal to
+    /// it means workers send no pings.
+    pub sync_interval: Duration,
     pub lost_window: Duration,
     pub missed_beats_before_lost: u32,
     /// `None` on a fleet too small to measure (below `min_fleet`).
@@ -221,12 +299,59 @@ pub struct CadenceReport {
     /// `maxInterval` — backing off is not infinite, and past this point the
     /// answer is more control plane.
     pub at_max_interval: bool,
+    /// The same report per pool.
+    pub pools: Vec<PoolCadence>,
+}
+
+impl CadenceReport {
+    /// The measurable pool furthest behind, when it is behind the fleet as a
+    /// whole: what the warning names, because a struggling small pool is
+    /// exactly what the fleet-wide ratio hides.
+    pub fn worst_pool(&self) -> Option<&PoolCadence> {
+        self.pools
+            .iter()
+            .filter(|pool| pool.freshness_ratio.is_some())
+            .min_by(|a, b| {
+                a.freshness_ratio
+                    .partial_cmp(&b.freshness_ratio)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// The lowest measurable ratio, fleet-wide or in any one pool — what the
+    /// warning compares with its threshold.
+    pub fn lowest_freshness(&self) -> Option<f64> {
+        let pool_low = self.worst_pool().and_then(|pool| pool.freshness_ratio);
+        match (self.freshness_ratio, pool_low) {
+            (Some(fleet), Some(pool)) => Some(fleet.min(pool)),
+            (fleet, pool) => fleet.or(pool),
+        }
+    }
+}
+
+/// The served intervals a report describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServedCadence {
+    /// The liveness interval.
+    pub liveness: Duration,
+    /// The full-heartbeat interval; raised to `liveness` when below it.
+    pub sync: Duration,
+}
+
+impl ServedCadence {
+    /// One interval for both: every beat a full heartbeat, no pings.
+    pub fn uniform(interval: Duration) -> Self {
+        Self {
+            liveness: interval,
+            sync: interval,
+        }
+    }
 }
 
 /// Build the cadence report from one liveness snapshot.
 pub fn cadence_report(
     nodes: &[NodeLiveness],
-    served_interval: Duration,
+    served: ServedCadence,
     missed_beats: u32,
     headroom: f64,
     min_fleet: usize,
@@ -234,15 +359,27 @@ pub fn cadence_report(
     at_max_interval: bool,
 ) -> CadenceReport {
     let active = nodes.len();
-    let ratio = freshness_ratio(nodes, served_interval, min_fleet);
+    let served_interval = served.liveness;
+    let ratio = freshness_ratio(nodes, missed_beats, min_fleet);
     let interval_secs = served_interval.as_secs_f64().max(f64::EPSILON);
-    let observed_rate =
-        ratio.map(|ratio| (active as f64 * ratio / interval_secs).max(f64::EPSILON));
+    // Beats per second the fleet is observed to sustain: every on-time node
+    // contributes one beat per its OWN interval, so a slow pool is not
+    // credited with the fast pool's rate (for a uniform fleet this is
+    // `active x ratio / interval`, as it always was).
+    let observed_rate = ratio.map(|_| {
+        nodes
+            .iter()
+            .filter(|node| node.is_fresh(missed_beats))
+            .map(|node| 1.0 / node.interval(missed_beats).as_secs_f64())
+            .sum::<f64>()
+            .max(f64::EPSILON)
+    });
     let sustainable = observed_rate.map(|rate| (rate * interval_secs).round() as u64);
     let suggested = observed_rate.map(|rate| (headroom * active as f64 / rate).ceil() as u64);
     CadenceReport {
         active_nodes: active,
         served_interval,
+        sync_interval: served.sync.max(served_interval),
         lost_window: served_interval * missed_beats,
         missed_beats_before_lost: missed_beats,
         freshness_ratio: ratio,
@@ -251,6 +388,7 @@ pub fn cadence_report(
         suggested_heartbeat_seconds: suggested,
         adaptive_enabled,
         at_max_interval,
+        pools: pool_cadence(nodes, missed_beats, min_fleet),
     }
 }
 
@@ -353,7 +491,7 @@ pub fn advance_ladder(
 /// The remedy is COMPUTED, not generic: an operator staring at a collapsing
 /// cluster is handed the number to set, not the formula to evaluate.
 pub fn freshness_warning(report: &CadenceReport) -> String {
-    let ratio = report.freshness_ratio.unwrap_or(1.0);
+    let fleet_ratio = report.freshness_ratio.unwrap_or(1.0);
     let false_loss_at =
         report.served_interval.as_secs_f64() / report.lost_window.as_secs_f64().max(f64::EPSILON);
     let remedy = match report.suggested_heartbeat_seconds {
@@ -363,11 +501,34 @@ pub fn freshness_warning(report: &CadenceReport) -> String {
         ),
         None => "Add control-plane capacity.".to_string(),
     };
+    // A pool well behind a fleet that looks fine is the case the fleet-wide
+    // ratio hides, so the warning says which pool when it is the pool that
+    // tripped it.
+    let behind = match report.worst_pool() {
+        Some(pool)
+            if pool.freshness_ratio.is_some_and(|ratio| {
+                ratio < fleet_ratio && ratio < HEARTBEAT_FRESHNESS_WARN_RATIO
+            }) =>
+        {
+            format!(
+                "{percent:.0}% of pool {name} ({nodes} nodes, {interval}s interval) checked in \
+                 within one interval ({fleet:.0}% of the whole fleet)",
+                percent = pool.freshness_ratio.unwrap_or(0.0) * 100.0,
+                name = pool.pool,
+                nodes = pool.active_nodes,
+                interval = pool.interval.as_secs(),
+                fleet = fleet_ratio * 100.0,
+            )
+        }
+        _ => format!(
+            "{percent:.0}% of this fleet checked in within one interval",
+            percent = fleet_ratio * 100.0
+        ),
+    };
     format!(
-        "Heartbeat cadence is not being sustained: {percent:.0}% of this fleet checked in \
-         within one interval. Healthy nodes will be marked lost when freshness falls below \
-         {false_loss_at:.2}. {remedy} See docs/heartbeat-cadence-and-scale.md",
-        percent = ratio * 100.0,
+        "Heartbeat cadence is not being sustained: {behind}. Healthy nodes will be marked \
+         lost when freshness falls below {false_loss_at:.2}. {remedy} See \
+         docs/heartbeat-cadence-and-scale.md"
     )
 }
 
@@ -381,8 +542,13 @@ mod cadence_test {
     use super::*;
 
     fn node(id: &str, age_secs: u64, window_secs: u64) -> NodeLiveness {
+        pooled("default", id, age_secs, window_secs)
+    }
+
+    fn pooled(pool: &str, id: &str, age_secs: u64, window_secs: u64) -> NodeLiveness {
         NodeLiveness {
             id: id.to_string(),
+            pool: pool.to_string(),
             age: Duration::from_secs(age_secs),
             window: Duration::from_secs(window_secs),
         }
@@ -490,7 +656,7 @@ mod cadence_test {
         for node in nodes.iter_mut().take(78) {
             node.age = Duration::from_secs(9);
         }
-        let ratio = freshness_ratio(&nodes, Duration::from_secs(2), 20).expect("measurable");
+        let ratio = freshness_ratio(&nodes, 5, 20).expect("measurable");
         assert!((ratio - 0.22).abs() < 1e-9, "ratio was {ratio}");
     }
 
@@ -499,7 +665,84 @@ mod cadence_test {
         let nodes: Vec<NodeLiveness> = (0..19)
             .map(|index| node(&format!("n-{index}"), 1, 10))
             .collect();
-        assert!(freshness_ratio(&nodes, Duration::from_secs(2), 20).is_none());
+        assert!(freshness_ratio(&nodes, 5, 20).is_none());
+    }
+
+    #[test]
+    fn a_slow_pool_is_judged_against_its_own_interval_test() {
+        // 50 nodes on a 2s cadence (10s window), 50 on a 60s batch cadence
+        // (300s window), the batch nodes 40s into their interval. Judged
+        // against one 2s served interval, half the fleet read as late; judged
+        // against each node's own interval, everyone is on time.
+        let mut nodes: Vec<NodeLiveness> = (0..50)
+            .map(|index| pooled("fast", &format!("f-{index}"), 1, 10))
+            .collect();
+        nodes.extend((0..50).map(|index| pooled("batch", &format!("b-{index}"), 40, 300)));
+        assert_eq!(freshness_ratio(&nodes, 5, 20), Some(1.0));
+        let report = cadence_report(
+            &nodes,
+            ServedCadence::uniform(Duration::from_secs(2)),
+            5,
+            2.0,
+            20,
+            true,
+            false,
+        );
+        let pools: Vec<(&str, u64, u64)> = report
+            .pools
+            .iter()
+            .map(|pool| {
+                (
+                    pool.pool.as_str(),
+                    pool.interval.as_secs(),
+                    pool.lost_window.as_secs(),
+                )
+            })
+            .collect();
+        assert_eq!(pools, vec![("batch", 60, 300), ("fast", 2, 10)]);
+        // The observed rate credits each pool with its own cadence:
+        // 50 / 2s + 50 / 60s.
+        let rate = report.observed_rate.expect("measurable");
+        assert!((rate - (25.0 + 50.0 / 60.0)).abs() < 1e-9, "{rate}");
+    }
+
+    #[test]
+    fn a_struggling_pool_shows_through_a_healthy_fleet_test() {
+        // A 1,000-node batch pool keeping up and a 40-node latency pool where
+        // 30 nodes are late: the blend reads 97% and would never warn.
+        let mut nodes: Vec<NodeLiveness> = (0..1000)
+            .map(|index| pooled("batch", &format!("b-{index}"), 1, 10))
+            .collect();
+        nodes.extend((0..40).map(|index| {
+            let age = if index < 30 { 7 } else { 1 };
+            pooled("latency", &format!("l-{index}"), age, 10)
+        }));
+        let report = cadence_report(
+            &nodes,
+            ServedCadence::uniform(Duration::from_secs(2)),
+            5,
+            2.0,
+            20,
+            true,
+            false,
+        );
+        let fleet = report.freshness_ratio.expect("measurable");
+        assert!(fleet > 0.95, "{fleet}");
+        let worst = report.worst_pool().expect("a measurable pool");
+        assert_eq!(worst.pool, "latency");
+        assert_eq!(worst.freshness_ratio, Some(0.25));
+        assert_eq!(report.lowest_freshness(), Some(0.25));
+        let warning = freshness_warning(&report);
+        assert!(warning.contains("pool latency"), "{warning}");
+        assert!(warning.contains("25%"), "{warning}");
+
+        // A pool under the floor is reported but never measured.
+        let small: Vec<NodeLiveness> = (0..5)
+            .map(|index| pooled("tiny", &format!("t-{index}"), 9, 10))
+            .collect();
+        let pools = pool_cadence(&small, 5, 20);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].freshness_ratio, None);
     }
 
     #[test]
@@ -555,6 +798,51 @@ mod cadence_test {
             );
             // Steady-state load never exceeds rate / headroom.
             assert!(nodes as f64 / served.as_secs_f64() <= rate / headroom);
+        }
+    }
+
+    #[test]
+    fn default_ping_rate_keeps_detection_fast_while_sync_backs_off_test() {
+        // The "What the defaults serve" table in
+        // docs/heartbeat-cadence-and-scale.md: the lost window follows the
+        // liveness interval (sized from the ping rate), the full heartbeat
+        // follows the sync interval (sized from the target rate).
+        let headroom = DEF_HEARTBEAT_HEADROOM;
+        let min = Duration::from_secs(DEF_HEARTBEAT_MIN_INTERVAL_SEC);
+        let max = Duration::from_secs(DEF_HEARTBEAT_MAX_INTERVAL_SEC);
+        let missed = DEF_MISSED_BEATS_BEFORE_LOST;
+        let served = |nodes: usize, rate: f64| {
+            ladder_rung(target_interval(nodes, rate, headroom, min, max), min, max)
+        };
+        // (nodes, liveness interval, lost window, sync interval)
+        let table = [
+            (1_000, 2, 10, 2),
+            (2_500, 2, 10, 2),
+            (5_000, 2, 10, 5),
+            (10_000, 2, 10, 8),
+            (20_000, 2, 10, 21),
+            (25_000, 2, 10, 21),
+            (25_001, 3, 15, 21),
+            (50_000, 5, 25, 55),
+        ];
+        for (nodes, liveness, window, sync) in table {
+            let ping = served(nodes, DEF_HEARTBEAT_PING_RATE_PER_SECOND);
+            let full = served(nodes, DEF_HEARTBEAT_TARGET_RATE_PER_SECOND).max(ping);
+            assert_eq!(ping, Duration::from_secs(liveness), "{nodes} nodes");
+            assert_eq!(
+                lost_window_for(ping, missed),
+                Duration::from_secs(window),
+                "{nodes} nodes"
+            );
+            assert_eq!(full, Duration::from_secs(sync), "{nodes} nodes");
+            // Neither load exceeds its budget at steady state.
+            assert!(
+                nodes as f64 / ping.as_secs_f64() <= DEF_HEARTBEAT_PING_RATE_PER_SECOND / headroom
+            );
+            assert!(
+                nodes as f64 / full.as_secs_f64()
+                    <= DEF_HEARTBEAT_TARGET_RATE_PER_SECOND / headroom
+            );
         }
     }
 
@@ -631,7 +919,15 @@ mod cadence_test {
                 node(&format!("n-{index}"), if late { 9 } else { 1 }, 10)
             })
             .collect();
-        let report = cadence_report(&nodes, Duration::from_secs(2), 5, 2.0, 20, false, false);
+        let report = cadence_report(
+            &nodes,
+            ServedCadence::uniform(Duration::from_secs(2)),
+            5,
+            2.0,
+            20,
+            false,
+            false,
+        );
         assert_eq!(report.lost_window, Duration::from_secs(10));
         let ratio = report.freshness_ratio.expect("measurable");
         assert!((ratio - 0.22).abs() < 1e-9);

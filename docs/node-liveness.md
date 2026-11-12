@@ -27,7 +27,10 @@ Three facts live in three places:
 | **Last heartbeat time** | The status-lane leader's memory | Every beat, with no commit and no fsync |
 
 Only the last row changes often. It is also the only one the manager derives
-instead of the worker reporting it.
+instead of the worker reporting it. A beat is a full heartbeat or a liveness
+ping (`Manager.Ping`); both refresh this row the same way, and a ping does
+nothing else. See
+[Pings and heartbeats](heartbeat-cadence-and-scale.md#pings-and-heartbeats).
 
 ### Why a heartbeat timestamp does not earn durability
 
@@ -92,7 +95,8 @@ It never touches `drained`. Each repair is logged, and the first counts in
 `legion_nodes_recovered_total{path="reconcile"}`.
 
 Legion counts recoveries in `legion_nodes_recovered_total{path}`. It uses
-`path="heartbeat"` for the heartbeat path above, `path="reregistration"`
+`path="heartbeat"` for the heartbeat path above (a ping that brings a node
+back counts here too), `path="reregistration"`
 when a worker re-registers instead of resuming, and `path="reconcile"` when
 the reconcile pass below returns a node to the pool.
 `legion_nodes_marked_lost_total` minus this counter is the fleet's net loss. A
@@ -371,10 +375,9 @@ meaning. The checkpoint writes it instead of every beat.
 
 ## Known limitations
 
-- **No per-pool liveness reporting.** `legion_liveness_tracked_nodes` and
-  `legion_heartbeat_freshness_ratio` are fleet-wide, with no pool label. See
-  [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md) for the
-  freshness ratio.
+- **`legion_liveness_tracked_nodes` is fleet-wide**, with no pool label.
+  Per-pool freshness is `legion_heartbeat_pool_freshness_ratio{pool}`; see
+  [Per pool](heartbeat-cadence-and-scale.md#per-pool).
 - **The last-heartbeat timestamp is approximate on any manager that does not
   own liveness**, by up to `checkpointInterval`. The status is exact.
 - **The digest carries ids, not per-node times.** Liveness for those nodes is

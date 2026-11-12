@@ -64,6 +64,7 @@ mod gated_container_default;
 mod gated_sandbox_default;
 mod gitops;
 mod grants;
+mod heartbeat_ping_measure;
 mod heartbeat_scale_benchmark;
 mod index_truncation_spread;
 mod ingress;

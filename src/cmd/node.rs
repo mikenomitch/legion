@@ -396,6 +396,19 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
             "adaptiveEnabled": reply.adaptive_enabled,
             "atMaxInterval": reply.at_max_interval,
             "isLivenessOwner": reply.is_liveness_owner,
+            "syncIntervalSeconds": reply.sync_interval_seconds,
+            "pools": reply
+                .pools
+                .iter()
+                .map(|pool| json!({
+                    "pool": pool.pool,
+                    "activeNodes": pool.active_nodes,
+                    "intervalSeconds": pool.interval_seconds,
+                    "lostWindowSeconds": pool.lost_window_seconds,
+                    "freshnessRatio": pool.freshness_ratio,
+                    "freshnessMeasurable": pool.freshness_measurable,
+                }))
+                .collect::<Vec<_>>(),
         }));
         return Ok(());
     }
@@ -410,7 +423,7 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
 
     println!("Fleet             {} nodes", reply.active_nodes);
     println!(
-        "Served interval   {}s{}",
+        "Liveness interval {}s{}",
         reply.served_interval_seconds,
         if reply.adaptive_enabled {
             if reply.at_max_interval {
@@ -422,6 +435,17 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
             "  (workers use their worker-type heartbeatSeconds)"
         }
     );
+    if reply.sync_interval_seconds > reply.served_interval_seconds {
+        println!(
+            "Full heartbeat    every {}s  (pings in between)",
+            reply.sync_interval_seconds
+        );
+    } else if reply.sync_interval_seconds > 0 {
+        println!(
+            "Full heartbeat    every {}s  (every beat; no pings)",
+            reply.sync_interval_seconds
+        );
+    }
     println!(
         "Lost window       {}s  ({} missed beats)",
         reply.lost_window_seconds, reply.missed_beats_before_lost
@@ -456,6 +480,30 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
             "Freshness         not measurable on a fleet this small (under {} nodes)",
             crate::prelude::HEARTBEAT_FRESHNESS_MIN_FLEET
         );
+    }
+    // Per pool, only when there is more than one: a pool falling behind can
+    // hide inside a fleet-wide ratio that looks fine.
+    if reply.pools.len() > 1 {
+        println!();
+        println!(
+            "{:<20} {:>7} {:>9} {:>12} {:>10}",
+            "POOL", "NODES", "INTERVAL", "LOST WINDOW", "FRESHNESS"
+        );
+        for pool in &reply.pools {
+            let freshness = if pool.freshness_measurable {
+                format!("{:.2}", pool.freshness_ratio)
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{:<20} {:>7} {:>8}s {:>11}s {:>10}",
+                pool.pool,
+                pool.active_nodes,
+                pool.interval_seconds,
+                pool.lost_window_seconds,
+                freshness
+            );
+        }
     }
 
     Ok(())

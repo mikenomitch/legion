@@ -2422,6 +2422,53 @@ pub(crate) fn adopt_served_interval(
     (target != current).then_some(target)
 }
 
+/// The intervals a manager served on a heartbeat or ping reply.
+///
+/// `liveness` is how often to prove the node is alive (a ping or a full
+/// heartbeat), and the node's lost window derives from it; `sync` is how
+/// often to send a FULL heartbeat. Both absent with adaptive cadence off,
+/// which means "beat at your worker-type interval, every beat a full
+/// heartbeat" (docs/heartbeat-cadence-and-scale.md, "Pings and heartbeats").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServedIntervals {
+    pub liveness: Option<u32>,
+    pub sync: Option<u32>,
+}
+
+/// The full-heartbeat interval to keep, given the liveness interval in force
+/// and what the manager served.
+///
+/// Never shorter than `liveness`: a full heartbeat is a beat too, so the
+/// worker never wants one more often than it beats. A reply with no sync
+/// interval (adaptive cadence off, or an older manager) means "every beat is
+/// a full heartbeat", which is the behavior from before pings existed.
+pub(crate) fn sync_interval_for(liveness: Duration, served_sync: Option<u32>) -> Duration {
+    match served_sync {
+        Some(seconds) => liveness.max(Duration::from_secs(
+            u64::from(seconds).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)),
+        )),
+        None => liveness,
+    }
+}
+
+/// Whether the next beat must be a full heartbeat rather than a ping.
+///
+/// Due once the time since the last full heartbeat reaches the sync interval
+/// less half a liveness tick, so the full heartbeat lands on the liveness
+/// tick nearest its due time instead of one tick late. With the two
+/// intervals equal this is every tick, so a worker served no separate sync
+/// interval never pings.
+pub(crate) fn full_heartbeat_due(
+    since_full: Option<Duration>,
+    liveness: Duration,
+    sync: Duration,
+) -> bool {
+    match since_full {
+        None => true,
+        Some(elapsed) => elapsed + liveness / 2 >= sync,
+    }
+}
+
 /// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
 /// does not stay phase-locked forever — 10k workers heartbeating in the
 /// same instant is a self-inflicted thundering herd (heartbeat-scale plan
@@ -2476,29 +2523,49 @@ async fn start_heartbeats(
         .state_store()
         .clone();
     let configured_interval = heartbeat_interval;
+    // How often a FULL heartbeat goes out. Starts equal to the liveness
+    // interval (every beat a full heartbeat, no pings) until a manager serves
+    // a slower one (docs/heartbeat-cadence-and-scale.md, "Pings and
+    // heartbeats").
+    let mut sync_interval = heartbeat_interval;
+    // When the last full heartbeat succeeded; `None` makes the next beat a
+    // full one (startup, and after an early wake or a `sync_now`).
+    let mut last_full: Option<std::time::Instant> = None;
 
     loop {
         let tick_started = std::time::Instant::now();
-        // Stops on this tick drain for one interval of the cadence the node
-        // is actually on — how long every other node needs to learn an
-        // endpoint is gone (docs/graceful-stop.md).
-        task_manager
-            .lock()
-            .expect("task manager")
-            .set_drain_window(heartbeat_interval);
-        let tick_result = heartbeat_tick(
-            &name,
-            &manager_addr,
-            &node_identity,
-            &client,
-            &task_manager,
-            &identity_manager,
-            &credentials,
-            &netd,
-            spec_cache.as_ref(),
-            managers.as_ref(),
-        )
-        .await;
+        let full = full_heartbeat_due(
+            last_full.map(|at| at.elapsed()),
+            heartbeat_interval,
+            sync_interval,
+        );
+        let tick_result = if full {
+            // Stops on this tick drain for one interval of the cadence other
+            // nodes refresh their endpoints on — how long every other node
+            // needs to learn an endpoint is gone (docs/graceful-stop.md). The
+            // endpoint feed rides the full heartbeat, so that is the sync
+            // interval, not the liveness one.
+            task_manager
+                .lock()
+                .expect("task manager")
+                .set_drain_window(sync_interval);
+            heartbeat_tick(
+                &name,
+                &manager_addr,
+                &node_identity,
+                &client,
+                &task_manager,
+                &identity_manager,
+                &credentials,
+                &netd,
+                spec_cache.as_ref(),
+                managers.as_ref(),
+            )
+            .await
+            .map(|served| (served, false))
+        } else {
+            ping_tick(&name, &client, &credentials).await
+        };
         // Failover bookkeeping: a manager that answered (with anything) is
         // reachable; consecutive transport failures move the worker to the
         // next known manager, and the retry below goes there.
@@ -2513,10 +2580,7 @@ async fn start_heartbeats(
             }
         }
         let worker_metrics = crate::telemetry::worker_metrics();
-        worker_metrics
-            .heartbeat_duration_seconds
-            .observe(tick_started.elapsed().as_secs_f64());
-        worker_metrics.heartbeats_total.inc(&[match &tick_result {
+        let outcome = match &tick_result {
             Ok(_) => "ok",
             Err(err)
                 if err
@@ -2526,32 +2590,61 @@ async fn start_heartbeats(
                 "unauthenticated"
             }
             Err(_) => "error",
-        }]);
+        };
+        if full {
+            worker_metrics
+                .heartbeat_duration_seconds
+                .observe(tick_started.elapsed().as_secs_f64());
+            worker_metrics.heartbeats_total.inc(&[outcome]);
+        } else {
+            worker_metrics.pings_total.inc(&[outcome]);
+        }
         match tick_result {
-            Ok(served) => {
+            Ok((served, sync_now)) => {
+                // A ping proves to the manager that this node is alive just
+                // as a full heartbeat does, so either one resets the
+                // self-fence clock.
                 *last_successful_heartbeat
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
                 record_manager_contact(&contact_store);
                 backoff = HEARTBEAT_RETRY_MIN;
+                if full {
+                    last_full = Some(tick_started);
+                }
+                // A ping that brought the node back from lost: report the
+                // node's state now rather than one sync interval later.
+                if sync_now {
+                    info!(worker = %name, "Manager marked this node lost; sending a full heartbeat now");
+                    last_full = None;
+                }
+                let next_liveness =
+                    adopt_served_interval(heartbeat_interval, configured_interval, served.liveness);
+                sync_interval =
+                    sync_interval_for(next_liveness.unwrap_or(heartbeat_interval), served.sync);
                 // Adopt a manager-served interval, once, with a full-width
                 // re-phase so a fleet that all learns the new value within one
                 // old interval spreads across the new period instead of
                 // re-phasing onto the same boundary.
-                match adopt_served_interval(heartbeat_interval, configured_interval, served) {
+                let woken = match next_liveness {
                     Some(next) => {
                         info!(
                             worker = %name,
                             from_seconds = heartbeat_interval.as_secs(),
                             to_seconds = next.as_secs(),
-                            "Manager served a new heartbeat interval; re-phasing once"
+                            sync_seconds = sync_interval.as_secs(),
+                            "Manager served a new liveness interval; re-phasing once"
                         );
                         heartbeat_interval = next;
-                        sleep_or_work(rephase_sleep(next)).await;
+                        sleep_or_work(rephase_sleep(next)).await
                     }
-                    None => {
-                        sleep_or_work(jittered_heartbeat_interval(heartbeat_interval)).await;
-                    }
+                    None if sync_now => false,
+                    None => sleep_or_work(jittered_heartbeat_interval(heartbeat_interval)).await,
+                };
+                // Work the manager is waiting on goes out on a full
+                // heartbeat now, not on the next sync tick.
+                if woken {
+                    last_full = None;
                 }
             }
             // The node token can be revoked (for example ACLs were just
@@ -2564,7 +2657,11 @@ async fn start_heartbeats(
                     .downcast_ref::<tonic::Status>()
                     .is_some_and(|status| status.code() == tonic::Code::Unauthenticated) =>
             {
-                warn!(worker = %name, "Heartbeat rejected as unauthenticated; re-registering");
+                warn!(
+                    worker = %name,
+                    kind = if full { "heartbeat" } else { "ping" },
+                    "Heartbeat rejected as unauthenticated; re-registering"
+                );
                 credentials.clear_node_token();
                 match register_self(client.clone(), &registration, &credentials).await {
                     Ok(reported) => {
@@ -2582,6 +2679,7 @@ async fn start_heartbeats(
             Err(err) => {
                 warn!(
                     worker = %name,
+                    kind = if full { "heartbeat" } else { "ping" },
                     error = ?err,
                     retry_in_ms = backoff.as_millis() as u64,
                     "Heartbeat failed; retrying (self-fence clock running)"
@@ -2621,11 +2719,11 @@ pub async fn heartbeat_tick(
     netd: &Arc<Netd>,
     spec_cache: Option<&crate::worker::edge::SpecCache>,
     managers: Option<&Arc<crate::worker::managers::ManagerEndpoints>>,
-) -> R<Option<u32>> {
+) -> R<ServedIntervals> {
     let mut client_clone = client.clone();
-    // The cadence the manager wants, when it dictates one. `None` (the
-    // default, and every pre-adaptive manager) means "keep your worker-type
-    // interval".
+    // The cadence the manager wants, when it dictates one. `None` (adaptive
+    // cadence off, and every pre-adaptive manager) means "keep your
+    // worker-type interval".
     let served_interval;
 
     {
@@ -2982,7 +3080,10 @@ pub async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let mut reply = response.into_inner();
-        served_interval = reply.next_interval_seconds;
+        served_interval = ServedIntervals {
+            liveness: reply.next_interval_seconds,
+            sync: reply.sync_interval_seconds,
+        };
         // Terminal reports the manager answered but could not record go out
         // again next beat: a batch task's dependents wait on them. So do
         // failure reports: nothing replaces a failed allocation until one is
@@ -3384,6 +3485,29 @@ pub async fn heartbeat_tick(
     }
 
     Ok(served_interval)
+}
+
+/// One liveness ping: prove the node is alive and learn the served intervals,
+/// nothing else (`Manager.Ping`, docs/heartbeat-cadence-and-scale.md, "Pings
+/// and heartbeats"). Returns the intervals and whether the manager wants a
+/// full heartbeat now (`sync_now`: this ping brought the node back from lost).
+pub async fn ping_tick(
+    name: &str,
+    client: &ManagerClient<Channel>,
+    credentials: &Arc<WorkerCredentials>,
+) -> R<(ServedIntervals, bool)> {
+    let request = credentials.attach(tonic::Request::new(crate::structs::PingRequest {
+        node_id: name.to_string(),
+    }));
+    let reply = client.clone().ping(request).await?.into_inner();
+    debug!(worker = %name, "Ping acknowledged by manager");
+    Ok((
+        ServedIntervals {
+            liveness: reply.next_interval_seconds,
+            sync: reply.sync_interval_seconds,
+        },
+        reply.sync_now,
+    ))
 }
 
 /// Rewrite the `onChange = "update"` KV files of running allocations
@@ -3950,10 +4074,12 @@ fn launch_streamed_work(
 }
 
 /// Sleep for `duration`, or until a work-stream message wakes the loop.
-async fn sleep_or_work(duration: Duration) {
+/// Sleep for `duration`, or until something wakes the heartbeat early.
+/// Returns true when it was woken.
+async fn sleep_or_work(duration: Duration) -> bool {
     tokio::select! {
-        _ = tokio::time::sleep(duration) => {}
-        _ = HEARTBEAT_WAKE.notified() => {}
+        _ = tokio::time::sleep(duration) => false,
+        _ = HEARTBEAT_WAKE.notified() => true,
     }
 }
 
@@ -4686,5 +4812,52 @@ mod tests {
             adopt_served_interval(secs(2), secs(2), Some(10_000)),
             Some(secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS)))
         );
+    }
+
+    #[test]
+    fn sync_interval_is_never_faster_than_the_liveness_interval_test() {
+        let secs = Duration::from_secs;
+        // A served sync interval slower than the beat: full heartbeats back
+        // off, pings fill in.
+        assert_eq!(sync_interval_for(secs(2), Some(21)), secs(21));
+        // A batch pool beating every 60s never sends a full heartbeat more
+        // often than it beats.
+        assert_eq!(sync_interval_for(secs(60), Some(21)), secs(60));
+        // No sync interval served: every beat is a full heartbeat.
+        assert_eq!(sync_interval_for(secs(2), None), secs(2));
+        assert_eq!(
+            sync_interval_for(secs(2), Some(10_000)),
+            secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS))
+        );
+    }
+
+    #[test]
+    fn a_full_heartbeat_lands_on_the_tick_nearest_its_due_time_test() {
+        let secs = Duration::from_secs;
+        // The first beat, and the one after a wake or `sync_now`, is full.
+        assert!(full_heartbeat_due(None, secs(2), secs(21)));
+        // Equal intervals: every tick is a full heartbeat, so no pings.
+        assert!(full_heartbeat_due(
+            Some(Duration::from_millis(1_800)),
+            secs(2),
+            secs(2)
+        ));
+        // 2s beats against a 21s sync: pings until ~20s, then a full one.
+        assert!(!full_heartbeat_due(Some(secs(2)), secs(2), secs(21)));
+        assert!(!full_heartbeat_due(Some(secs(19)), secs(2), secs(21)));
+        assert!(full_heartbeat_due(Some(secs(20)), secs(2), secs(21)));
+        // Count the ticks over a minute of steady 2s beats at a 21s sync:
+        // one full heartbeat about every ten beats, pings in between.
+        let (mut since, mut full, mut pings) = (None, 0, 0);
+        for _ in 0..30 {
+            if full_heartbeat_due(since, secs(2), secs(21)) {
+                full += 1;
+                since = Some(secs(2));
+            } else {
+                pings += 1;
+                since = since.map(|elapsed| elapsed + secs(2));
+            }
+        }
+        assert_eq!((full, pings), (3, 27));
     }
 }

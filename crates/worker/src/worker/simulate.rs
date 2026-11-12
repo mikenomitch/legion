@@ -607,6 +607,8 @@ struct SimFleet {
     heartbeat_interval: Duration,
     registered: AtomicU64,
     heartbeats_ok: AtomicU64,
+    /// Successful liveness pings (between full heartbeats).
+    pings_ok: AtomicU64,
     heartbeats_failed: AtomicU64,
     /// Allocations reported as running across the whole fleet, maintained
     /// by per-node deltas and mirrored into
@@ -1099,6 +1101,7 @@ pub async fn launch_simulated_fleet(
         heartbeat_interval: heartbeat_interval_for(&config),
         registered: AtomicU64::new(0),
         heartbeats_ok: AtomicU64::new(0),
+        pings_ok: AtomicU64::new(0),
         heartbeats_failed: AtomicU64::new(0),
         reported_allocations: AtomicI64::new(0),
         checkpoints: opts.checkpoints,
@@ -1317,6 +1320,11 @@ async fn run_sim_node(
     // fleet that ignores it.
     let mut heartbeat_interval = fleet.heartbeat_interval;
     let configured_interval = fleet.heartbeat_interval;
+    // Full heartbeats and pings split exactly as a real worker splits them
+    // (`daemon::full_heartbeat_due`), so a scale run measures the cadence a
+    // real fleet would put on the manager.
+    let mut sync_interval = heartbeat_interval;
+    let mut last_full: Option<Instant> = None;
     let ticks_per_health_check = ((WORKER_NODE_CHECK_DURATION_SEC as f64
         / heartbeat_interval.as_secs_f64().max(0.001))
     .round() as u64)
@@ -1332,19 +1340,44 @@ async fn run_sim_node(
         // (`daemon::run_heartbeat_loop`), so a campaign reads one set of
         // `legion_worker_heartbeat*` families whichever fleet produced it.
         let tick_started = Instant::now();
-        let tick_result = heartbeat_sim_node(&client, &node, &fleet, ready_after).await;
+        let full = !scheduled
+            || crate::worker::daemon::full_heartbeat_due(
+                last_full.map(|at| at.elapsed()),
+                heartbeat_interval,
+                sync_interval,
+            );
+        let tick_result = if full {
+            heartbeat_sim_node(&client, &node, &fleet, ready_after)
+                .await
+                .map(|served| (served, false))
+        } else {
+            ping_sim_node(&client, &node).await
+        };
         let metrics = crate::telemetry::worker_metrics();
-        metrics
-            .heartbeat_duration_seconds
-            .observe(tick_started.elapsed().as_secs_f64());
-        metrics.heartbeats_total.inc(&[match &tick_result {
+        let outcome = match &tick_result {
             Ok(_) => "ok",
             Err(status) if status.code() == tonic::Code::Unauthenticated => "unauthenticated",
             Err(_) => "error",
-        }]);
+        };
+        if full {
+            metrics
+                .heartbeat_duration_seconds
+                .observe(tick_started.elapsed().as_secs_f64());
+            metrics.heartbeats_total.inc(&[outcome]);
+        } else {
+            metrics.pings_total.inc(&[outcome]);
+        }
         match tick_result {
-            Ok(served) => {
-                fleet.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
+            Ok((served, sync_now)) => {
+                if full {
+                    fleet.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
+                    last_full = Some(tick_started);
+                } else {
+                    fleet.pings_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                if sync_now {
+                    last_full = None;
+                }
                 backoff = SIM_RETRY_MIN;
                 if scheduled {
                     if tick.is_multiple_of(ticks_per_health_check) {
@@ -1360,15 +1393,21 @@ async fn run_sim_node(
                     }
                     tick += 1;
                 }
-                let sleep = match crate::worker::daemon::adopt_served_interval(
+                let next_liveness = crate::worker::daemon::adopt_served_interval(
                     heartbeat_interval,
                     configured_interval,
-                    served,
-                ) {
+                    served.liveness,
+                );
+                sync_interval = crate::worker::daemon::sync_interval_for(
+                    next_liveness.unwrap_or(heartbeat_interval),
+                    served.sync,
+                );
+                let sleep = match next_liveness {
                     Some(next) => {
                         heartbeat_interval = next;
                         crate::worker::daemon::rephase_sleep(next)
                     }
+                    None if sync_now => Duration::ZERO,
                     None => jittered_heartbeat_interval(heartbeat_interval),
                 };
                 // Or until a checkpoint report is waiting.
@@ -1398,6 +1437,27 @@ async fn run_sim_node(
             }
         }
     }
+}
+
+/// One simulated liveness ping, exactly as a real worker sends it
+/// (`daemon::ping_tick`).
+async fn ping_sim_node(
+    client: &ManagerClient<Channel>,
+    node: &SimNode,
+) -> Result<(crate::worker::daemon::ServedIntervals, bool), Status> {
+    let request = node
+        .credentials
+        .attach(Request::new(crate::structs::PingRequest {
+            node_id: node.name.clone(),
+        }));
+    let reply = client.clone().ping(request).await?.into_inner();
+    Ok((
+        crate::worker::daemon::ServedIntervals {
+            liveness: reply.next_interval_seconds,
+            sync: reply.sync_interval_seconds,
+        },
+        reply.sync_now,
+    ))
 }
 
 async fn register_sim_node(
@@ -1454,7 +1514,7 @@ async fn heartbeat_sim_node(
     node: &SimNode,
     fleet: &SimFleet,
     ready_after: Duration,
-) -> Result<Option<u32>, Status> {
+) -> Result<crate::worker::daemon::ServedIntervals, Status> {
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
     let work_stream = if fleet.work_stream {
@@ -1574,13 +1634,17 @@ async fn heartbeat_sim_node(
         node.mark_reports_delivered(&snapshot_reports);
         node.answer_checkpoint_requests(&reply.checkpoint_requests, true);
     }
-    Ok(reply.next_interval_seconds)
+    Ok(crate::worker::daemon::ServedIntervals {
+        liveness: reply.next_interval_seconds,
+        sync: reply.sync_interval_seconds,
+    })
 }
 
 /// Periodic fleet-status line — cheap enough for campaign scripts to
 /// grep, informative enough to spot a stalled fleet.
 async fn run_summary_loop(fleet: Arc<SimFleet>, opts: SimulateOptions) {
     let mut last_ok = 0u64;
+    let mut last_pings = 0u64;
     let mut last_at = Instant::now();
     loop {
         tokio::time::sleep(SIM_SUMMARY_INTERVAL).await;
@@ -1588,20 +1652,26 @@ async fn run_summary_loop(fleet: Arc<SimFleet>, opts: SimulateOptions) {
         let ok = fleet.heartbeats_ok.load(Ordering::Relaxed);
         let elapsed = last_at.elapsed().as_secs_f64().max(0.001);
         let rate = (ok - last_ok) as f64 / elapsed;
-        // Every live node heartbeats once per interval; the expected rate
-        // tells the reader at a glance whether the fleet is keeping up.
+        let pings = fleet.pings_ok.load(Ordering::Relaxed);
+        let ping_rate = (pings - last_pings) as f64 / elapsed;
+        // Every live node beats (a full heartbeat or a ping) once per
+        // interval; the expected rate tells the reader at a glance whether
+        // the fleet is keeping up. It is the worker-type rate, so under a
+        // served slower cadence compare it with heartbeats + pings.
         let expected = fleet.registered.load(Ordering::Relaxed) as f64
             / fleet.heartbeat_interval.as_secs_f64().max(0.001);
         info!(
             nodes_registered = fleet.registered.load(Ordering::Relaxed),
             nodes_target = opts.count,
             heartbeats_per_sec = format!("{rate:.1}"),
+            pings_per_sec = format!("{ping_rate:.1}"),
             heartbeats_expected_per_sec = format!("{expected:.1}"),
             heartbeats_failed_total = fleet.heartbeats_failed.load(Ordering::Relaxed),
             acked_allocations = fleet.acked_total(opts.ready_after),
             "Simulated fleet status"
         );
         last_ok = ok;
+        last_pings = pings;
         last_at = Instant::now();
     }
 }
@@ -1823,6 +1893,7 @@ mod tests {
             heartbeat_interval: Duration::from_secs(1),
             registered: AtomicU64::new(0),
             heartbeats_ok: AtomicU64::new(0),
+            pings_ok: AtomicU64::new(0),
             heartbeats_failed: AtomicU64::new(0),
             reported_allocations: AtomicI64::new(0),
             checkpoints: false,

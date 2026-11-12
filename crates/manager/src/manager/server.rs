@@ -70,22 +70,22 @@ use crate::structs::{
     ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
     ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, ManagedByInfo, ManagerMember,
     MintExecTicketReply, MintExecTicketRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
-    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
-    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
-    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
-    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    PingReply, PingRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
+    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
+    RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
+    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
+    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchDatapathMaterialReply,
@@ -9706,6 +9706,13 @@ impl Manager for ManagerDaemonService {
             .liveness()
             .served_interval()
             .map(|interval| interval.as_secs() as u32);
+        // And how often it wants a FULL heartbeat; between them the worker
+        // pings (docs/heartbeat-cadence-and-scale.md, "Pings and heartbeats").
+        let sync_interval_seconds = self
+            .store
+            .liveness()
+            .served_sync_interval()
+            .map(|interval| interval.as_secs() as u32);
 
         // Direct exec (docs/exec-and-actions.md, "Direct exec"): finished
         // sessions join the `exec_audit` log the proxied path writes, and
@@ -9766,6 +9773,7 @@ impl Manager for ManagerDaemonService {
             stop_notices,
             claim_verdicts,
             next_interval_seconds,
+            sync_interval_seconds,
             checkpoint_requests,
             content_resync,
             cluster_ca_pins: self.cluster_ca_pins(),
@@ -9788,6 +9796,55 @@ impl Manager for ManagerDaemonService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    /// A liveness ping: the beat without the reports (docs/
+    /// heartbeat-cadence-and-scale.md, "Pings and heartbeats").
+    ///
+    /// The steady path stays on the calling async worker on purpose: it is
+    /// one read-model lookup and one map write, and the blocking-pool hop a
+    /// heartbeat pays to keep its commits off the runtime would cost more
+    /// than the work. Only a ping that has to commit (a node coming back from
+    /// `lost`, or the mixed-version fallback) takes the hop.
+    #[instrument(skip_all)]
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
+        // ACL: worker-plane endpoint, the same credential a heartbeat needs:
+        // the node token minted at registration (or a management token).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let id = request.into_inner().node_id;
+        acl::enforce_node_binding(&identity, &id)?;
+        crate::manager::telemetry::metrics().pings_total.inc();
+
+        let sync_now = match self.store.observe_ping(&id) {
+            crate::storage::store::PingPath::Observed => false,
+            crate::storage::store::PingPath::Ghost => {
+                return Err(map_store_error(
+                    "Error recording node ping",
+                    anyhow::Error::new(crate::storage::errors::StorageError::not_found("node", id)),
+                ));
+            }
+            crate::storage::store::PingPath::Replicate { recovering } => {
+                let store = self.store.clone();
+                let node_id = id.clone();
+                tokio::task::spawn_blocking(move || store.update_node_heartbeat(node_id))
+                    .await
+                    .map_err(|e| Status::internal(format!("ping task failed: {e}")))?
+                    .map_err(|e| map_store_error("Error recording node ping", e))?;
+                recovering
+            }
+        };
+
+        let liveness = self.store.liveness();
+        Ok(Response::new(PingReply {
+            next_interval_seconds: liveness
+                .served_interval()
+                .map(|interval| interval.as_secs() as u32),
+            sync_interval_seconds: liveness
+                .served_sync_interval()
+                .map(|interval| interval.as_secs() as u32),
+            sync_now,
+        }))
     }
 
     #[instrument(skip_all, fields(node_id = %request.get_ref().node_id))]
@@ -9862,9 +9919,13 @@ impl Manager for ManagerDaemonService {
             .liveness()
             .served_interval()
             .unwrap_or_else(|| self.heartbeat.parsed_min_interval());
+        let sync = self.store.liveness().served_sync_interval();
         let report = crate::manager::cadence::cadence_report(
             &snapshot,
-            served,
+            crate::manager::cadence::ServedCadence {
+                liveness: served,
+                sync: sync.unwrap_or(served),
+            },
             self.heartbeat.missed_beats_before_lost.max(1),
             self.heartbeat.headroom,
             HEARTBEAT_FRESHNESS_MIN_FLEET,
@@ -9883,6 +9944,23 @@ impl Manager for ManagerDaemonService {
             at_max_interval: report.at_max_interval,
             missed_beats_before_lost: report.missed_beats_before_lost,
             is_liveness_owner: true,
+            // Zero when nothing is served (adaptive cadence off): workers
+            // then send a full heartbeat every beat.
+            sync_interval_seconds: sync
+                .map(|_| report.sync_interval.as_secs() as u32)
+                .unwrap_or(0),
+            pools: report
+                .pools
+                .iter()
+                .map(|pool| crate::structs::PoolHeartbeatCadence {
+                    pool: pool.pool.clone(),
+                    active_nodes: pool.active_nodes as u32,
+                    interval_seconds: pool.interval.as_secs() as u32,
+                    lost_window_seconds: pool.lost_window.as_secs() as u32,
+                    freshness_ratio: pool.freshness_ratio.unwrap_or(0.0),
+                    freshness_measurable: pool.freshness_ratio.is_some(),
+                })
+                .collect(),
         }))
     }
 

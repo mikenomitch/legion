@@ -48,6 +48,7 @@ pub const RPC_ACCESS: &[(&str, Access)] = &[
     ("WorkerPreRegister", Access::Worker),
     ("WorkerRegister", Access::Worker),
     ("Heartbeat", Access::Worker),
+    ("Ping", Access::Worker),
     ("StreamWork", Access::Worker),
     ("HealthCheck", Access::Worker),
     ("RunJob", Access::Protected("job", "write")),

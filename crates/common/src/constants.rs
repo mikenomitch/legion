@@ -164,6 +164,16 @@ pub const DEF_HEARTBEAT_MAX_INTERVAL_SEC: u64 = 55;
 /// 4-vCPU leader on the AWS rig at 20k nodes, so the budget is deliberately
 /// small. See docs/heartbeat-cadence-and-scale.md.
 pub const DEF_HEARTBEAT_TARGET_RATE_PER_SECOND: f64 = 2500.0;
+/// Default aggregate liveness-ping rate the manager sizes the LIVENESS
+/// interval for (`heartbeat.pingRatePerSecond`), and so every node's lost
+/// window. With the default headroom of 2 the liveness interval is
+/// `ceil(N / 12,500)` seconds: every fleet up to 25,000 nodes keeps the 2s
+/// floor and the 10s lost window, and the ping load never exceeds 12,500/s.
+/// A ping is answered from memory with no blocking-pool hop, so it costs a
+/// fraction of even a steady full heartbeat (measured in
+/// `tests/integration/heartbeat_ping_measure.rs`; numbers in
+/// docs/heartbeat-cadence-and-scale.md).
+pub const DEF_HEARTBEAT_PING_RATE_PER_SECOND: f64 = 25000.0;
 /// Headroom factor in the sizing formula `heartbeatSeconds >= H x N / R`.
 /// 2 means "run at half the measured ceiling so a burst is not an outage".
 pub const DEF_HEARTBEAT_HEADROOM: f64 = 2.0;

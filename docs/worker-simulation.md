@@ -88,9 +88,11 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   exponentially with re-registration on `Unauthenticated`. A simulated
   node reports its resolved cadence at registration and honors an
   interval served by the manager (with the same one-shot re-phase) just
-  as a real worker does. That means a scale run measures the actual
-  controller. The manager's lost-node detection applies unchanged. The
-  window is `missedBeatsBeforeLost x that node's interval`, which is 10s
+  as a real worker does, including the split between full heartbeats and
+  liveness pings once the manager serves a longer sync interval. That
+  means a scale run measures the actual controller. The manager's
+  lost-node detection applies unchanged. The window is
+  `missedBeatsBeforeLost x that node's liveness interval`, which is 10s
   at the defaults ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
 - **Shared channels.** Nodes share a small pool of gRPC channels (one
   per 256 nodes, max 16). One process holds a handful of connections
@@ -147,7 +149,8 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   worker host. The only state is the fleet's key and certificate, under
   `<data dir>/sim/<prefix>/identity/`.
 - **Status line.** Every 30s the process logs `Simulated fleet
-  status` with nodes registered, achieved vs. expected heartbeat rate,
+  status` with nodes registered, achieved full-heartbeat and ping rates
+  (`heartbeats_per_sec`, `pings_per_sec`) vs. the expected beat rate,
   cumulative failures, and acked allocations. Scripts can watch this to
   confirm a fleet is healthy.
 
@@ -165,7 +168,7 @@ curl -s localhost:9101/metrics | grep legion_worker_
 ```
 
 The usual families (`legion_worker_heartbeats_total`,
-`legion_worker_heartbeat_duration_seconds`,
+`legion_worker_pings_total`, `legion_worker_heartbeat_duration_seconds`,
 `legion_worker_allocations_running`) aggregate over the whole fleet.
 This is one worker process carrying N nodes, so its metrics are per
 process. Three more metrics describe the fleet:
