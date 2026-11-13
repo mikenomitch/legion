@@ -2,10 +2,16 @@
 
 > **Judgement calls:** [task-start-critical-path-plan_calls.md](../calls/task-start-critical-path-plan_calls.md)
 
-**Status: IN EXECUTION.** Phases 1 to 3 are built. Phase 4 (start reports
-that do not wait for a heartbeat) and phase 5 (the gated datapath and its
-policy for a streamed placement before boot) are deferred and tracked in
-[`TODO.md`](../TODO.md). Neither is measured on a real VMM yet.
+**Status: SHIPPED.** Phases 1 to 3 shipped first. Phase 4 (start reports
+that do not wait for a heartbeat) and phase 5 (a streamed placement's policy
+on its delta) shipped 2026-11-12, with the follow-up work on the node's
+start path in [Follow-up](#follow-up-2026-11-12): the worker state file off
+the lock, TAP devices without `ip`, and the rest of the worker's blocking
+work off the task-manager lock. Phases 4 and 5 are tested against the real
+manager service on loopback; none of the follow-up is measured on a real VMM
+yet. The public record is
+[architecture-managers-workers.md, "Reports between heartbeats"](../../docs/architecture-managers-workers.md#reports-between-heartbeats)
+and [network-handlers.md](../../docs/network-handlers.md).
 
 ## Problem
 
@@ -131,20 +137,65 @@ that first lists it.
 1. Stage timings and the start log line. Ships alone: pure observability.
 2. Startup probing. Ships alone.
 3. Namespace ordering. Ships alone.
-4. *(Deferred)* Start reports that do not wait for a heartbeat. A health
-   transition reaches the manager on the next beat: about 1 s on average at
-   the default 2 s cadence, and up to the adaptive cadence (21 s on a large
-   fleet). Waking the heartbeat per transition would add a full heartbeat per
-   start to a manager whose cadence exists to bound heartbeat load. The fix is
-   a worker-to-manager report frame on `StreamWork`, which the checkpoint
-   reports are moving onto.
-5. *(Deferred)* The gated datapath for a streamed placement before boot. A
-   placement from `StreamWork` starts at once, but its listeners, network
-   policy, upstream endpoints, and credentials all arrive on the next beat.
-   Binding the listeners early is not enough, because the policy is what lets
-   anything through. The fix is to carry the policy assignment on the delta.
+4. *(Shipped 2026-11-12)* Start reports that do not wait for a heartbeat. A
+   health transition reached the manager on the next beat: about 1 s on
+   average at the default 2 s cadence, and up to the adaptive cadence (21 s
+   on a large fleet). Waking the heartbeat per transition would have added a
+   full heartbeat per start. `StreamWorkRequest` gains a `report` frame
+   (`StreamWorkReport { allocation_health }`): the worker sends each
+   `healthy` flip of a manager allocation as it happens, and the manager
+   writes it as it writes a heartbeat's health. A hint: the heartbeat still
+   carries every allocation's health and replaces it.
+5. *(Shipped 2026-11-12)* A streamed placement's policy on its delta. A
+   placement from `StreamWork` starts at once, and since 2026-11-08 its
+   namespace, proxy, resolver, and upstreams bind at launch, but they failed
+   closed until a heartbeat brought the policy assignment, and ingress bound
+   on that heartbeat. `StreamWorkReply.net_policies` now carries the
+   assignment of each upsert, from the same memoized merge the heartbeat
+   uses; the launch applies it and binds ingress, and wakes the heartbeat
+   only when the policy's body is not cached on the node. Upstream
+   endpoints and credentials still arrive as before (pushed endpoint sets,
+   and the material fetch).
+
+## Follow-up (2026-11-12)
+
+The start path's remaining per-node costs, done with phases 4 and 5. Each is
+a behavior-preserving change to where work runs, except where the calls doc
+says otherwise.
+
+- **The worker state file is written off the lock.** `persist_state` built,
+  serialized, wrote, and fsynced every allocation under the task-manager lock
+  on every start and stop, and read `/proc` for each one, so a burst on a
+  dense node was quadratic. The lock now builds the snapshot (process start
+  times from a per-allocation cache) and hands it to one writer thread per
+  state file, which writes the newest snapshot it holds. Measured with the
+  `persist_cost_probe` (release build, 4 vCPUs, ext4): the lock's share per
+  persist went from about 24.5 ms to 3.8 ms at 1,000 allocations, and from
+  117 ms to 28 ms at 5,000.
+- **TAP devices without `ip`.** Create, up, down, master, and delete are the
+  kernel calls `ip` makes (`TUNSETIFF`/`TUNSETPERSIST`, `SIOCSIFFLAGS`,
+  rtnetlink), with no process spawned.
+- **The rest of the worker's blocking work off the task-manager lock**
+  (architecture audit W3): every teardown (reaps, immediate stops, failures,
+  self-fences) and the stop signal run from the supervisor without the lock;
+  restarts, edge-boot starts, a `stage`-gated claim's start at
+  ratification, a start's directories and log directory, and a memory
+  checkpoint's write run with it released; the heartbeat takes the lock with
+  `block_in_place` on a multi-threaded runtime.
 
 ## Testing
+
+Phases 4 and 5: `work_stream::a_health_report_on_the_stream_lands_without_a_heartbeat`
+and `work_stream::a_streamed_placement_carries_its_policy_assignment`
+(integration, the real manager service on loopback), and the worker's
+`health_flips_are_reported_to_the_work_stream_test` and
+`a_streamed_gated_task_opens_with_the_policy_its_delta_carried_test`. The
+follow-up: the state store's writer tests, `tap_link`'s tests (one creates
+a real TAP when the test runs with `CAP_NET_ADMIN`), and the task manager's
+off-lock tests (`a_stop_signals_and_destroys_off_the_lock_test`,
+`a_failure_is_torn_down_off_the_lock_test`,
+`a_stop_during_an_off_lock_restart_cancels_it_test`,
+`a_held_start_runs_off_the_lock_at_ratification_test`).
 
 - Unit: `start_timing` records, summarizes, bounds its list, and reaches the
   worker registry.

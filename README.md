@@ -91,9 +91,11 @@ there:
   stops concurrent submits from fighting over the same node.
 - **Heartbeats that adapt to the fleet.** With
   [adaptive cadence](docs/heartbeat-cadence-and-scale.md), on by default,
-  the manager stretches each worker's check-in interval as the fleet grows,
-  so a busy control plane doesn't mistake healthy nodes for dead ones. A
-  circuit breaker refuses to mark half the fleet lost in one tick.
+  the manager stretches each worker's full heartbeat as the fleet grows,
+  while workers prove they are alive in between with a ping the manager
+  answers from memory, so a 20,000-node fleet notices a dead machine in 25
+  seconds instead of 105. A circuit breaker refuses to mark half the fleet lost in
+  one tick.
 
 Legion can boot a sandbox in 0.2 seconds and sustain ~150 boots per second
 on a large node. Nodes start sandboxes without a manager in the path, so the
@@ -464,6 +466,7 @@ start:
   [GitOps](docs/gitops.md) · [Autoscaling](docs/autoscaling.md) ·
   [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
+  [Spot Interruption](docs/spot-interruption.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md) ·
   [Devices and GPUs](docs/devices.md)

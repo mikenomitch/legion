@@ -206,6 +206,7 @@ pub unsafe fn contained_constructor<T: ?Sized>(
 }
 
 pub mod containment;
+pub mod index_kind;
 
 /// Opens a plugin dylib and refuses it unless its ABI fingerprint matches
 /// this binary's (see [`PLUGIN_ABI_FINGERPRINT`]). Every dylib loader goes

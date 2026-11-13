@@ -127,7 +127,8 @@ When one is required and what goes in it:
 | [edge-admission-control-plan.md](plans/edge-admission-control-plan.md) | in execution (Phase 1 built: the per-node claim window that sheds edge starts `OVERLOADED` before boot when ratification is slow, and enforces `maxProvisionalPerNode`. Manager-side speculation shedding and deadline-aware ratification planned) |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
 | [edge-ratify-throughput-plan.md](plans/edge-ratify-throughput-plan.md) | in execution (Phase 1 shipped 2026-10-14: in-process ratify load harness, ratifications fenced by committed state instead of epochs, create decided inside the entry, ratify off the async runtime. Per-node RPC batching deferred on data, networked load test planned) |
-| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | in execution (Phases 1–3 shipped; rank/world size, readiness timeout, and Phase 4 open) |
+| [gang-reservation-plan.md](plans/gang-reservation-plan.md) | shipped (2026-11-12: a long-waiting gang reserves room on the nodes it needs; backfill by room, not time) |
+| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | shipped (Phases 1–4 and Revision 3, 2026-11-12: views that follow a scale, readiness timeout, in-place restarts, local restarts as losses, gang-aware wake, whole-gang preemption, multi-level topology; cross-job and named cross-task gangs, a start barrier, and the UI badge not built) |
 | [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 5 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs, ingress into gated and TAP sandboxes, and upstreams in gated sandboxes; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
@@ -141,13 +142,14 @@ When one is required and what goes in it:
 | [kv-encryption-plan.md](plans/kv-encryption-plan.md) | shipped (all four phases, 2026-09-21: KV values encrypted at rest by default, replicated keyring with the root key outside the store, `file`/`env`/`exec` providers, rotation + rewrap, join-time root key delivery; rendered task-config copies deliberately left for a follow-up plan) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [kv-cert-delivery-plan.md](plans/kv-cert-delivery-plan.md) | shipped: live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) |
-| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | shipped (phases 0–3; Phase 4 backlog deferred) |
+| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | shipped (phases 0–3; from Phase 4, capacity-aware skipping and `distinct` fallback lists shipped, partial commit and a full-pool lane not planned) |
 | [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) | in execution (phase 1 shipped: one credential path for every streaming store, the platform-identity chain checked at boot, the lease's missing conditional puts; `--restore-from` from the replica and credential introspection deferred) |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
-| [raft-write-path-plan.md](plans/raft-write-path-plan.md) | in execution (2026-11-08, review SCH1/ST1/ST4): group commit, the leader executing each write once under `single` (speculative commit with undo records), one state-DB fsync per log purge instead of per entry, the log tail retained by bytes (`raft.logRetainBytes`), and data migrations as replicated control-lane entries. Deferred: a capture mutex per lane (per-lane DB files), speculation under `lanes`, overlapping capture with the quorum wait, logical commands |
+| [raft-write-path-plan.md](plans/raft-write-path-plan.md) | in execution (2026-11-08, review SCH1/ST1/ST4): group commit, the leader executing each write once under `single` (speculative commit with undo records), one state-DB fsync per log purge instead of per entry, the log tail retained by bytes (`raft.logRetainBytes`), and data migrations as replicated control-lane entries. Deferred: a capture mutex per lane (per-lane DB files), speculation under `lanes`, overlapping capture with the quorum wait, logical commands (the first three now in lane-isolation-plan.md); purge barrier power-cut test passed 2026-11-12 |
+| [lane-isolation-plan.md](plans/lane-isolation-plan.md) | planned (2026-11-12): projection from the changeset, a pipelined lane (`raft.pipelineDepth`), a database file per lane under `lanes`, and one execution under `lanes` |
 | [multi-eval-plans-plan.md](plans/multi-eval-plans-plan.md) | in execution: Phase 2 shipped (the fused settle in every placing handler whose plan is its last write, and no second settle write). Phase 1, one running eval per job, was built and measured and left out until a lane-bound rig run shows a gain. Phase 3 deferred behind it |
 | [namespaces-plan.md](plans/namespaces-plan.md) | shipped 2026-10-19 (all four phases; public page [docs/namespaces.md](../docs/namespaces.md)): canonical `namespace/name` job ids (bare in `default`), explicit `namespaces` on ACL rules, services and instance keys namespaced with jobs, cross-namespace upstreams, tenant events, namespace metrics, the UI switcher and Namespaces pages, and namespace policies (aggregate per-band quota, counts, pools, runtimes, host volumes); hierarchy, rename/move and namespaced KV deliberately out |
 | [read-model-coherence-plan.md](plans/read-model-coherence-plan.md) | in execution (all five phases built; raft shadow check deferred) |
@@ -162,17 +164,19 @@ When one is required and what goes in it:
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
 | [scheduler-sharding-strategies-proposal.md](plans/scheduler-sharding-strategies-proposal.md) | proposal, revision 3 (sharding the scheduler across more raft groups; extends multi-raft Phase 8; recommends pool-keyed shards that are raft group **plus** own state file, co-located first, spread later, with plan shipping (M3) as the peer lever for planner-bound large fleets; Phase 0 attributes the October campaigns' wall per fleet-size regime before anything graduates) |
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
-| [placement-and-commit-cost-plan.md](plans/placement-and-commit-cost-plan.md) | shipped (2026-11-08: review SCH2/SCH3/SCH4/SCH8, the SCH5 plan round trip, and gang topology (AI7); the SCH5 node-row half, spot-interruption handling, and multi-level topology deferred) |
+| [placement-and-commit-cost-plan.md](plans/placement-and-commit-cost-plan.md) | shipped (2026-11-08: review SCH2/SCH3/SCH4/SCH8, the SCH5 plan round trip, and gang topology (AI7); the SCH5 node-row half followed 2026-11-12; spot interruption and multi-level topology shipped 2026-11-12 with the gang follow-ups) |
 | [plan-path-fleet-scaling-plan.md](plans/plan-path-fleet-scaling-plan.md) | in execution (per-eval cost that grows with node count, from the 2026-10-09 campaign: 99 ms/eval at 10k vs 36 at 5k; Phases 1-3 done; Phase 4 removed the per-eval node lookup and O(jobs) SQL scans and instruments the whole eval, AWS re-run pending) |
 | [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md); the throughput half of that cell is retracted by [aws-phase4-findings.md](aws-phase4-findings.md), which found the rig measuring its own submission rate) |
 | [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue + eval-loop batching landed; phase 5 — in-memory reprojection memo + audit hardening — landed 2026-08-06; the AWS re-measurement is not run) |
-| [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md) | shipped 2026-08-06 (every JSON column rebuilt to TEXT affinity; `STRING`/`TIMESTAMP` columns deliberately left NUMERIC — see the calls doc) |
+| [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md) | shipped 2026-08-06 (every JSON column rebuilt to TEXT affinity); the `STRING`/`TIMESTAMP` half followed 2026-11-12 (TEXT, `job.created_at` INTEGER; calls #7–#9) |
 | [node-loss-storm-plan.md](plans/node-loss-storm-plan.md) | shipped 2026-08-06 (below-default reschedule priority, empty-node filter, single-round batched fan-out, recovery counter); the AWS storm re-measurement is not run |
 | [eval-thread-default-plan.md](plans/eval-thread-default-plan.md) | planned; **deliberately picks no number** (the 2026-08-05 sweep rose monotonically 177.27 → 251.68 alloc/s from 4 to 32 eval threads and its 64-thread cell was driver-bound, so `available_parallelism()` is wrong but the knee is unmeasured; Phase 0a is load-generator work and gates everything) |
+| [eval-handler-deadline-plan.md](plans/eval-handler-deadline-plan.md) | shipped (2026-11-12): a five-minute deadline on each eval handler; a stuck handler's eval is requeued with a delay and the rest of its batch runs. Not built: a configurable deadline, a delivery limit, stopping the stuck thread |
 | [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
 | [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
 | [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | **shipped** 2026-08-03 (sizing + freshness warning + per-node lost windows + adaptive cadence); phase 5, adaptive cadence **on by default** at 2,500 beats/s, shipped 2026-10-09; the AWS reproduction is not run |
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
+| [liveness-ping-split-plan.md](plans/liveness-ping-split-plan.md) | **shipped** 2026-11-12: liveness pings (`Manager.Ping`) between full heartbeats, a liveness interval sized from `heartbeat.pingRatePerSecond` (10,000/s) that sets every lost window, the full heartbeat on its own sync interval, and per-pool freshness (metric, `legion node cadence` table, warning). The AWS rig rerun is not done; pings as `StreamWork` frames deferred |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (cross-system campaign rerun 2026-10-14 with every store on NVMe, results in [docs/benchmarks.md](../docs/benchmarks.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
 | [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md) | shipped (2026-11-08): Tier 1 spot-check bugs and four security gaps; deferrals in §9, AWS re-run pending |
@@ -180,15 +184,18 @@ When one is required and what goes in it:
 | [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | in execution: Phases 0 to 8 built; hardware verification open (launch blocker: workers on other hosts lose exec, logs, and the mesh. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
-| [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
+| [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; the group path and the Phase 4 backlog shipped with candidates-and-indexes-plan.md) |
+| [candidates-and-indexes-plan.md](plans/candidates-and-indexes-plan.md) | shipped (2026-11-12): `fit` sees `maxAllocations`, the per-node permit flag, in-place allow-lists, truncation for every task shape but gangs (`distinct`, stateful, `count.per` by partition enumeration, co-placed groups), plugin index kinds, device dims, `indexHint`, the heap walk, and the volume-pin apply fence |
 | [security-gap-closure-plan.md](plans/security-gap-closure-plan.md) | shipped (2026-10-17): the README's and TODO's known security gaps plus an audit's findings — KV reads through jobspecs, root-worker path escapes, node credentials leaving the node, forged identities, plaintext raft; direct exec revocation push, fleet certificates, and git/OCI fetch judging deferred |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | v1 shipped; §8 mesh follow-on superseded by service-mesh-plan.md |
 | [service-discovery-plan.md](plans/service-discovery-plan.md) | superseded (rationale + full mesh design) |
 | [service-discovery-mesh-and-config.md](plans/service-discovery-mesh-and-config.md) | superseded (cookbook + mesh extensions) |
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
+| [session-snapshot-start-plan.md](plans/session-snapshot-start-plan.md) | planned (2026-11-12): opt-in session starts from a per-node memory snapshot of a template guest, restored as a fork, falling back to a boot |
+| [spot-interruption-plan.md](plans/spot-interruption-plan.md) | shipped (2026-11-12: the worker's EC2 spot watcher and `legion node interrupt`; gangs keep off and move off interrupted nodes; other clouds via a handler) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
-| [task-start-critical-path-plan.md](plans/task-start-critical-path-plan.md) | in execution (phases 1–3 built: start stage timings, startup probing for health checks, gated namespaces before their listeners; phases 4–5, start reports and the streamed datapath off the heartbeat, deferred; the stage timings ran on real KVM in the sandbox-boot campaign, where they found its bottlenecks) |
+| [task-start-critical-path-plan.md](plans/task-start-critical-path-plan.md) | shipped (phases 1–3: start stage timings, startup probing for health checks, gated namespaces before their listeners; phases 4–5, 2026-11-12: health transitions reported on `StreamWork` between heartbeats, a streamed placement's policy assignment on its delta; follow-up: the worker state file written off the lock, TAP devices without `ip`, the rest of the worker's blocking work off the task-manager lock) |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md) | shipped (2026-10-12; public-address auto-detect, a manager reverse proxy, and `GetAllocation` deferred) |
 | [manager-reverse-proxy-plan.md](plans/manager-reverse-proxy-plan.md) | planned (open an allocation's or instance's web UI through the manager when node ports are closed: one-time code for a target-scoped cookie, an L4 tunnel on the worker plane, a new `proxy` ACL resource; subpath first, a host per target in Phase 2, `legion proxy` port-forward in Phase 3; multi-host needs worker-plane-auth Phase 1) |
@@ -201,14 +208,14 @@ When one is required and what goes in it:
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-3 and 7a shipped, KVM checks pending) |
 | [lazy-memory-restore-plan.md](plans/lazy-memory-restore-plan.md) | in execution: Phase 1 built (restores trust the content store's digest instead of rehashing every part, cloud-hypervisor v52+ restores on demand, `config.memory_restore = "lazy" \| "eager"` with `lazy` the default). KVM measurement open. Streaming a published restore, working-set prefetch, and cloud-hypervisor `copyonwrite` planned (executes the suspend plan's Phase 8 lazy memory item) |
 | [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | in execution: Phases 0–6 shipped (measurement, group commit and write trimming, `StreamWork` delivery, blocked evals, untombstoned minted ids, archived idle keyed instances, and the `session` instance mode with running sessions as node-owned soft state and promotion); session suspend, identity, and the session log deferred; Phase 7's wake on request is built under wake-on-request-plan (keyed and archived instances); Phases 8+ planned (snapshot-clone density, a sub-VM seam, cells past a measured trigger) |
-| [scheduler-lane-entry-cost-plan.md](plans/scheduler-lane-entry-cost-plan.md) | in execution: Phase 1 shipped (keyed placements bind their instance from two indexes instead of scanning the task's whole population, the largest piece of serial lane time in the profile), with the pipelined lane (Phase 2) and one fsync per entry (Phase 3) designed, not built |
+| [scheduler-lane-entry-cost-plan.md](plans/scheduler-lane-entry-cost-plan.md) | in execution: Phase 1 shipped (keyed placements bind their instance from two indexes instead of scanning the task's whole population, the largest piece of serial lane time in the profile), and since 2026-11-12 a bind outside a rollout no longer grows with the live population; the pipelined lane (Phase 2, now in lane-isolation-plan.md) and one fsync per entry (Phase 3) designed, not built |
 | [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md) | in execution in #36 (Phases 1–5 built; real-S3, sandbox-memory and edge-move runs open) (builds on session mode: concurrent starts on each node, sessions that survive a worker restart, the start node in the session id, edge starts picked by a load balancer outside Legion with no manager on the path, sessions that sleep on their node, and `store` sessions that move between nodes without split brain; a batched raft session directory deferred behind a trigger) |
 | [park-plan.md](plans/park-plan.md) | in execution: Phases 1–2 built (`suspend.park` and `$LEGION_PARK_SOCKET` with `park`, `unpark`, `busy`, `status`; a park suspends a keyed instance from its node as a local suspension with reason `park`, or a session on its node; a per-park checkpoint kind; `busy` holds the idle policy off; the socket inside sandbox guests over the guest agent's vsock). Executes the suspend plan's deferred `hint` signal in another shape. Timed wake, Legion-run tools that wake their caller, park state across worker restarts, and publishing a keyed park under `durability = "store"` planned |
 | [wake-on-request-plan.md](plans/wake-on-request-plan.md) | in execution: Phase 1 shipped (`suspend.wake`, `legion start gateway` that resumes a suspended keyed instance on a request and holds it until the instance serves, `CONNECT` for any declared port, a wake webhook, wake fields on `GetInstance`); gateway metrics, waking sessions, and node-local wake on connect planned |
 | [checkpoints-on-stream-plan.md](plans/checkpoints-on-stream-plan.md) | shipped Phase 1 (checkpoint requests pushed on `StreamWork`, reports on an early heartbeat, so suspend and resume no longer wait on the cadence). A report path that skips the heartbeat is deferred until early beats show up as load |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
 | [rootfs-base-cache-plan.md](plans/rootfs-base-cache-plan.md) | in execution: Phase 1 built and booted on real KVM (cloud-hypervisor) in the sandbox-boot campaign (one base root disk per image per node, cloned per sandbox, per-sandbox files by debugfs, `ensure_image_base` for prefetchers, one tag resolution per burst); artifacts on the cached path, the `container` runtime, visibility, and Firecracker planned |
-| [sandbox-boot-throughput-plan.md](plans/sandbox-boot-throughput-plan.md) | shipped, phases 1–3 (raw disks and `hvc0` on cloud-hypervisor, `running` on guest readiness, `stateful.placement`, the worker's start and stop paths off the lock, measured on AWS: 0.23 s a boot, 69 a second from four 4-vCPU nodes); phase 4's lock fixes (a 96-vCPU node at 150 to 200 boots a second sustained); the root disk ceiling on large nodes, open |
+| [sandbox-boot-throughput-plan.md](plans/sandbox-boot-throughput-plan.md) | shipped, phases 1–3 (raw disks and `hvc0` on cloud-hypervisor, `running` on guest readiness, `stateful.placement`, the worker's start and stop paths off the lock, measured on AWS: 0.23 s a boot, 69 a second from four 4-vCPU nodes); phase 4's lock fixes (a 96-vCPU node at 150 to 200 boots a second sustained); and (2026-11-12) the root disk ceiling's fix, clones spread over full copies of each base, not yet re-measured |
 | [suspend-resume-ui-plan.md](plans/suspend-resume-ui-plan.md) | shipped (UI-1 to UI-6, with the §7.3 server reads: ListNodeUsage, GetNodeContent, last_stop, checkpoint_support) |
 | [session-ui-plan.md](plans/session-ui-plan.md) | shipped (UI only: sessions and envelopes on the job, instance, allocation, node, and task pages, Promote and End, and bounded fetching, polling, and rendering for very large session counts; `ListInstances` paging, counts, and node/envelope filters deferred to the API) |
 | [elastic-session-envelopes-plan.md](plans/elastic-session-envelopes-plan.md) | in execution: Phase 1 built (`stateful.envelope.max` and `shrinkAfter`: each node grows and shrinks its session envelope between a floor and a ceiling, one scheduler-lane entry per resize, a shrink capped on the node first); preemptible elastic room and a fleet resize budget planned |
@@ -280,6 +287,8 @@ by project impact. The full template and a worked example:
 - [checkpoints-on-stream-plan_calls.md](calls/checkpoints-on-stream-plan_calls.md)
 - [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
+- [gang-reservation-plan_calls.md](calls/gang-reservation-plan_calls.md)
+- [spot-interruption-plan_calls.md](calls/spot-interruption-plan_calls.md)
 - [heartbeat-cadence-at-scale-plan_calls.md](calls/heartbeat-cadence-at-scale-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
@@ -287,6 +296,7 @@ by project impact. The full template and a worked example:
 - [app-per-node-replicas-plan_calls.md](calls/app-per-node-replicas-plan_calls.md)
 - [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
 - [task-start-critical-path-plan_calls.md](calls/task-start-critical-path-plan_calls.md)
+- [session-snapshot-start-plan_calls.md](calls/session-snapshot-start-plan_calls.md)
 - [job-status-plan_calls.md](calls/job-status-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
@@ -311,6 +321,7 @@ by project impact. The full template and a worked example:
 - [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
 - [lazy-memory-restore-plan_calls.md](calls/lazy-memory-restore-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
+- [liveness-ping-split-plan_calls.md](calls/liveness-ping-split-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
 - [managers-page-raft-members_calls.md](calls/managers-page-raft-members_calls.md)
 - [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)
@@ -322,6 +333,8 @@ by project impact. The full template and a worked example:
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [nickel-eval-budget_calls.md](calls/nickel-eval-budget_calls.md)
 - [raft-write-path-plan_calls.md](calls/raft-write-path-plan_calls.md)
+- [lane-isolation-plan_calls.md](calls/lane-isolation-plan_calls.md)
+- [write-path-cost-followups_calls.md](calls/write-path-cost-followups_calls.md)
 - [multi-eval-plans-plan_calls.md](calls/multi-eval-plans-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)
 - [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
@@ -330,6 +343,7 @@ by project impact. The full template and a worked example:
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
 - [placement-and-commit-cost-plan_calls.md](calls/placement-and-commit-cost-plan_calls.md)
 - [plan-apply-conflict-reduction-plan_calls.md](calls/plan-apply-conflict-reduction-plan_calls.md)
+- [candidates-and-indexes-plan_calls.md](calls/candidates-and-indexes-plan_calls.md)
 - [plan-path-fleet-scaling-plan_calls.md](calls/plan-path-fleet-scaling-plan_calls.md)
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)
 - [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
@@ -346,6 +360,7 @@ by project impact. The full template and a worked example:
 - [todo-bug-sweep-2026-11-08_calls.md](calls/todo-bug-sweep-2026-11-08_calls.md)
 - [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-11-10_calls.md)
 - [todo-closeout-2026-11-11_calls.md](calls/todo-closeout-2026-11-11_calls.md)
+- [correctness-gaps-2026-11-12_calls.md](calls/correctness-gaps-2026-11-12_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)

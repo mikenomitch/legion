@@ -1,17 +1,25 @@
 //! Declarable scheduling indexes: ad-hoc, operator-defined candidate
 //! generation for the scheduler (`internal_docs/plans/scheduling-index-plan.md`,
-//! public doc `docs/scheduling-indexes.md`).
+//! `internal_docs/plans/candidates-and-indexes-plan.md`, public doc
+//! `docs/scheduling-indexes.md`).
 //!
 //! An index is `partition_by` (exact-match attribute keys, each distinct
-//! value-tuple is a shard) times `dims` (numeric dimensions bucketed into a
-//! sparse grid — free resource capacity via `resources.*`, or any numeric
-//! node attribute). A query picks the shard the task's equality constraints
-//! bind, then walks the shard's occupied cells *nearest-fit first*: cells
-//! whose every bucket covers the request's bucket ("the orthant"), ordered by
+//! value-tuple is a shard) times a geometry that projects every node of a
+//! shard into a cell. The built-in geometry (`kind = "grid"`) is `dims`:
+//! numeric dimensions bucketed into a sparse grid — free resource capacity via
+//! `resources.*`, free device counts via `devices.*`, or any numeric node
+//! attribute. A query picks the shard the task's equality constraints bind,
+//! then walks the shard's occupied cells *nearest-fit first*: cells whose
+//! every bucket covers the request's bucket ("the orthant"), ordered by
 //! weighted bucket distance, then every remaining cell. Ordering is therefore
 //! fit-informed but the untruncated candidate *set* is exactly the shard —
 //! with an unbounded budget the scheduler's re-verified candidates equal
 //! today's full scan, which is what the equivalence tests pin down.
+//!
+//! A plugin kind ([`IndexKind`]) replaces only the geometry: it projects a
+//! node to a cell and ranks a cell for a request. Shards, maintenance, the
+//! walk, truncation, and re-verification stay here, so a plugin can make the
+//! order worse but never a placement invalid.
 //!
 //! Within one cell the index has no preference, so when a budget cut lands
 //! inside a cell the remainder is sampled uniformly from that cell rather
@@ -24,12 +32,14 @@
 //! through the ordinary constraint/permit/ledger chain, so a stale or wrong
 //! index costs a refill or a worse pick, never an invalid placement.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::sync::Arc;
 
 use crate::constraints::{node_attr, value_token};
+use crate::devices::{DeviceName, POOL_KEY_PREFIX};
 use crate::prelude::*;
-use crate::resources::ResourcePool;
+use crate::resources::{ResourcePool, ResourceRequest, ResourceValue};
 use crate::structs::Node;
 
 /// Default for `schedulerSettings.index_min_nodes`: below this many candidate
@@ -41,9 +51,25 @@ pub const DEFAULT_INDEX_MIN_NODES: usize = 128;
 /// degrade with dimensionality, so this fails fast at parse time.
 pub const MAX_DIMS_PER_INDEX: usize = 6;
 
+/// The `indexHint` value that skips every index and scans, and therefore a
+/// name no declared index may take.
+pub const SCAN_HINT: &str = "scan";
+
+/// The built-in geometry's kind name.
+pub const GRID_KIND: &str = "grid";
+
+/// The resource every task requests one of and `maxAllocations` caps. It is
+/// never counted as selection coverage: every request names it, so counting
+/// it would only tilt selection toward whichever index happens to carry it.
+pub const ALLOCATIONS_RESOURCE: &str = "allocations";
+
 /// Dim attrs with this prefix read free resource capacity; anything else
 /// reads the node attribute chain (config -> fingerprint -> dynamic).
 const RESOURCE_DIM_PREFIX: &str = "resources.";
+
+/// Dim attrs with this prefix count free devices whose group matches the
+/// device name after it (`devices.gpu`, `devices.nvidia/gpu/A100`).
+const DEVICE_DIM_PREFIX: &str = "devices.";
 
 /// Joins per-key partition tokens into one shard key. An ASCII unit
 /// separator cannot appear unescaped in `value_token` output (serde_json
@@ -58,6 +84,10 @@ const ABSENT_TOKEN: &str = "\u{1f}absent";
 /// Log-scale bucket reserved for infinite capacity (unfingerprinted
 /// resources); finite values cap one below it.
 const LOG_INFINITY_BUCKET: u16 = 64;
+
+/// Longest cell a plugin kind may project (longer ones are cut). Cells are
+/// map keys compared on every walk, so they stay small.
+pub const MAX_PLUGIN_CELL_LEN: usize = 16;
 
 /// How an index participates in planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,14 +131,173 @@ pub enum DimScale {
     Linear { step: f64 },
 }
 
+/// What a dim reads, decided once at parse time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DimSource {
+    /// `resources.<name>`: free capacity. An amount reads as itself; an item
+    /// set (a custom item resource, a device pool key) as its free count.
+    Resource(String),
+    /// `devices.<name>`: free devices across every group the name matches.
+    Device(DeviceName),
+    /// Any other key: a numeric node attribute.
+    Attr(String),
+}
+
+impl DimSource {
+    fn parse(index_name: &str, attr: &str) -> R<DimSource> {
+        if let Some(name) = attr.strip_prefix(RESOURCE_DIM_PREFIX) {
+            if name.is_empty() {
+                bail!("index {index_name}: dim {attr} names no resource");
+            }
+            return Ok(DimSource::Resource(name.to_string()));
+        }
+        if let Some(name) = attr.strip_prefix(DEVICE_DIM_PREFIX) {
+            let parsed = DeviceName::parse(name)
+                .with_context(|| format!("index {index_name}: dim {attr}"))?;
+            return Ok(DimSource::Device(parsed));
+        }
+        Ok(DimSource::Attr(attr.to_string()))
+    }
+
+    /// Counts toward selection coverage when the request asks for it.
+    fn is_request_dim(&self) -> bool {
+        match self {
+            DimSource::Resource(name) => name != ALLOCATIONS_RESOURCE,
+            DimSource::Device(_) => true,
+            DimSource::Attr(_) => false,
+        }
+    }
+}
+
 /// One numeric dimension of an index.
 #[derive(Debug, Clone)]
 pub struct DimSpec {
-    /// `resources.<name>` for free capacity, else a numeric node attribute.
+    /// As declared: `resources.<name>`, `devices.<name>`, or an attribute.
     pub attr: String,
-    /// Multiplies this dim's contribution to the ordering distance.
+    /// Multiplies this dim's contribution to the ordering distance. `0`
+    /// makes the dim a pure fit test (the built-in `allocations` dim).
     pub weight: f64,
     pub scale: DimScale,
+    pub source: DimSource,
+}
+
+impl DimSpec {
+    fn new(index_name: &str, attr: &str, weight: f64, scale: DimScale) -> R<DimSpec> {
+        Ok(DimSpec {
+            attr: attr.to_string(),
+            weight,
+            scale,
+            source: DimSource::parse(index_name, attr)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pluggable kinds
+// ---------------------------------------------------------------------------
+
+/// A cell's place in a walk, as an [`IndexKind`] judges it for one request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellRank {
+    /// False sends the cell to the walk's tail (after every fitting cell):
+    /// the kind believes no node in it can take the request. The ledger
+    /// re-checks either way.
+    pub fits: bool,
+    /// Lower walks first within the fitting (and within the tail) cells.
+    pub distance: f64,
+}
+
+/// An index geometry (`kind = "<name>"` on an index declaration,
+/// docs/scheduling-indexes.md "Index kinds"). Stateless: Legion owns the
+/// shards and calls [`IndexKind::project`] under the read-model lock whenever
+/// a node or its free capacity changes, and [`IndexKind::rank`] once per
+/// occupied cell per query. Both must be cheap and must not block.
+pub trait IndexKind: Send + Sync {
+    /// The kind's name, for logs.
+    fn name(&self) -> &'static str;
+
+    /// One node's cell: a short vector (at most [`MAX_PLUGIN_CELL_LEN`]
+    /// values; longer ones are cut). Nodes with equal cells are
+    /// indistinguishable to the index.
+    fn project(&self, node: &Node, free: &ResourcePool) -> Vec<u16>;
+
+    /// Where a cell falls in the walk for `request`.
+    fn rank(&self, cell: &[u16], request: &IndexRequest) -> CellRank;
+
+    /// How many of `request`'s resources this kind orders by: automatic
+    /// selection prefers the index that covers the most.
+    fn coverage(&self, _request: &IndexRequest) -> usize {
+        0
+    }
+
+    /// False once the kind can no longer be trusted (a guarded plugin that
+    /// panicked). Selection then skips the index and planning scans.
+    fn healthy(&self) -> bool {
+        true
+    }
+}
+
+impl<T: IndexKind + ?Sized> IndexKind for Box<T> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    fn project(&self, node: &Node, free: &ResourcePool) -> Vec<u16> {
+        (**self).project(node, free)
+    }
+    fn rank(&self, cell: &[u16], request: &IndexRequest) -> CellRank {
+        (**self).rank(cell, request)
+    }
+    fn coverage(&self, request: &IndexRequest) -> usize {
+        (**self).coverage(request)
+    }
+    fn healthy(&self) -> bool {
+        (**self).healthy()
+    }
+}
+
+/// What a kind plugin exports: one [`IndexKind`] per index declared with
+/// that kind, built from the declaration's free-form `options`.
+pub trait IndexKindFactory: Send + Sync {
+    /// The kind's name, for logs.
+    fn name(&self) -> &'static str;
+
+    /// The geometry for index `index_name`. An error fails manager startup,
+    /// naming the index — the same posture as any malformed declaration.
+    fn build(&self, index_name: &str, options: &Value) -> R<Box<dyn IndexKind>>;
+}
+
+/// A resolved plugin kind, shared by every clone of the settings.
+#[derive(Clone)]
+pub struct KindHandle(pub Arc<dyn IndexKind>);
+
+impl std::fmt::Debug for KindHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "KindHandle({})", self.0.name())
+    }
+}
+
+/// An index's geometry, as declared.
+#[derive(Debug, Clone)]
+pub enum IndexKindRef {
+    /// The built-in grid over `dims`.
+    Grid,
+    /// `kind = "<name>"`: a plugin geometry, resolved after parsing
+    /// ([`IndexSettings::resolve_kinds`]). `handle` stays `None` until then;
+    /// an unresolved kind is never selected.
+    Plugin {
+        name: String,
+        options: Value,
+        handle: Option<KindHandle>,
+    },
+}
+
+impl IndexKindRef {
+    pub fn name(&self) -> &str {
+        match self {
+            IndexKindRef::Grid => GRID_KIND,
+            IndexKindRef::Plugin { name, .. } => name,
+        }
+    }
 }
 
 /// A parsed index declaration.
@@ -119,15 +308,152 @@ pub struct IndexSpec {
     pub dims: Vec<DimSpec>,
     pub order: IndexOrder,
     pub mode: IndexMode,
+    pub kind: IndexKindRef,
 }
 
 impl IndexSpec {
-    fn resource_dim_names(&self) -> impl Iterator<Item = &str> {
-        self.dims
-            .iter()
-            .filter_map(|dim| dim.attr.strip_prefix(RESOURCE_DIM_PREFIX))
+    /// Why this index cannot serve any query right now, if it cannot:
+    /// `off`, an unresolved plugin kind, or a quarantined one.
+    fn unavailable(&self) -> Option<String> {
+        if self.mode == IndexMode::Off {
+            return Some(format!("{} is off", self.name));
+        }
+        match &self.kind {
+            IndexKindRef::Grid => None,
+            IndexKindRef::Plugin { name, handle, .. } => match handle {
+                None => Some(format!("{}: kind {name} is not loaded", self.name)),
+                Some(handle) if !handle.0.healthy() => Some(format!(
+                    "{}: kind {name} is quarantined after a plugin failure",
+                    self.name
+                )),
+                Some(_) => None,
+            },
+        }
+    }
+
+    fn coverage(&self, request: &IndexRequest) -> usize {
+        match &self.kind {
+            IndexKindRef::Grid => self
+                .dims
+                .iter()
+                .filter(|dim| dim.source.is_request_dim() && request.dim_value(dim) > 0.0)
+                .count(),
+            IndexKindRef::Plugin { handle, .. } => handle
+                .as_ref()
+                .map_or(0, |handle| handle.0.coverage(request)),
+        }
+    }
+
+    fn project(&self, node: &Node, pool: &ResourcePool) -> Vec<u16> {
+        match &self.kind {
+            IndexKindRef::Grid => self
+                .dims
+                .iter()
+                .map(|dim| bucket_value(&dim.scale, dim_value(node, pool, dim)))
+                .collect(),
+            IndexKindRef::Plugin { handle, .. } => match handle {
+                Some(handle) => {
+                    let mut cell = handle.0.project(node, pool);
+                    cell.truncate(MAX_PLUGIN_CELL_LEN);
+                    cell
+                }
+                None => Vec::new(),
+            },
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+/// What a task (or a co-placed group) asks of an index: its resource amounts,
+/// item-set sizes, device demands, and an optional `indexHint`.
+#[derive(Debug, Clone, Default)]
+pub struct IndexRequest {
+    /// `Amount` resources by name.
+    pub amounts: HashMap<String, f64>,
+    /// `Items` resources by name: how many items the request names.
+    pub item_counts: HashMap<String, f64>,
+    /// Unassigned device demands: name and count.
+    pub devices: Vec<(DeviceName, u32)>,
+    /// The task's `indexHint`: an index name, or [`SCAN_HINT`].
+    pub hint: Option<String>,
+}
+
+impl IndexRequest {
+    /// A request of plain amounts (tests and simple callers).
+    pub fn from_amounts(amounts: HashMap<String, f64>) -> IndexRequest {
+        IndexRequest {
+            amounts,
+            ..IndexRequest::default()
+        }
+    }
+
+    /// A task's normalized resource request, as the index sees it.
+    pub fn from_resource_request(request: &ResourceRequest) -> IndexRequest {
+        let mut out = IndexRequest::default();
+        for (name, value) in &request.values {
+            match value {
+                ResourceValue::Amount(amount) => {
+                    out.amounts.insert(name.clone(), *amount);
+                }
+                ResourceValue::Items(items) => {
+                    out.item_counts.insert(name.clone(), items.len() as f64);
+                }
+            }
+        }
+        out.devices = request
+            .devices
+            .iter()
+            .map(|demand| (demand.name.clone(), demand.count))
+            .collect();
+        out
+    }
+
+    pub fn with_hint(mut self, hint: Option<&str>) -> IndexRequest {
+        self.hint = hint.map(str::to_string);
+        self
+    }
+
+    /// Adds `other` to this request: what one node must hold for both (a
+    /// multi-task group's members all land on one node).
+    pub fn add(&mut self, other: &IndexRequest) {
+        for (name, amount) in &other.amounts {
+            *self.amounts.entry(name.clone()).or_default() += amount;
+        }
+        for (name, count) in &other.item_counts {
+            *self.item_counts.entry(name.clone()).or_default() += count;
+        }
+        self.devices.extend(other.devices.iter().cloned());
+        if self.hint.is_none() {
+            self.hint = other.hint.clone();
+        }
+    }
+
+    /// The request's value along `dim`: what a node must have free there.
+    pub fn dim_value(&self, dim: &DimSpec) -> f64 {
+        match &dim.source {
+            DimSource::Resource(name) => self
+                .amounts
+                .get(name)
+                .or_else(|| self.item_counts.get(name))
+                .copied()
+                .unwrap_or(0.0),
+            DimSource::Device(wanted) => self
+                .devices
+                .iter()
+                .filter(|(name, _)| name.compatible(wanted))
+                .map(|(_, count)| f64::from(*count))
+                .sum(),
+            DimSource::Attr(_) => 0.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
 
 /// Parsed `schedulerSettings.indexes` + `index_min_nodes`.
 #[derive(Debug, Clone)]
@@ -150,21 +476,46 @@ impl Default for IndexSettings {
 /// land in that dim's zero-free bucket — they match requests that don't ask
 /// for it and sort last for requests that do, which is exactly what the
 /// ledger would conclude anyway.
+///
+/// The fourth dim, free `allocations` at weight 0, is a cap flag: it takes
+/// part in the orthant test only. A node at its `maxAllocations` lands in the
+/// non-fitting tail instead of a fitting cell (where, looking idle on cpu and
+/// memory, it used to rank first under `bin_pack` and waste the candidate
+/// budget), while every node with a free slot ranks exactly as before —
+/// uncapped nodes (infinite free) and capped ones alike contribute nothing to
+/// the distance.
 fn default_fit_spec(order: IndexOrder) -> IndexSpec {
+    let mut dims: Vec<DimSpec> = ["resources.cpu", "resources.memory", "resources.disk"]
+        .iter()
+        .map(|attr| DimSpec {
+            attr: (*attr).to_string(),
+            weight: 1.0,
+            scale: DimScale::Log,
+            source: DimSource::Resource(attr[RESOURCE_DIM_PREFIX.len()..].to_string()),
+        })
+        .collect();
+    dims.push(DimSpec {
+        attr: format!("{RESOURCE_DIM_PREFIX}{ALLOCATIONS_RESOURCE}"),
+        weight: 0.0,
+        scale: DimScale::Log,
+        source: DimSource::Resource(ALLOCATIONS_RESOURCE.to_string()),
+    });
     IndexSpec {
         name: "fit".to_string(),
         partition_by: vec!["pool".to_string()],
-        dims: ["resources.cpu", "resources.memory", "resources.disk"]
-            .iter()
-            .map(|attr| DimSpec {
-                attr: (*attr).to_string(),
-                weight: 1.0,
-                scale: DimScale::Log,
-            })
-            .collect(),
+        dims,
         order,
         mode: IndexMode::On,
+        kind: IndexKindRef::Grid,
     }
+}
+
+/// Which index serves a query, and anything the explain surface should say
+/// about how it was chosen (an ignored hint).
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub index: usize,
+    pub note: Option<String>,
 }
 
 impl IndexSettings {
@@ -173,6 +524,9 @@ impl IndexSettings {
     /// everything else packs (`tight`). Unknown fields and malformed specs
     /// fail loudly — indexes silently doing nothing is the failure mode the
     /// explain surface exists to prevent, and that starts at parse time.
+    ///
+    /// Plugin kinds parse into unresolved [`IndexKindRef::Plugin`] entries;
+    /// the manager resolves them with [`IndexSettings::resolve_kinds`].
     pub fn from_scheduler_settings(
         settings: Option<&Value>,
         scheduling_policy: &str,
@@ -207,6 +561,9 @@ impl IndexSettings {
                 _ => bail!("scheduler_settings.indexes must be an object of name -> index"),
             };
             for (name, value) in entries.into_iter().flatten() {
+                if name == SCAN_HINT {
+                    bail!("index name {SCAN_HINT} is reserved: `indexHint = \"{SCAN_HINT}\"` means no index");
+                }
                 if name == "fit" {
                     fit_handled = true;
                 }
@@ -239,6 +596,43 @@ impl IndexSettings {
         Ok(IndexSettings { indexes, min_nodes })
     }
 
+    /// The plugin kind names the declarations use, deduplicated.
+    pub fn plugin_kinds(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .indexes
+            .iter()
+            .filter_map(|spec| match &spec.kind {
+                IndexKindRef::Plugin { name, .. } => Some(name.clone()),
+                IndexKindRef::Grid => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Resolves every plugin-kind declaration: `build(kind, index, options)`
+    /// returns the geometry for one index. An error names the index and
+    /// fails the whole parse, like any malformed declaration.
+    pub fn resolve_kinds(
+        &mut self,
+        mut build: impl FnMut(&str, &str, &Value) -> R<Arc<dyn IndexKind>>,
+    ) -> R<()> {
+        for spec in &mut self.indexes {
+            if let IndexKindRef::Plugin {
+                name,
+                options,
+                handle,
+            } = &mut spec.kind
+            {
+                let kind = build(name, &spec.name, options)
+                    .with_context(|| format!("index {}: kind {name}", spec.name))?;
+                *handle = Some(KindHandle(kind));
+            }
+        }
+        Ok(())
+    }
+
     /// True when any declared index can ever serve a query.
     pub fn any_active(&self) -> bool {
         self.min_nodes > 0 && self.indexes.iter().any(|spec| spec.mode != IndexMode::Off)
@@ -250,39 +644,100 @@ impl IndexSettings {
         self.any_active() && candidate_count >= self.min_nodes
     }
 
-    /// Picks the index for a task: usable means not `off` and every
-    /// `partition_by` key bound by `bindings`; best coverage of the task's
-    /// requested resources wins, then more partition keys, then declaration
-    /// order. `Err` carries the human-readable reason for the explain surface.
+    /// Picks the index for a task: usable means available (not `off`, its
+    /// kind loaded and healthy) and every `partition_by` key bound by
+    /// `bindings`; best coverage of the task's requested resources wins,
+    /// then more partition keys, then declaration order. `Err` carries the
+    /// human-readable reason for the explain surface.
     pub fn select(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &IndexRequest,
     ) -> Result<usize, String> {
+        self.select_hinted(bindings, request)
+            .map(|selection| selection.index)
+    }
+
+    /// [`Self::select`], honoring `request.hint`: a hinted index that is
+    /// usable wins outright; one that is not falls back to automatic
+    /// selection, with a note saying why. A [`SCAN_HINT`] is the caller's
+    /// to honor before querying; here it selects nothing.
+    pub fn select_hinted(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &IndexRequest,
+    ) -> Result<Selection, String> {
+        self.select_where(|key| bindings.contains_key(key), request, None)
+    }
+
+    /// Selection core: `bound(key)` says whether a partition key is bound,
+    /// and `require` (partition enumeration) admits only indexes whose
+    /// `partition_by` contains that key.
+    fn select_where(
+        &self,
+        bound: impl Fn(&str) -> bool,
+        request: &IndexRequest,
+        require: Option<&str>,
+    ) -> Result<Selection, String> {
         if self.indexes.is_empty() {
             return Err("no indexes configured".to_string());
         }
-        let mut best: Option<(usize, usize, usize)> = None;
-        let mut unusable = Vec::new();
-        for (idx, spec) in self.indexes.iter().enumerate() {
-            if spec.mode == IndexMode::Off {
-                continue;
+        if request.hint.as_deref() == Some(SCAN_HINT) {
+            return Err(format!("indexHint = \"{SCAN_HINT}\""));
+        }
+        let usable = |spec: &IndexSpec| -> Result<(), String> {
+            if let Some(reason) = spec.unavailable() {
+                return Err(reason);
+            }
+            if let Some(key) = require {
+                if !spec.partition_by.iter().any(|partition| partition == key) {
+                    return Err(format!("{} does not partition by {key}", spec.name));
+                }
             }
             let missing: Vec<&str> = spec
                 .partition_by
                 .iter()
-                .filter(|key| !bindings.contains_key(key.as_str()))
+                .filter(|key| !bound(key.as_str()))
                 .map(String::as_str)
                 .collect();
-            if !missing.is_empty() {
-                unusable.push(format!("{} needs [{}]", spec.name, missing.join(", ")));
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} needs [{}]", spec.name, missing.join(", ")))
+            }
+        };
+
+        let mut note = None;
+        if let Some(hint) = request.hint.as_deref() {
+            match self.indexes.iter().position(|spec| spec.name == hint) {
+                Some(idx) => match usable(&self.indexes[idx]) {
+                    Ok(()) => {
+                        return Ok(Selection {
+                            index: idx,
+                            note: None,
+                        })
+                    }
+                    Err(reason) => note = Some(format!("hint {hint} unusable: {reason}")),
+                },
+                None => note = Some(format!("hint {hint} names no declared index")),
+            }
+        }
+
+        let mut best: Option<(usize, usize, usize)> = None;
+        let mut unusable = Vec::new();
+        let mut every_off = true;
+        for (idx, spec) in self.indexes.iter().enumerate() {
+            if spec.mode != IndexMode::Off {
+                every_off = false;
+            }
+            if spec.mode == IndexMode::Off {
                 continue;
             }
-            let coverage = spec
-                .resource_dim_names()
-                .filter(|name| request.get(*name).copied().unwrap_or(0.0) > 0.0)
-                .count();
-            let candidate = (coverage, spec.partition_by.len(), idx);
+            if let Err(reason) = usable(spec) {
+                unusable.push(reason);
+                continue;
+            }
+            let candidate = (spec.coverage(request), spec.partition_by.len(), idx);
             let better = match best {
                 None => true,
                 // Highest coverage, then most partition keys, then earliest
@@ -296,18 +751,25 @@ impl IndexSettings {
                 best = Some(candidate);
             }
         }
+        let with_note = |reason: String| match &note {
+            Some(note) => format!("{note}; {reason}"),
+            None => reason,
+        };
         match best {
-            Some((_, _, idx)) => Ok(idx),
-            None if unusable.is_empty() => Err("every index is off".to_string()),
-            None => Err(format!("no usable index: {}", unusable.join("; "))),
+            Some((_, _, idx)) => Ok(Selection { index: idx, note }),
+            None if every_off => Err(with_note("every index is off".to_string())),
+            None => Err(with_note(format!(
+                "no usable index: {}",
+                unusable.join("; ")
+            ))),
         }
     }
 }
 
 fn parse_index_spec(name: &str, value: &Value, default_order: IndexOrder) -> R<IndexSpec> {
-    let (partition_by, dims, order, mode) = match value {
-        // Shorthand: a list of attribute keys. `resources.*` entries become
-        // dims, everything else partitions.
+    let (partition_by, dims, order, mode, kind) = match value {
+        // Shorthand: a list of attribute keys. `resources.*` and `devices.*`
+        // entries become dims, everything else partitions.
         Value::Array(items) => {
             let mut partition_by = Vec::new();
             let mut dims = Vec::new();
@@ -315,22 +777,27 @@ fn parse_index_spec(name: &str, value: &Value, default_order: IndexOrder) -> R<I
                 let key = item
                     .as_str()
                     .with_context(|| format!("index {name}: shorthand entries must be strings"))?;
-                if key.starts_with(RESOURCE_DIM_PREFIX) {
-                    dims.push(DimSpec {
-                        attr: key.to_string(),
-                        weight: 1.0,
-                        scale: DimScale::Log,
-                    });
+                if key.starts_with(RESOURCE_DIM_PREFIX) || key.starts_with(DEVICE_DIM_PREFIX) {
+                    dims.push(DimSpec::new(name, key, 1.0, DimScale::Log)?);
                 } else {
                     partition_by.push(key.to_string());
                 }
             }
-            (partition_by, dims, default_order, IndexMode::On)
+            (
+                partition_by,
+                dims,
+                default_order,
+                IndexMode::On,
+                IndexKindRef::Grid,
+            )
         }
         Value::Object(map) => {
             for key in map.keys() {
-                if !matches!(key.as_str(), "partition_by" | "dims" | "order" | "mode") {
-                    bail!("index {name}: unknown field {key} (expected partition_by, dims, order, mode)");
+                if !matches!(
+                    key.as_str(),
+                    "partition_by" | "dims" | "order" | "mode" | "kind" | "options"
+                ) {
+                    bail!("index {name}: unknown field {key} (expected partition_by, dims, order, mode, kind, options)");
                 }
             }
             let partition_by = match map.get("partition_by") {
@@ -366,12 +833,41 @@ fn parse_index_spec(name: &str, value: &Value, default_order: IndexOrder) -> R<I
                 Some("off") => IndexMode::Off,
                 Some(other) => bail!("index {name}: mode must be on, shadow, or off, got {other}"),
             };
-            (partition_by, dims, order, mode)
+            let options = map.get("options").cloned().unwrap_or(Value::Null);
+            let kind = match map.get("kind") {
+                None | Some(Value::Null) => IndexKindRef::Grid,
+                Some(Value::String(kind)) if kind == GRID_KIND => IndexKindRef::Grid,
+                Some(Value::String(kind)) => {
+                    if kind.is_empty()
+                        || !kind
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                    {
+                        bail!("index {name}: kind must be a plugin name (letters, digits, `_`, `-`), got {kind:?}");
+                    }
+                    if !dims.is_empty() {
+                        bail!("index {name}: dims belong to the grid kind; a {kind} index takes its geometry from the plugin (configure it with options)");
+                    }
+                    if map.contains_key("order") {
+                        bail!("index {name}: order belongs to the grid kind; a {kind} index ranks cells itself");
+                    }
+                    IndexKindRef::Plugin {
+                        name: kind.clone(),
+                        options: options.clone(),
+                        handle: None,
+                    }
+                }
+                Some(_) => bail!("index {name}: kind must be a string"),
+            };
+            if matches!(kind, IndexKindRef::Grid) && !options.is_null() {
+                bail!("index {name}: options only apply to a plugin kind");
+            }
+            (partition_by, dims, order, mode, kind)
         }
         _ => bail!("index {name}: must be false, a list of attribute keys, or an object"),
     };
 
-    if partition_by.is_empty() && dims.is_empty() {
+    if partition_by.is_empty() && dims.is_empty() && matches!(kind, IndexKindRef::Grid) {
         bail!("index {name}: needs at least one partition_by key or dim");
     }
     if dims.len() > MAX_DIMS_PER_INDEX {
@@ -396,16 +892,13 @@ fn parse_index_spec(name: &str, value: &Value, default_order: IndexOrder) -> R<I
         dims,
         order,
         mode,
+        kind,
     })
 }
 
 fn parse_dim_spec(index_name: &str, value: &Value) -> R<DimSpec> {
     match value {
-        Value::String(attr) => Ok(DimSpec {
-            attr: attr.clone(),
-            weight: 1.0,
-            scale: DimScale::Log,
-        }),
+        Value::String(attr) => DimSpec::new(index_name, attr, 1.0, DimScale::Log),
         Value::Object(map) => {
             for key in map.keys() {
                 if !matches!(key.as_str(), "attr" | "weight" | "scale" | "step") {
@@ -452,11 +945,7 @@ fn parse_dim_spec(index_name: &str, value: &Value) -> R<DimSpec> {
                     bail!("index {index_name}: dim scale must be log or linear, got {other}")
                 }
             };
-            Ok(DimSpec {
-                attr,
-                weight,
-                scale,
-            })
+            DimSpec::new(index_name, &attr, weight, scale)
         }
         _ => bail!("index {index_name}: dims must be strings or objects"),
     }
@@ -466,11 +955,14 @@ fn parse_dim_spec(index_name: &str, value: &Value) -> R<DimSpec> {
 // Live state
 // ---------------------------------------------------------------------------
 
-/// One node's projection into one index.
+/// One node's projection into one index: shard key and cell.
 type NodeProjection = (String, Vec<u16>);
 
 #[derive(Debug, Clone, Default)]
 struct Shard {
+    /// The partition tokens this shard's key joins, in `partition_by`
+    /// order: what partition enumeration matches against.
+    tokens: Vec<String>,
     /// Cell -> node ids in it, ids kept sorted for deterministic output.
     cells: BTreeMap<Vec<u16>, Vec<String>>,
 }
@@ -482,8 +974,19 @@ struct IndexState {
 }
 
 impl IndexState {
-    pub fn insert(&mut self, node_id: &str, projection: NodeProjection) {
-        let shard = self.shards.entry(projection.0.clone()).or_default();
+    fn insert(
+        &mut self,
+        node_id: &str,
+        projection: NodeProjection,
+        tokens: impl FnOnce() -> Vec<String>,
+    ) {
+        let shard = self
+            .shards
+            .entry(projection.0.clone())
+            .or_insert_with(|| Shard {
+                tokens: tokens(),
+                cells: BTreeMap::new(),
+            });
         let ids = shard.cells.entry(projection.1.clone()).or_default();
         if let Err(pos) = ids.binary_search_by(|id| id.as_str().cmp(node_id)) {
             ids.insert(pos, node_id.to_string());
@@ -530,6 +1033,9 @@ pub struct IndexCandidates {
     /// Shard population before any budget truncation.
     pub partition_size: usize,
     pub truncated: bool,
+    /// How selection went, when there is something to say (an ignored
+    /// `indexHint`).
+    pub note: Option<String>,
 }
 
 /// Cut a best-first list of `(item, cell rank)` down to `budget` items.
@@ -607,6 +1113,80 @@ pub struct IndexWalk<T> {
     /// More eligible nodes existed than `budget` (the old
     /// `verified.len() > budget`).
     pub truncated: bool,
+    /// See [`IndexCandidates::note`].
+    pub note: Option<String>,
+}
+
+/// The shards a `count.per` key splits a query into
+/// ([`IndexSet::enumerate_partitions`]): one per value of the key.
+#[derive(Debug, Clone)]
+pub struct PartitionEnumeration {
+    pub index: String,
+    /// Position of the serving index in the settings.
+    pub index_pos: usize,
+    /// `(per-key value token, shard key)`, sorted by token. The token is
+    /// `value_token` of the node attribute, the same token
+    /// `count.per` grouping uses.
+    pub groups: Vec<(String, String)>,
+    pub note: Option<String>,
+}
+
+/// One ranked cell in a walk. Ordered so a [`BinaryHeap`] (a max-heap) pops
+/// the best cell first: fitting before the tail, lower distance first, then
+/// the cell key for a deterministic walk.
+struct HeapCell<'s> {
+    tail: bool,
+    distance: f64,
+    key: &'s Vec<u16>,
+    ids: &'s Vec<String>,
+}
+
+impl HeapCell<'_> {
+    fn order(&self, other: &Self) -> Ordering {
+        self.tail
+            .cmp(&other.tail)
+            .then(self.distance.total_cmp(&other.distance))
+            .then(self.key.cmp(other.key))
+    }
+}
+
+impl PartialEq for HeapCell<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.order(other) == Ordering::Equal
+    }
+}
+impl Eq for HeapCell<'_> {}
+impl PartialOrd for HeapCell<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapCell<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed: the max-heap's top is the smallest (best) cell.
+        other.order(self)
+    }
+}
+
+/// A shard's cells in walk order, produced lazily: ranking is O(cells) up
+/// front, and each pop is O(log cells). A walk that stops after a few cells
+/// (the budgeted walk) never pays for ordering the rest — the incremental
+/// enumeration with early termination the grid deferred in v1
+/// (scheduling-index calls 8).
+enum CellWalk<'s> {
+    Unordered(std::collections::btree_map::Values<'s, Vec<u16>, Vec<String>>),
+    Ordered(BinaryHeap<HeapCell<'s>>),
+}
+
+impl<'s> Iterator for CellWalk<'s> {
+    type Item = &'s Vec<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            CellWalk::Unordered(values) => values.next(),
+            CellWalk::Ordered(heap) => heap.pop().map(|cell| cell.ids),
+        }
+    }
 }
 
 /// Every declared index's live state. Lives inside the scheduling read model
@@ -657,7 +1237,7 @@ impl IndexSet {
                 continue;
             }
             state.remove(&node.id);
-            state.insert(&node.id, projection);
+            state.insert(&node.id, projection, || partition_tokens(spec, node));
         }
     }
 
@@ -674,18 +1254,12 @@ impl IndexSet {
     pub fn query(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &IndexRequest,
         budget: Option<usize>,
     ) -> IndexQueryOutcome {
         self.query_with_order(bindings, request, budget, true)
     }
 
-    /// [`IndexSet::query`], with the nearest-fit cell ordering optional.
-    /// A caller that re-orders the candidates itself (the scheduler's
-    /// untruncated path sorts verified candidates by node id) passes
-    /// `ordered: false` and skips the shard's cell sort entirely — under
-    /// `budget: None` the sort's only effect was an ordering the caller
-    /// threw away.
     /// The index this query uses and its shard's occupied cells, walked
     /// best-first when `ordered` (the cell rank is the position here).
     /// `Err` carries an outcome that needs no walk: indexing disabled, no
@@ -693,19 +1267,17 @@ impl IndexSet {
     fn select_cells<'s>(
         &'s self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &IndexRequest,
         ordered: bool,
-    ) -> Result<(&'s IndexSpec, Vec<&'s Vec<String>>), IndexQueryOutcome> {
+    ) -> Result<(&'s IndexSpec, CellWalk<'s>, usize, Option<String>), IndexQueryOutcome> {
         if self.settings.indexes.is_empty() || self.settings.min_nodes == 0 {
             return Err(IndexQueryOutcome::Disabled);
         }
-        let idx = match self.settings.select(bindings, request) {
-            Ok(idx) => idx,
+        let Selection { index: idx, note } = match self.settings.select_hinted(bindings, request) {
+            Ok(selection) => selection,
             Err(reason) => return Err(IndexQueryOutcome::Unusable { reason }),
         };
         let spec = &self.settings.indexes[idx];
-        let state = &self.states[idx];
-
         let partition = spec
             .partition_by
             .iter()
@@ -719,95 +1291,115 @@ impl IndexSet {
             .collect::<Vec<_>>()
             .join(&PARTITION_SEPARATOR.to_string());
 
-        let Some(shard) = state.shards.get(&partition) else {
+        match self.shard_walk(idx, &partition, request, ordered) {
+            Some((walk, size)) => Ok((spec, walk, size, note)),
             // No node carries this exact attribute tuple. The scan would
             // reject every node on the same equality constraint, so an empty
             // candidate set is the *correct* answer, not a fallback case.
-            return Err(IndexQueryOutcome::Candidates(IndexCandidates {
+            None => Err(IndexQueryOutcome::Candidates(IndexCandidates {
                 index: spec.name.clone(),
                 mode: spec.mode,
                 node_ids: Vec::new(),
                 cell_ranks: Vec::new(),
                 partition_size: 0,
                 truncated: false,
-            }));
-        };
-
-        let request_cell: Vec<u16> = spec
-            .dims
-            .iter()
-            .map(|dim| {
-                let wanted = dim
-                    .attr
-                    .strip_prefix(RESOURCE_DIM_PREFIX)
-                    .and_then(|name| request.get(name).copied())
-                    .unwrap_or(0.0);
-                bucket_value(&dim.scale, wanted)
-            })
-            .collect();
-
-        // Order every occupied cell: the orthant (every bucket covers the
-        // request's) first by weighted distance — ascending for tight,
-        // descending for loose — then the provably-non-fitting tail, closest
-        // first. Cell key breaks ties between cells so the cell walk is
-        // deterministic. Skipped entirely for unordered queries (the caller
-        // re-orders).
-        let mut cells: Vec<(&Vec<u16>, &Vec<String>)> = shard.cells.iter().collect();
-        if ordered {
-            let ranked = |cell: &[u16]| -> (u8, f64) {
-                let fits = cell
-                    .iter()
-                    .zip(request_cell.iter())
-                    .all(|(have, want)| have >= want);
-                let distance: f64 = cell
-                    .iter()
-                    .zip(request_cell.iter())
-                    .zip(spec.dims.iter())
-                    .map(|((have, want), dim)| {
-                        dim.weight * (f64::from(*have) - f64::from(*want)).abs()
-                    })
-                    .sum();
-                if fits {
-                    let distance = match spec.order {
-                        IndexOrder::Tight => distance,
-                        IndexOrder::Loose => -distance,
-                    };
-                    (0, distance)
-                } else {
-                    (1, distance)
-                }
-            };
-            // Rank once per cell, not once per comparison: the comparator
-            // used to recompute both sides' ranks O(n log n) times.
-            type RankedCell<'c> = ((u8, f64), (&'c Vec<u16>, &'c Vec<String>));
-            let mut ranked_cells: Vec<RankedCell<'_>> = cells
-                .into_iter()
-                .map(|cell| (ranked(cell.0), cell))
-                .collect();
-            ranked_cells.sort_by(|a, b| {
-                (a.0 .0)
-                    .cmp(&b.0 .0)
-                    .then(a.0 .1.total_cmp(&b.0 .1))
-                    .then(a.1 .0.cmp(b.1 .0))
-            });
-            cells = ranked_cells.into_iter().map(|(_, cell)| cell).collect();
+                note,
+            })),
         }
+    }
 
-        Ok((spec, cells.into_iter().map(|(_, ids)| ids).collect()))
+    /// One shard's cells as a walk, with the shard's population. `None` for
+    /// a shard no node occupies.
+    fn shard_walk<'s>(
+        &'s self,
+        idx: usize,
+        partition: &str,
+        request: &IndexRequest,
+        ordered: bool,
+    ) -> Option<(CellWalk<'s>, usize)> {
+        let spec = &self.settings.indexes[idx];
+        let shard = self.states[idx].shards.get(partition)?;
+        let size = shard.cells.values().map(Vec::len).sum();
+        if !ordered {
+            return Some((CellWalk::Unordered(shard.cells.values()), size));
+        }
+        // Rank every occupied cell once — the orthant (every bucket covers
+        // the request's) first by weighted distance, ascending for tight and
+        // descending for loose, then the provably-non-fitting tail, closest
+        // first; a plugin kind ranks cells itself — and heapify. The walk
+        // pops cells in order and stops when it has what it needs.
+        let heap: BinaryHeap<HeapCell<'_>> = match &spec.kind {
+            IndexKindRef::Grid => {
+                let request_cell: Vec<u16> = spec
+                    .dims
+                    .iter()
+                    .map(|dim| bucket_value(&dim.scale, request.dim_value(dim)))
+                    .collect();
+                shard
+                    .cells
+                    .iter()
+                    .map(|(key, ids)| {
+                        let fits = key
+                            .iter()
+                            .zip(request_cell.iter())
+                            .all(|(have, want)| have >= want);
+                        let distance: f64 = key
+                            .iter()
+                            .zip(request_cell.iter())
+                            .zip(spec.dims.iter())
+                            .map(|((have, want), dim)| {
+                                dim.weight * (f64::from(*have) - f64::from(*want)).abs()
+                            })
+                            .sum();
+                        let distance = match (fits, spec.order) {
+                            (true, IndexOrder::Loose) => -distance,
+                            _ => distance,
+                        };
+                        HeapCell {
+                            tail: !fits,
+                            distance,
+                            key,
+                            ids,
+                        }
+                    })
+                    .collect()
+            }
+            IndexKindRef::Plugin { handle, .. } => {
+                let handle = handle.as_ref()?;
+                shard
+                    .cells
+                    .iter()
+                    .map(|(key, ids)| {
+                        let rank = handle.0.rank(key, request);
+                        HeapCell {
+                            tail: !rank.fits,
+                            distance: if rank.distance.is_nan() {
+                                f64::INFINITY
+                            } else {
+                                rank.distance
+                            },
+                            key,
+                            ids,
+                        }
+                    })
+                    .collect()
+            }
+        };
+        Some((CellWalk::Ordered(heap), size))
     }
 
     pub fn query_with_order(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &IndexRequest,
         budget: Option<usize>,
         ordered: bool,
     ) -> IndexQueryOutcome {
-        let (spec, cells) = match self.select_cells(bindings, request, ordered) {
-            Ok(selected) => selected,
-            Err(outcome) => return outcome,
-        };
-        let partition_size: usize = cells.iter().map(|ids| ids.len()).sum();
+        let (spec, cells, partition_size, note) =
+            match self.select_cells(bindings, request, ordered) {
+                Ok(selected) => selected,
+                Err(outcome) => return outcome,
+            };
         // Tag every id with its cell's rank in the walk. Within a cell the
         // index has no opinion, so a budget cut that lands inside a cell
         // samples it (`truncate_within_boundary_cell`) — the sorted-id
@@ -816,7 +1408,7 @@ impl IndexSet {
         // The scheduler asks for the whole shard and truncates AFTER
         // re-verification, so the ranks travel with the ids.
         let mut ranked: Vec<(String, u32)> = Vec::with_capacity(partition_size);
-        for (rank, ids) in cells.iter().enumerate() {
+        for (rank, ids) in cells.enumerate() {
             ranked.extend(ids.iter().map(|id| (id.clone(), rank as u32)));
         }
         let (node_ids, cell_ranks): (Vec<String>, Vec<u32>) = match budget {
@@ -843,6 +1435,7 @@ impl IndexSet {
             cell_ranks,
             partition_size,
             truncated,
+            note,
         })
     }
 
@@ -855,11 +1448,12 @@ impl IndexSet {
     /// and verified every node id per task — linear in fleet size under the
     /// read-model lock.
     ///
-    /// Cells are walked best-first. A cell that fits in the remaining
-    /// budget is verified whole and kept in order. The first cell that does
-    /// not fit is drawn in uniformly random order and verified one member
-    /// at a time: the first `remaining` verified members are a uniform
-    /// sample of the cell's verified members, which is exactly what
+    /// Cells are walked best-first, popped from a heap, so the walk orders
+    /// only the cells it reaches. A cell that fits in the remaining budget
+    /// is verified whole and kept in order. The first cell that does not
+    /// fit is drawn in uniformly random order and verified one member at a
+    /// time: the first `remaining` verified members are a uniform sample of
+    /// the cell's verified members, which is exactly what
     /// `truncate_within_boundary_cell` takes from the boundary rank, and
     /// they are emitted in the cell's own order, as it emits them. If the
     /// cell runs out first, all its verified members were kept and the walk
@@ -877,67 +1471,183 @@ impl IndexSet {
     pub fn walk_verified<T>(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &IndexRequest,
         budget: usize,
-        mut verify: impl FnMut(&str) -> Option<T>,
+        verify: impl FnMut(&str) -> Option<T>,
     ) -> Result<IndexWalk<T>, IndexQueryOutcome> {
-        use rand::Rng;
-
-        let (spec, cells) = self.select_cells(bindings, request, true)?;
+        let (spec, cells, partition_size, note) = self.select_cells(bindings, request, true)?;
         if spec.mode != IndexMode::On {
             return Err(self.query_with_order(bindings, request, None, true));
         }
-        let partition_size: usize = cells.iter().map(|ids| ids.len()).sum();
-        let mut rng = rand::thread_rng();
-        let mut out: Vec<T> = Vec::with_capacity(budget.min(partition_size));
-        let mut truncated = false;
-        for ids in cells {
-            let remaining = budget - out.len();
-            if remaining == 0 {
-                // Budget full: one more eligible node anywhere means the
-                // old path would have truncated (and kept exactly `out`).
-                if ids.iter().any(|id| verify(id).is_some()) {
-                    truncated = true;
-                    break;
+        let (items, truncated) = walk_cells(cells, partition_size, budget, verify);
+        Ok(IndexWalk {
+            index: spec.name.clone(),
+            items,
+            partition_size,
+            truncated,
+            note,
+        })
+    }
+
+    /// Partition enumeration for `count.per = per_key`: picks an `on` index
+    /// whose `partition_by` contains `per_key` and whose other keys are all
+    /// bound, and lists its shards that match the bindings — one per value
+    /// of `per_key` that some node carries. `None` when no index can serve
+    /// it (the caller scans and groups). `per_key` values of `pool` and
+    /// `id` never enumerate: `count.per` groups those by different rules
+    /// than partitions do.
+    pub fn enumerate_partitions(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &IndexRequest,
+        per_key: &str,
+    ) -> Option<PartitionEnumeration> {
+        if self.settings.indexes.is_empty()
+            || self.settings.min_nodes == 0
+            || matches!(per_key, "pool" | "id")
+        {
+            return None;
+        }
+        let Selection { index: idx, note } = self
+            .settings
+            .select_where(
+                |key| key == per_key || bindings.contains_key(key),
+                request,
+                Some(per_key),
+            )
+            .ok()?;
+        let spec = &self.settings.indexes[idx];
+        if spec.mode != IndexMode::On {
+            return None;
+        }
+        let per_position = spec.partition_by.iter().position(|key| key == per_key)?;
+        let wanted: Vec<Option<String>> = spec
+            .partition_by
+            .iter()
+            .map(|key| {
+                if key == per_key {
+                    None
+                } else {
+                    bindings.get(key).map(value_token)
                 }
-                continue;
-            }
-            if ids.len() <= remaining {
-                out.extend(ids.iter().filter_map(|id| verify(id)));
-                continue;
-            }
-            // The boundary candidate: a lazy Fisher-Yates over positions,
-            // stopping one verified member past `remaining`.
-            let mut order: Vec<u32> = (0..ids.len() as u32).collect();
-            let mut accepted: Vec<(u32, T)> = Vec::with_capacity(remaining);
-            let mut extra = false;
-            for i in 0..order.len() {
-                let j = rng.gen_range(i..order.len());
-                order.swap(i, j);
-                let position = order[i];
-                if let Some(item) = verify(&ids[position as usize]) {
-                    if accepted.len() < remaining {
-                        accepted.push((position, item));
-                    } else {
-                        extra = true;
-                        break;
-                    }
+            })
+            .collect();
+        let mut groups: Vec<(String, String)> = self.states[idx]
+            .shards
+            .iter()
+            .filter(|(_, shard)| {
+                shard.tokens.len() == wanted.len()
+                    && shard.tokens[per_position] != ABSENT_TOKEN
+                    && shard
+                        .tokens
+                        .iter()
+                        .zip(wanted.iter())
+                        .all(|(have, want)| want.as_ref().is_none_or(|want| want == have))
+            })
+            .map(|(key, shard)| (shard.tokens[per_position].clone(), key.clone()))
+            .collect();
+        groups.sort();
+        Some(PartitionEnumeration {
+            index: spec.name.clone(),
+            index_pos: idx,
+            groups,
+            note,
+        })
+    }
+
+    /// [`Self::walk_verified`] over one shard of an enumeration
+    /// ([`Self::enumerate_partitions`]). An empty or vanished shard walks
+    /// to nothing.
+    pub fn walk_shard_verified<T>(
+        &self,
+        index_pos: usize,
+        shard: &str,
+        request: &IndexRequest,
+        budget: usize,
+        verify: impl FnMut(&str) -> Option<T>,
+    ) -> IndexWalk<T> {
+        let name = self
+            .settings
+            .indexes
+            .get(index_pos)
+            .map(|spec| spec.name.clone())
+            .unwrap_or_default();
+        match self.shard_walk(index_pos, shard, request, true) {
+            Some((cells, partition_size)) => {
+                let (items, truncated) = walk_cells(cells, partition_size, budget, verify);
+                IndexWalk {
+                    index: name,
+                    items,
+                    partition_size,
+                    truncated,
+                    note: None,
                 }
             }
-            accepted.sort_unstable_by_key(|(position, _)| *position);
-            out.extend(accepted.into_iter().map(|(_, item)| item));
-            if extra {
+            None => IndexWalk {
+                index: name,
+                items: Vec::new(),
+                partition_size: 0,
+                truncated: false,
+                note: None,
+            },
+        }
+    }
+}
+
+/// The budgeted walk shared by [`IndexSet::walk_verified`] and
+/// [`IndexSet::walk_shard_verified`]: `(kept, truncated)`.
+fn walk_cells<'s, T>(
+    cells: impl Iterator<Item = &'s Vec<String>>,
+    partition_size: usize,
+    budget: usize,
+    mut verify: impl FnMut(&str) -> Option<T>,
+) -> (Vec<T>, bool) {
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    let mut out: Vec<T> = Vec::with_capacity(budget.min(partition_size));
+    let mut truncated = false;
+    for ids in cells {
+        let remaining = budget - out.len();
+        if remaining == 0 {
+            // Budget full: one more eligible node anywhere means the
+            // old path would have truncated (and kept exactly `out`).
+            if ids.iter().any(|id| verify(id).is_some()) {
                 truncated = true;
                 break;
             }
+            continue;
         }
-        Ok(IndexWalk {
-            index: spec.name.clone(),
-            items: out,
-            partition_size,
-            truncated,
-        })
+        if ids.len() <= remaining {
+            out.extend(ids.iter().filter_map(|id| verify(id)));
+            continue;
+        }
+        // The boundary candidate: a lazy Fisher-Yates over positions,
+        // stopping one verified member past `remaining`.
+        let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+        let mut accepted: Vec<(u32, T)> = Vec::with_capacity(remaining);
+        let mut extra = false;
+        for i in 0..order.len() {
+            let j = rng.gen_range(i..order.len());
+            order.swap(i, j);
+            let position = order[i];
+            if let Some(item) = verify(&ids[position as usize]) {
+                if accepted.len() < remaining {
+                    accepted.push((position, item));
+                } else {
+                    extra = true;
+                    break;
+                }
+            }
+        }
+        accepted.sort_unstable_by_key(|(position, _)| *position);
+        out.extend(accepted.into_iter().map(|(_, item)| item));
+        if extra {
+            truncated = true;
+            break;
+        }
     }
+    (out, truncated)
 }
 
 pub fn project_node(spec: &IndexSpec, node: &Node, pool: &ResourcePool) -> NodeProjection {
@@ -947,12 +1657,14 @@ pub fn project_node(spec: &IndexSpec, node: &Node, pool: &ResourcePool) -> NodeP
         .map(|key| partition_token(node, key))
         .collect::<Vec<_>>()
         .join(&PARTITION_SEPARATOR.to_string());
-    let cell = spec
-        .dims
+    (partition, spec.project(node, pool))
+}
+
+fn partition_tokens(spec: &IndexSpec, node: &Node) -> Vec<String> {
+    spec.partition_by
         .iter()
-        .map(|dim| bucket_value(&dim.scale, dim_value(node, pool, dim)))
-        .collect();
-    (partition, cell)
+        .map(|key| partition_token(node, key))
+        .collect()
 }
 
 /// `pool` reads the node's pool column (the same special case permits use);
@@ -967,14 +1679,30 @@ pub fn partition_token(node: &Node, key: &str) -> String {
 }
 
 /// A missing or non-numeric dim value projects to zero — the node matches
-/// requests that don't ask for the dim and sorts last for ones that do.
+/// requests that don't ask for the dim and sorts last for ones that do. An
+/// item-set resource reads as its free item count; a device dim as the
+/// free devices of every group its name matches.
 pub fn dim_value(node: &Node, pool: &ResourcePool, dim: &DimSpec) -> f64 {
-    if let Some(resource) = dim.attr.strip_prefix(RESOURCE_DIM_PREFIX) {
-        return pool.amount(resource).unwrap_or(0.0);
+    match &dim.source {
+        DimSource::Resource(resource) => match pool.values.get(resource) {
+            Some(ResourceValue::Amount(amount)) => *amount,
+            Some(ResourceValue::Items(items)) => items.len() as f64,
+            None => 0.0,
+        },
+        DimSource::Device(wanted) => pool
+            .values
+            .iter()
+            .filter_map(|(key, value)| {
+                let group = key.strip_prefix(POOL_KEY_PREFIX)?;
+                let ResourceValue::Items(free) = value else {
+                    return None;
+                };
+                let name = DeviceName::parse(group).ok()?;
+                name.compatible(wanted).then_some(free.len() as f64)
+            })
+            .sum(),
+        DimSource::Attr(attr) => node_attr(node, attr).and_then(Value::as_f64).unwrap_or(0.0),
     }
-    node_attr(node, &dim.attr)
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0)
 }
 
 fn bucket_value(scale: &DimScale, value: f64) -> u16 {
@@ -1055,7 +1783,9 @@ mod tests {
         let fit = &parsed.indexes[0];
         assert_eq!(fit.name, "fit");
         assert_eq!(fit.partition_by, vec!["pool"]);
-        assert_eq!(fit.dims.len(), 3);
+        assert_eq!(fit.dims.len(), 4);
+        assert_eq!(fit.dims[3].attr, "resources.allocations");
+        assert_eq!(fit.dims[3].weight, 0.0);
         assert_eq!(fit.order, IndexOrder::Tight);
         assert_eq!(fit.mode, IndexMode::On);
         assert_eq!(parsed.min_nodes, DEFAULT_INDEX_MIN_NODES);
@@ -1204,7 +1934,7 @@ mod tests {
             ],
         );
         let bindings = HashMap::from([("region".to_string(), json!("east"))]);
-        let outcome = set.query(&bindings, &HashMap::new(), None);
+        let outcome = set.query(&bindings, &IndexRequest::default(), None);
         let IndexQueryOutcome::Candidates(candidates) = outcome else {
             panic!("expected candidates");
         };
@@ -1220,7 +1950,8 @@ mod tests {
             vec![make_node("a", "default", json!({}))],
         );
         let bindings = HashMap::from([("region".to_string(), json!("east"))]);
-        let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &HashMap::new(), None)
+        let IndexQueryOutcome::Candidates(candidates) =
+            set.query(&bindings, &IndexRequest::default(), None)
         else {
             panic!("expected candidates");
         };
@@ -1238,7 +1969,7 @@ mod tests {
             )],
         );
         let bindings = HashMap::from([("region".to_string(), json!("east"))]);
-        let outcome = set.query(&bindings, &HashMap::new(), None);
+        let outcome = set.query(&bindings, &IndexRequest::default(), None);
         let IndexQueryOutcome::Unusable { reason } = outcome else {
             panic!("expected unusable");
         };
@@ -1259,11 +1990,13 @@ mod tests {
             ("region".to_string(), json!("east")),
         ]);
         // A gpu_vram request: coverage wins over partition count.
-        let request = HashMap::from([("gpu_vram".to_string(), 1024.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("gpu_vram".to_string(), 1024.0)]));
         let idx = parsed.select(&bindings, &request).expect("selects");
         assert_eq!(parsed.indexes[idx].name, "gpu");
         // No gpu request: equal coverage (0), more partition keys wins.
-        let idx = parsed.select(&bindings, &HashMap::new()).expect("selects");
+        let idx = parsed
+            .select(&bindings, &IndexRequest::default())
+            .expect("selects");
         assert_eq!(parsed.indexes[idx].name, "topo");
     }
 
@@ -1276,7 +2009,7 @@ mod tests {
             }
         }));
         let bindings = HashMap::from([("region".to_string(), json!("east"))]);
-        assert!(parsed.select(&bindings, &HashMap::new()).is_err());
+        assert!(parsed.select(&bindings, &IndexRequest::default()).is_err());
         assert!(!parsed.any_active());
     }
 
@@ -1307,7 +2040,7 @@ mod tests {
             fit_nodes(),
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
         let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, None) else {
             panic!("expected candidates");
         };
@@ -1328,7 +2061,7 @@ mod tests {
             fit_nodes(),
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
         let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, None) else {
             panic!("expected candidates");
         };
@@ -1349,7 +2082,7 @@ mod tests {
             fit_nodes(),
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
         let IndexQueryOutcome::Candidates(ordered) = set.query(&bindings, &request, None) else {
             panic!("expected candidates");
         };
@@ -1374,7 +2107,7 @@ mod tests {
             fit_nodes(),
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
         let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, Some(2))
         else {
             panic!("expected candidates");
@@ -1405,7 +2138,7 @@ mod tests {
             nodes,
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
 
         let mut seen: HashSet<String> = HashSet::new();
         for _ in 0..20 {
@@ -1443,7 +2176,7 @@ mod tests {
 
     /// Two vram cells (tight order puts the 1024 cell first), every third
     /// node "ineligible" so verification really filters.
-    fn walk_fixture() -> (IndexSet, HashMap<String, Value>, HashMap<String, f64>) {
+    fn walk_fixture() -> (IndexSet, HashMap<String, Value>, IndexRequest) {
         let mut nodes = Vec::new();
         for n in 0..30 {
             nodes.push(make_node(
@@ -1466,7 +2199,7 @@ mod tests {
         (
             set,
             HashMap::from([("pool".to_string(), json!("default"))]),
-            HashMap::from([("vram".to_string(), 512.0)]),
+            IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)])),
         )
     }
 
@@ -1478,7 +2211,7 @@ mod tests {
     fn walk(
         set: &IndexSet,
         b: &HashMap<String, Value>,
-        r: &HashMap<String, f64>,
+        r: &IndexRequest,
         budget: usize,
     ) -> IndexWalk<String> {
         set.walk_verified(b, r, budget, eligible).expect("walkable")
@@ -1608,7 +2341,7 @@ mod tests {
             fit_nodes(),
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
         let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, None) else {
             panic!("expected candidates");
         };
@@ -1644,7 +2377,7 @@ mod tests {
             nodes,
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
-        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let request = IndexRequest::from_amounts(HashMap::from([("vram".to_string(), 512.0)]));
         let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, Some(8))
         else {
             panic!("expected candidates");
@@ -1667,7 +2400,8 @@ mod tests {
         );
         let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
         // No vram in the request: every node fits, including "none".
-        let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &HashMap::new(), None)
+        let IndexQueryOutcome::Candidates(candidates) =
+            set.query(&bindings, &IndexRequest::default(), None)
         else {
             panic!("expected candidates");
         };
@@ -1688,12 +2422,14 @@ mod tests {
         nodes.get_mut("a").unwrap().config_attrs = json!({ "region": "west" });
         let node = nodes.get("a").unwrap();
         set.reindex_node(node, &pool_for(node));
-        let IndexQueryOutcome::Candidates(candidates) = set.query(&east, &HashMap::new(), None)
+        let IndexQueryOutcome::Candidates(candidates) =
+            set.query(&east, &IndexRequest::default(), None)
         else {
             panic!()
         };
         assert!(candidates.node_ids.is_empty());
-        let IndexQueryOutcome::Candidates(candidates) = set.query(&west, &HashMap::new(), None)
+        let IndexQueryOutcome::Candidates(candidates) =
+            set.query(&west, &IndexRequest::default(), None)
         else {
             panic!()
         };
@@ -1702,7 +2438,8 @@ mod tests {
         // Unavailable/deleted nodes leave via remove_node (the read model
         // decides membership), and removal is idempotent.
         set.remove_node("a");
-        let IndexQueryOutcome::Candidates(candidates) = set.query(&west, &HashMap::new(), None)
+        let IndexQueryOutcome::Candidates(candidates) =
+            set.query(&west, &IndexRequest::default(), None)
         else {
             panic!()
         };
@@ -1718,7 +2455,7 @@ mod tests {
         );
         let bindings = HashMap::from([("region".to_string(), json!("east"))]);
         assert!(matches!(
-            set.query(&bindings, &HashMap::new(), None),
+            set.query(&bindings, &IndexRequest::default(), None),
             IndexQueryOutcome::Disabled
         ));
     }
@@ -1733,10 +2470,424 @@ mod tests {
             ],
         );
         let bindings = HashMap::from([("pool".to_string(), json!("gpu-pool"))]);
-        let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &HashMap::new(), None)
+        let IndexQueryOutcome::Candidates(candidates) =
+            set.query(&bindings, &IndexRequest::default(), None)
         else {
             panic!()
         };
         assert_eq!(candidates.node_ids, vec!["a"]);
+    }
+
+    // --- candidates-and-indexes plan ---------------------------------------
+
+    fn ids_of(outcome: IndexQueryOutcome) -> Vec<String> {
+        match outcome {
+            IndexQueryOutcome::Candidates(candidates) => candidates.node_ids,
+            other => panic!("expected candidates, got {other:?}"),
+        }
+    }
+
+    /// § 6.1: a node at its `maxAllocations` falls to the non-fitting tail
+    /// of the default `fit` index; a capped node with room and an uncapped
+    /// node keep their cpu/memory order (the allocations dim weighs 0).
+    #[test]
+    fn fit_sends_nodes_at_their_allocation_cap_to_the_tail() {
+        let (set, _) = set_for(
+            json!({ "index_min_nodes": 1 }),
+            vec![
+                make_node("full", "default", json!({ "maxAllocations": 0 })),
+                make_node("room", "default", json!({ "maxAllocations": 4 })),
+                make_node("open", "default", json!({})),
+            ],
+        );
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = IndexRequest::from_amounts(HashMap::from([
+            (ALLOCATIONS_RESOURCE.to_string(), 1.0),
+            ("memory".to_string(), 64.0),
+        ]));
+        let ids = ids_of(set.query(&bindings, &request, None));
+        assert_eq!(ids.last().map(String::as_str), Some("full"), "{ids:?}");
+        assert_eq!(ids.len(), 3);
+        // A budget of two keeps both nodes with a free slot.
+        let mut kept = ids_of(set.query(&bindings, &request, Some(2)));
+        kept.sort();
+        assert_eq!(kept, vec!["open", "room"]);
+    }
+
+    #[test]
+    fn coverage_ignores_the_allocations_resource() {
+        let parsed = settings(json!({
+            "indexes": { "gpu": ["pool", "region", "resources.gpu_vram", "resources.memory"] }
+        }));
+        let bindings = HashMap::from([
+            ("pool".to_string(), json!("default")),
+            ("region".to_string(), json!("east")),
+        ]);
+        // fit covers cpu + memory (+ allocations, which must not count);
+        // gpu covers gpu_vram + memory and has more partition keys.
+        let request = IndexRequest::from_amounts(HashMap::from([
+            ("cpu".to_string(), 100.0),
+            ("memory".to_string(), 64.0),
+            ("gpu_vram".to_string(), 1024.0),
+            (ALLOCATIONS_RESOURCE.to_string(), 1.0),
+        ]));
+        let idx = parsed.select(&bindings, &request).expect("selects");
+        assert_eq!(parsed.indexes[idx].name, "gpu");
+    }
+
+    /// § 6.10: the heap walk yields exactly the order a full sort would.
+    #[test]
+    fn heap_walk_matches_a_full_sort_of_the_cells() {
+        let mut nodes = Vec::new();
+        for n in 0..64u32 {
+            nodes.push(make_node(
+                &format!("n-{n:03}"),
+                "default",
+                json!({ "resources": { "vram": 1u64 << (n % 13), "disk": 100 * (n % 5) } }),
+            ));
+        }
+        let (set, _) = set_for(
+            json!({ "indexes": { "fit": false, "x": ["pool", "resources.vram", "resources.disk"] } }),
+            nodes,
+        );
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = IndexRequest::from_amounts(HashMap::from([
+            ("vram".to_string(), 256.0),
+            ("disk".to_string(), 150.0),
+        ]));
+        let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, None) else {
+            panic!()
+        };
+        // Recompute the order by brute force from each node's projection.
+        let spec = &set.settings().indexes[0];
+        let want: Vec<u16> = spec
+            .dims
+            .iter()
+            .map(|dim| bucket_value(&dim.scale, request.dim_value(dim)))
+            .collect();
+        let key = |id: &str| {
+            let cell = &set.states[0].node_records[id].1;
+            let fits = cell.iter().zip(&want).all(|(have, want)| have >= want);
+            let distance: f64 = cell
+                .iter()
+                .zip(&want)
+                .map(|(have, want)| (f64::from(*have) - f64::from(*want)).abs())
+                .sum();
+            (!fits, distance, cell.clone(), id.to_string())
+        };
+        let mut expected = candidates.node_ids.clone();
+        expected.sort_by(|a, b| {
+            let (a, b) = (key(a), key(b));
+            a.0.cmp(&b.0)
+                .then(a.1.total_cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        assert_eq!(candidates.node_ids, expected);
+    }
+
+    /// § 6.8: an item-set resource and a device dim bucket by free count,
+    /// and the request side counts items and matching device demands.
+    #[test]
+    fn device_and_item_dims_bucket_by_free_count() {
+        let dims = settings(json!({
+            "indexes": { "fit": false, "gpu": ["pool", "devices.nvidia/gpu", "resources.slots"] }
+        }));
+        let spec = &dims.indexes[0];
+        assert!(matches!(spec.dims[0].source, DimSource::Device(_)));
+        let node = make_node("a", "default", json!({}));
+        let items =
+            |ids: &[&str]| ResourceValue::Items(ids.iter().map(|id| id.to_string()).collect());
+        let pool = ResourcePool {
+            values: HashMap::from([
+                (
+                    "device:nvidia/gpu/A100".to_string(),
+                    items(&["0", "1", "2"]),
+                ),
+                ("device:nvidia/gpu/H100".to_string(), items(&["3"])),
+                ("device:amd/gpu/MI300".to_string(), items(&["4", "5"])),
+                ("slots".to_string(), items(&["x", "y"])),
+            ]),
+            ..ResourcePool::default()
+        };
+        assert_eq!(dim_value(&node, &pool, &spec.dims[0]), 4.0);
+        assert_eq!(dim_value(&node, &pool, &spec.dims[1]), 2.0);
+
+        let request = IndexRequest {
+            devices: vec![
+                (DeviceName::parse("gpu").expect("name"), 2),
+                (DeviceName::parse("amd/gpu").expect("name"), 5),
+            ],
+            item_counts: HashMap::from([("slots".to_string(), 1.0)]),
+            ..IndexRequest::default()
+        };
+        // `gpu` could be an nvidia gpu, `amd/gpu` cannot.
+        assert_eq!(request.dim_value(&spec.dims[0]), 2.0);
+        assert_eq!(request.dim_value(&spec.dims[1]), 1.0);
+        assert_eq!(spec.coverage(&request), 2);
+    }
+
+    #[test]
+    fn device_dims_order_nodes_by_free_devices() {
+        let parsed = Arc::new(settings(json!({
+            "index_min_nodes": 1,
+            "indexes": { "fit": false, "gpu": ["pool", "devices.gpu"] },
+        })));
+        let mut set = IndexSet::new(parsed);
+        for (id, free) in [("one", 1usize), ("four", 4), ("eight", 8)] {
+            let pool = ResourcePool {
+                values: HashMap::from([(
+                    format!("device:nvidia/gpu/{id}"),
+                    ResourceValue::Items((0..free).map(|n| n.to_string()).collect()),
+                )]),
+                ..ResourcePool::default()
+            };
+            set.reindex_node(&make_node(id, "default", json!({})), &pool);
+        }
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = IndexRequest {
+            devices: vec![(DeviceName::parse("nvidia/gpu").expect("name"), 4)],
+            ..IndexRequest::default()
+        };
+        // Tight: the smallest sufficient first, the too-small node last.
+        assert_eq!(
+            ids_of(set.query(&bindings, &request, None)),
+            vec!["four", "eight", "one"]
+        );
+    }
+
+    /// § 6.9: a usable hint wins outright; an unusable one falls back to
+    /// automatic selection and says why; `scan` selects nothing.
+    #[test]
+    fn index_hints_select_explain_and_scan() {
+        let parsed = settings(json!({
+            "indexes": { "topo": ["pool", "region"], "zones": ["pool", "zone"] }
+        }));
+        let bindings = HashMap::from([
+            ("pool".to_string(), json!("default")),
+            ("region".to_string(), json!("east")),
+        ]);
+        let hinted = |hint: &str| IndexRequest::default().with_hint(Some(hint));
+
+        // `fit` would lose to `topo` (more partition keys); the hint wins.
+        let chosen = parsed
+            .select_hinted(&bindings, &hinted("fit"))
+            .expect("hint");
+        assert_eq!(parsed.indexes[chosen.index].name, "fit");
+        assert!(chosen.note.is_none());
+
+        let fallback = parsed
+            .select_hinted(&bindings, &hinted("zones"))
+            .expect("auto");
+        assert_eq!(parsed.indexes[fallback.index].name, "topo");
+        assert!(
+            fallback
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("hint zones unusable: zones needs [zone]"),
+            "{:?}",
+            fallback.note
+        );
+
+        let unknown = parsed
+            .select_hinted(&bindings, &hinted("nope"))
+            .expect("auto");
+        assert!(unknown
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("names no declared index"));
+
+        let scan = parsed
+            .select_hinted(&bindings, &hinted(SCAN_HINT))
+            .unwrap_err();
+        assert!(scan.contains("indexHint = \"scan\""), "{scan}");
+    }
+
+    #[test]
+    fn scan_is_a_reserved_index_name_and_kind_fields_are_checked() {
+        for (case, value) in [
+            ("reserved", json!({ "indexes": { "scan": ["region"] } })),
+            (
+                "dims on a plugin kind",
+                json!({ "indexes": { "x": { "kind": "islands", "dims": ["resources.a"] } } }),
+            ),
+            (
+                "order on a plugin kind",
+                json!({ "indexes": { "x": { "kind": "islands", "order": "tight" } } }),
+            ),
+            (
+                "options on the grid",
+                json!({ "indexes": { "x": { "partition_by": ["a"], "options": {} } } }),
+            ),
+            (
+                "bad kind name",
+                json!({ "indexes": { "x": { "kind": "../evil" } } }),
+            ),
+            (
+                "bad device dim",
+                json!({ "indexes": { "x": ["devices."] } }),
+            ),
+        ] {
+            assert!(
+                IndexSettings::from_scheduler_settings(Some(&value), "bin_pack").is_err(),
+                "{case} should fail to parse"
+            );
+        }
+        let parsed = settings(json!({
+            "indexes": { "x": { "kind": "grid", "partition_by": ["a"] } }
+        }));
+        assert!(matches!(parsed.indexes[0].kind, IndexKindRef::Grid));
+    }
+
+    /// A toy plugin geometry: one cell per node holding its `slot` attr,
+    /// ranked by distance from the request's memory in GiB.
+    struct SlotKind {
+        panic_on_rank: bool,
+        broken: std::sync::atomic::AtomicBool,
+    }
+
+    impl IndexKind for SlotKind {
+        fn name(&self) -> &'static str {
+            "slots"
+        }
+        fn project(&self, node: &Node, _free: &ResourcePool) -> Vec<u16> {
+            vec![node_attr(node, "slot").and_then(Value::as_u64).unwrap_or(0) as u16]
+        }
+        fn rank(&self, cell: &[u16], request: &IndexRequest) -> CellRank {
+            if self.panic_on_rank {
+                self.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let want = request.amounts.get("memory").copied().unwrap_or(0.0) / 1024.0;
+            let have = f64::from(cell[0]);
+            CellRank {
+                fits: have >= want,
+                distance: have - want,
+            }
+        }
+        fn coverage(&self, request: &IndexRequest) -> usize {
+            usize::from(request.amounts.contains_key("memory"))
+        }
+        fn healthy(&self) -> bool {
+            !self.broken.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn plugin_set(panic_on_rank: bool) -> IndexSet {
+        let mut parsed = settings(json!({
+            "index_min_nodes": 1,
+            "indexes": {
+                "fit": false,
+                "slots": { "kind": "slots", "partition_by": ["pool"], "options": { "x": 1 } },
+            },
+        }));
+        assert_eq!(parsed.plugin_kinds(), vec!["slots"]);
+        parsed
+            .resolve_kinds(|kind, index, options| {
+                assert_eq!((kind, index), ("slots", "slots"));
+                assert_eq!(options, &json!({ "x": 1 }));
+                Ok(Arc::new(SlotKind {
+                    panic_on_rank,
+                    broken: Default::default(),
+                }) as Arc<dyn IndexKind>)
+            })
+            .expect("resolve");
+        let mut set = IndexSet::new(Arc::new(parsed));
+        for (id, slot) in [("s1", 1), ("s4", 4), ("s8", 8), ("s2", 2)] {
+            let node = make_node(id, "default", json!({ "slot": slot }));
+            set.reindex_node(&node, &pool_for(&node));
+        }
+        set
+    }
+
+    /// § 6.7: a plugin kind's projection and rank drive the walk order.
+    #[test]
+    fn plugin_kinds_project_and_rank_cells() {
+        let set = plugin_set(false);
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request =
+            IndexRequest::from_amounts(HashMap::from([("memory".to_string(), 3.0 * 1024.0)]));
+        assert_eq!(
+            ids_of(set.query(&bindings, &request, None)),
+            // Fitting cells by distance, then the tail by distance (the
+            // kind's own numbers, so -2 before -1).
+            vec!["s4", "s8", "s1", "s2"]
+        );
+    }
+
+    #[test]
+    fn unresolved_and_unhealthy_plugin_kinds_are_never_selected() {
+        let unresolved = settings(json!({
+            "indexes": { "fit": false, "slots": { "kind": "slots", "partition_by": ["pool"] } }
+        }));
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let reason = unresolved
+            .select(&bindings, &IndexRequest::default())
+            .unwrap_err();
+        assert!(reason.contains("kind slots is not loaded"), "{reason}");
+
+        // A kind that turns unhealthy mid-query (a guarded plugin that
+        // panicked) is skipped from the next selection on.
+        let set = plugin_set(true);
+        let _ = set.query(&bindings, &IndexRequest::default(), None);
+        let IndexQueryOutcome::Unusable { reason } =
+            set.query(&bindings, &IndexRequest::default(), None)
+        else {
+            panic!("expected unusable");
+        };
+        assert!(reason.contains("quarantined"), "{reason}");
+    }
+
+    /// § 6.6: `count.per` partition enumeration lists one shard per value
+    /// of the per key, matching the other bound keys only.
+    #[test]
+    fn partitions_enumerate_per_key_values_under_the_bindings() {
+        let (set, _) = set_for(
+            json!({ "index_min_nodes": 1, "indexes": { "zones": ["pool", "region", "zone"] } }),
+            vec![
+                make_node("a", "default", json!({ "region": "east", "zone": "1" })),
+                make_node("b", "default", json!({ "region": "east", "zone": "2" })),
+                make_node("c", "default", json!({ "region": "east", "zone": "2" })),
+                make_node("d", "default", json!({ "region": "west", "zone": "3" })),
+                make_node("e", "default", json!({ "region": "east" })),
+                make_node("f", "other", json!({ "region": "east", "zone": "1" })),
+            ],
+        );
+        let bindings = HashMap::from([
+            ("pool".to_string(), json!("default")),
+            ("region".to_string(), json!("east")),
+        ]);
+        let request = IndexRequest::default();
+        let enumeration = set
+            .enumerate_partitions(&bindings, &request, "zone")
+            .expect("served");
+        assert_eq!(enumeration.index, "zones");
+        let tokens: Vec<&str> = enumeration
+            .groups
+            .iter()
+            .map(|(token, _)| token.as_str())
+            .collect();
+        assert_eq!(tokens, vec!["\"1\"", "\"2\""]);
+        let shard = &enumeration.groups[1].1;
+        let mut walked = set
+            .walk_shard_verified(enumeration.index_pos, shard, &request, 10, |id| {
+                Some(id.to_string())
+            })
+            .items;
+        walked.sort();
+        assert_eq!(walked, vec!["b", "c"]);
+
+        // Not a partition key of any index, or an unbound other key: no.
+        assert!(set
+            .enumerate_partitions(&bindings, &request, "rack")
+            .is_none());
+        let pool_only = HashMap::from([("pool".to_string(), json!("default"))]);
+        assert!(set
+            .enumerate_partitions(&pool_only, &request, "zone")
+            .is_none());
+        assert!(set
+            .enumerate_partitions(&bindings, &request, "pool")
+            .is_none());
     }
 }

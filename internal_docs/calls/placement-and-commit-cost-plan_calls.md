@@ -60,6 +60,11 @@ the packing term stopped being inflated by min-max normalization.
 
 ## 2. Node rows in the apply walk are still parsed from the row, not borrowed from the read model
 
+> **Superseded 2026-11-12** by the follow-up at the end of this entry: the
+> walk now borrows the read model's node when the row's bytes match it
+> exactly. The original reasoning is kept below because it is why the
+> follow-up compares bytes instead of trusting an epoch.
+
 **Call.** SCH5's second half — "read nodes from the read model's
 `Arc<Node>`, guarded by the node epoch" — is not shipped. The walk still
 SELECTs and parses each attempted candidate's node row once per plan.
@@ -86,6 +91,22 @@ is sound modulo a keyed-hash collision and reuses the read model's memory,
 and is the design recorded in the TODO; it was cut for time in favor of
 finishing SCH4 and AI7, and because its gain (serialize+hash vs parse) has
 not been measured.
+
+**Follow-up (2026-11-12): compare the row's bytes, not a digest.** The walk
+still reads every attempted node row inside the transaction, but borrows the
+read model's `Arc<Node>` when the row's eight columns are byte-for-byte what
+that node serializes to (`node_row_matches`, a streaming compare that stops
+at the first differing byte), and parses the row otherwise. That is
+alternative (c) with the hash removed: equal bytes parse to an equal value,
+so there is no collision to reason about, and a mismatch costs less than a
+parse because it stops early. Measured on `plan_apply_node_rows` (an
+eight-placement plan, 10k nodes with ~3 KiB attribute bags): apply 2,404 →
+1,887 µs (plan §12.1). The read model is read with `try_read`, so the walk never
+waits on a projection while it holds the write connection; a busy lock
+falls back to the parse. `last_heartbeat` is not compared because the walk
+never reads it. `legion_scheduler_plan_node_rows_total{source}` makes a
+workload where rows and model disagree in form (a worker writing
+non-canonical JSON) visible, since every apply would then pay both costs.
 
 ## 3. `plan_submission` keeps rejections and staged plans in an id window; applied plans write nothing
 
@@ -172,6 +193,10 @@ the rest fit there. Trying domains whole gives the gang's all-or-nothing
 rule a domain-sized unit, and best fit (Kueue's default) keeps large domains
 whole for large gangs, the same argument as SCH4's `bin_pack`.
 
+**Amended 2026-11-12.** The bound is now sixteen domains across every
+`topology.keys` level, and only domains whose estimate, counting what
+preemption could reclaim, reaches the quorum are tried (gang calls 30).
+
 ## 6. The claim's pending count is capped at the fair share's saturation point; the queue-depth gauge is rate-limited
 
 **Call.** A claim counts pending rows only up to `workers × max + held`
@@ -230,6 +255,9 @@ later than it could have.
 (worker and plugin), and a checkpoint story; none exists, and a half-built
 version would be a jobspec promise without a mechanism. The existing
 member-loss path already gives the correct end state.
+
+**Resolved 2026-11-12** by
+[spot-interruption-plan.md](../plans/spot-interruption-plan.md).
 
 ## 9. Per-plan and per-claim logs move to `debug`; one `info` line for a plan slower than a second
 

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use std::cell::RefCell;
 use std::time::Duration;
@@ -168,6 +168,72 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
         }
     }
 
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// `distinct` replicas (late-binding plan apply, Phase 4)
+// ---------------------------------------------------------------------------
+//
+// Ten jobs of `replicas` copies each, every copy on a different `rack`, over
+// a 1,000-node fleet of 250 racks. Uncontended, so every placement binds
+// rank 0: what moves with the coupling rule is the candidate lists a
+// `distinct` plan carries (one node each when `distinct` coupled its
+// replicas, up to `plan_candidates` each without) and the wider epoch sample
+// that covers their union.
+
+const DISTINCT_REPLICA_STEPS: &[usize] = &[10, 100];
+
+fn distinct_fallback_lists_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("distinct_fallback_lists");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    for &replicas in DISTINCT_REPLICA_STEPS {
+        let bench_id = BenchmarkId::new("spread", format!("nodes_1000_replicas_{replicas}"));
+        group.throughput(Throughput::Elements((replicas * JOB_COUNT) as u64));
+        group.bench_function(bench_id, |b| {
+            b.iter_batched(
+                || {
+                    let (store, dir) = setup_store("spread").expect("store");
+                    for idx in 0..1_000 {
+                        let attrs = json!({ "rack": format!("rack-{}", idx % 250) });
+                        store
+                            .insert_node(make_node_msg(&format!("node-{idx:06}"), attrs))
+                            .expect("node");
+                    }
+                    let jobs: Vec<JobConfig> = (0..JOB_COUNT)
+                        .map(|job_idx| JobConfig {
+                            priority: Default::default(),
+                            name: format!("distinct-job-{job_idx}"),
+                            tasks: vec![TaskConfig {
+                                count: TaskCount::new(replicas as u32),
+                                constraints: json!([{ "key": "rack", "operator": "distinct" }]),
+                                ..TaskConfig::new(format!("task-{job_idx}"), "noop")
+                            }],
+                            rollout: None,
+                            rollout_by_group: Default::default(),
+                            version: None,
+                            pending_extensions: Default::default(),
+                            extensions: Default::default(),
+                        })
+                        .collect();
+                    let job_ids = submit_jobs(&store, &jobs).expect("jobs");
+                    (store, dir, job_ids)
+                },
+                |(store, dir, job_ids)| {
+                    for job_config_id in job_ids {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let outcome = scheduler
+                            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(outcome.allocations.len(), replicas);
+                    }
+                    (store, dir)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
     group.finish();
 }
 
@@ -1396,15 +1462,229 @@ fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
     );
 }
 
-criterion_group!(
-    benches,
-    scheduler_speed_benchmark,
-    candidate_construction_benchmark,
-    plan_under_fill_benchmark,
-    plan_fleet_scaling_benchmark,
-    locality_benchmark,
-    restore_benchmark,
-    snapshot_budget_benchmark,
-    keyed_bind_benchmark
-);
-criterion_main!(benches);
+/// The attribute bags a real worker registers, at roughly a real worker's
+/// size (~3 KiB of fingerprint: per-core CPU entries, disks, interfaces,
+/// two GPUs, drivers), where `scaling_node_resources` is the minimum the
+/// scheduler needs. What the plan-apply walk's node-row check costs depends
+/// on these bytes, not on the fleet.
+fn realistic_node_msg(id: &str, class: &str) -> NodeMsg {
+    let cpus: serde_json::Map<String, serde_json::Value> = (1..=16)
+        .map(|idx| {
+            (
+                format!("cpu-{idx}"),
+                json!({
+                    "frequency": "3000",
+                    "model": "AMD EPYC 7R13 Processor",
+                    "vendor": "AuthenticAMD",
+                    "cache_kb": 512,
+                    "flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov"
+                }),
+            )
+        })
+        .collect();
+    let fingerprint = json!({
+        "memory_total": (64u64 << 30).to_string(),
+        "cpus": cpus,
+        "os": { "name": "linux", "distro": "ubuntu", "version": "24.04", "kernel": "6.8.0-1015-aws", "arch": "x86_64" },
+        "disks": [
+            { "mount": "/", "fs": "ext4", "total": "214748364800", "device": "/dev/nvme0n1p1" },
+            { "mount": "/var/lib/legion", "fs": "xfs", "total": "1099511627776", "device": "/dev/nvme1n1" }
+        ],
+        "interfaces": [
+            { "name": "ens5", "mtu": 9001, "addresses": ["10.0.12.34/20", "fe80::8ff:feff:fe12:3456/64"] },
+            { "name": "docker0", "mtu": 1500, "addresses": ["172.17.0.1/16"] }
+        ],
+        "devices": { "gpu": [
+            { "id": "GPU-1f2e3d4c", "model": "NVIDIA A10G", "memory": "24576", "driver": "550.90.07" },
+            { "id": "GPU-5a6b7c8d", "model": "NVIDIA A10G", "memory": "24576", "driver": "550.90.07" }
+        ] },
+        "drivers": { "exec": "1", "container": "1", "noop": "1", "isolate": "1" }
+    });
+    NodeMsg {
+        fingerprint_attrs: fingerprint.to_string(),
+        config_attrs: json!({
+            "class": class,
+            "zone": "us-east-1a",
+            "rack": format!("rack-{}", id.len() % 7),
+            "heartbeatSeconds": 10,
+            "publicAddress": "10.0.12.34",
+            "hostGuard": "enforcing",
+            "netKernel": "ebpf"
+        })
+        .to_string(),
+        dynamic_attrs:
+            json!({ "capabilities": ["checkpoint", "checkpoint-fetch"], "load": { "1m": 0.42 } })
+                .to_string(),
+        health_checks: json!({ "disk": "ok", "runtime": "ok", "network": "ok" }).to_string(),
+        ..make_node_msg(id, json!({}))
+    }
+}
+
+/// The plan-apply walk reads every candidate node it tries inside the
+/// serialized commit. With realistic attribute bags (a few KiB per node) the
+/// row's handling is a visible share of `apply`; this cell reports the apply
+/// phase mean for an eight-placement plan on a 10k-node fleet so the
+/// node-row check can be compared before and after.
+fn plan_apply_node_rows_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("plan_apply_node_rows");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(4));
+    group.sample_size(30);
+    let nodes = std::env::var("LEGION_BENCH_NODE_ROW_NODES")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(10_000usize);
+    let (store, _dir) = setup_store("bin_pack").expect("store");
+    for idx in 0..nodes {
+        let class = if idx % 6 == 5 { "util" } else { "web" };
+        store
+            .insert_node(realistic_node_msg(&format!("node-{idx}"), class))
+            .expect("node");
+    }
+    let cell = format!("nodes_{nodes}");
+    let mut next_job = 0usize;
+    let timings: RefCell<Vec<PlanTimings>> = RefCell::new(Vec::new());
+    let placed: RefCell<Vec<i64>> = RefCell::new(Vec::new());
+    group.bench_function(BenchmarkId::new("plan_and_apply", &cell), |b| {
+        b.iter_batched(
+            || {
+                for id in placed.borrow_mut().drain(..) {
+                    store.remove_allocation_by_id(id).expect("cleanup");
+                }
+                next_job += 1;
+                let job = make_api_job(&format!("rows-{next_job}"));
+                submit_jobs(&store, std::slice::from_ref(&job))
+                    .expect("job")
+                    .pop()
+                    .expect("one id")
+            },
+            |job_config_id| {
+                let scheduler = Scheduler::new(&store).expect("scheduler");
+                let outcome = scheduler
+                    .plan_and_apply(&job_config_id, PlanMode::Fresh)
+                    .expect("plan");
+                assert_eq!(outcome.allocations.len(), 8);
+                timings.borrow_mut().push(outcome.timings.clone());
+                placed
+                    .borrow_mut()
+                    .extend(outcome.allocations.iter().map(|a| a.id));
+                outcome
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+    print_phase_means(
+        &format!("plan_apply_node_rows/plan_and_apply/{cell}"),
+        &timings.borrow(),
+    );
+    group.finish();
+}
+
+/// Stopping and destroying jobs on a full fleet, one at a time, timing each
+/// step: the AWS 10k-node cleanup drained `job_stop` evals at ~4/s. A fleet
+/// of `nodes` nodes runs `jobs` small jobs (the api job: two tasks of four);
+/// the cell stops and destroys `stops` of them, timing the `StopJob` write,
+/// the `job_stop` eval's handler steps, and the `DestroyJob` writes.
+fn job_stop_drain_benchmark(_c: &mut Criterion) {
+    let nodes = std::env::var("LEGION_BENCH_STOP_NODES")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(10_000usize);
+    let jobs = std::env::var("LEGION_BENCH_STOP_JOBS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(1_500usize);
+    let stops = 100usize.min(jobs);
+    let (store, _dir) = setup_store("bin_pack").expect("store");
+    insert_web_fleet(&store, nodes).expect("nodes");
+    let mut names = Vec::with_capacity(jobs);
+    for idx in 0..jobs {
+        let name = format!("drain-{idx}");
+        let job_config_id = submit_jobs(&store, &[make_api_job(&name)])
+            .expect("job")
+            .pop()
+            .expect("one id");
+        Scheduler::new(&store)
+            .expect("scheduler")
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .expect("plan");
+        names.push(name);
+    }
+    let allocations: usize = store.scheduling_read_model().map_or(0, |model| {
+        model
+            .allocations_by_node
+            .values()
+            .map(|list| list.len())
+            .sum()
+    });
+    let cell = format!("nodes_{nodes}/jobs_{jobs}");
+    eprintln!("job_stop_drain/{cell}: {allocations} allocations placed");
+
+    let mut stop_write = Duration::ZERO;
+    let mut remove_allocs = Duration::ZERO;
+    let mut clear_gangs = Duration::ZERO;
+    let mut stop_instances = Duration::ZERO;
+    let mut destroy = Duration::ZERO;
+    for name in names.iter().take(stops) {
+        let started = std::time::Instant::now();
+        store.stop_job(name).expect("stop");
+        stop_write += started.elapsed();
+        // The `job_stop` eval's handler (`Eval::handle_job_stop`), step by
+        // step.
+        let started = std::time::Instant::now();
+        store.remove_allocs_for_job(name).expect("remove");
+        remove_allocs += started.elapsed();
+        let started = std::time::Instant::now();
+        store.clear_gang_waits_for_job(name).expect("gangs");
+        clear_gangs += started.elapsed();
+        let started = std::time::Instant::now();
+        store.stop_instances_for_job(name).expect("instances");
+        stop_instances += started.elapsed();
+        let started = std::time::Instant::now();
+        store.destroy_job(name).expect("destroy");
+        destroy += started.elapsed();
+    }
+    let per = |total: Duration| total.as_micros() as f64 / stops as f64;
+    eprintln!(
+        "job_stop_drain/{cell}: {stops} jobs, mean us: stop write {:.0}, remove allocs {:.0}, \
+         clear gang waits {:.0}, stop instances {:.0}, destroy {:.0}, total {:.0}",
+        per(stop_write),
+        per(remove_allocs),
+        per(clear_gangs),
+        per(stop_instances),
+        per(destroy),
+        per(stop_write + remove_allocs + clear_gangs + stop_instances + destroy),
+    );
+}
+
+/// Every group, by name. `LEGION_BENCH_ONLY=group,group` runs a subset: each
+/// group builds its fleet before Criterion's own filter is consulted, so a
+/// filter alone still pays every other group's setup (minutes at 20k nodes).
+const GROUPS: &[(&str, fn(&mut Criterion))] = &[
+    ("scheduler_speed", scheduler_speed_benchmark),
+    ("distinct_fallback_lists", distinct_fallback_lists_benchmark),
+    ("candidate_construction", candidate_construction_benchmark),
+    ("plan_under_fill", plan_under_fill_benchmark),
+    ("plan_fleet_scaling", plan_fleet_scaling_benchmark),
+    ("locality", locality_benchmark),
+    ("restore", restore_benchmark),
+    ("snapshot_budget", snapshot_budget_benchmark),
+    ("keyed_bind", keyed_bind_benchmark),
+    ("plan_apply_node_rows", plan_apply_node_rows_benchmark),
+    ("job_stop_drain", job_stop_drain_benchmark),
+];
+
+fn main() {
+    let only = std::env::var("LEGION_BENCH_ONLY").ok();
+    let selected = |name: &str| {
+        only.as_deref()
+            .is_none_or(|list| list.split(',').any(|group| group.trim() == name))
+    };
+    let mut criterion = Criterion::default().configure_from_args();
+    for (name, group) in GROUPS {
+        if selected(name) {
+            group(&mut criterion);
+        }
+    }
+    criterion.final_summary();
+}

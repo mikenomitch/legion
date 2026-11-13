@@ -276,6 +276,10 @@ impl InstanceLastStop {
                  when the runtime is enabled."
                     .to_string()
             }
+            StopCause::Interruption => format!(
+                "Moved off node {node_id} ahead of its pending interruption (a spot reclaim \
+                 or a scheduled maintenance)."
+            ),
             StopCause::Unknown => "Stopped.".to_string(),
         };
         Self {

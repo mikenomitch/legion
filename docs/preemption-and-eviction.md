@@ -233,10 +233,15 @@ victims (1 protected by disruption.minAvailable)`.
 
 A [gang](gang-scheduling.md)'s quorum is a floor of the same kind: preemption
 never leaves fewer than `gang.min` members running (all of them for `gang =
-true`), because taking one member idles the rest. The stricter of the two
-floors binds, and the placement error names `disruption.minAvailable` either
-way. A gang that preempts does so as a unit: if every replica cannot fit with
-the victims it may take, the plan evicts nothing.
+true`), because taking one member idles the rest. It may take the **whole**
+gang instead: when no victim set within every floor makes room, a lower-band
+gang that only its quorum protects is a victim set of its own, every member
+on every node, evicted in the same transaction as the preemptor's placement
+(see [Gang Scheduling, Preemption](gang-scheduling.md#preemption)). Its whole
+size is its cost, so it is taken only when nothing cheaper fits, and a gang
+with a `disruption.minAvailable` of its own is never taken below that floor.
+A gang that preempts does so as a unit: if every replica cannot fit with the
+victims it may take, the plan evicts nothing.
 
 **What this does not protect you from:** an operator draining half the
 cluster can take your service below `minAvailable`. A Kubernetes

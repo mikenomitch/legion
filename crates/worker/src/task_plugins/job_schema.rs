@@ -51,6 +51,7 @@ pub fn core_jobspec_schema() -> Value {
         serde_json::from_str(&text).unwrap_or(Value::Null);
     // Built apart: inline, the envelope's `json!` exceeds the macro
     // recursion limit.
+    schema["$defs"]["task"]["properties"]["gang"] = gang_schema();
     if let Some(gang_block) = schema["$defs"]["task"]["properties"]["gang"]["oneOf"]
         .as_array_mut()
         .and_then(|forms| forms.get_mut(1))
@@ -61,23 +62,69 @@ pub fn core_jobspec_schema() -> Value {
     schema
 }
 
+/// A task's `gang` block (docs/gang-scheduling.md).
+fn gang_schema() -> Value {
+    json!({
+        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait, `readyTimeout` bounds how long a placed member may take to come up, `onMemberLoss` says what a lost member does to the rest and `onLocalRestart` whether a member's in-place restart is a loss; `topology` keeps every member inside one domain of a node attribute (one rack, else one zone). Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
+        "oneOf": [
+            { "type": "boolean" },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "min": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Quorum: replicas that must place together, 1..=count. Default: the whole count."
+                    },
+                    "placementTimeout": {
+                        "type": ["string", "integer"],
+                        "description": "How long the gang may wait for its quorum before its job fails (any members already running stop), as a duration (`\"30m\"`) or seconds. Counted from the first time the gang came up short. At least 1s. Default: unset, wait indefinitely."
+                    },
+                    "readyTimeout": {
+                        "type": ["string", "integer"],
+                        "description": "How long each placed member may take to report healthy once (running, and passing its checks if it has any) before it counts as a lost member and `onMemberLoss` applies, as a duration or seconds. Spends the move budget like a failure. At least 1s. Default: unset, no bound."
+                    },
+                    "onMemberLoss": {
+                        "type": "string",
+                        "enum": ["restart", "restartInPlace", "replace", "fail"],
+                        "description": "What a lost member does to the rest when it leaves fewer than the quorum running. `restart` (default): stop the survivors and place the whole gang again once their stop grace has passed. `restartInPlace`: keep the survivors on their nodes, restart their processes there under a new LEGION_GANG_EPOCH, and place the missing members together once they fit. `replace`: keep the survivors and place the missing members together once they fit. `fail`: fail the job and stop every member. A loss that leaves the quorum running is replaced alone. Restarts after a failure spend on_unhealthy's move budget; once it is spent the job fails."
+                    },
+                    "onLocalRestart": {
+                        "type": "string",
+                        "enum": ["loss", "ignore"],
+                        "description": "A member its worker restarts in place under the task's restart policy. `loss` (default): it counts as a lost member and `onMemberLoss` applies. `ignore`: it rejoins on its own and the rest keep running."
+                    }
+                }
+            }
+        ]
+    })
+}
+
 /// `gang.topology` (docs/gang-scheduling.md, "Topology").
 fn gang_topology_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["key"],
-        "description": "Place every member within one value (domain) of a node attribute, such as one rack or one NVLink domain. Nodes without the attribute are in no domain. The planner tries whole domains, best fit first, at most eight per plan; `job plan` reports the domain chosen or the closest one. See docs/gang-scheduling.md, \"Topology\".",
+        "description": "Place every member within one value (domain) of a node attribute, such as one rack or one NVLink domain. Set `key` for one level or `keys` for several, innermost first (one rack, else one zone). Nodes without an attribute are in no domain of that level. The planner tries whole domains, best fit first, skipping any that cannot hold the quorum even by preempting, at most sixteen per plan; `job plan` reports the level and domain chosen or the closest one. See docs/gang-scheduling.md, \"Topology\".",
         "properties": {
             "key": {
                 "type": "string",
                 "minLength": 1,
-                "description": "The node attribute name, looked up like count.per and distinct (config, then fingerprint, then dynamic attributes)."
+                "description": "The node attribute name, looked up like count.per and distinct (config, then fingerprint, then dynamic attributes). One level; exclusive with `keys`."
+            },
+            "keys": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 },
+                "description": "Several levels, innermost first: `[\"rack\", \"zone\"]` places in one rack when one fits, else in one zone. Exclusive with `key`."
             },
             "mode": {
                 "type": "string",
                 "enum": ["required", "preferred"],
-                "description": "`required` (default): every member in one domain, or the gang waits holding nothing; a top-up stays in its domain. `preferred`: one domain when one fits, else the fewest domains that hold the quorum, else any eligible nodes."
+                "description": "`required` (default): every member in one domain of some level, or the gang waits holding nothing; a top-up stays in its domain. `preferred`: one domain when one fits, else the fewest outermost domains that hold the quorum, else any eligible nodes."
             }
         }
     })
@@ -223,31 +270,11 @@ fn jobspec_schema_envelope() -> Value {
                             }
                         }
                     },
-                    "gang": {
-                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait and `onMemberLoss` says what a lost member does to the rest; `topology` keeps every member inside one domain of a node attribute (one rack). Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
-                        "oneOf": [
-                            { "type": "boolean" },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "min": {
-                                        "type": "integer",
-                                        "minimum": 1,
-                                        "description": "Quorum: replicas that must place together, 1..=count. Default: the whole count."
-                                    },
-                                    "placementTimeout": {
-                                        "type": ["string", "integer"],
-                                        "description": "How long the gang may wait for its quorum before its job fails (any members already running stop), as a duration (`\"30m\"`) or seconds. Counted from the first time the gang came up short. At least 1s. Default: unset, wait indefinitely."
-                                    },
-                                    "onMemberLoss": {
-                                        "type": "string",
-                                        "enum": ["restart", "replace", "fail"],
-                                        "description": "What a lost member does to the rest when it leaves fewer than the quorum running. `restart` (default): stop the survivors and place the whole gang again once their stop grace has passed. `replace`: keep the survivors and place the missing members together once they fit. `fail`: fail the job and stop every member. A loss that leaves the quorum running is replaced alone. Restarts after a failure spend on_unhealthy's move budget; once it is spent the job fails."
-                                    }
-                                }
-                            }
-                        ]
+                    "gang": {},
+                    "indexHint": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The scheduling index this task's candidates should come from: the name of an index in the manager's schedulerSettings.indexes, or \"scan\" for the full scan. Advisory: a hint naming no index, or one the task cannot use (a partition key it does not bind with an `=` constraint), falls back to automatic selection, and `job plan` says why in the task's index reason. Default: automatic. See docs/scheduling-indexes.md."
                     },
                     "speculativeStart": {
                         "type": "object",

@@ -771,3 +771,108 @@ fn static_port_service_rollout_replaces_instead_of_waiting_forever() -> R<()> {
     );
     Ok(())
 }
+
+/// A gang job spec: `count` members of 3,000 MiB in group `worker`, rolled
+/// out blue-green (`createFirst`, one step) — the documented zero-downtime
+/// gang update (docs/gang-scheduling.md, "Rollouts").
+fn blue_green_gang(version: u32) -> String {
+    json!({
+        "name": "trainer",
+        "tasks": {
+            "worker": {
+                "group": "worker",
+                "runtime": "exec",
+                "count": 2,
+                "gang": true,
+                "config": { "command": ["true"], "version": version },
+                "resources": { "memory": 3000 }
+            }
+        },
+        "rollout": {
+            "progression": "auto",
+            "replacement": "createFirst",
+            "allocationStagger": "0s",
+            "minHealthyTime": "0s",
+            "healthyDeadline": "30s"
+        }
+    })
+    .to_string()
+}
+
+/// `(old, new)` members of the rollout's source and target configs.
+fn gang_generations(store: &Store, job: &str) -> R<(usize, usize)> {
+    let rollout = latest_rollout_for_job(store, job)?;
+    let old = match rollout.from_job_config_id.as_deref() {
+        Some(from) => store.allocs_for_job_config(from)?.len(),
+        None => 0,
+    };
+    Ok((
+        old,
+        store
+            .allocs_for_job_config(&rollout.to_job_config_id)?
+            .len(),
+    ))
+}
+
+/// Phase 4 of the gang plan: a `createFirst` update of a gang places the new
+/// gang whole beside the old one, and only then retires the old one. At no
+/// point is a partial new gang placed, and at no point does less than a
+/// whole gang run.
+#[test]
+fn a_create_first_gang_update_is_blue_green() -> R<()> {
+    let store = setup_store()?;
+    insert_node(&store, "node-a")?;
+    insert_node(&store, "node-b")?;
+    let manager = ManagerDaemonService::new(store.clone());
+    let runtime = Runtime::new()?;
+    runtime.block_on(manager.run_job(Request::new(run_request(blue_green_gang(1), "v1"))))?;
+    drain_eval_queue_with_rollout_health(&store, "trainer", 20)?;
+    let v1 = store.get_job_config("trainer")?.id();
+    assert_eq!(store.allocs_for_job_config(&v1)?.len(), 2);
+
+    runtime.block_on(manager.run_job(Request::new(run_request(blue_green_gang(2), "v2"))))?;
+    let mut new_seen = false;
+    for _ in 0..120 {
+        let Some(_eval) = process_next_eval(&store)? else {
+            break;
+        };
+        mark_active_rollout_replacements_healthy(&store, "trainer")?;
+        let (old, new) = gang_generations(&store, "trainer")?;
+        assert!(new == 0 || new == 2, "the new gang places whole: {new}");
+        assert!(
+            old + new >= 2,
+            "a whole gang runs throughout: old {old}, new {new}"
+        );
+        new_seen |= new == 2 && old == 2;
+    }
+    assert!(new_seen, "both gangs ran side by side before the swap");
+    let rollout = latest_rollout_for_job(&store, "trainer")?;
+    assert_eq!(rollout.status, "completed");
+    assert_eq!(gang_generations(&store, "trainer")?, (0, 2));
+    Ok(())
+}
+
+/// With room for one gang only, a `createFirst` gang update waits for room
+/// for the second one: the old gang keeps running, untouched, and nothing
+/// of the new gang places.
+#[test]
+fn a_create_first_gang_update_waits_for_room_for_both_gangs() -> R<()> {
+    let store = setup_store()?;
+    insert_node(&store, "node-a")?;
+    let manager = ManagerDaemonService::new(store.clone());
+    let runtime = Runtime::new()?;
+    runtime.block_on(manager.run_job(Request::new(run_request(blue_green_gang(1), "v1"))))?;
+    drain_eval_queue_with_rollout_health(&store, "trainer", 20)?;
+    runtime.block_on(manager.run_job(Request::new(run_request(blue_green_gang(2), "v2"))))?;
+    for _ in 0..40 {
+        if process_next_eval(&store).ok().flatten().is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        gang_generations(&store, "trainer")?,
+        (2, 0),
+        "the old gang serves; the new one waits whole"
+    );
+    Ok(())
+}

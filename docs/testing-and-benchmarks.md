@@ -321,6 +321,21 @@ Benchmark targets:
 What they measure:
 
 - `scheduler_bench`: scheduler planning/apply throughput across a scale matrix.
+  - Every group builds its own fleet before Criterion's name filter is
+    consulted, so a filter alone still pays every other group's setup
+    (minutes at 20k nodes). Run a subset of groups with
+    `LEGION_BENCH_ONLY=group,group` (`plan_fleet_scaling`, `keyed_bind`,
+    `plan_apply_node_rows`, `job_stop_drain`, …; the names are the
+    `GROUPS` table at the bottom of the file).
+  - `plan_apply_node_rows`: an eight-placement plan on a 10k-node fleet
+    whose nodes carry realistic attribute bags (a few KiB of fingerprint),
+    printing the `apply` phase mean, which is where the apply walk's node
+    rows are read (`LEGION_BENCH_NODE_ROW_NODES` sets the fleet).
+  - `job_stop_drain`: stops and destroys 100 of 1,500 placed jobs on a
+    10k-node fleet one at a time and prints the mean of each step (the
+    `StopJob` write, the `job_stop` handler's steps, `DestroyJob`).
+    `LEGION_BENCH_STOP_NODES` and `LEGION_BENCH_STOP_JOBS` size it. A step
+    whose cost grows with the job count is a statement scanning a table.
   - Policies tested: `bin_pack`, `spread`.
   - Scale dimensions: node counts 10 -> 100,000, and allocation counts 10 -> 100,000.
   - `candidate_construction` group: isolates per-task candidate-set cost
@@ -747,6 +762,31 @@ heartbeat cost at up to a million sessions) and the router's
 cargo test --release --test session_index_scale_measure -- --ignored --nocapture
 cargo test --release --lib -- pick_cost_measure --ignored --nocapture
 ```
+
+### Power-cut test of the raft log's purge barrier
+
+`scripts/power-cut-test.sh` (root, Linux) proves that a raft log purge
+never outlives the applied marker it relies on after a power loss
+([multi-raft.md](multi-raft.md), "Durability"). It puts the state DB and the
+raft log on two loop-mounted ext4 images, turns the kernel's background
+writeback off, and runs the two ignored `power_cut_*` tests in
+`storage::raft::state_machine`. Each applies 20 entries, purges through 15,
+and then "cuts power" by copying the images: with writeback off a write
+reaches an image only when something fsyncs it, so the copies hold exactly
+what was durable. The copies are mounted (ext4 replays its journal, as
+after a crash) and read back:
+
+```console
+$ sudo scripts/power-cut-test.sh
+power cut (with-barrier): applied marker 20, purged through 15
+power cut (without-barrier): applied marker 0, purged through 15
+```
+
+The second test is the control: without the barrier the same cut loses the
+marker, which shows the harness models a power cut at all. Separate
+filesystems keep one file's fsync from flushing the other's pages through a
+shared journal commit. The test does not model a directory entry that was
+never synced, or a disk that reorders or tears writes inside an fsync.
 
 ### Control-plane write and delivery tests
 

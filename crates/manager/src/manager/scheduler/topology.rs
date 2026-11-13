@@ -1,11 +1,14 @@
 //! Topology-aware gang placement (docs/gang-scheduling.md, "Topology";
 //! architecture review AI7).
 //!
-//! A gang with `topology = { key, mode }` places inside one **domain**: the
-//! eligible nodes that share one value of the node attribute `key`. The
-//! planner tries whole domains, one at a time, and keeps the first in which
-//! the gang reaches its quorum; this module decides which domains exist,
-//! roughly how many members each can hold, and the order to try them in.
+//! A gang with `topology = { keys, mode }` places inside one **domain**: the
+//! eligible nodes that share one value of a node attribute. `keys` are
+//! levels, innermost first (`["rack", "zone"]`): the planner tries the
+//! domains of the first level, one at a time, and keeps the first in which
+//! the gang reaches its quorum; only when none does does it try the next
+//! level. This module decides which domains exist, roughly how many members
+//! each can hold (with and without preemption), and the order to try them
+//! in.
 //! The placement itself is the ordinary per-replica placement, restricted to
 //! the domain's nodes, so every other rule (constraints, ports, `distinct`,
 //! preemption) applies unchanged inside it.
@@ -19,11 +22,13 @@ use crate::resources::{ResourcePool, ResourceRequest, ResourceValue};
 use crate::storage::store::SharedNodePools;
 use crate::structs::{Node, TopologyMode};
 
-/// Domains one gang may try per plan. Each try is a full placement of the
-/// gang inside the domain, so this bounds planning cost on a cluster with
-/// hundreds of racks; the ordering puts the domains most likely to fit
-/// first.
-pub(super) const MAX_TOPOLOGY_TRIALS: usize = 8;
+/// Domains one gang may try per plan, across all its levels. Each try is a
+/// full placement of the gang inside the domain, so this bounds planning
+/// cost on a cluster with hundreds of racks. Only domains whose estimate
+/// (counting what preemption could free) reaches the quorum are tried at
+/// all, so the bound only bites when that many domains could plausibly fit
+/// and every one of them turned out not to.
+pub(super) const MAX_TOPOLOGY_TRIALS: usize = 16;
 
 /// One domain: the eligible nodes sharing one value of the topology key.
 #[derive(Debug, Clone)]
@@ -38,6 +43,11 @@ pub(super) struct TopologyDomain<'b> {
     /// needs), summed. Ignores anti-affinity, ports, and `distinct`, which
     /// the real placement inside the domain still checks.
     pub(super) estimate: u32,
+    /// The same estimate over free capacity plus what preemption could
+    /// reclaim (allocations in a band below the gang's), an upper bound on
+    /// what the domain could hold if the placement inside it preempts. Equal
+    /// to `estimate` when the gang cannot preempt.
+    pub(super) reachable: u32,
 }
 
 /// The value of `key` on `node` as a person reads it.
@@ -49,11 +59,13 @@ pub(super) fn domain_label(value: &Value) -> String {
 }
 
 /// The domains among `eligible`, ordered by token. Nodes without `key` are
-/// in no domain.
+/// in no domain. `reclaim` is, per node, its free capacity plus what
+/// preemption could free there; `None` when the gang cannot preempt.
 pub(super) fn domains<'b>(
     eligible: &[&'b Node],
     key: &str,
     pools: &SharedNodePools,
+    reclaim: Option<&HashMap<String, ResourcePool>>,
     request: &ResourceRequest,
     cap: u32,
 ) -> Vec<TopologyDomain<'b>> {
@@ -66,6 +78,10 @@ pub(super) fn domains<'b>(
         let fit = pools
             .get(node.id.as_str())
             .map_or(0, |pool| replicas_fit(pool, request, cap));
+        let reachable = match reclaim.and_then(|reclaim| reclaim.get(node.id.as_str())) {
+            Some(pool) => replicas_fit(pool, request, cap).max(fit),
+            None => fit,
+        };
         let domain = by_token
             .entry(token.clone())
             .or_insert_with(|| TopologyDomain {
@@ -73,11 +89,13 @@ pub(super) fn domains<'b>(
                 label: domain_label(value),
                 nodes: Vec::new(),
                 estimate: 0,
+                reachable: 0,
             });
         domain.nodes.push(node);
         // Summed uncapped: best fit needs to tell a domain that holds
         // exactly the gang from one that holds three of it.
         domain.estimate = domain.estimate.saturating_add(fit);
+        domain.reachable = domain.reachable.saturating_add(reachable);
     }
     let mut domains: Vec<TopologyDomain<'b>> = by_token.into_values().collect();
     domains.sort_by(|left, right| left.token.cmp(&right.token));
@@ -87,7 +105,7 @@ pub(super) fn domains<'b>(
 /// How many replicas of `request` fit in `pool`, at most `cap`: the
 /// smallest `free / requested` over the amounts it asks for. A request for
 /// specific items (device ids) fits once or not at all.
-pub(super) fn replicas_fit(pool: &ResourcePool, request: &ResourceRequest, cap: u32) -> u32 {
+pub(crate) fn replicas_fit(pool: &ResourcePool, request: &ResourceRequest, cap: u32) -> u32 {
     let mut fit = cap as f64;
     for (name, demand) in &request.values {
         match demand {
@@ -111,7 +129,8 @@ pub(super) fn replicas_fit(pool: &ResourcePool, request: &ResourceRequest, cap: 
     }
 }
 
-/// The order to try domains in, at most [`MAX_TOPOLOGY_TRIALS`] of them.
+/// The order to try one level's domains in. The caller stops after
+/// [`MAX_TOPOLOGY_TRIALS`] tries across every level.
 ///
 /// - `pinned` (the domain most of a running gang's members occupy) comes
 ///   first; under `required` it is the only domain a top-up may use.
@@ -119,7 +138,11 @@ pub(super) fn replicas_fit(pool: &ResourcePool, request: &ResourceRequest, cap: 
 ///   (`needed`), smallest first: best fit, which keeps large domains whole
 ///   for large gangs.
 /// - Then domains that hold the quorum (`need_now`), largest first.
-/// - Then the rest, largest first: they can only fit by preemption.
+/// - Then domains that hold the quorum only with what preemption could
+///   reclaim, largest reclaimable first.
+/// - The rest cannot hold the quorum even by preempting everything below
+///   the gang's band, and are never tried: this is what keeps the trial
+///   bound from skipping a domain where preemption would have made room.
 pub(super) fn trial_order(
     domains: &[TopologyDomain<'_>],
     needed: u32,
@@ -137,7 +160,7 @@ pub(super) fn trial_order(
     }
     let mut whole: Vec<usize> = Vec::new();
     let mut quorum: Vec<usize> = Vec::new();
-    let mut rest: Vec<usize> = Vec::new();
+    let mut preempting: Vec<usize> = Vec::new();
     for (index, domain) in domains.iter().enumerate() {
         if Some(index) == pinned_index {
             continue;
@@ -146,20 +169,19 @@ pub(super) fn trial_order(
             whole.push(index);
         } else if domain.estimate >= need_now.max(1) {
             quorum.push(index);
-        } else {
-            rest.push(index);
+        } else if domain.reachable >= need_now.max(1) {
+            preempting.push(index);
         }
     }
     // Ties fall back to token order, which `domains` already sorted by.
     whole.sort_by_key(|index| domains[*index].estimate);
     quorum.sort_by_key(|index| std::cmp::Reverse(domains[*index].estimate));
-    rest.sort_by_key(|index| std::cmp::Reverse(domains[*index].estimate));
+    preempting.sort_by_key(|index| std::cmp::Reverse(domains[*index].reachable));
     pinned_index
         .into_iter()
         .chain(whole)
         .chain(quorum)
-        .chain(rest)
-        .take(MAX_TOPOLOGY_TRIALS)
+        .chain(preempting)
         .collect()
 }
 
@@ -193,7 +215,11 @@ pub(super) struct TopologyOutcome {
     /// domain whose try got furthest. Empty when a `preferred` gang spans
     /// domains.
     pub(super) domain: String,
-    /// Domains with at least one eligible node.
+    /// The level (`topology.keys` entry) `domain` belongs to; empty with no
+    /// domain.
+    pub(super) key: String,
+    /// Domains with at least one eligible node, at that level (the first
+    /// level when no domain was chosen).
     pub(super) domains: u32,
 }
 
@@ -253,7 +279,7 @@ mod topology_test {
         ]
         .into_iter()
         .collect();
-        let found = domains(&refs, "rack", &pools, &request(1000.0), 6);
+        let found = domains(&refs, "rack", &pools, None, &request(1000.0), 6);
         assert_eq!(found.len(), 2, "the node without the key is in no domain");
         assert_eq!(found[0].label, "a");
         assert_eq!(found[0].nodes.len(), 2);
@@ -271,21 +297,38 @@ mod topology_test {
             label: token.into(),
             nodes: Vec::new(),
             estimate,
+            reachable: estimate,
         }
     }
 
     #[test]
     fn whole_fits_go_first_smallest_first_then_quorum_fits_largest_first() {
-        let found = [
+        let mut found = vec![
             domain("a", 9),
             domain("b", 4),
             domain("c", 8),
             domain("d", 6),
             domain("e", 1),
+            domain("f", 2),
         ];
+        // `f` holds the quorum only by preempting; `b` and `e` never do.
+        found[5].reachable = 7;
         let order = trial_order(&found, 8, 6, None, TopologyMode::Required);
         let labels: Vec<&str> = order.iter().map(|i| found[*i].label.as_str()).collect();
-        assert_eq!(labels, vec!["c", "a", "d", "b", "e"]);
+        assert_eq!(labels, vec!["c", "a", "d", "f"]);
+    }
+
+    #[test]
+    fn reclaimable_capacity_counts_toward_reachable_only() {
+        let nodes = [node("a1", Some("a"))];
+        let refs: Vec<&Node> = nodes.iter().collect();
+        let pools: SharedNodePools = [("a1".to_string(), pool(1000.0))].into_iter().collect();
+        let reclaim: HashMap<String, ResourcePool> = [("a1".to_string(), (*pool(4000.0)).clone())]
+            .into_iter()
+            .collect();
+        let found = domains(&refs, "rack", &pools, Some(&reclaim), &request(1000.0), 8);
+        assert_eq!(found[0].estimate, 1);
+        assert_eq!(found[0].reachable, 4);
     }
 
     #[test]
@@ -302,15 +345,6 @@ mod topology_test {
         assert_eq!(
             trial_order(&found, 2, 2, Some("b"), TopologyMode::Preferred),
             vec![1, 0]
-        );
-    }
-
-    #[test]
-    fn trials_are_bounded() {
-        let found: Vec<TopologyDomain> = (0..20).map(|i| domain(&format!("d{i:02}"), 9)).collect();
-        assert_eq!(
-            trial_order(&found, 8, 8, None, TopologyMode::Required).len(),
-            MAX_TOPOLOGY_TRIALS
         );
     }
 

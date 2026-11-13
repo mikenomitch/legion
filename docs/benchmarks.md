@@ -219,7 +219,9 @@ on `web_fleet`:
 **Legion with `RunJob` off the async runtime.** The tables above measure
 `main`. The same release moves `RunJob`'s raft writes off the manager's
 async worker threads (`block_in_place`), so a burst of submits no longer
-leaves evaluations and heartbeats waiting for a thread. Rerun on the same
+leaves evaluations and heartbeats waiting for a thread. (A later change
+moved the same step into the store itself, so every handler's raft writes
+wait off the async workers; these numbers measure `RunJob` alone.) Rerun on the same
 rig, one run per cell:
 
 | Workload           | Fleet / density | `main`  | With the change |

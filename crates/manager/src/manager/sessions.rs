@@ -1511,6 +1511,38 @@ pub async fn session_nodes(
     Ok(nodes)
 }
 
+/// The refusal for a session start or run that found no envelope for the
+/// task on any node. When the scheduler recorded why it left the envelope
+/// unplaced (a full node, a constraint, a port), the message quotes that
+/// reason: "no node runs an envelope yet" alone read as though no node were
+/// eligible, which misled when one was eligible and full. Without a recorded
+/// reason the message says how envelopes are placed and where to look.
+fn no_envelope_status(store: &Store, job_id: &str, task_name: &str) -> Status {
+    match store.last_unplaced_reason(job_id, task_name) {
+        Ok(Some(reason)) => Status::failed_precondition(format!(
+            "no node runs an envelope for {job_id}/{task_name}: the scheduler could not place \
+             one ({reason}); it retries when capacity frees up or a node joins (see `legion \
+             events list --kind plan.unplaced --job {job_id}`)"
+        )),
+        result => {
+            if let Err(error) = result {
+                debug!(
+                    %job_id,
+                    task = %task_name,
+                    error = %format!("{error:#}"),
+                    "Could not read why the envelope is unplaced"
+                );
+            }
+            Status::failed_precondition(format!(
+                "no node runs an envelope for {job_id}/{task_name} yet; the scheduler places one \
+                 on every eligible node that reports the `sessions` capability and has room \
+                 for it (see `legion job status {job_id}` and `legion events list --kind \
+                 plan.unplaced --job {job_id}`)"
+            ))
+        }
+    }
+}
+
 /// Why a node holding an envelope does not accept edge session starts, or
 /// `""` when it does (`SessionNode.reason`).
 fn session_node_reason(
@@ -1694,12 +1726,7 @@ pub async fn start(
         Ok(reservation) => Some(reservation),
         Err(NoRoom { envelopes: 0 }) => {
             metrics.session_starts_total.inc(&["no_envelope"]);
-            return Err(Status::failed_precondition(format!(
-                "no node runs an envelope for {job_id}/{} yet; the scheduler places one on \
-                 every eligible node that reports the `sessions` capability (see `legion job \
-                 status {job_id}`)",
-                task.name
-            )));
+            return Err(no_envelope_status(store, job_id, &task.name));
         }
         Err(NoRoom { envelopes }) => {
             metrics.session_starts_total.inc(&["no_room"]);
@@ -2089,12 +2116,7 @@ pub async fn run(
     metrics.session_runs_total.inc(&["refused"]);
     if tried.is_empty() {
         return Err(match envelopes {
-            Some(0) | None => Status::failed_precondition(format!(
-                "no node runs an envelope for {job_id}/{} yet; the scheduler places one on \
-                 every eligible node that reports the `sessions` capability (see `legion job \
-                 status {job_id}`)",
-                task.name
-            )),
+            Some(0) | None => no_envelope_status(store, job_id, &task.name),
             Some(count) => Status::resource_exhausted(format!(
                 "every envelope for {job_id}/{} is full ({count} nodes); {}",
                 task.name,

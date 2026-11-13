@@ -1674,18 +1674,53 @@ pub struct GangConfig {
     /// Place the members within one value of a node attribute. `None` = no
     /// topology preference.
     pub topology: Option<GangTopology>,
+    /// How long a placed member may take to become ready (its first healthy
+    /// report: running, and passing its checks if it has any) before it
+    /// counts as a lost member. `None` = no readiness bound.
+    pub ready_timeout: Option<Duration>,
+    /// Whether a member the worker restarts in place under the task's
+    /// `restart` policy counts as a member loss.
+    pub on_local_restart: LocalRestartPolicy,
+}
+
+/// What a gang member's *local* restart (its worker relaunching it in place
+/// under the task's `restart` policy) does to the gang
+/// (docs/gang-scheduling.md, "Local restarts").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalRestartPolicy {
+    /// The restart is a member loss: the gang's `onMemberLoss` applies, as
+    /// if the member had failed. The default, because the frameworks that
+    /// need a gang cannot take a restarted member back mid-run.
+    #[default]
+    Loss,
+    /// The restarted member rejoins on its own; the rest of the gang keeps
+    /// running untouched.
+    Ignore,
+}
+
+impl LocalRestartPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LocalRestartPolicy::Loss => "loss",
+            LocalRestartPolicy::Ignore => "ignore",
+        }
+    }
 }
 
 /// A gang's `topology` block (docs/gang-scheduling.md, "Topology"): place
 /// every member on nodes that share one value of the node attribute `key`
 /// — a **domain**, such as one rack or one NVLink domain.
 ///
-/// `key` is a node attribute name, looked up the way `count.per` and
-/// `distinct` look one up (config, then fingerprint, then dynamic
-/// attributes). Nodes without the attribute belong to no domain.
+/// `keys` are node attribute names, innermost level first (`["rack",
+/// "zone"]`: one rack, else one zone), each looked up the way `count.per`
+/// and `distinct` look one up (config, then fingerprint, then dynamic
+/// attributes). Nodes without an attribute belong to no domain of that
+/// level. Written `key = "rack"` for one level, `keys = [...]` for more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GangTopology {
-    pub key: String,
+    /// At least one; innermost (tightest) level first.
+    pub keys: Vec<String>,
     pub mode: TopologyMode,
 }
 
@@ -1714,7 +1749,16 @@ impl TopologyMode {
 }
 
 impl GangTopology {
-    /// Parse `{ key = "rack", mode = "required" }`.
+    /// Most levels a gang may name: each is tried in turn per plan.
+    pub const MAX_LEVELS: usize = 4;
+
+    /// The innermost level's key (the one a single-level gang names).
+    pub fn key(&self) -> &str {
+        self.keys.first().map(String::as_str).unwrap_or_default()
+    }
+
+    /// Parse `{ key = "rack", mode = "required" }` or `{ keys = ["rack",
+    /// "zone"] }`.
     fn from_value(value: Value) -> Result<GangTopology, String> {
         let Value::Object(fields) = value else {
             return Err(format!(
@@ -1722,22 +1766,38 @@ impl GangTopology {
                  got {value}"
             ));
         };
+        let attribute = |value: &Value, field: &str| -> Result<String, String> {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "gang.topology.{field} must be a node attribute name like \"rack\", \
+                         got {value}"
+                    )
+                })
+        };
         let mut key: Option<String> = None;
+        let mut keys: Option<Vec<String>> = None;
         let mut mode = TopologyMode::default();
         for (field, value) in fields {
             match field.as_str() {
-                "key" => {
-                    let raw = value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|raw| !raw.is_empty())
-                        .ok_or_else(|| {
-                            format!(
-                                "gang.topology.key must be a node attribute name like \"rack\", \
-                                 got {value}"
-                            )
-                        })?;
-                    key = Some(raw.to_string());
+                "key" => key = Some(attribute(&value, "key")?),
+                "keys" => {
+                    let Value::Array(items) = &value else {
+                        return Err(format!(
+                            "gang.topology.keys must be a list of node attribute names, \
+                             innermost first, like [\"rack\", \"zone\"], got {value}"
+                        ));
+                    };
+                    keys = Some(
+                        items
+                            .iter()
+                            .map(|item| attribute(item, "keys"))
+                            .collect::<Result<_, _>>()?,
+                    );
                 }
                 "mode" => {
                     mode = serde_json::from_value(value.clone()).map_err(|_| {
@@ -1748,18 +1808,52 @@ impl GangTopology {
                 }
                 other => {
                     return Err(format!(
-                        "unknown field `{other}` in gang.topology, expected one of `key`, `mode` \
-                         (see docs/gang-scheduling.md)"
+                        "unknown field `{other}` in gang.topology, expected one of `key`, `keys`, \
+                         `mode` (see docs/gang-scheduling.md)"
                     ))
                 }
             }
         }
-        let key = key.ok_or_else(|| {
-            "gang.topology needs a key: the node attribute whose value the members share, \
-             like `topology = { key = \"rack\" }`"
-                .to_string()
-        })?;
-        Ok(GangTopology { key, mode })
+        let keys = match (key, keys) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "gang.topology sets both key and keys; write `key = \"rack\"` for \
+                            one level or `keys = [\"rack\", \"zone\"]` for several"
+                        .to_string(),
+                )
+            }
+            (Some(key), None) => vec![key],
+            (None, Some(keys)) => keys,
+            (None, None) => {
+                return Err(
+                    "gang.topology needs a key: the node attribute whose value the members \
+                     share, like `topology = { key = \"rack\" }`"
+                        .to_string(),
+                )
+            }
+        };
+        if keys.is_empty() {
+            return Err("gang.topology.keys needs at least one node attribute name".to_string());
+        }
+        if keys.len() > Self::MAX_LEVELS {
+            return Err(format!(
+                "gang.topology.keys names {} levels; at most {} are allowed",
+                keys.len(),
+                Self::MAX_LEVELS
+            ));
+        }
+        if let Some(repeated) = keys
+            .iter()
+            .enumerate()
+            .find(|(index, key)| keys[..*index].contains(key))
+            .map(|(_, key)| key)
+        {
+            return Err(format!(
+                "gang.topology.keys names {repeated:?} twice; list each level once, innermost \
+                 first"
+            ));
+        }
+        Ok(GangTopology { keys, mode })
     }
 }
 
@@ -1769,7 +1863,11 @@ impl Serialize for GangTopology {
         S: serde::Serializer,
     {
         let mut state = serializer.serialize_struct("GangTopology", 2)?;
-        state.serialize_field("key", &self.key)?;
+        if self.keys.len() == 1 {
+            state.serialize_field("key", &self.keys[0])?;
+        } else {
+            state.serialize_field("keys", &self.keys)?;
+        }
         state.serialize_field("mode", &self.mode)?;
         state.end()
     }
@@ -1788,6 +1886,12 @@ pub enum MemberLossPolicy {
     /// (`on_unhealthy.moveCount`); node loss and drain spend nothing.
     #[default]
     Restart,
+    /// Keep the survivors on their nodes and restart their processes in
+    /// place (the worker stops and starts each, as for a local restart),
+    /// under a new gang epoch; the missing members place together once they
+    /// fit. Cheaper than `Restart` at scale: nothing is re-placed but the
+    /// members that were lost.
+    RestartInPlace,
     /// Keep the survivors, and place the missing members together once they
     /// fit.
     Replace,
@@ -1800,6 +1904,7 @@ impl MemberLossPolicy {
     pub fn as_str(&self) -> &'static str {
         match self {
             MemberLossPolicy::Restart => "restart",
+            MemberLossPolicy::RestartInPlace => "restartInPlace",
             MemberLossPolicy::Replace => "replace",
             MemberLossPolicy::Fail => "fail",
         }
@@ -1823,6 +1928,15 @@ impl GangConfig {
 
     /// Spec-shape rules for a task with this block and `count`.
     pub fn validate(&self, task: &str, count: u32) -> R<()> {
+        if self
+            .ready_timeout
+            .is_some_and(|timeout| timeout < Duration::from_secs(1))
+        {
+            bail!(
+                "task {task} gang.readyTimeout must be at least 1s; omit it to wait for each \
+                 member's own failure"
+            );
+        }
         if self
             .placement_timeout
             .is_some_and(|timeout| timeout < Duration::from_secs(1))
@@ -1872,7 +1986,22 @@ impl GangConfig {
                                 serde_json::from_value(value.clone()).map_err(|_| {
                                     format!(
                                         "gang.onMemberLoss must be one of \"restart\", \
-                                         \"replace\", \"fail\", got {value}"
+                                         \"restartInPlace\", \"replace\", \"fail\", got {value}"
+                                    )
+                                })?;
+                        }
+                        "readyTimeout" => {
+                            gang.ready_timeout = Some(
+                                parse_duration_value(&value)
+                                    .map_err(|err| format!("gang.readyTimeout: {err}"))?,
+                            );
+                        }
+                        "onLocalRestart" => {
+                            gang.on_local_restart =
+                                serde_json::from_value(value.clone()).map_err(|_| {
+                                    format!(
+                                        "gang.onLocalRestart must be \"loss\" or \"ignore\", \
+                                         got {value}"
                                     )
                                 })?;
                         }
@@ -1885,8 +2014,8 @@ impl GangConfig {
                         other => {
                             return Err(format!(
                                 "unknown field `{other}` in gang, expected one of `min`, \
-                                 `placementTimeout`, `onMemberLoss`, `topology` (see \
-                                 docs/gang-scheduling.md)"
+                                 `placementTimeout`, `readyTimeout`, `onMemberLoss`, \
+                                 `onLocalRestart`, `topology` (see docs/gang-scheduling.md)"
                             ))
                         }
                     }
@@ -1909,7 +2038,7 @@ impl Serialize for GangConfig {
         if *self == GangConfig::default() {
             return serializer.serialize_bool(true);
         }
-        let mut state = serializer.serialize_struct("GangConfig", 4)?;
+        let mut state = serializer.serialize_struct("GangConfig", 6)?;
         if let Some(min) = self.min {
             state.serialize_field("min", &min)?;
         }
@@ -1921,6 +2050,15 @@ impl Serialize for GangConfig {
         }
         if self.on_member_loss != MemberLossPolicy::default() {
             state.serialize_field("onMemberLoss", &self.on_member_loss)?;
+        }
+        if let Some(timeout) = self.ready_timeout {
+            state.serialize_field(
+                "readyTimeout",
+                &humantime::format_duration(timeout).to_string(),
+            )?;
+        }
+        if self.on_local_restart != LocalRestartPolicy::default() {
+            state.serialize_field("onLocalRestart", &self.on_local_restart)?;
         }
         if let Some(topology) = &self.topology {
             state.serialize_field("topology", topology)?;
@@ -2188,6 +2326,15 @@ pub struct TaskConfig {
     )]
     #[tabled(skip)]
     pub gang: Option<GangConfig>,
+    /// The scheduling index this task's candidates should come from
+    /// (docs/scheduling-indexes.md, "Hinting an index"): the name of an
+    /// index in the manager's `schedulerSettings.indexes`, or `"scan"` for
+    /// the full scan. Advisory: a hint naming no index, or one this task
+    /// cannot use (a partition key it does not bind), falls back to
+    /// automatic selection and `job plan` says why. `None` = automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub index_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
@@ -2942,6 +3089,8 @@ struct TaskConfigInput {
     #[serde(default, deserialize_with = "deserialize_gang")]
     gang: Option<GangConfig>,
     #[serde(default)]
+    index_hint: Option<String>,
+    #[serde(default)]
     kv: Option<KvInjectionPolicy>,
     #[serde(default)]
     env: Vec<TaskKvEnvInjection>,
@@ -3013,6 +3162,7 @@ extension_point!(
         "stop",
         "disruption",
         "gang",
+        "indexHint",
         "kv",
         "env",
         "files",
@@ -3140,6 +3290,16 @@ impl TaskConfigInput {
                 ));
             }
         }
+        if self
+            .index_hint
+            .as_deref()
+            .is_some_and(|hint| hint.trim().is_empty() || hint.trim() != hint)
+        {
+            return Err(format!(
+                "task {name} indexHint must name a scheduling index (or \"scan\" for the full \
+                 scan) with no surrounding spaces; see docs/scheduling-indexes.md"
+            ));
+        }
         if self.on_lost.is_some() {
             return Err(if self.stateful.is_some() {
                 format!(
@@ -3188,6 +3348,7 @@ impl TaskConfigInput {
             stop: self.stop,
             disruption: self.disruption,
             gang: self.gang.clone(),
+            index_hint: self.index_hint,
             kv_injections: Some(if let Some(existing) = self.kv_injections {
                 TaskKvInjections {
                     kv: self.kv.or(existing.kv),
@@ -3486,6 +3647,7 @@ impl TaskConfig {
             run: None,
             children: None,
             autoscale: None,
+            index_hint: None,
             name: name.into(),
             count: default_task_count(),
             runtime: runtime.into(),
@@ -6002,7 +6164,7 @@ mod tests {
         assert_eq!(
             task.gang.as_ref().and_then(|gang| gang.topology.clone()),
             Some(GangTopology {
-                key: "rack".into(),
+                keys: vec!["rack".into()],
                 mode: TopologyMode::Required,
             })
         );
@@ -6043,6 +6205,53 @@ mod tests {
             (
                 serde_json::json!({ "topology": { "key": "rack", "level": 2 } }),
                 "unknown field `level` in gang.topology",
+            ),
+        ] {
+            let error = gang_task(bad).expect_err(needle);
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gang_topology_takes_several_levels_innermost_first() -> R<()> {
+        let task = gang_task(serde_json::json!({ "topology": { "keys": ["rack", "zone"] } }))?;
+        let topology = task.gang.as_ref().and_then(|gang| gang.topology.clone());
+        assert_eq!(
+            topology,
+            Some(GangTopology {
+                keys: vec!["rack".into(), "zone".into()],
+                mode: TopologyMode::Required,
+            })
+        );
+        assert_eq!(topology.as_ref().map(GangTopology::key), Some("rack"));
+        assert_eq!(
+            serde_json::to_value(&task)?["gang"],
+            serde_json::json!({ "topology": { "keys": ["rack", "zone"], "mode": "required" } })
+        );
+        let reparsed: TaskConfig = serde_json::from_value(serde_json::to_value(&task)?)?;
+        assert_eq!(reparsed.gang, task.gang);
+
+        for (bad, needle) in [
+            (
+                serde_json::json!({ "topology": { "key": "rack", "keys": ["zone"] } }),
+                "sets both key and keys",
+            ),
+            (
+                serde_json::json!({ "topology": { "keys": [] } }),
+                "needs at least one",
+            ),
+            (
+                serde_json::json!({ "topology": { "keys": ["rack", "rack"] } }),
+                "twice",
+            ),
+            (
+                serde_json::json!({ "topology": { "keys": ["a", "b", "c", "d", "e"] } }),
+                "at most 4",
+            ),
+            (
+                serde_json::json!({ "topology": { "keys": "rack" } }),
+                "must be a list",
             ),
         ] {
             let error = gang_task(bad).expect_err(needle);

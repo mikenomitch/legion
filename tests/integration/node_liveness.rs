@@ -12,7 +12,8 @@
 //! seconds long, and a suite that waits them out is a suite nobody runs.
 
 use legion::manager::cadence::{
-    cadence_report, decide_lost_nodes, freshness_ratio, LossContext, SuppressionReason,
+    cadence_report, decide_lost_nodes, freshness_ratio, LossContext, ServedCadence,
+    SuppressionReason,
 };
 use legion::manager::daemon::liveness_snapshot;
 use legion::manager::eval::EvalExt;
@@ -411,10 +412,7 @@ fn freshness_reads_the_fleet_and_computes_a_remedy() -> R<()> {
 
     // Everyone on time.
     let snapshot = liveness_snapshot(&store, Instant::now())?;
-    assert_eq!(
-        freshness_ratio(&snapshot, Duration::from_secs(2), 20),
-        Some(1.0)
-    );
+    assert_eq!(freshness_ratio(&snapshot, 5, 20), Some(1.0));
 
     // Three quarters of the fleet slips to a 9s effective interval: the
     // control plane is behind, and the report says what to set.
@@ -422,7 +420,15 @@ fn freshness_reads_the_fleet_and_computes_a_remedy() -> R<()> {
         silent_for(&store, &format!("node-{index}"), 9);
     }
     let snapshot = liveness_snapshot(&store, Instant::now())?;
-    let report = cadence_report(&snapshot, Duration::from_secs(2), 5, 2.0, 20, false, false);
+    let report = cadence_report(
+        &snapshot,
+        ServedCadence::uniform(Duration::from_secs(2)),
+        5,
+        2.0,
+        20,
+        false,
+        false,
+    );
     assert_eq!(report.active_nodes, 100);
     assert_eq!(report.lost_window, Duration::from_secs(10));
     let ratio = report.freshness_ratio.expect("measurable");
@@ -721,5 +727,191 @@ fn a_cordoned_node_stays_cordoned_through_loss_and_recovery() -> R<()> {
     let node = store.get_node("node-1")?;
     assert_eq!(node.status, "active");
     assert_eq!(node.availability, "drained", "recovery must not uncordon");
+    Ok(())
+}
+
+/// A registered node in `pool`, reporting `heartbeat_seconds` as its cadence.
+fn register_in(store: &Store, id: &str, pool: &str, heartbeat_seconds: u64) -> R<()> {
+    store.insert_node(NodeMsg {
+        id: id.to_string(),
+        pool: pool.into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: json!({ "heartbeatSeconds": heartbeat_seconds }).to_string(),
+        fingerprint_attrs: "{}".into(),
+        dynamic_attrs: "{}".into(),
+        health_checks: "{}".into(),
+        last_heartbeat: String::new(),
+        heartbeat_source: String::new(),
+    })?;
+    Ok(())
+}
+
+// The tests read the gRPC status, so it is returned as is.
+#[allow(clippy::result_large_err)]
+fn ping(
+    rt: &tokio::runtime::Runtime,
+    svc: &legion::manager::server::ManagerDaemonService,
+    id: &str,
+) -> Result<legion::structs::PingReply, tonic::Status> {
+    use legion::structs::manager_server::Manager;
+    rt.block_on(svc.ping(tonic::Request::new(legion::structs::PingRequest {
+        node_id: id.to_string(),
+    })))
+    .map(tonic::Response::into_inner)
+}
+
+fn runtime() -> R<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?)
+}
+
+/// A ping is a beat and nothing else: it refreshes the node's liveness, writes
+/// no replicated state, and hands back both served intervals so the worker
+/// knows when its next full heartbeat is due.
+#[test]
+fn a_ping_refreshes_liveness_and_writes_nothing() -> R<()> {
+    let store = setup_store(5)?;
+    register(&store, "node-1", None)?;
+    store.liveness().become_responsible(&["node-1".into()]);
+    silent_for(&store, "node-1", 9);
+    store
+        .liveness()
+        .set_served_intervals(Some(Duration::from_secs(2)), Some(Duration::from_secs(21)));
+
+    let svc = legion::manager::server::ManagerDaemonService::new(store.clone());
+    let rt = runtime()?;
+    let reply = ping(&rt, &svc, "node-1")?;
+    assert_eq!(reply.next_interval_seconds, Some(2));
+    assert_eq!(reply.sync_interval_seconds, Some(21));
+    assert!(
+        !reply.sync_now,
+        "an active node needs no early full heartbeat"
+    );
+
+    // The 9s of silence is gone: the node is fresh again.
+    let snapshot = liveness_snapshot(&store, Instant::now())?;
+    assert!(
+        snapshot[0].age < Duration::from_secs(1),
+        "{:?}",
+        snapshot[0]
+    );
+    assert_eq!(freshness_ratio(&snapshot, 5, 1), Some(1.0));
+    // And nothing reached the replicated heartbeat clock.
+    let persisted = store
+        .active_node_liveness_rows()?
+        .into_iter()
+        .find(|row| row.id == "node-1")
+        .and_then(|row| row.last_heartbeat_unix);
+    assert_eq!(persisted, None, "a steady ping must not commit");
+
+    // With adaptive cadence off nothing is served, and the worker keeps its
+    // worker-type cadence with every beat a full heartbeat.
+    store.liveness().set_served_intervals(None, None);
+    let reply = ping(&rt, &svc, "node-1")?;
+    assert_eq!(reply.next_interval_seconds, None);
+    assert_eq!(reply.sync_interval_seconds, None);
+    Ok(())
+}
+
+/// A ping from a node marked lost brings it back exactly as a heartbeat
+/// would — status, availability, and all — and asks the worker for a full
+/// heartbeat now, so the manager hears the node's allocations at once.
+#[test]
+fn a_ping_brings_a_lost_node_back_and_asks_for_a_full_heartbeat() -> R<()> {
+    let store = setup_store(5)?;
+    register(&store, "node-1", None)?;
+    store.mark_nodes_as_lost(&["node-1".to_string()])?;
+    assert_eq!(store.get_node("node-1")?.availability, "unavailable");
+
+    let svc = legion::manager::server::ManagerDaemonService::new(store.clone());
+    let rt = runtime()?;
+    let reply = ping(&rt, &svc, "node-1")?;
+    assert!(reply.sync_now, "a recovery must ask for a full heartbeat");
+    let node = store.get_node("node-1")?;
+    assert_eq!(node.status, "active");
+    assert_eq!(node.availability, "available");
+
+    // Once back, pings are ordinary again.
+    assert!(!ping(&rt, &svc, "node-1")?.sync_now);
+    Ok(())
+}
+
+/// A ghost is refused, as its heartbeat is: its self-fence clock must not be
+/// fed by a manager that does not know it.
+#[test]
+fn a_ghost_ping_gets_not_found() -> R<()> {
+    let store = setup_store(5)?;
+    let svc = legion::manager::server::ManagerDaemonService::new(store.clone());
+    let rt = runtime()?;
+    let status = ping(&rt, &svc, "never-registered").expect_err("a ghost ping must fail");
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+    assert_eq!(store.liveness().tracked(), 0);
+    Ok(())
+}
+
+/// The cadence report breaks the fleet down by pool, each pool judged
+/// against its own cadence, so a struggling latency pool shows through a
+/// batch pool that is keeping up.
+#[test]
+fn the_cadence_report_shows_each_pool_on_its_own_cadence() -> R<()> {
+    let store = setup_store(5)?;
+    let mut active = Vec::new();
+    for index in 0..60 {
+        let id = format!("batch-{index}");
+        register_in(&store, &id, "batch", 60)?;
+        active.push(id);
+    }
+    for index in 0..20 {
+        let id = format!("latency-{index}");
+        register_in(&store, &id, "latency", 2)?;
+        active.push(id);
+    }
+    store.liveness().become_responsible(&active);
+    // Every batch node is 40s into its 60s interval: on time. Fifteen of the
+    // twenty latency nodes are 7s into a 2s interval: behind.
+    for index in 0..60 {
+        silent_for(&store, &format!("batch-{index}"), 40);
+    }
+    for index in 0..15 {
+        silent_for(&store, &format!("latency-{index}"), 7);
+    }
+
+    let snapshot = liveness_snapshot(&store, Instant::now())?;
+    let report = cadence_report(
+        &snapshot,
+        ServedCadence::uniform(Duration::from_secs(2)),
+        5,
+        2.0,
+        20,
+        true,
+        false,
+    );
+    let fleet = report.freshness_ratio.expect("measurable");
+    assert!((fleet - 65.0 / 80.0).abs() < 1e-9, "{fleet}");
+    let rows: Vec<(String, usize, u64, u64, Option<f64>)> = report
+        .pools
+        .iter()
+        .map(|pool| {
+            (
+                pool.pool.clone(),
+                pool.active_nodes,
+                pool.interval.as_secs(),
+                pool.lost_window.as_secs(),
+                pool.freshness_ratio,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("batch".to_string(), 60, 60, 300, Some(1.0)),
+            ("latency".to_string(), 20, 2, 10, Some(0.25)),
+        ]
+    );
+    // The fleet-wide ratio (81%) would not warn; the pool does.
+    assert_eq!(report.lowest_freshness(), Some(0.25));
     Ok(())
 }

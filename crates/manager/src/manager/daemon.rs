@@ -110,6 +110,25 @@ const MAX_EVAL_BATCH: usize = 16;
 /// a whole batch of handled evals.
 const EVAL_SETTLE_MAX_ATTEMPTS: u32 = 3;
 
+/// How long an eval worker waits on one handler before it stops waiting
+/// (docs/scheduler-and-eval-loop.md, "Handler deadline").
+///
+/// A handler's legitimate worst case is bounded and far below this: the
+/// plan-conflict loop is at most `plan_conflict_max_retries` (clamped to
+/// 20) attempts with backoffs capped by `plan_conflict_backoff_max_ms`, and
+/// a raft write that cannot reach a leader fails within `LEADER_WAIT`
+/// (15s). A handler past five minutes is not slow, it is stuck: a deadlock,
+/// a blocking call with no timeout. Without a deadline it held its eval's
+/// claim and every claim behind it in the batch until scheduler-lane
+/// leadership changed, which on a stable leader is never.
+const EVAL_HANDLER_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long an eval whose handler ran past [`EVAL_HANDLER_DEADLINE`] waits
+/// before it may be claimed again. As long as the deadline, so an eval that
+/// hangs every time it runs ("poison") strands at most one blocking-pool
+/// thread per ten minutes instead of eating the pool.
+const EVAL_HANDLER_TIMEOUT_REQUEUE_DELAY: Duration = EVAL_HANDLER_DEADLINE;
+
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     run_manager_with(config, run_worker, None).await
@@ -1841,16 +1860,30 @@ pub struct IdleSweepConfig {
 /// One indexed read when nothing is resuming.
 const MAKE_ROOM_EVERY: Duration = Duration::from_secs(5);
 
-/// The interval this manager currently serves, and the ladder state behind it.
+/// The intervals this manager currently serves, and the ladder state behind
+/// each.
 ///
-/// With adaptive cadence off (`heartbeat.adaptive = false`) the served
-/// interval is just the floor — the manager tells workers nothing and they
-/// keep their worker-type `heartbeatSeconds`. The value is still tracked
-/// because the freshness ratio and the sizing arithmetic need an interval to
-/// be "on time" relative to.
-struct ServedCadence {
+/// `ladder` is the LIVENESS interval (sized from `pingRatePerSecond`), which
+/// every lost window derives from; `sync_ladder` is the full-heartbeat
+/// interval (sized from `targetRatePerSecond`), served no lower than the
+/// liveness interval. With adaptive cadence off (`heartbeat.adaptive =
+/// false`) both are just the floor — the manager tells workers nothing and
+/// they keep their worker-type `heartbeatSeconds`. The value is still tracked
+/// because the sizing arithmetic needs an interval to be "on time" relative
+/// to.
+struct CadenceControl {
     ladder: crate::manager::cadence::LadderState,
+    sync_ladder: crate::manager::cadence::LadderState,
     at_max: bool,
+}
+
+impl CadenceControl {
+    fn served(&self) -> crate::manager::cadence::ServedCadence {
+        crate::manager::cadence::ServedCadence {
+            liveness: self.ladder.served,
+            sync: self.sync_ladder.served.max(self.ladder.served),
+        }
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -1866,8 +1899,9 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     let liveness_settings = config.liveness.settings();
     store.liveness().configure(liveness_settings.clone());
 
-    let mut cadence_state = ServedCadence {
+    let mut cadence_state = CadenceControl {
         ladder: LadderState::new(min_interval),
+        sync_ladder: LadderState::new(min_interval),
         at_max: false,
     };
     // Freshness warning debounce: 3 consecutive sub-threshold ticks, then at
@@ -1951,15 +1985,18 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     ..cadence::LossContext::default()
                 },
             );
-            report_liveness_metrics(
-                &store,
+            // The cadence report for this tick, from the intervals served
+            // going into it: what the metrics publish and the warning reads.
+            let report = cadence::cadence_report(
                 &snapshot,
-                &decision,
-                &peer_gap,
-                cadence_state.ladder.served,
+                cadence_state.served(),
                 missed_beats,
-                now,
+                config.heartbeat.headroom,
+                HEARTBEAT_FRESHNESS_MIN_FLEET,
+                adaptive,
+                cadence_state.at_max,
             );
+            report_liveness_metrics(&store, &report, &decision, &peer_gap, now);
             for (reason, count) in &decision.suppressed {
                 match reason {
                     cadence::SuppressionReason::MassDisruption => error!(
@@ -2040,19 +2077,13 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
 
             // Cadence: recompute what to serve, warn when the fleet is not
             // sustaining it, and keep the per-node windows honest.
-            let report = cadence::cadence_report(
-                &snapshot,
-                cadence_state.ladder.served,
-                missed_beats,
-                config.heartbeat.headroom,
-                HEARTBEAT_FRESHNESS_MIN_FLEET,
-                adaptive,
-                cadence_state.at_max,
-            );
             if adaptive {
+                // The liveness interval, sized from the PING rate: it is what
+                // every lost window derives from, so it is the ladder that
+                // widens and narrows windows.
                 let target = cadence::target_interval(
                     snapshot.len(),
-                    config.heartbeat.target_rate_per_second,
+                    config.heartbeat.ping_rate_per_second,
                     config.heartbeat.headroom,
                     min_interval,
                     max_interval,
@@ -2070,7 +2101,7 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                         active_nodes = snapshot.len(),
                         from_seconds = cadence_state.ladder.served.as_secs(),
                         to_seconds = next.served.as_secs(),
-                        "Serving a new heartbeat interval for this fleet size"
+                        "Serving a new liveness interval for this fleet size"
                     );
                     if next.served < cadence_state.ladder.served {
                         narrow_windows_on_confirmation(
@@ -2095,13 +2126,43 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     cadence_state.ladder.served,
                     missed_beats,
                 );
-                // Only a manager running adaptive cadence puts an interval on
+                // The full-heartbeat interval, sized from the TARGET rate on
+                // its own ladder. It moves no window (a missed full heartbeat
+                // is covered by the pings between), so its dwell only keeps
+                // it from flapping.
+                let sync_target = cadence::target_interval(
+                    snapshot.len(),
+                    config.heartbeat.target_rate_per_second,
+                    config.heartbeat.headroom,
+                    min_interval,
+                    max_interval,
+                );
+                let next_sync = cadence::advance_ladder(
+                    &cadence_state.sync_ladder,
+                    sync_target,
+                    check_interval,
+                    min_interval,
+                    max_interval,
+                );
+                if next_sync.served != cadence_state.sync_ladder.served {
+                    info!(
+                        active_nodes = snapshot.len(),
+                        from_seconds = cadence_state.sync_ladder.served.as_secs(),
+                        to_seconds = next_sync.served.as_secs(),
+                        liveness_seconds = cadence_state.ladder.served.as_secs(),
+                        "Serving a new full-heartbeat interval for this fleet size"
+                    );
+                }
+                cadence_state.sync_ladder = next_sync;
+                // Only a manager running adaptive cadence puts intervals on
                 // the reply. With it off (`heartbeat.adaptive = false`),
-                // workers keep their worker-type value and the wire field
-                // stays absent, exactly as before adaptive cadence existed.
+                // workers keep their worker-type value, send a full heartbeat
+                // every beat, and the wire fields stay absent, exactly as
+                // before adaptive cadence existed.
+                let served = cadence_state.served();
                 store
                     .liveness()
-                    .set_served_interval(Some(cadence_state.ladder.served));
+                    .set_served_intervals(Some(served.liveness), Some(served.sync));
             }
             warn_on_stale_cadence(
                 &report,
@@ -2537,6 +2598,7 @@ pub fn liveness_snapshot(
             let window = row.window();
             crate::manager::cadence::NodeLiveness {
                 id: row.id,
+                pool: row.pool,
                 age: now.saturating_duration_since(beat.at),
                 window,
             }
@@ -2568,13 +2630,18 @@ async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
         .inc(&[outcome.metric_label()]);
     telemetry.liveness_digest_nodes.observe(count as f64);
     match &outcome {
-        DigestOutcome::Accepted { served_interval } => {
+        DigestOutcome::Accepted {
+            served_interval,
+            served_sync_interval,
+        } => {
             store.liveness().set_digest_fallback(false);
             // Serve the leader's cadence to the workers talking to THIS
             // manager. Without the relay, adaptive cadence only reached the
             // leader's own workers, and a fleet spread over three managers
             // kept two thirds of its beats at the floor.
-            store.liveness().set_served_interval(*served_interval);
+            store
+                .liveness()
+                .set_served_intervals(*served_interval, *served_sync_interval);
             debug!(
                 nodes = count,
                 "Reported node liveness to the status-lane leader"
@@ -2606,11 +2673,9 @@ async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
 /// Publish the liveness and cadence gauges for one tick.
 fn report_liveness_metrics(
     store: &Store,
-    snapshot: &[crate::manager::cadence::NodeLiveness],
+    report: &crate::manager::cadence::CadenceReport,
     decision: &crate::manager::cadence::LossDecision,
     peer_gap: &crate::storage::liveness::PeerGap,
-    served_interval: Duration,
-    missed_beats: u32,
     now: std::time::Instant,
 ) {
     let telemetry = crate::manager::telemetry::metrics();
@@ -2622,23 +2687,35 @@ fn report_liveness_metrics(
         .set(store.liveness().responsible_for_at(now).as_secs() as i64);
     telemetry
         .heartbeat_served_interval_seconds
-        .set(served_interval.as_secs() as i64);
+        .set(report.served_interval.as_secs() as i64);
+    telemetry
+        .heartbeat_sync_interval_seconds
+        .set(report.sync_interval.as_secs() as i64);
     telemetry
         .heartbeat_lost_window_seconds
-        .set((served_interval * missed_beats).as_secs() as i64);
-    let ratio = crate::manager::cadence::freshness_ratio(
-        snapshot,
-        served_interval,
-        HEARTBEAT_FRESHNESS_MIN_FLEET,
-    );
+        .set(report.lost_window.as_secs() as i64);
+    let ratio = report.freshness_ratio;
     telemetry
         .heartbeat_freshness_ratio
         .set(ratio.unwrap_or(0.0));
     telemetry.heartbeat_sustainable_nodes.set(
         ratio
-            .map(|ratio| (snapshot.len() as f64 * ratio).round() as i64)
+            .map(|ratio| (report.active_nodes as f64 * ratio).round() as i64)
             .unwrap_or(0),
     );
+    // Per pool: only measurable pools get a series, so a pool too small to
+    // mean anything never reads as 0 ("nobody is on time").
+    let pool_series: Vec<(Vec<String>, f64)> = report
+        .pools
+        .iter()
+        .filter_map(|pool| {
+            pool.freshness_ratio
+                .map(|ratio| (vec![pool.pool.clone()], ratio))
+        })
+        .collect();
+    telemetry
+        .heartbeat_pool_freshness_ratio
+        .replace_all(&pool_series);
     for (reason, count) in &decision.suppressed {
         telemetry
             .liveness_loss_suppressed_total
@@ -2669,7 +2746,10 @@ fn warn_on_stale_cadence(
     last_warn: &mut Option<std::time::Instant>,
     active_nodes: usize,
 ) {
-    let Some(ratio) = report.freshness_ratio else {
+    // The lowest measurable ratio, fleet-wide or in any one pool: a pool
+    // falling behind inside a fleet that is keeping up is exactly what the
+    // blended figure hides.
+    let Some(ratio) = report.lowest_freshness() else {
         *low_ticks = 0;
         return;
     };
@@ -3490,7 +3570,7 @@ async fn eval_worker_loop(
             // handlers run one at a time, so a per-batch timer would blur
             // kinds together and make the histogram unreadable.
             let handle_started = std::time::Instant::now();
-            let handled = tokio::task::spawn_blocking(move || {
+            let handler = tokio::task::spawn_blocking(move || {
                 // The blocking pool is shared with every heartbeat's
                 // `spawn_blocking`, so the wait for a pool thread is its
                 // own phase: without it, a saturated pool reads as a slow
@@ -3502,23 +3582,47 @@ async fn eval_worker_loop(
                         handle_started.elapsed().as_secs_f64(),
                     );
                 resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
-            })
-            .await;
+            });
+            let handled = await_eval_handler(handler, EVAL_HANDLER_DEADLINE).await;
             crate::manager::telemetry::metrics()
                 .eval_handle_seconds
                 .observe(&[&eval.kind], handle_started.elapsed().as_secs_f64());
             match handled {
-                Ok(completion) => completions.push((eval.id.clone(), completion)),
+                HandlerWait::Finished(completion) => {
+                    completions.push((eval.id.clone(), *completion))
+                }
                 // The handler panicked or was cancelled. Its outcome is
                 // unknown, so record nothing for it and CARRY ON with the
                 // rest of the batch: its siblings' outcomes are known and
                 // must not be thrown away because this one is not.
-                Err(join_error) => {
+                HandlerWait::Failed(join_error) => {
                     error!(
                         worker_id,
                         eval_id = %eval.id,
                         "Eval handler task failed: {join_error:?}"
                     );
+                }
+                // Stuck, not slow (see `EVAL_HANDLER_DEADLINE`). Stop
+                // waiting, requeue it with a delay through this batch's
+                // fenced settle, and carry on with the rest of the batch,
+                // which would otherwise sit claimed behind it.
+                HandlerWait::TimedOut => {
+                    warn!(
+                        worker_id,
+                        eval_id = %eval.id,
+                        kind = %eval.kind,
+                        deadline_secs = EVAL_HANDLER_DEADLINE.as_secs(),
+                        requeue_delay_secs = EVAL_HANDLER_TIMEOUT_REQUEUE_DELAY.as_secs(),
+                        "Eval handler ran past its deadline; requeueing the eval and moving on"
+                    );
+                    completions.push((
+                        eval.id.clone(),
+                        handler_timeout_completion(
+                            eval,
+                            EVAL_HANDLER_DEADLINE,
+                            EVAL_HANDLER_TIMEOUT_REQUEUE_DELAY,
+                        ),
+                    ));
                 }
             }
         }
@@ -3610,6 +3714,57 @@ async fn eval_worker_loop(
             .release_eval_claims_from_epoch(batch.iter().map(|eval| eval.id.as_str()), claim_epoch);
         // The permit ends with the batch; a carried-ahead batch asks again.
         drop(permit);
+    }
+}
+
+/// How waiting on one eval handler ended ([`await_eval_handler`]).
+#[derive(Debug)]
+enum HandlerWait {
+    /// The handler returned this outcome (boxed: it is ten times the size
+    /// of the other variants).
+    Finished(Box<EvalCompletion>),
+    /// The handler panicked or was cancelled; its outcome is unknown.
+    Failed(tokio::task::JoinError),
+    /// The handler was still running at the deadline. It keeps running on
+    /// its blocking-pool thread (a blocking task cannot be cancelled), and
+    /// whatever it returns is discarded.
+    TimedOut,
+}
+
+/// Wait on a handler for at most `deadline`. Dropping the join handle on
+/// timeout detaches the task rather than stopping it.
+async fn await_eval_handler(
+    handler: tokio::task::JoinHandle<EvalCompletion>,
+    deadline: Duration,
+) -> HandlerWait {
+    match tokio::time::timeout(deadline, handler).await {
+        Ok(Ok(completion)) => HandlerWait::Finished(Box::new(completion)),
+        Ok(Err(join_error)) => HandlerWait::Failed(join_error),
+        Err(_elapsed) => HandlerWait::TimedOut,
+    }
+}
+
+/// The outcome the eval loop settles for a handler that ran past
+/// `deadline`: back to `pending` after `delay`, with an `eval.requeued`
+/// event whose `reason` is `handler_timeout`, counted in
+/// `legion_eval_handler_timeouts_total`.
+///
+/// Requeued rather than failed, like plan-conflict exhaustion: a stuck
+/// handler says nothing about whether the eval's work is wanted, and
+/// failing it would drop acknowledged work. The settle is fenced by the
+/// batch's claim epoch like any other, so it never writes over a newer
+/// claim. The stuck handler is still running: if it returns, its outcome
+/// is discarded, and any write it makes in the meantime is the same
+/// idempotent reconcile a second run would make (a plan it applies is
+/// fenced by the job-config epoch, and one that settles its own eval
+/// deletes a row that would otherwise just run again).
+fn handler_timeout_completion(eval: &Eval, deadline: Duration, delay: Duration) -> EvalCompletion {
+    crate::manager::telemetry::metrics()
+        .eval_handler_timeouts_total
+        .inc(&[&eval.kind]);
+    EvalCompletion::Released {
+        delay,
+        event: Some(drafts::eval_handler_timed_out(eval, deadline, delay)),
     }
 }
 
@@ -4078,6 +4233,20 @@ fn spawn_blocked_eval_waker(store: &Store) {
                 Ok(Err(err)) => warn!(error = ?err, "Gang placement timeout pass failed"),
                 Err(err) => warn!(error = ?err, "Gang placement timeout pass panicked"),
             }
+            // Time-driven gang work: views after a scale, readiness
+            // timeouts, reservations (`Store::gang_sweep`).
+            let sweep_store = store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let sweep = sweep_store.gang_sweep()?;
+                crate::manager::server::fail_unready_gang_members(&sweep_store, &sweep.not_ready);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(error = ?err, "Gang sweep failed"),
+                Err(err) => warn!(error = ?err, "Gang sweep panicked"),
+            }
         }
     });
 }
@@ -4282,12 +4451,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         // The top-level `content`, `contentStore`, `sessions`, `devices`,
         // and `isolate` blocks ride in the artifacts payload (see
         // `WorkerArtifactsPayload`).
+        if let Some(spot) = wcp.spot_interruption.as_ref() {
+            spot.validate().with_context(|| {
+                format!("invalid spotInterruption config in worker config {path_str}")
+            })?;
+        }
         let artifacts = if wcp.artifacts.is_none()
             && wcp.content.is_none()
             && wcp.content_store.is_none()
             && wcp.sessions.is_none()
             && wcp.devices.is_none()
             && isolate.is_none()
+            && wcp.spot_interruption.is_none()
         {
             String::new()
         } else {
@@ -4298,6 +4473,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 sessions: wcp.sessions.clone(),
                 devices: wcp.devices.clone(),
                 isolate,
+                spot_interruption: wcp.spot_interruption.clone(),
             })?
         };
 
@@ -4945,6 +5121,104 @@ mod tests {
         .expect_err("non-transient startup errors must still abort");
         assert!(format!("{err:#}").contains("malformed"), "{err:#}");
         assert_eq!(attempts, 1, "a real error must not be retried");
+        Ok(())
+    }
+
+    /// A handler still running at the deadline is reported as timed out
+    /// instead of being waited on; one that returns in time is not. The
+    /// stuck handler is released afterwards so the runtime can shut down.
+    #[tokio::test]
+    async fn eval_handler_past_its_deadline_is_not_waited_on_test() {
+        let done = |message: &str| EvalCompletion::Released {
+            delay: Duration::ZERO,
+            event: Some(crate::storage::events::EventDraft::info(
+                "test",
+                message.to_string(),
+            )),
+        };
+        let quick = tokio::task::spawn_blocking(move || done("quick"));
+        assert!(matches!(
+            await_eval_handler(quick, Duration::from_secs(30)).await,
+            HandlerWait::Finished(_)
+        ));
+
+        let (release, stuck_until) = std::sync::mpsc::channel::<()>();
+        let stuck = tokio::task::spawn_blocking(move || {
+            let _ = stuck_until.recv();
+            done("stuck")
+        });
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            await_eval_handler(stuck, Duration::from_millis(50)).await,
+            HandlerWait::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        release
+            .send(())
+            .expect("the stuck handler is still waiting");
+
+        let panicked = tokio::task::spawn_blocking(|| -> EvalCompletion { panic!("boom") });
+        assert!(matches!(
+            await_eval_handler(panicked, Duration::from_secs(30)).await,
+            HandlerWait::Failed(_)
+        ));
+    }
+
+    /// The timed-out outcome requeues the eval through the batch's fenced
+    /// settle: the row goes back to `pending` but cannot be claimed again
+    /// until the delay passes, the claim is released, and the requeue is
+    /// visible as an `eval.requeued` event with `reason: handler_timeout`
+    /// and in `legion_eval_handler_timeouts_total`.
+    #[test]
+    fn eval_handler_timeout_requeues_the_eval_with_a_delay_test() -> R<()> {
+        let store = setup_store()?;
+        let eval = store.enqueue_eval("job_submit", Some("web"), Some("jc-1"), None, Some(50))?;
+        let limits = EvalBatchLimits { max: 1, workers: 1 };
+        let (claimed, epoch) = store.claim_evals_in_epoch(limits, ClaimScope::Any)?;
+        assert_eq!(claimed[0].id, eval.id);
+
+        let timeouts = || {
+            crate::manager::telemetry::metrics()
+                .eval_handler_timeouts_total
+                .get(&["job_submit"])
+        };
+        let before = timeouts();
+        let completion = handler_timeout_completion(
+            &claimed[0],
+            EVAL_HANDLER_DEADLINE,
+            Duration::from_secs(600),
+        );
+        assert!(timeouts() > before);
+
+        let (next, _) = store.complete_claimed_evals_and_claim_next(
+            vec![(eval.id.clone(), completion)],
+            epoch,
+            limits,
+            ClaimScope::Any,
+        )?;
+        assert!(next.is_empty(), "the requeued eval is not ready yet");
+        assert!(!store.eval_is_claimed(&eval.id), "its claim is released");
+        let row = store
+            .get_evals()?
+            .into_iter()
+            .find(|row| row.id == eval.id)
+            .context("the requeued eval is still in the queue")?;
+        assert_eq!(row.status, "pending");
+        let (again, _) = store.claim_evals_in_epoch(limits, ClaimScope::Any)?;
+        assert!(again.is_empty(), "nothing claims it before the delay");
+
+        let requeued =
+            store.list_scheduler_events(&crate::storage::events::SchedulerEventFilter {
+                kind: Some("eval.requeued".to_string()),
+                ..Default::default()
+            })?;
+        let event = requeued
+            .iter()
+            .find(|event| event.eval_id.as_deref() == Some(eval.id.as_str()))
+            .context("an eval.requeued event names the eval")?;
+        let meta: serde_json::Value = serde_json::from_str(&event.metadata_json)?;
+        assert_eq!(meta["reason"], "handler_timeout");
+        assert_eq!(meta["deadlineMs"], EVAL_HANDLER_DEADLINE.as_millis() as u64);
         Ok(())
     }
 

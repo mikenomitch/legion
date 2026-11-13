@@ -222,7 +222,7 @@ Validation rules (enforced at `job validate` and submit time):
   it at the task level, including on a stateless task, is rejected at parse
   time with a pointer to the right nesting.
 - **The lost window must stay below the self-fence.** A node's lost window is
-  `missedBeatsBeforeLost x its heartbeat interval`
+  `missedBeatsBeforeLost x its liveness interval`
   ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). If that
   reaches `selfTerminateAfter`, a healthy worker would kill its own stateful
   tasks between heartbeats. The manager refuses to start with a worker config
@@ -231,11 +231,14 @@ Validation rules (enforced at `job validate` and submit time):
   60-second batch cadence would need `selfTerminateAfter` raised well past its
   300-second window.
 
-  Adaptive cadence (on by default) is not covered by that startup check. At
-  the default `targetRatePerSecond`, a fleet past about 16,250 nodes is
-  served 21s, so its window (105s) passes the 90s fence. A healthy worker
-  still beats every 21s and only fences after about 70 seconds of failed
-  retries. The margin shrinks with every rung, which is why the served
+  Adaptive cadence (on by default) is not covered by that startup check.
+  The window follows the liveness interval, which liveness pings keep at 2s
+  up to 10,000 nodes at the default `pingRatePerSecond`; a fleet past about
+  65,000 nodes is served 21s, so its window (105s) passes the 90s fence. A
+  healthy worker still beats every 21s, and a ping resets the fence clock
+  as a full heartbeat does, so it only fences after about 70 seconds of
+  failed retries. With pings off (`pingRatePerSecond` equal to
+  `targetRatePerSecond`) the same happens past about 16,250 nodes. The margin shrinks with every rung, which is why the served
   interval stops at 55s by default (`heartbeat.maxInterval`), leaving about
   30 seconds of retries. See the known limitations in
   [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md#known-limitations).
@@ -273,7 +276,7 @@ dispatch time, so they are present at process start for `exec` and
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
-| `LEGION_GANG_RANK`, `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, `LEGION_GANG_LEADER_ADDR` | [gang](gang-scheduling.md#starting-together) tasks only | The member's rank `0..size-1`, the gang's count, its quorum, and the address of the node running rank 0. Fixed when the member is placed. |
+| `LEGION_GANG_RANK`, `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, `LEGION_GANG_LEADER_ADDR`, `LEGION_GANG_EPOCH` | [gang](gang-scheduling.md#starting-together) tasks only | The member's rank `0..size-1`, the gang's count, its quorum, the address of the node running rank 0, and the gang's incarnation. When the gang's view changes, every member restarts in place with the new values. |
 | `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task has **no** `LEGION_ALLOC_ID` yet, and Legion doesn't set a placeholder. `LEGION_INSTANCE_ID` is correct from the start. |
 
 Key your app's durable state and "who am I" decisions on

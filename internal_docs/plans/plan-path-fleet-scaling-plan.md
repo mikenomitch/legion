@@ -910,7 +910,8 @@ before the indexes, 1.3 ms after, and 1.4 ms at 16.7k jobs.
 - `sync_missing_task_volume_claims` still does one task-config query per
   active job per checker tick (TODO.md).
 - In-place rollout ticks build an O(fleet) exclusion set and so a filtered
-  node-set copy (`crates/manager/src/manager/rollout.rs`, TODO.md).
+  node-set copy (`crates/manager/src/manager/rollout.rs`). Shipped since as
+  an allow-list ([candidates-and-indexes plan § 6.3](candidates-and-indexes-plan.md)).
 - `build_plan` still grows mildly with nodes (240 → 398 µs from 5k to 50k);
   not located.
 
@@ -939,3 +940,24 @@ Done alongside Phase 4, from the live `perf` profile of the 20k leader.
   - `run-campaign.sh` refuses a storm step that is not the last step.
   - `worker_instances` skips instances that have no private IP yet.
 
+
+### 13.7 The commit at 50k, profiled locally (2026-11-12)
+
+Release `plan_fleet_scaling`, `local_disk` store, 4-vCPU container,
+`LEGION_BENCH_SCALING_NODES=5000,50000`, fill 5, an eight-placement plan:
+
+| phase (µs) | 5k | 50k |
+| --- | ---: | ---: |
+| `apply` (plan_and_apply cell) | 2,102 | 2,332 |
+| `build_plan` | 921 | 1,340 |
+| plan total | 3,174 | 3,894 |
+
+The apply phase, which holds the in-transaction free-pool rebuild and the
+read-model reprojection, grows 11% for ten times the fleet, so neither is
+what grows 9.2 → 23.3 ms on AWS. What remains is outside the plan's own
+transaction: other writes sharing the `single` pipeline (status-lane
+writes, intake) and the raft round itself, which only the rig reproduces
+([TODO](../TODO.md), [write-path follow-ups calls #3](../calls/write-path-cost-followups_calls.md)).
+The same run's `eval_cycle` showed `dispatch` growing 360 → 2,992 µs per
+eval; that was the bench building a Tokio runtime per dispatch with nothing
+to send, fixed by returning early.

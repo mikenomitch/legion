@@ -334,7 +334,33 @@ pub mod drafts {
         .meta(json!({
             "evalKind": eval.kind,
             "delayMs": delay.as_millis() as u64,
+            "reason": "plan_conflict",
             "error": format!("{error:#}"),
+        }))
+    }
+
+    /// `eval.requeued` for a handler that outran the eval loop's deadline
+    /// (docs/scheduler-and-eval-loop.md, "Handler deadline"). The same kind
+    /// as a conflict requeue, told apart by `meta.reason`.
+    pub fn eval_handler_timed_out(eval: &Eval, deadline: Duration, delay: Duration) -> EventDraft {
+        EventDraft::warn(
+            "eval.requeued",
+            format!(
+                "Eval {} ({}) handler ran past the {}s handler deadline; requeued, retrying in {}ms",
+                eval.id,
+                eval.kind,
+                deadline.as_secs(),
+                delay.as_millis()
+            ),
+        )
+        .job(&eval.job_id)
+        .node(&eval.node_name)
+        .eval(&eval.id)
+        .meta(json!({
+            "evalKind": eval.kind,
+            "delayMs": delay.as_millis() as u64,
+            "reason": "handler_timeout",
+            "deadlineMs": deadline.as_millis() as u64,
         }))
     }
 
@@ -357,6 +383,53 @@ pub mod drafts {
             "key": key,
             "detail": detail,
         }))
+    }
+
+    /// `plan.unplaced` (warn) — a plan placed part of a job and left the
+    /// rest unplaced. One event per eval (or capacity-pass reconcile) that
+    /// leaves work behind, naming each unplaced task with its count and the
+    /// planner's reason. A plan that places nothing blocks its eval instead
+    /// (`eval.blocked`), so this covers the partial case, which before
+    /// showed only as `allocation.placed` and a manager log line. A
+    /// `count.per` task (a session's envelope) is listed when an eligible
+    /// node has no room for it. `None` when nothing was left unplaced.
+    pub fn plan_unplaced(
+        job_id: &str,
+        job_config_id: &str,
+        eval_id: Option<&str>,
+        unplaced: &[crate::manager::scheduler::UnplacedTask],
+    ) -> Option<EventDraft> {
+        if unplaced.is_empty() {
+            return None;
+        }
+        let count: u32 = unplaced.iter().map(|task| task.count).sum();
+        let tasks = unplaced
+            .iter()
+            .map(|task| format!("{} ({}): {}", task.task_name, task.count, task.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let draft = EventDraft::warn(
+            "plan.unplaced",
+            format!("Job {job_id} left {count} allocation(s) unplaced: {tasks}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "jobConfigId": job_config_id,
+            "unplaced": count,
+            "tasks": unplaced
+                .iter()
+                .map(|task| json!({
+                    "task": task.task_name,
+                    "taskConfigId": task.task_config_id,
+                    "count": task.count,
+                    "reason": task.reason,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+        Some(match eval_id {
+            Some(eval_id) => draft.eval(eval_id),
+            None => draft,
+        })
     }
 
     /// `eval.unblocked` — capacity that could help a blocked eval appeared
@@ -1134,7 +1207,7 @@ pub mod drafts {
     /// failed (docs/gang-scheduling.md, "When a member is lost").
     pub fn job_gang_member_lost(
         lost: &Allocation,
-        cause: StopCause,
+        cause: &str,
         loss: &crate::storage::store::GangLoss,
     ) -> EventDraft {
         use crate::structs::MemberLossPolicy;
@@ -1156,14 +1229,18 @@ pub mod drafts {
             MemberLossPolicy::Restart => {
                 format!("restarting the whole gang ({} stopped)", loss.stopped)
             }
+            MemberLossPolicy::RestartInPlace => format!(
+                "restarting the gang in place ({} member(s) restart on their nodes)",
+                loss.restarted_in_place
+            ),
             MemberLossPolicy::Fail => {
                 format!("failing the job ({} allocation(s) stopped)", loss.stopped)
             }
         };
-        let cause = if cause.is_known() {
-            cause.as_str()
-        } else {
+        let cause = if cause.is_empty() || cause == StopCause::Unknown.as_str() {
             "failed"
+        } else {
+            cause
         };
         let message = format!(
             "Gang {} of job {} lost allocation {} on node {} ({cause}): {state}; {action}",
@@ -2938,6 +3015,22 @@ impl EventRecorder<'_> {
         ));
     }
 
+    /// `plan.unplaced` — see [`drafts::plan_unplaced`].
+    pub fn plan_unplaced(
+        self,
+        job_id: &str,
+        job_config_id: &str,
+        eval_id: Option<&str>,
+        unplaced: &[crate::manager::scheduler::UnplacedTask],
+    ) {
+        self.emit_opt(drafts::plan_unplaced(
+            job_id,
+            job_config_id,
+            eval_id,
+            unplaced,
+        ));
+    }
+
     pub fn allocations_removed_for_job_config(self, job_config_id: &str, removed: &[Allocation]) {
         self.emit_opt(drafts::allocations_removed_for_job_config(
             job_config_id,
@@ -3056,7 +3149,7 @@ impl EventRecorder<'_> {
     pub fn job_gang_member_lost(
         self,
         lost: &Allocation,
-        cause: StopCause,
+        cause: &str,
         loss: &crate::storage::store::GangLoss,
     ) {
         self.emit(drafts::job_gang_member_lost(lost, cause, loss));

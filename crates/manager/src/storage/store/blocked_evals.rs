@@ -227,6 +227,45 @@ impl Store {
         self.request_runtime_wake();
     }
 
+    /// Why the scheduler last left `job_id`'s task `task_name` unplaced, if
+    /// it recorded a reason: the job's blocked eval when it blocked on that
+    /// task (a plan that placed nothing), else the newest `plan.unplaced`
+    /// event naming it (a plan that placed the rest). `None` when neither
+    /// says anything about the task. For error messages that would
+    /// otherwise have to guess, such as a session start finding no envelope
+    /// on an eligible node that is full. The event read walks the bounded
+    /// journal newest first, on an error path only.
+    pub fn last_unplaced_reason(&self, job_id: &str, task_name: &str) -> R<Option<String>> {
+        if let Some(blocked) = self.blocked_evals_by_job()?.get(job_id) {
+            let job_blocked = blocked.to_job_blocked();
+            if job_blocked.task == task_name && !job_blocked.message.is_empty() {
+                return Ok(Some(job_blocked.message));
+            }
+        }
+        let conn = self.read_connection()?;
+        let metadata: Option<String> = conn
+            .prepare_cached(
+                "SELECT metadata_json FROM scheduler_event
+                 WHERE kind = 'plan.unplaced' AND job_id = ?1
+                 ORDER BY id DESC LIMIT 1;",
+            )?
+            .query_row([job_id], |row| row.get(0))
+            .optional()?;
+        drop(conn);
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        let metadata: Value = serde_json::from_str(&metadata).unwrap_or_default();
+        Ok(metadata
+            .get("tasks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|task| task.get("task").and_then(Value::as_str) == Some(task_name))
+            .and_then(|task| task.get("reason").and_then(Value::as_str))
+            .map(str::to_owned))
+    }
+
     /// Every blocked eval, oldest first.
     pub fn blocked_evals(&self) -> R<Vec<BlockedEval>> {
         let conn = self.read_connection()?;
@@ -280,7 +319,16 @@ impl Store {
                 if job.status == "pending" {
                     job.status = "blocked".to_string();
                 }
-                job.blocked = Some(eval.to_job_blocked());
+                let mut detail = eval.to_job_blocked();
+                // A reservation is made after the block, by the gang sweep.
+                if let Some(gang) = detail.gang.as_mut() {
+                    if let Some(reservation) = self.gang_reservation(&eval.job_config_id)? {
+                        gang.reserved_members = reservation.members();
+                        gang.reserved_nodes = reservation.nodes.len() as u32;
+                        gang.reservation_expires = reservation.expires_unix;
+                    }
+                }
+                job.blocked = Some(detail);
             }
         }
         Ok(())
@@ -374,6 +422,86 @@ impl Store {
             let node = available.get(node_id)?;
             node_could_help(key, task.as_ref(), job_id, node).then(|| (node_id.clone(), *kind))
         })
+    }
+
+    /// Gang-aware wake (docs/gang-scheduling.md, "While it waits"): whether
+    /// the free capacity on every node that could take a blocked gang's task
+    /// now holds the members its quorum still needs (`min - running`). A
+    /// gang's plan places nothing short of that, so waking it for less is a
+    /// full re-plan that changes nothing. The estimate is an upper bound
+    /// (free capacity over the request, per node, summed; it ignores ports,
+    /// `distinct`, and anti-affinity, which the plan still checks), so it
+    /// never keeps back a gang that would have placed.
+    ///
+    /// A gang whose band can preempt counts, on each node, the usage of
+    /// every allocation in a lower band as room too: a preempting plan can
+    /// use it, so leaving it out would keep back a gang that fits.
+    ///
+    /// True (wake as before) for anything that is not a gang, and whenever
+    /// the estimate cannot be made.
+    fn blocked_gang_could_fit(&self, eval: &BlockedEval) -> bool {
+        let Some(report) = eval.gang() else {
+            return true;
+        };
+        let need = report.min.saturating_sub(report.running);
+        if need == 0 {
+            return true;
+        }
+        let Ok(band) = self.cached_band_for_job_config(&eval.job_config_id) else {
+            return true;
+        };
+        let Some(task) = self.blocked_task(&eval.job_config_id, &eval.detail) else {
+            return true;
+        };
+        let Ok(request) = self
+            .resource_policy
+            .normalize_task_resources(&task.resources, false)
+            .and_then(|normalized| crate::resources::ResourceRequest::from_value(&normalized))
+        else {
+            return true;
+        };
+        let Ok(available) = self.available_nodes() else {
+            return true;
+        };
+        let (pools, allocations) = match self.read_model_reader() {
+            Ok(guard) => (guard.node_pools.clone(), guard.allocations_by_node.clone()),
+            Err(_) => return true,
+        };
+        let mut fit = 0u32;
+        for node in available.as_slice() {
+            if !node_could_help(&eval.key, Some(&task), &eval.job_id, node) {
+                continue;
+            }
+            if let Some(pool) = pools.get(node.id.as_str()) {
+                let mut room = (**pool).clone();
+                if band.can_preempt() {
+                    for allocation in allocations
+                        .get(node.id.as_str())
+                        .map(|rows| rows.as_slice())
+                        .unwrap_or_default()
+                    {
+                        let lower = self
+                            .cached_band_for_job_config(&allocation.job_config_id)
+                            .map(|victim| band.outranks(victim))
+                            .unwrap_or(false);
+                        if lower {
+                            if let Ok(usage) =
+                                self.resource_policy.usage_request(&allocation.resources)
+                            {
+                                room.release(&usage);
+                            }
+                        }
+                    }
+                }
+                fit = fit.saturating_add(crate::manager::scheduler::topology::replicas_fit(
+                    &room, &request, need,
+                ));
+                if fit >= need {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The task a blocked eval could not place, from the read model.
@@ -472,6 +600,12 @@ impl Store {
              WHERE job_config_id = (SELECT job_config_id FROM eval WHERE id = ?1);",
         )?
         .execute([eval_id])?;
+        // The gang placed: its reservation has done its job.
+        conn.prepare_cached(
+            "DELETE FROM gang_reservation
+             WHERE job_config_id = (SELECT job_config_id FROM eval WHERE id = ?1);",
+        )?
+        .execute([eval_id])?;
         Ok(())
     }
 
@@ -499,6 +633,18 @@ impl Store {
                 &eval.detail,
                 &nodes,
             ) {
+                // A gang re-plans only when the quorum it is short of could
+                // fit now, not on every replica's worth of freed room.
+                if !self.blocked_gang_could_fit(eval) {
+                    crate::telemetry::metrics().gang_wakes_skipped_total.inc();
+                    debug!(
+                        eval_id = %eval.id,
+                        job_id = %eval.job_id,
+                        node_id = %node_id,
+                        "Capacity event too small for a blocked gang; it keeps waiting"
+                    );
+                    continue;
+                }
                 woken.push((eval.clone(), node_id, cause));
             }
         }
@@ -549,7 +695,35 @@ impl Store {
         self.lock_capacity_events().processed = upto;
         let woken_ids: HashSet<&str> = woken.iter().map(|(eval, _, _)| eval.id.as_str()).collect();
         self.publish_blocked_gauge(&blocked, &woken_ids);
+        // A blocked eval is a job that placed nothing; a job that placed
+        // part of its count waits for the capacity pass instead. The same
+        // events are what can help it, so one on a node that takes work
+        // queues that pass too (a no-op unless some plan left replicas
+        // unplaced). This is the one trigger every source of room shares:
+        // a lost node heartbeating again flips its availability back
+        // without registering, and frees from preemption, drains, or gang
+        // losses never pass through the terminal-report handlers that
+        // queue the pass themselves.
+        if self.capacity_events_on_schedulable_nodes(&nodes) {
+            self.request_capacity_reconcile_if_waiting();
+        }
         Ok(woken.len() + runtime_woken)
+    }
+
+    /// Whether any of these capacity events is on a node that can take work
+    /// now (registered, `available`, and not lost). A cordon or a node
+    /// going lost records an event too, and adds no room.
+    fn capacity_events_on_schedulable_nodes(&self, events: &[(String, &'static str)]) -> bool {
+        let Ok(model) = self.read_model_reader() else {
+            // Unknown: the pass is cheap, and missing one strands a job.
+            return !events.is_empty();
+        };
+        events.iter().any(|(node_id, _)| {
+            model
+                .nodes
+                .get(node_id)
+                .is_some_and(|node| node.availability == "available" && node.status != "lost")
+        })
     }
 
     /// The runtime half of the wake pass (docs/runtime-disable.md): after a

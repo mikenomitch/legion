@@ -34,6 +34,7 @@ pub mod runtime_class;
 mod sandbox;
 pub mod sandbox_addr;
 mod sandbox_checkpoint;
+mod tap_link;
 pub(crate) use microvm::warn_if_no_static_guest_binary;
 pub use sandbox::{
     sandbox_config_is_tap, sandbox_dir_for, sandbox_guest_address, sandbox_guest_port,

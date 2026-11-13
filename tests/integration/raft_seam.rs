@@ -253,6 +253,12 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "unblock_evals",
     "update_app_object_status",
     "wake_timed_out_gangs",
+    // Gang follow-ups (docs/gang-scheduling.md): the leader's gang sweep and
+    // a local restart's in-place restart.
+    "gang_members_ready",
+    "gang_restart_in_place",
+    "sweep_gang_reservations",
+    "sync_gang_views",
     // Child sessions and resize.
     "create_keyed_child_instance",
     "end_orphaned_keyed_children",
@@ -343,6 +349,12 @@ const DELEGATED_BODIES: &[&str] = &[
     "sync_object_kinds",
     "update_app_object_status",
     "wake_timed_out_gangs",
+    // The gang sweep's views, readiness, and reservations, and a local
+    // restart's epoch bump: inlined statements in their closures.
+    "gang_members_ready",
+    "gang_restart_in_place",
+    "sweep_gang_reservations",
+    "sync_gang_views",
     // Child sessions and resize: inlined statements or composed bodies.
     "end_orphaned_keyed_children",
     "set_task_resize",
@@ -549,6 +561,10 @@ fn lane_for(method: &str) -> Lane {
         | "set_snapshot_alias"
         | "spend_unused_fork_snapshots"
         | "unblock_evals"
+        | "gang_members_ready"
+        | "gang_restart_in_place"
+        | "sweep_gang_reservations"
+        | "sync_gang_views"
         | "wake_timed_out_gangs" => Lane::Scheduler,
         "checkpoint_node_heartbeats"
         | "destroy_job_status_cleanup"

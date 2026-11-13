@@ -115,7 +115,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_snapshot_list` | no | List instance [snapshots](suspend-and-resume.md), newest first. Filters by job, instance, and state. |
 | `legion_snapshot_get` | no | Inspect one snapshot by id (or name plus job), including its manifest and, for a failed one, why. |
 | `legion_node_list` | no | List worker nodes. Each carries `heartbeatSource` (see the freshness note below). |
-| `legion_node_cadence` | no | Check whether the fleet is keeping up with its heartbeat cadence. Returns the freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
+| `legion_node_cadence` | no | Check whether the fleet is keeping up with its heartbeat cadence. Returns the freshness ratio (fleet-wide and per pool in `pools`), the liveness and full-heartbeat intervals, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
 | `legion_node_usage` | no | One node's memory and CPU: capacity, reservations, and measured usage per allocation (current and peak memory, CPU, idle seconds). Also the node's oversubscription ratio and memory pressure status, and each allocation's place in the pressure order (`pressure_rank`, `pressure_steps`): which allocations a short node would stop first. Use it to compare reservations with real use before resizing a job ([resource-enforcement.md](resource-enforcement.md#memory-pressure)). |
 | `legion_node_devices` | no | The devices nodes report ([devices.md](devices.md)): per node, each device group (`vendor/type/model`, attributes such as `memoryMiB` and `driver`) with its instances (`id`, `healthy`, `healthDetail`, `numaNode`, `peerGroup`), and each device plugin's last status. Omit `node_id` for every node with devices. Use it before asking for `resources.devices`, and to see why a GPU job is pending (unhealthy or taken instances). An allocation's assigned ids are in its `resources.devices[].assigned`. |
 | `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `usedMillicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
@@ -216,6 +216,12 @@ documents each):
 | Scaling | `legion_scaling_inputs`, `legion_scaling_defaults_get`, **`legion_scaling_defaults_apply`** |
 | Operator | `legion_raft_status`, `legion_raft_history`, `legion_manager_configs`, `legion_observability`, **`legion_raft_command`**, **`legion_raft_join_token`**, **`legion_keyring_rewrap_kv`**, **`legion_node_restart_worker`**, **`legion_node_update_dynamic`** |
 | Networking, state, snapshots, join tokens | `legion_net_policy_get`, `legion_state_saved_query_list`, `legion_join_token_list`, **`legion_net_policy_delete`**, **`legion_net_plugin_delete`**, **`legion_state_saved_query_upsert`**, **`legion_state_saved_query_delete`**, **`legion_snapshot_alias_delete`**, **`legion_join_token_create`**, **`legion_join_token_delete`** |
+
+`legion_node_update_dynamic` is also how an agent records a node's pending
+interruption (a spot reclaim it learned of): set the dynamic attribute
+`legion.interruption` to `{ deadline, source, detail }`, or `null` to clear
+it, exactly what `legion node interrupt` does. Gangs then keep off the node
+and its gang members are moved first ([spot-interruption.md](spot-interruption.md)).
 
 Tool errors come back in-band (`result.isError = true`, with the error
 envelope as `structuredContent` on 2025-06-18), following MCP convention.
@@ -1262,7 +1268,10 @@ token can act. See [Namespaces](namespaces.md).
      adds `topologyKey`, `topologyMode`, `topologyDomain` (the domain it
      would use, or the closest one when it would wait), and
      `topologyDomains`; `topologyDomains: 0` means no eligible node reports
-     the attribute ([Topology](gang-scheduling.md#topology)).
+     the attribute ([Topology](gang-scheduling.md#topology)). On a blocked
+     job, `legion_job_info`'s `blocked.gang` also carries `reservedMembers`,
+     `reservedNodes`, and `reservationExpires` once a long-waiting gang has
+     [reserved](gang-scheduling.md#reservations) room.
 
    `preemptionMode` tells you whether that list is empty because nothing would
    be displaced or because preemption is off. Ask for confirmation when

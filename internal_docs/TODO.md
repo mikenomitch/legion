@@ -99,135 +99,49 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 - [ ] **Plan-commit cost is the throughput ceiling past 10k nodes.** On AWS
       the plan phase is ~25x the micro-bench (26 ms/eval at 20k, 45 ms at 50k),
       `apply` is ~82% of it, and the slowest coalesced commit grows 9.2 → 23.3 ms
-      from 5k to 50k nodes for the same plan size. Profile the commit at 50k
-      (suspects: free-pool rebuild, reprojection, heartbeats sharing the lane)
-      ([plan §13](plans/plan-path-fleet-scaling-plan.md)). Also caps edge ratification.
+      from 5k to 50k nodes for the same plan size ([plan §13](plans/plan-path-fleet-scaling-plan.md)).
+      Also caps edge ratification. A local release profile at 5k and 50k rules
+      out the in-commit suspects (free-pool rebuild, reprojection: `apply`
+      grows 11% for 10x the fleet); what grows is outside the plan's transaction, most
+      likely the other lanes' writes sharing the `single` pipeline
+      ([calls #3](calls/write-path-cost-followups_calls.md)). Next: on the rig,
+      read `legion_raft_pipeline_depth{lane}` and `legion_store_coalesce_batch_size`
+      at 50k while the campaign runs; the structural fix is
+      [lane-isolation phase 3](plans/lane-isolation-plan.md).
   - [ ] Batch more plans per commit: ~1.75 plans/commit today. Re-measure with
         `run-campaign.sh --eval-threads 8` at 20k now that conflicts are zero.
   - [ ] Plan N / apply N in one commit was declined (handlers write as they go;
-        [call 2](calls/eval-path-raft-cost-plan_calls.md)). Cost it against
-        this commit, not the eval loop.
-- [ ] **The plan apply still parses each attempted node row** (review SCH5's
-      unshipped half; [plan §6.2](plans/placement-and-commit-cost-plan.md) ·
-      [calls #2](calls/placement-and-commit-cost-plan_calls.md)). Reusing the
-      read model's `Arc<Node>` by epoch is unsound; hash the raw attribute bytes
-      in the transaction and compare. Measure serialize+hash vs parse at 10k first.
+        [call 2](calls/eval-path-raft-cost-plan_calls.md)). Each eval's own
+        writes already share its plan's entry (fused settle, fused claim); the
+        open question is plans per entry, measured by the item above.
 - [ ] **One capture mutex serializes every lane, and every write runs twice**
       (review SCH1; `CAPTURE_MUTEX` in `raft/capture.rs`, one write connection).
-      Group commit and single execution under `single` shipped. Open:
-  - [ ] The leader still executes twice under `lanes`; unblocked by per-lane
-        files ([plan §6.3.6](plans/raft-write-path-plan.md)).
-  - [ ] A database file per lane (own WAL lock and capture mutex). Needs its own
-        plan ([§6.4](plans/raft-write-path-plan.md) · [calls #6](calls/raft-write-path-plan_calls.md)).
+      Group commit and single execution under `single` shipped; the rest is
+      planned in [lane-isolation-plan.md](plans/lane-isolation-plan.md)
+      ([calls](calls/lane-isolation-plan_calls.md)), not built:
+  - [x] A database file per lane needs its own plan: written, phase 3 of
+        [lane-isolation](plans/lane-isolation-plan.md#63-phase-3-a-database-file-per-lane).
+  - [ ] Build per-lane database files (own WAL lock, capture mutex and write
+        connection per lane; commutative tables per lane; per-file snapshots
+        and backup) — lane-isolation phase 3.
+  - [ ] The leader still executes twice under `lanes` — lane-isolation phase 4,
+        after phase 3 ([raft-write-path §6.3.6](plans/raft-write-path-plan.md)).
 - [ ] **Pipeline the scheduler lane**: capture entry N+1 while N commits. Keyed
       sandbox lifecycles are bound at ~50/s on 4 vCPU against a ~125/s target.
-      Blocked on projecting from the changeset's own values, not re-read rows
-      ([raft-write-path §6.2.4](plans/raft-write-path-plan.md) · [calls #5](calls/raft-write-path-plan_calls.md);
-      [scheduler-lane-entry-cost §6.2](plans/scheduler-lane-entry-cost-plan.md)).
-- [ ] **A keyed bind still visits every live instance of the task**, two index
-      lookups each, so tens of thousands of running instances cost milliseconds
-      per placement ([scheduler-lane-entry-cost §11](plans/scheduler-lane-entry-cost-plan.md)).
-- [ ] **Power-cut test of the purge barrier.** Ordering is unit-tested
-      (`purge_runs_the_barrier_before_deleting`); cut power right after a purge
-      (unsynced VM block device or `dm-flakey`) to prove the applied marker never
-      regresses below the purge horizon ([plan §6.1](plans/raft-write-path-plan.md)).
-- [ ] **`STRING` and `TIMESTAMP` columns still carry NUMERIC affinity**: ids and
-      timestamps that look numeric are stored as INTEGER. A re-type is a
-      value-rewriting migration ([calls 2](calls/jsonb-text-affinity-plan_calls.md)).
-- [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup).
-      Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
-- [ ] **Other mutating handlers still commit on a runtime worker.** `StopJob`,
-      `DestroyJob`, KV writes and most mutating RPCs call the store inline, as
-      `RunJob` did; a burst starves evals and heartbeats. Move them behind
-      `run_blocking_admission` as they show up.
-
-### Eval loop and concurrency
-
-- [ ] **A hung eval handler is never re-swept.** A stale worker can no longer
-      settle an eval a newer claim holds (claim-epoch fence, 2026-11-08), and a
-      plan's own settle is still unfenced (benign). A handler that never returns
-      keeps its claim until leadership changes; a periodic re-sweep needs a
-      stated bound on handler time ([docs](../docs/scheduler-and-eval-loop.md)).
-- [ ] **Decide the `evalThreads` default** ([plan](plans/eval-thread-default-plan.md),
-      picks no number yet). `available_parallelism()` placed slowest in the
-      2026-08-05 sweep and the curve never turned over. When it moves, also fix
-      the read pool (`evalThreads + 4`, capped at 16) re-coupling with the runtime
-      on >12-core hosts, and `configs/manager.ncl`'s pinned `evalThreads = 4`.
-- [ ] **`web_fleet` at 5k got slower with the `RunJob` offload** (1,175 → 968
-      alloc/s, one run) while every other size got faster. Find whether faster
-      admission changes coalescer batching or crowds heartbeats before tuning.
-- [ ] **`legion_eval_queue_depth` lags up to a second on a deep queue** (above
-      `evalThreads × 16` pending; [calls #6](calls/placement-and-commit-cost-plan_calls.md)).
-      A `kind` label would want the same treatment.
-- [ ] **Adaptive scheduler concurrency, phases 4–5**
-      ([plan](plans/adaptive-scheduler-concurrency-plan.md)). Everything waits on
-      the Phase 0 matrix (plan §11, §16):
-  - [ ] Flip the default to `enforce` if the matrix shows it beats the best
-        static `evalThreads`; then make the `evalThreads` guidance unconditional.
-  - [ ] The `pool` label on `legion_plan_apply_total` (deferred with Phase 0;
-        [calls #2](calls/adaptive-scheduler-concurrency-plan_calls.md)).
-  - [ ] Phase 5: per-pool controllers, fallback rate and lane pipeline wait as
-        extra signals, live reload of `adaptiveConcurrency`.
-  - [ ] Only `job_stop` is exempt from throttling; if recovery latency matters,
-        add a priority lane for recovery kinds ([calls #1](calls/adaptive-scheduler-concurrency-plan_calls.md)).
-- [ ] **Late-binding plan apply, Phase 4 backlog** ([plan §8](plans/late-binding-plan-apply-plan.md)):
-      capacity-aware candidate skipping, per-component partial commit + eval
-      refill, striped disjoint candidate lists for identical replicas (highest
-      value: rejections lose a plan's one candidate per task), and a batched
-      apply lane for physically full pools.
-- [ ] **Fused top-k candidate scoring** for ranked candidate lists, like the
-      one-candidate argmax path; when `candidate_construction` says it pays
-      ([calls #20](calls/late-binding-plan-apply-plan_calls.md)).
-
-### Candidates and indexes
-
-- [ ] **The `fit` index does not see `maxAllocations`.** A capped node still
-      projects into a fitting cell, so under `bin_pack` capped nodes rank first
-      and waste the candidate budget. Project `allocations` as a fourth dim or a
-      cap flag that moves the node to the non-fitting tail.
-- [ ] **Node namespace restrictions cost one attribute lookup per node per task**
-      (`PermitSet::is_permitted`; 11.0 → 12.2 ms at 10k nodes;
-      [calls 25](calls/legion-apps-plan_calls.md)). Precompute "accepts every
-      namespace" per node, or fold it into `permits_restrictions`, and re-measure.
-- [ ] **In-place rollout ticks build an O(fleet) exclusion set**
-      (`crates/manager/src/manager/rollout.rs`, `available_node_ids`), forcing the plan's node-set
-      copy. Express it as an allow-list ([plan §13](plans/plan-path-fleet-scaling-plan.md)).
-- [ ] **Truncation-ineligible tasks still scan the fleet** (`count.per`,
-      `distinct`, volumes, multi-task groups); a non-goal of the fleet-scaling plan.
-- [ ] **Scheduling-index follow-ups** ([plan](plans/scheduling-index-plan.md)):
-      index-served group co-placement (calls 10), pluggable index kinds,
-      `count.per` by partition enumeration, device-set dims, task-level
-      `index_hint`, incremental orthant enumeration with early termination.
-- [ ] **Volume-pin staleness in planning**: pins are read mid-plan with no epoch
-      coupling, so a pin invalidated mid-plan (`volume delete --force`) can still
-      direct a placement. Low severity; reconciliation covers it.
-
-### Correctness gaps
-
-- [ ] **Fresh plans overcommit while the old config still runs** (audit SC7).
-      Apply counts the replaced job's allocations as free. Remove them inside the
-      same apply, with care for stateful release and rebind
-      ([calls #17](calls/architecture-audit-2026-10-09_calls.md)).
-- [ ] **The capacity pass has triggers it doesn't listen to yet** (audit SC4).
-      Allocations freed by stop or scale-in and a node recovering by heartbeat
-      queue nothing, and batch tasks are never woken ([calls #10](calls/architecture-audit-2026-10-09_calls.md)).
-- [ ] **A partly placed job says nothing about the envelopes it left out.**
-      When a session task's envelope does not fit an eligible node, the
-      only traces are the "Placed N allocation(s)" event and a manager
-      WARN log line; the pending/capacity-demand view skips `count.per`
-      tasks, so an unplaced envelope never shows as pending
-      ([`pending_capacity_work`](../crates/manager/src/storage/store/demand_ops.rs));
-      and a session start or run on that task then answers
-      `FAILED_PRECONDITION no node runs an envelope for <job>/<task> yet`,
-      which misleads when the node is eligible but full
-      ([`sessions.rs`](../crates/manager/src/manager/sessions.rs)). The
-      cheapest diagnostic: one warn-level scheduler event per eval naming
-      each unplaced task with its reason, from `outcome.unplaced`
-      ([`eval.rs`](../crates/manager/src/manager/eval.rs)). Found while
-      chasing an isolate test harness whose node was sized from its
-      fingerprint, not `config_attrs.resources`
-      ([`ResourcePool::from_node`](../crates/common/src/resources.rs));
-      pre-existing for every session task.
+      Planned as [lane-isolation phases 1–2](plans/lane-isolation-plan.md):
+      project the read model from the changeset's own values (no re-read rows),
+      then `raft.pipelineDepth` with an audited allowlist.
+- [ ] **A rollout's keyed placements still scan every live instance.** Outside
+      a rollout a keyed bind seeks only instances with no allocation; a rollout
+      rebinding instances bound under the old config falls back to the live
+      query, two index lookups per live instance per placement
+      ([scheduler-lane-entry-cost calls #2](calls/scheduler-lane-entry-cost-plan_calls.md)).
+      `legion_scheduler_keyed_binds_total{query="live"}` shows when it happens.
+- [ ] **Re-measure the 10k cleanup's job stop/destroy drain** (was ~4 evals/s
+      on AWS) now that stop/destroy statements seek and handlers wait off the
+      runtime; locally a destroy went 3.2 → 1.0 ms at 4,000 jobs. If it is still
+      slow, profile with `legion_eval_phase_seconds{kind="job_stop"}`
+      ([calls #2](calls/write-path-cost-followups_calls.md)).
 
 ### Placement features
 
@@ -260,35 +174,6 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 - [ ] **A feasibility cache by computed node class** (review SCH7); class keys
       exist only for blocked evals (`blocked.rs`).
 - [ ] **Usage-aware placement and a descheduler** (review SCH7).
-
-### Gang scheduling
-
-[plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md)
-
-- [ ] **Gang variables go stale after a scale or a moved leader**: members keep
-      the `LEGION_GANG_SIZE` / `LEGION_GANG_LEADER_ADDR` they were placed with.
-      Restart the gang on scale, or deliver them as a re-read file (calls 9).
-- [ ] **Readiness timeout** (Kueue's `waitForPodsReady`): `placementTimeout`
-      covers placement only, not a placed member that hangs before running.
-- [ ] **In-place gang restart** (JobSet `InPlaceRestart`).
-- [ ] **Local restarts as gang losses**: a worker restarting a crashed member in
-      place is invisible to the manager; a worker report would let
-      `onMemberLoss` apply (calls 5).
-- [ ] **Phase 4**: an integration test for the `createFirst` blue-green gang
-      update, and the autoscaler consuming a blocked gang's shortfall.
-- [ ] **Gang-aware wake**: a blocked gang re-plans on any capacity on its class.
-      Wake only when `min - running - placeable` could fit, once measured (calls 2).
-- [ ] **Whole-gang preemption victims**: a `gang = true` job is never
-      preemptible because preemption won't go below quorum (calls 7).
-- [ ] **Reservation / backfill for starving gangs.** Watch
-      `legion_gang_blocked_jobs` first; needs its own plan.
-- [ ] **Gangs ignore spot-interruption notices** (review AI7;
-      [calls #8](calls/placement-and-commit-cost-plan_calls.md)). Wants an
-      "interruption pending" node condition from IMDS or the `aws-asg` plugin.
-      Needs its own plan.
-- [ ] **Multi-level gang topology** (`keys = ["rack", "zone"]`); also at most
-      eight domains are tried per plan ([plan §11](plans/placement-and-commit-cost-plan.md) ·
-      [calls #5](calls/placement-and-commit-cost-plan_calls.md)).
 
 ### Edge boot
 
@@ -333,14 +218,9 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 
 [liveness plan](plans/liveness-off-the-raft-path-plan.md) ·
 [cadence plan](plans/heartbeat-cadence-at-scale-plan.md) ·
+[ping plan](plans/liveness-ping-split-plan.md) ·
 [docs](../docs/heartbeat-cadence-and-scale.md)
 
-- [ ] **Tighten failure detection at large fleets.** 20k nodes get 21s beats, so
-      loss detection takes ~105s vs 10s on small fleets. Raise the default
-      `targetRatePerSecond` (rerun 20k at 5,000 and 10,000), then split a cheap
-      liveness ping from desired-state sync (wire change; needs a plan).
-- [ ] **Per-pool heartbeat freshness.** `legion_heartbeat_freshness_ratio` is
-      fleet-wide and blends fast and slow pools.
 - [ ] **`heartbeat = { adaptive = false }` never settled onto its fixed 2s** at
       5k nodes on the AWS rig (freshness 0.46), so the fixed-cadence ablation
       row understates its cost. Find why the fixed cadence isn't held
@@ -352,49 +232,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 ### Start path and node throughput
 
-- [ ] **Sandbox boot throughput, what is still open**
-      ([plan](plans/sandbox-boot-throughput-plan.md) ·
-      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
-      [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
-  - [ ] **A large node is bound by its root disks** (calls 13). Reflinked
-        clones plus `debugfs` writes contend in XFS locks (~150–200 boots/s on
-        96 vCPU). Write per-sandbox files without touching shared extents, or
-        spread clones over several base copies, then re-measure.
-  - [ ] **Parallel branches not stacked** (calls 1): `sandbox-warm-pool`,
-        `edge-prewarm`, `elastic-session-envelopes`, `edge-admission-backpressure`,
-        `edge-ratify-throughput`, `chunked-checkpoints`, `checkpoints-on-stream`,
-        `multi-eval-plans`, `scheduler-lane-entry-cost`, `flat-commit-cost`,
-        `web-fleet-throughput`; each needs its own measured case.
-  - [ ] **A memory-snapshot start for sessions**: restore from a per-node
-        template snapshot instead of booting (opt-in, falls back to a boot).
-- [ ] **Start reports wait for a heartbeat.** A health transition reaches the
-      manager on the next beat (~1 s, up to 21 s on adaptive cadence), so
-      rollouts and discovery wait. Carry it on a `StreamWork` report frame
-      ([plan](plans/task-start-critical-path-plan.md) phases 4–5,
-      [calls 4](calls/task-start-critical-path-plan_calls.md)).
-- [ ] **A pushed gated task's policy and ingress wait for the heartbeat.** Its
-      namespace, proxy, resolver, and upstreams bind at launch (2026-11-08) but
-      fail closed until the heartbeat delivers the policy, and ingress listeners
-      bind on the heartbeat. Carry the policy assignment on the delta
-      ([docs](../docs/network-handlers.md)).
-- [ ] **The worker state file is rewritten whole on every start.**
-      `persist_state` serializes every allocation, reads `/proc`, and fsyncs
-      under the task-manager lock, so a burst on a dense node is quadratic.
-      Group-commit off the lock or keep a record per allocation
-      (`legion_task_start_stage_seconds{stage="register"}`).
-- [ ] **TAP sandboxes shell out to `ip` on the start path**
-      (`sandbox_checkpoint::HostTaps`, `sandbox::set_tap_link`). Use the
-      ioctls instead, if the `network` stage shows up on a real KVM node.
-- [ ] **Finish moving worker blocking work off the task-manager lock (audit
-      W3).** Still under it: `reap_terminating`, `record_failure`/self-fence,
-      `prepare`/`start` for `ratify_claim`, `restart_allocation`, edge-boot
-      starts, snapshot restores (an `eager` restore holds it for the whole
-      read), and `container stop` on reconcile. `heartbeat_tick` locks a std
-      mutex from async; teardown needs a "tearing down" state
-      ([calls #11](calls/architecture-audit-2026-10-09_calls.md)). Also under
-      it: a start's filesystem work (`prepare_instance`, log dir and sink), a
-      stop's fsync of the worker state file, and the runtime's memory
-      `checkpoint`.
+- [ ] **A memory-snapshot start for sessions**: restore from a per-node
+      template snapshot instead of booting (opt-in, falls back to a boot)
+      ([plan](plans/session-snapshot-start-plan.md) ·
+      [calls](calls/session-snapshot-start-plan_calls.md), PLANNED).
 
 ### Host runtimes (`exec`, `container`, new runtimes)
 
@@ -1290,6 +1131,8 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
 
 - **Node liveness off the raft path** — heartbeats hit an in-memory `LivenessTable`, only transitions replicate; failover grace from liveness responsibility; mass-disruption breaker; peer liveness digest; display checkpoint ([plan](plans/liveness-off-the-raft-path-plan.md) · [calls](calls/liveness-off-the-raft-path-plan_calls.md) · [docs](../docs/node-liveness.md))
 - **Heartbeat cadence at scale** — per-node lost windows, `heartbeatSeconds` up to 300 with a self-fence startup check, freshness metrics, `legion node cadence`, adaptive cadence on by default (`targetRatePerSecond` 2,500) ([plan](plans/heartbeat-cadence-at-scale-plan.md) · [calls](calls/heartbeat-cadence-at-scale-plan_calls.md) · [docs](../docs/heartbeat-cadence-and-scale.md))
+- **Failure detection slows far less with fleet size** — a cheap liveness ping (`Manager.Ping`) split from desired-state sync: the lost window follows a liveness interval sized from `heartbeat.pingRatePerSecond` (10,000), so 10k nodes keep a 10s window and 20k nodes get 25s instead of 105s, while full heartbeats back off on `targetRatePerSecond` as before; a ping recovers a lost node and asks for a full heartbeat ([plan](plans/liveness-ping-split-plan.md) · [calls](calls/liveness-ping-split-plan_calls.md) · [docs](../docs/heartbeat-cadence-and-scale.md#pings-and-heartbeats))
+- **Per-pool heartbeat freshness** — freshness judged against each node's own interval, `legion_heartbeat_pool_freshness_ratio{pool}`, a pool table in `legion node cadence` and `GetHeartbeatCadence`, and a warning that names the pool falling behind ([plan](plans/liveness-ping-split-plan.md) · [docs](../docs/heartbeat-cadence-and-scale.md#per-pool))
 - **A returning node is schedulable again** — recovery undoes both lost/unavailable halves, never un-cordons a drained node ([docs](../docs/node-liveness.md))
 - **Worker basics** — add a worker, RPC contact and messaging, heartbeats with unhealthy-on-miss, fingerprinting, dynamic attributes, the manager's node ledger, restart from the server
 
@@ -1300,6 +1143,9 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **Placement quality and commit cost** — bounded `plan_submission`, O(batch) claims, `bin_pack`/`spread` scored against capacity with count-scaled anti-affinity, in-memory plan apply, debug-level plan logs, topology-aware gang placement (review SCH2/3/4/5a/8, AI7a) ([plan](plans/placement-and-commit-cost-plan.md) · [calls](calls/placement-and-commit-cost-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md))
 - **Gang scheduling, Phase 1** — `gang = true | { min }`, all-or-nothing quorum placement, preemption floor, one-step rollout, `gang_reports` ([plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md))
 - **Gang scheduling, Revision 2** — `gang.placementTimeout`, `gang.onMemberLoss = restart|replace|fail`, `LEGION_GANG_RANK/SIZE/MIN/LEADER_ADDR` ([plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) · [docs](../docs/gang-scheduling.md#placement-timeout))
+- **Gang scheduling, Revision 3** — gang views that follow a `job scale` or a moved rank 0 (members restart in place under `LEGION_GANG_EPOCH`), `gang.readyTimeout`, `onMemberLoss = "restartInPlace"`, local restarts as losses (`gang.onLocalRestart`), gang-aware wake, whole-gang preemption victims, multi-level topology (`topology.keys`, preemption-aware domain filter, 16 trials), and the Phase 4 tests (`createFirst` blue-green update, the autoscaler consuming a blocked gang's shortfall) ([plan](plans/gang-scheduling-plan.md#revision-3-the-follow-ups-2026-11-12) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md))
+- **Gang reservations** — a gang waiting past `schedulerSettings.gangReservation.after` reserves room on the nodes it needs for one `hold`; work of its band or below backfills only what is beyond it ([plan](plans/gang-reservation-plan.md) · [calls](calls/gang-reservation-plan_calls.md) · [docs](../docs/gang-scheduling.md#reservations))
+- **Spot interruption** — the worker's EC2 `spotInterruption` watcher and `legion node interrupt` record a node's pending interruption; gangs keep off the node and its gang members move first (stop cause `interruption`) ([plan](plans/spot-interruption-plan.md) · [calls](calls/spot-interruption-plan_calls.md) · [docs](../docs/spot-interruption.md))
 - **Elastic session envelopes, Phase 1** — `stateful.envelope.max`/`shrinkAfter` grow and shrink a node's envelope ([plan](plans/elastic-session-envelopes-plan.md) · [calls](calls/elastic-session-envelopes-plan_calls.md) · [docs](../docs/session-mode.md#elastic-envelopes))
 - **Submit/update/scale-out evals settle with their plans** — fused settle saves one entry each ([plan](plans/multi-eval-plans-plan.md) · [calls](calls/multi-eval-plans-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md))
 - **Index truncation samples a tied cell uniformly** — fixes the planner seeing only the lowest-id slice at rig scale ([findings](aws-phase5-findings.md#open-in-priority-order) · [calls](calls/scheduling-index-plan_calls.md) · [docs](../docs/scheduling-indexes.md))
@@ -1310,13 +1156,22 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 - **The per-pool preemption toggle stays in manager config** — decided, not ACL-scoped: a pool-scoped token cannot exempt its pool (plan Open Question 6 · [calls 17](calls/preemption-and-eviction-plan_calls.md) · [docs](../docs/preemption-and-eviction.md#operator-controls))
 - **Plugin ABI version symbol** — `declare_task_plugin_abi!()` makes stale dylibs fail at load ([docs](../docs/task-runtime-plugins.md))
 - **Declarable scheduling indexes** — `partition_by` × `dims` indexes, nearest-fit candidates, shadow mode, default `fit` index ([plan](plans/scheduling-index-plan.md) · [docs](../docs/scheduling-indexes.md))
+- **Candidates and indexes** — `fit` sends nodes at `maxAllocations` to the tail; a per-node permit flag removes the namespace lookup; in-place rollouts pass an allow-list; every task shape but gangs truncates (`distinct`, stateful with pinned-node top-up, `count.per` by partition enumeration, co-placed groups through the index); plugin index kinds; `devices.*` and item-set dims; `indexHint`; heap-ordered walk; volume pins fenced at apply ([plan](plans/candidates-and-indexes-plan.md) · [calls](calls/candidates-and-indexes-plan_calls.md) · [docs](../docs/scheduling-indexes.md))
 - **Late-binding plan apply (phases 0–3)** — ranked candidates per placement, conflict-exhausted evals requeue with backoff, `plan_candidates` ([plan](plans/late-binding-plan-apply-plan.md) · [docs](../docs/late-binding-plan-apply.md))
 - **Adaptive scheduler concurrency (phases 1–3)** — AIMD planner gate with goodput guard, `legion scheduler concurrency`; default `observe` ([plan](plans/adaptive-scheduler-concurrency-plan.md) · [calls](calls/adaptive-scheduler-concurrency-plan_calls.md) · [docs](../docs/adaptive-scheduler-concurrency.md))
+- **Late-binding plan apply, Phase 4 (part)** — capacity-aware skipping shipped as the walk's pass 2 ([calls #17](calls/late-binding-plan-apply-plan_calls.md)); `distinct` replicas get fallback lists, the walk enforces `distinct` ([calls #2](calls/late-binding-plan-apply-plan_calls.md) · [docs](../docs/late-binding-plan-apply.md#coupled-placements)). Partial commit and a full-pool lane not planned ([plan](plans/late-binding-plan-apply-plan.md))
+- **Eval handler deadline** — a handler past five minutes is requeued with a delay and the rest of its batch runs; `legion_eval_handler_timeouts_total{kind}`, `eval.requeued` `reason: handler_timeout` ([plan](plans/eval-handler-deadline-plan.md) · [calls](calls/eval-handler-deadline-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#handler-deadline))
 - **Builtin names in a worker type's `resources` fail startup** — no longer silently ignored ([calls](calls/node-resource-overrides_calls.md) · [docs](../docs/resource-enforcement.md))
 - **`run_dispatch_future` requires a `Send` future** — a guard held across `.await` on the dispatch path no longer compiles
 - **Scheduler basics** — ledger command, scheduler plugin framework, random/bin-pack/spread schedulers, constraints, affinities, task groups, rescheduling, health-check reschedule, attribute-change re-evaluation
 - **Per-eval planning cost flat in fleet size** — persistent read-model maps, budgeted index walk, shared node set, O(jobs) scan indexes, eval phase metrics; confirmed on AWS to 50k nodes ([plan](plans/plan-path-fleet-scaling-plan.md) · [calls #15](calls/plan-path-fleet-scaling-plan_calls.md) · [docs](../docs/benchmarks.md))
 - **`RunJob` no longer parks tokio workers** — submit under `block_in_place` (`run_blocking_admission`), PR #40 ([docs](../docs/benchmarks.md))
+- **Every store write waits for quorum off the async runtime** — `Store::replicated` waits under `block_in_place`, so `StopJob`, `DestroyJob`, KV writes and every other mutating handler stop parking tokio workers, not just `RunJob` ([calls #1](calls/write-path-cost-followups_calls.md) · [docs](../docs/metrics.md#diagnosing-a-manager-throughput-ceiling))
+- **The plan apply no longer parses node rows the read model already holds** — the row is still read, and its bytes compared to the read model's node; apply −21% on a realistic 10k fleet (review SCH5's second half; [plan §6.2](plans/placement-and-commit-cost-plan.md) · [calls #2](calls/placement-and-commit-cost-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#apply-time-re-validation))
+- **A keyed bind outside a rollout no longer grows with live instances** — `idx_instance_keyed_unbound` first, the live query as fallback, `legion_scheduler_keyed_binds_total` ([plan §11](plans/scheduler-lane-entry-cost-plan.md) · [calls #2](calls/scheduler-lane-entry-cost-plan_calls.md) · [docs](../docs/sandboxes-at-scale.md))
+- **Job stop/destroy no longer scans tables per job** — `job.name`, `task_status.job_id` and five foreign keys indexed; schema tests fail on an unindexed foreign key or a scanning stop/destroy statement; destroy 3.2 → 1.0 ms per job at 4,000 jobs locally, now flat in the job count ([calls #2](calls/write-path-cost-followups_calls.md) · [docs](../docs/state-store.md#column-affinity))
+- **`STRING`/`TIMESTAMP` columns re-typed** — TEXT (`job.created_at` INTEGER), numeric values rewritten in the same migration; a job named `2026` reads back ([plan](plans/jsonb-text-affinity-plan.md) · [calls #7–#9](calls/jsonb-text-affinity-plan_calls.md) · [docs](../docs/state-store.md#column-affinity))
+- **Power-cut test of the purge barrier** — loop-mounted ext4 images with writeback off; marker 20 ≥ purge 15 with the barrier, 0 without ([plan §6.1](plans/raft-write-path-plan.md) · [calls #4](calls/write-path-cost-followups_calls.md) · [docs](../docs/testing-and-benchmarks.md#power-cut-test-of-the-raft-logs-purge-barrier))
 - **Read-connection pool fixed and sized `evalThreads + 4` (cap 16)** — steal-on-contention, `legion_store_read_lock_wait_seconds` ([calls 5](calls/eval-path-raft-cost-plan_calls.md))
 - **Fewer raft rounds per eval** — fused complete-and-claim, one-round fan-out, batch claim/complete, intake group commit, eval loop off tokio threads, condvar coalescer handoff ([plan](plans/eval-path-raft-cost-plan.md) · [calls](calls/eval-path-raft-cost-plan_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#batching))
 - **Eval-notifier thundering herd fixed** — one wake per claimable eval, `legion_eval_claim_total{outcome}`
@@ -1357,6 +1212,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **Park, Phases 1–2** — `suspend.park` and `$LEGION_PARK_SOCKET` for exec, container and sandbox ([plan](plans/park-plan.md) · [calls](calls/park-plan_calls.md) · [docs](../docs/park.md))
 - **Health-check startup fixes** — startup probing between `every` ticks, a `boot` check's first-interval failure not counted, `net_capture_unavailable` no longer sticks ([plan](plans/task-start-critical-path-plan.md) · [calls](calls/task-start-critical-path-plan_calls.md) · [docs](../docs/jobs-tasks-and-scheduling.md#startup-probing))
 - **Gated namespaces exist before their listeners** — created before proxy/resolver binds ([plan](plans/task-start-critical-path-plan.md))
+- **Start reports and streamed policy off the heartbeat** — health transitions on a `StreamWork` `report` frame; a streamed placement's policy assignment on its delta, with ingress bound at launch ([plan](plans/task-start-critical-path-plan.md) phases 4–5 · [calls](calls/task-start-critical-path-plan_calls.md) 3, 5 · [docs](../docs/architecture-managers-workers.md#reports-between-heartbeats))
+- **The worker's blocking work off the task-manager lock (closes audit W3)** — teardowns and stop signals from the supervisor, with `reaping` as the tearing-down state; restarts, edge-boot starts, a `stage` claim's start at ratification, a start's directories, and a memory capture's write without the lock; the heartbeat takes it with `block_in_place` ([plan](plans/task-start-critical-path-plan.md#follow-up-2026-11-12) · [calls](calls/task-start-critical-path-plan_calls.md) 2, 6, 10 · [docs](../docs/suspend-and-resume.md))
+- **Worker state file off the lock** — one newest-snapshot writer per file, process start times cached; 24.5 → 3.8 ms of lock per persist at 1,000 allocations ([calls](calls/task-start-critical-path-plan_calls.md) 4 · [docs](../docs/state-store.md#worker-local-state-store))
+- **TAP devices without `ip`** — create, up/down, master, delete by ioctl and rtnetlink ([calls](calls/task-start-critical-path-plan_calls.md) 9 · [docs](../docs/task-runtime-sandbox.md))
+- **Root disk clones spread over copies of each base** — one full copy per 16 vCPUs (1 to 8), filled in the background ([plan](plans/sandbox-boot-throughput-plan.md) · [calls](calls/sandbox-boot-throughput-plan_calls.md) 15 · [docs](../docs/task-runtime-sandbox.md#the-root-disk-cache))
+- **The sandbox-boot parallel branches, reconciled** — most landed on their own plans; the rest's ideas are open in their areas ([calls](calls/sandbox-boot-throughput-plan_calls.md) 1)
 - **Worker lock under churn** — VMM reaps, cgroup leaf creation, dir removal, and log manifests moved off the task-manager lock (busy ~20% at 250 starts/s) ([plan](plans/sandbox-boot-throughput-plan.md) · [results](../benchmarks/aws/sandbox-boot/RESULTS.md#bare-metal-second-campaign-2026-10-14))
 - **Task process supervision** — child reaping, `restart` policy, exit-code task outcomes ([plan](plans/host-process-supervision-plan.md) · [calls](calls/host-process-supervision-plan_calls.md) · [docs](../docs/task-supervision.md))
 - **Worker-owned cgroups for `exec`** — superseded by node-wide resource enforcement for `exec` and `container` ([docs](../docs/resource-enforcement.md) · [calls 16](calls/container-runtime-exec-and-signals-plan_calls.md))
@@ -1390,7 +1251,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - **`hint` idle signal as `suspend.park`** — workload says `busy`/`park` on the park socket ([plan](plans/park-plan.md) · [docs](../docs/park.md))
 - **Lazy memory restore, Phase 1** — on-demand restore on cloud-hypervisor v52+, `memory_restore = lazy|eager` ([plan](plans/lazy-memory-restore-plan.md) · [docs](../docs/task-runtime-sandbox.md#how-memory-comes-back))
 - **Sandbox `config.memory_mib` removed** — refused at submit; the guest boots at `resources.memoryMax`, else `memory`, else 512 MiB, read per unit at launch ([calls 26](calls/suspend-resume-and-oversubscription-plan_calls.md) · [docs](../docs/task-runtime-sandbox.md#guest-size))
-- **A smaller guest kernel, documented** — the options Legion needs and a build recipe ([docs](../docs/task-runtime-sandbox.md#a-smaller-guest-kernel) · [calls 18](calls/sandbox-boot-throughput-plan_calls.md))
+- **A smaller guest kernel, documented** — the options Legion needs and a build recipe ([docs](../docs/task-runtime-sandbox.md#a-smaller-guest-kernel) · [calls 19](calls/sandbox-boot-throughput-plan_calls.md))
 - **Container OCI stop tests drive `stop_with` then the hard stop**, and pass under runc 1.5.2
 
 ## Artifacts
@@ -1692,11 +1553,20 @@ judgement calls in [todo-closeout-2026-11-10_calls.md](calls/todo-closeout-2026-
 - **Removed, pending a full verify pass**: the Verify list (runs needing real hardware, KVM, macOS, root on cgroup v2, or the AWS rig); it is rebuilt from that pass rather than kept here.
 - **Removed, decided**: seventeen limitations and ideas, each with where its decision lives ([calls #10](calls/todo-closeout-2026-11-10_calls.md)).
 
+## Correctness gaps closed (2026-11-12)
+
+The three "Correctness gaps" under Scheduling & placement; judgement calls in
+[correctness-gaps-2026-11-12_calls.md](calls/correctness-gaps-2026-11-12_calls.md).
+
+- **A resubmit no longer overcommits while the old version runs** (audit SC7): a Fresh plan's apply transaction removes the replaced config's allocations after its placements bind, so no committed state holds both versions; stateful slots rebind to their replacement in the same transaction ([calls #1](calls/correctness-gaps-2026-11-12_calls.md) · [docs](../docs/scheduler-and-eval-loop.md#placement-application-and-conflict-safety)).
+- **Every capacity event on a schedulable node can queue the capacity pass** (audit SC4, finished): a lost node heartbeating again, and frees from preemption, drains, and gang losses, retry jobs left short, from the blocked-eval wake loop; stop, scale-in, and unfinished batch tasks were already covered ([calls #2](calls/correctness-gaps-2026-11-12_calls.md) · [docs](../docs/scheduler-and-eval-loop.md)).
+- **A partly placed job says what it left**: a warn `plan.unplaced` event per eval or capacity-pass replan names each unplaced task (a `count.per` envelope included) with its reason, and a session start that finds no envelope quotes that reason instead of implying no node is eligible ([calls #3, #4](calls/correctness-gaps-2026-11-12_calls.md) · [docs](../docs/event-stream.md) · [docs](../docs/session-mode.md)).
+
 ## Spot checks, audits and security closures
 
 - **Pre-launch spot check fixes (2026-10-11, #17)** — workers on other hosts (reachable bind, mTLS, CSR issuance); task lifecycle (batch finish, restart policies, staged health checks, stderr in failures); scheduler (DAG waits, static ports, partial placement); manager availability (worker failover, follower write forwarding, `transfer-leader`); Linux container hardening and install guide; CLI/diagnostics (`--json` everywhere, camelCase); `ListManagers` lists every raft member; cluster-wide CA pin after failover; CH VMM versions compared as semver ([findings](launch-spot-check-findings.md) · [plan](plans/launch-spot-check-fixes-plan.md) · [calls](calls/launch-spot-check-fixes-plan_calls.md))
 - **AWS spot-check re-run fixes (2026-10-12)** — exponential reschedule backoff as a replicated `reschedule_hold` with events and `--force-reschedule`; slot instances return to their volume's node uncharged; per-address `~/.legion/tokens/`; SIGPIPE exit 141; `state query` errors as `InvalidArgument`; errors name CLI flags; MCP node attrs as objects; `job plan` previews age-gated preemption; instance `nodeId`; macOS `--run-worker` stops its containers on shutdown ([calls](calls/launch-spot-check-fixes-plan_calls.md))
-- **Architecture audit (2026-10-09)** — worker W1–W6 (W3 partial), raft/store R1–R5 (R5 partial), scheduler SC1–SC6 (SC4 partial), manager lifecycle M1–M6 (M6 partial) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
+- **Architecture audit (2026-10-09)** — worker W1–W6 (W3 partial), raft/store R1–R5 (R5 partial), scheduler SC1–SC7 (SC4 and SC7 finished 2026-11-12), manager lifecycle M1–M6 (M6 partial) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
 - **Sandbox spot check (2026-10-12)** — `node.pressure` events from a lane-less follower are forwarded and journaled ([calls](calls/durability-and-ops-execution-plan_calls.md) · [docs](../docs/event-stream.md))
 - **Swappable seams (2026-10-14)** — one datapath `Attachment`, one listener/dialer (`netd::listen`), typed `netd::Netd` boundary, DNS on `hickory-proto`, egress proxy HTTP on hyper (pipelined requests judged), mesh upstreams honour `mesh_tls`, one object-storage layer (`crates/worker/src/objects/`), VIP blocks follow the node's OS ([plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [docs](../docs/codebase-conventions.md#datapath-conventions))
 - **Pluggable cluster CA providers** — `clusterCa.provider = builtin | file | exec` with a Vault PKI helper and `legion net ca provider test` ([plan](plans/cluster-ca-provider-plan.md) · [calls](calls/cluster-ca-provider-plan_calls.md) · [docs](../docs/cluster-ca.md))

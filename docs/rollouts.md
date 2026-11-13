@@ -118,6 +118,8 @@ For full semantics, the canary-promote walkthrough, and validation rules, see "O
 `inPlace = true` behavior:
 
 - Scheduler first attempts replacement placement constrained to retiree nodes.
+  The tick hands the scheduler those nodes as an allow-list, so the cost of
+  the in-place attempt grows with the group's old nodes, not with the fleet.
 - If same-node placement cannot be satisfied, rollout falls back to regular cross-node placement.
 - `inPlace = false` still allows same-node placement. It only removes the preference for it.
 
@@ -301,7 +303,7 @@ Core flow:
 2. `rollout_tick` eval is claimed by eval workers.
 3. Tick builds per-group plans and snapshots allocations/health once per tick.
 4. Tick decides mutation/wait/terminal action per group.
-5. Scheduler is invoked with per-task target counts and optional in-place exclusions.
+5. Scheduler is invoked with per-task target counts and, for an in-place tick, the allow-list of retiree nodes.
 6. Allocation dispatch and task status updates run after successful placement.
 7. Old allocations are retired according to replacement mode and lifecycle rules.
 8. Rollout status/events/runtime JSON are persisted.

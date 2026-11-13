@@ -125,6 +125,9 @@ impl Store {
     pub(crate) fn delete_gang_waits_for_job_tx(conn: &Connection, job_id: &str) -> R<()> {
         conn.prepare_cached("DELETE FROM gang_wait WHERE job_id = ?1;")?
             .execute([job_id])?;
+        // A reservation lives only as long as the wait it was made for.
+        conn.prepare_cached("DELETE FROM gang_reservation WHERE job_id = ?1;")?
+            .execute([job_id])?;
         Ok(())
     }
 

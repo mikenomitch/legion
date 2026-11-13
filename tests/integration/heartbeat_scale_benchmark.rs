@@ -171,9 +171,12 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
             let served_interval =
                 Duration::from_secs(legion::constants::WORKER_HEARTBEAT_DURATION_SEC);
             let snapshot = legion::manager::daemon::liveness_snapshot(store, Instant::now())?;
-            let freshness_ratio =
-                legion::manager::cadence::freshness_ratio(&snapshot, served_interval, 0)
-                    .unwrap_or(0.0);
+            let freshness_ratio = legion::manager::cadence::freshness_ratio(
+                &snapshot,
+                legion::constants::DEF_MISSED_BEATS_BEFORE_LOST,
+                0,
+            )
+            .unwrap_or(0.0);
 
             cells.push(Cell {
                 backend: backend.label(),

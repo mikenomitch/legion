@@ -231,8 +231,9 @@ impl EvalRun<'_> {
         }
 
         // A first submit's plan is its last write unless a batch follow-up
-        // is queued after it; a resubmit removes the previous config's
-        // allocations after its plan, so it settles in its own write.
+        // is queued after it; a resubmit may still remove the previous
+        // config's allocations after its plan (below), so it settles in its
+        // own write.
         if previous_config_id.is_none() && self.batch_follow_up_delay(store)?.is_none() {
             crate::storage::store::arm_eval_settle();
         }
@@ -247,6 +248,12 @@ impl EvalRun<'_> {
         }
 
         let finish_started = Instant::now();
+        // A plan that applied already removed the previous config's
+        // allocations in its own transaction, so the version it replaced
+        // never shared a node with it (`Store::retire_replaced_allocations_tx`,
+        // audit SC7), and this finds nothing. A plan that applied nothing
+        // (every task held by `dependsOn`, or nothing to place) did not, and
+        // the previous version still has to go.
         if let Some(prev_id) = previous_config_id {
             store.remove_allocs_for_job_config(&prev_id)?;
         }
@@ -611,6 +618,7 @@ impl EvalRun<'_> {
             let dispatch_started = Instant::now();
             dispatch_allocations(store, &outcome.allocations)?;
             observe_phase(&self.kind, "dispatch", dispatch_started.elapsed());
+            self.report_unplaced(store, &outcome);
             self.schedule_preemption_retry(store, &outcome)?;
             return Ok(outcome);
         };
@@ -688,8 +696,28 @@ impl EvalRun<'_> {
             }
         };
         observe_phase(&self.kind, "dispatch", dispatch_time);
+        self.report_unplaced(store, &outcome);
         self.schedule_preemption_retry(store, &outcome)?;
         Ok(outcome)
+    }
+
+    /// One `plan.unplaced` warn event for an eval whose plan placed part of
+    /// the job and left the rest, naming each unplaced task and why. Without
+    /// it the shortfall showed only in a manager log line and the
+    /// `eval.completed` outcome text, and nothing an operator queries by
+    /// kind or level (an envelope that does not fit an eligible node, say).
+    /// Best effort: the plan has applied, and an event that could not be
+    /// written must not fail the eval.
+    fn report_unplaced(&self, store: &Store, outcome: &PlanOutcome) {
+        if outcome.unplaced.is_empty() || self.job_id.trim().is_empty() {
+            return;
+        }
+        store.events().plan_unplaced(
+            &self.job_id,
+            &self.job_config_id,
+            Some(&self.id),
+            &outcome.unplaced,
+        );
     }
 
     /// A plan that placed part of the job and left a replica waiting for

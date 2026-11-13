@@ -167,14 +167,70 @@ impl PermitSet {
 
     /// Whether the task may land on `node`: its permit tolerates the node's
     /// pool and restrictions, and the node accepts its job's namespace.
+    ///
+    /// The node's `config_attrs` object is fetched once and both the
+    /// `restriction` block and the `namespaces` list are read from it: this
+    /// runs once per node per task on the candidate scan, and the namespace
+    /// check used to be a second, independent walk from the node
+    /// (candidates-and-indexes plan § 6.2).
     pub fn is_permitted(&self, node: &Node) -> bool {
-        self.permits_restrictions(node) && accepts_namespace(node, &self.namespace)
+        let attrs = node.config_attrs.as_object();
+        self.permits_restrictions_in(node, attrs)
+            && attrs
+                .and_then(|attrs| attrs.get(NODE_NAMESPACES_ATTR))
+                .is_none_or(|declared| namespaces_accept(declared, &self.namespace))
+    }
+
+    /// [`Self::is_permitted`] for a node whose [`node_is_unrestricted`] flag
+    /// the caller already holds (the scheduler's cached node set computes it
+    /// once per node). An unrestricted node is judged from its pool string
+    /// alone — no attribute lookups — which is the same answer
+    /// [`Self::is_permitted`] gives it.
+    pub fn is_permitted_flagged(&self, node: &Node, unrestricted: bool) -> bool {
+        if unrestricted {
+            self.permits_pool_only(&node.pool)
+        } else {
+            self.is_permitted(node)
+        }
+    }
+
+    /// The permit against a node whose only restriction is its pool: every
+    /// rule holds against `{pool}` and the pool is matched by some rule.
+    fn permits_pool_only(&self, pool: &str) -> bool {
+        let holds = self.rules.iter().all(|rule| {
+            if rule.key == "pool" {
+                match rule.operator {
+                    Operator::IsSet => true,
+                    Operator::IsNotSet => false,
+                    _ => rule.matches_pool(pool),
+                }
+            } else {
+                // The only attribute is `pool`, so every other key is
+                // unset: `is_not_set` holds, nothing else can.
+                rule.operator == Operator::IsNotSet
+            }
+        });
+        holds
+            && self
+                .rules
+                .iter()
+                .any(|rule| rule.key == "pool" && rule.matches_pool(pool))
     }
 
     /// [`Self::is_permitted`] without the namespace check: what the permit
     /// alone says. For the diagnostic that names nodes only the namespace
     /// restriction turned away.
     pub fn permits_restrictions(&self, node: &Node) -> bool {
+        self.permits_restrictions_in(node, node.config_attrs.as_object())
+    }
+
+    /// [`Self::permits_restrictions`] with the node's `config_attrs` object
+    /// already in hand.
+    fn permits_restrictions_in(
+        &self,
+        node: &Node,
+        attrs: Option<&serde_json::Map<String, Value>>,
+    ) -> bool {
         // A node's restrictions are its pool plus whatever its `restriction`
         // config block declares. Almost no node declares one, and for those
         // the restriction map would hold exactly one entry — so build no map
@@ -184,31 +240,12 @@ impl PermitSet {
         // candidate scan, so a map allocation here was a measurable share of
         // candidate construction at fleet scale. The general path below is
         // unchanged and gives the same answer whenever it is taken.
-        let declared = node
-            .config_attrs
-            .as_object()
+        let declared = attrs
             .and_then(|attrs| attrs.get("restriction"))
             .and_then(Value::as_object)
             .filter(|block| !block.is_empty());
         if declared.is_none() {
-            let holds = self.rules.iter().all(|rule| {
-                if rule.key == "pool" {
-                    match rule.operator {
-                        Operator::IsSet => true,
-                        Operator::IsNotSet => false,
-                        _ => rule.matches_pool(&node.pool),
-                    }
-                } else {
-                    // The only attribute is `pool`, so every other key is
-                    // unset: `is_not_set` holds, nothing else can.
-                    rule.operator == Operator::IsNotSet
-                }
-            });
-            return holds
-                && self
-                    .rules
-                    .iter()
-                    .any(|rule| rule.key == "pool" && rule.matches_pool(&node.pool));
+            return self.permits_pool_only(&node.pool);
         }
 
         let restrictions = node_restrictions(node);
@@ -260,6 +297,22 @@ pub fn node_namespaces(node: &Node) -> Option<Vec<&str>> {
     (!patterns.is_empty()).then_some(patterns)
 }
 
+/// True when `node` declares neither a non-empty `restriction` block nor a
+/// `namespaces` list: its pool is its only restriction and it accepts every
+/// namespace, so [`PermitSet::is_permitted_flagged`] can judge it from the
+/// pool alone. Conservative: an empty `namespaces` list (which accepts
+/// everything) still reads as restricted and takes the full check.
+pub fn node_is_unrestricted(node: &Node) -> bool {
+    let Some(attrs) = node.config_attrs.as_object() else {
+        return true;
+    };
+    let restricted = attrs
+        .get("restriction")
+        .and_then(Value::as_object)
+        .is_some_and(|block| !block.is_empty());
+    !restricted && !attrs.contains_key(NODE_NAMESPACES_ATTR)
+}
+
 /// Whether `node` accepts jobs from `namespace`. A node without a
 /// `namespaces` list accepts every namespace. A node with one accepts the
 /// namespaces its patterns match under the reserved-prefix rule
@@ -268,13 +321,15 @@ pub fn node_namespaces(node: &Node) -> Option<Vec<&str>> {
 /// `legion-`.
 pub fn accepts_namespace(node: &Node, namespace: &str) -> bool {
     // The common node declares no list: one map lookup, no allocation.
-    let Some(declared) = node
-        .config_attrs
+    node.config_attrs
         .as_object()
         .and_then(|attrs| attrs.get(NODE_NAMESPACES_ATTR))
-    else {
-        return true;
-    };
+        .is_none_or(|declared| namespaces_accept(declared, namespace))
+}
+
+/// Whether a node's declared `namespaces` value accepts `namespace`: an
+/// array of patterns (empty accepts all), or one pattern as a string.
+fn namespaces_accept(declared: &Value, namespace: &str) -> bool {
     let matches = |pattern: &Value| {
         pattern
             .as_str()
@@ -879,6 +934,50 @@ mod tests {
         assert!(score < 1.0);
         assert!(score > -1.0);
 
+        Ok(())
+    }
+
+    /// The cached unrestricted flag never changes a permit's answer: for
+    /// every node shape and permit, `is_permitted_flagged` with the node's
+    /// own flag equals `is_permitted`.
+    #[test]
+    fn flagged_permit_check_matches_the_full_check() -> R<()> {
+        let nodes = [
+            json!({}),
+            json!({ "restriction": {} }),
+            json!({ "restriction": { "gpu": "true" } }),
+            json!({ "namespaces": ["legion-*"] }),
+            json!({ "namespaces": [] }),
+            json!({ "namespaces": "payments" }),
+            json!({ "region": "east" }),
+        ];
+        let permits = [
+            json!({}),
+            json!({ "pool": "default" }),
+            json!({ "pool": "other" }),
+            json!({ "gpu": "true" }),
+            json!([{ "key": "gpu", "operator": "is_not_set" }]),
+        ];
+        for attrs in nodes {
+            let node = make_node(attrs.clone());
+            let flag = node_is_unrestricted(&node);
+            for permit in &permits {
+                for namespace in ["default", "payments", "legion-system"] {
+                    let set = PermitSet::new(permit, namespace)?;
+                    assert_eq!(
+                        set.is_permitted_flagged(&node, flag),
+                        set.is_permitted(&node),
+                        "node {attrs} permit {permit} namespace {namespace}"
+                    );
+                }
+            }
+        }
+        assert!(node_is_unrestricted(&make_node(
+            json!({ "region": "east" })
+        )));
+        assert!(!node_is_unrestricted(&make_node(
+            json!({ "namespaces": [] })
+        )));
         Ok(())
     }
 

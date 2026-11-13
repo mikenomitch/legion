@@ -23,6 +23,18 @@ every branch that compiled.
 worktrees or a pushed branch (`perf/lazy-memory-restore`). Their ideas are
 listed in `TODO.md` so they are not lost.
 
+*Follow-up, 2026-11-12: where the other branches went.* Most landed later
+on their own plans: `elastic-session-envelopes`, `edge-ratify-throughput`,
+`checkpoints-on-stream`, `chunked-checkpoints` (as
+`chunked-checkpoint-publish`), `multi-eval-plans`,
+`scheduler-lane-entry-cost`, `edge-admission-backpressure` (as
+`edge-admission-control`), and `lazy-memory-restore`, each with its own
+measured case in its plan. The rest (`sandbox-warm-pool`, `edge-prewarm`,
+`flat-commit-cost`, `web-fleet-throughput`) were never pushed, and their
+ideas are open where they belong in `TODO.md`: the pre-warm push and a
+memory-snapshot start for sessions (Task runtimes), the plan-commit cost,
+and the `web_fleet` regression (Scheduling). Nothing is left to stack.
+
 **Why (simplicity, then performance).** Mike asked for one PR without merge
 conflicts, and for judgement over volume: keep the scheduler streamlined.
 The bar was a gain measured on the rig, or a correctness or scale fix, worth
@@ -305,7 +317,39 @@ a change to how a guest gets its files, which touches checkpoints and both
 VMMs, and deserves its own plan rather than a rushed end to this one. The
 measurements, and what they ruled out, are in `RESULTS.md`.
 
-## 15. `auto` keeps preferring cloud-hypervisor, and every number is cloud-hypervisor's
+## 15. A large node spreads its clones over full copies of each base, by its CPU count
+
+*Follow-up, 2026-11-12.*
+
+**Call.** The root disk cache keeps one full copy of each base per 16
+vCPUs, from 1 to 8 (`base_copies`), and starts take them round robin. Copy
+`n` has its own key (the recipe gains `copy = n`), is a byte copy of copy 0
+made on a background thread the first time a start would have used it, and
+is budgeted and evicted like any base. A start never waits for one: until
+it lands, the start clones copy 0. Only a node whose clones are reflinks
+makes copies. There is no knob.
+
+**Alternatives.** (a) Write each sandbox's own files without touching the
+clone's shared extents: a small per-sandbox payload disk instead of the
+`debugfs` writes (entry 14's (b)). (b) A worker setting for the number of
+copies. (c) Copies made at fill time rather than on first use.
+
+**Trade-off.** Up to eight times a base's bytes on a large node, from the
+same derived budget, so other derived content is evicted sooner. The gain
+is not measured: the campaign's 96-vCPU node is the only place the ceiling
+showed, and it has not been re-run.
+
+**Why (performance, then simplicity).** The profile put the starts' wait in
+XFS buffer and inode locks that every clone of one base shares. Clones of
+different copies share no extents, so the contention divides by the number
+of copies, with no change to the guest, the VMMs, or checkpoints, which (a)
+touches all three. One copy per 16 vCPUs keeps every node under 32 vCPUs
+exactly as it was (they reach their CPU first), so (b) would be a setting
+almost nobody needs before it is measured. (c) puts the copies' disk and
+I/O on the first start of every image, where most images are never started
+fast enough to need them.
+
+## 16. `auto` keeps preferring cloud-hypervisor, and every number is cloud-hypervisor's
 
 **Call.** The campaign measured `hypervisor = "auto"`, which picks
 cloud-hypervisor on Linux with KVM, and left that default alone. The public
@@ -338,7 +382,7 @@ not fit the budget once the per-node ceiling run on metal was done. The
 measurement is open in `TODO.md`, and it decides whether (a) is worth
 revisiting.
 
-## 16. Guests are timed from the host, by their agent's vsock listener
+## 17. Guests are timed from the host, by their agent's vsock listener
 
 **Call.** The rig counts a guest up when a host connection to its vsock
 socket gets `OK` for `CONNECT 1100`, stamped on the host's clock.
@@ -355,7 +399,7 @@ baseline look like 1 s instead of 2.9 s. (b) measured the worker's log sink,
 which flushes late under load. The vsock probe is what a caller waiting to
 exec experiences.
 
-## 17. The session index's heartbeat costs O(stops), not O(sessions)
+## 18. The session index's heartbeat costs O(stops), not O(sessions)
 
 **Call.** `ingest` checks pending duplicate stops against the node's own
 map, instead of cloning every session id of the node into a set on every
@@ -369,7 +413,7 @@ heartbeat.
 index's write lock. Measured after the change, a heartbeat costs about 8 µs
 at a million sessions.
 
-## 18. The small guest kernel is documented, not shipped
+## 19. The small guest kernel is documented, not shipped
 
 **Call.** `docs/task-runtime-sandbox.md` ("A smaller guest kernel") lists the
 kernel options Legion's guests use, by what uses them, with an

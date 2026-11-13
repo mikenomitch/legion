@@ -10,7 +10,9 @@
 //! - `distinct` on a template-wide attribute hosts one replica;
 //! - a node-namespace-restricted template hosts only its namespaces;
 //! - upcoming nodes absorb work before any template is sized;
-//! - a job whose eval has not run is not demand yet.
+//! - a job whose eval has not run is not demand yet;
+//! - a gang blocked beside nodes with room for part of it asks for its whole
+//!   quorum, and the nodes the demand names let it place whole.
 
 use crate::support::temp_store;
 use legion::manager::daemon::resolve_claimed_eval;
@@ -308,5 +310,84 @@ async fn upcoming_nodes_absorb_work_and_unrun_evals_are_not_demand_test() -> R<(
         .await
         .expect_err("like_node must exist");
     assert_eq!(missing.code(), tonic::Code::NotFound);
+    Ok(())
+}
+
+/// A ready node with `memory` MiB and one 2400 MHz core.
+fn ready_node(id: &str, memory_mib: u64) -> legion::structs::Node {
+    legion::structs::Node {
+        id: id.to_string(),
+        pool: "default".into(),
+        status: "ready".into(),
+        availability: "available".into(),
+        last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
+        config_attrs: json!({ "node_id": id, "maxAllocations": 10, "resources": {} }),
+        fingerprint_attrs: json!({
+            "memory_total": (memory_mib * 1024 * 1024).to_string(),
+            "cpus": { "cpu-1": { "frequency": 2400.0 } }
+        }),
+        dynamic_attrs: json!({}),
+        health_checks: json!({}),
+    }
+}
+
+/// Phase 4 of the gang plan: a gang that is blocked though a node has room
+/// for two of its three members asks the autoscaler for its whole quorum
+/// (the room it could not use does not count, since nothing of the gang
+/// places short of it), and once the nodes the demand names join, the
+/// woken gang places whole.
+#[tokio::test]
+async fn a_blocked_gangs_shortfall_is_demand_for_its_whole_quorum_test() -> R<()> {
+    let store = temp_store("legion-capacity-demand-gang-")?;
+    store.insert_worker_type(&WorkerConfig {
+        name: "default".into(),
+        pool: "default".into(),
+        ..Default::default()
+    })?;
+    store.insert_node(legion::structs::NodeMsg::from(ready_node("n-1", 4096)))?;
+    let svc = ManagerDaemonService::new(store);
+    let mut trainer = task("trainer", 3, 500, 1500);
+    trainer["gang"] = json!(true);
+    run(&svc, "default", "trainer", trainer).await?;
+    settle(&svc.store)?;
+    assert!(
+        svc.store.allocs_for_node("n-1")?.is_empty(),
+        "two of three fit, and a gang holds nothing short of its quorum"
+    );
+    assert_eq!(svc.store.blocked_evals()?.len(), 1);
+
+    let reply = demand(&svc, vec![template("general", "default", 2400, 4096)]).await?;
+    let (_, pending_trainer) = pending(&reply, "trainer");
+    assert_eq!(
+        (
+            pending_trainer.pending,
+            pending_trainer.placed,
+            pending_trainer.gang_quorum
+        ),
+        (3, 0, Some(3)),
+        "{reply:#?}"
+    );
+    let general = group(&reply, "general");
+    assert_eq!(
+        (general.nodes, general.replicas),
+        (2, 3),
+        "two template nodes hold the whole quorum together: {general:#?}"
+    );
+
+    // What an autoscaler does with the answer: add the nodes it names.
+    for id in ["general-1", "general-2"] {
+        svc.store
+            .insert_node(legion::structs::NodeMsg::from(ready_node(id, 4096)))?;
+    }
+    svc.store.request_capacity_reconcile()?;
+    svc.store.wake_blocked_evals()?;
+    settle(&svc.store)?;
+    let placed: usize = ["n-1", "general-1", "general-2"]
+        .iter()
+        .map(|node| svc.store.allocs_for_node(node).map(|rows| rows.len()))
+        .sum::<R<usize>>()?;
+    assert_eq!(placed, 3, "the woken gang places whole");
+    assert!(svc.store.blocked_evals()?.is_empty());
     Ok(())
 }

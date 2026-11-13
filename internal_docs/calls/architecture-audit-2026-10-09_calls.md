@@ -214,6 +214,10 @@ minted key wraps none of the data keys, so (b) would hand back a useless key.
 
 ## 10. Capacity wakeups are one nodeless `node_join` eval (SC4)
 
+> **Revised 2026-11-12:** the remaining triggers (heartbeat recovery, and
+> frees outside the report handlers) now come from the blocked-eval wake
+> loop; see [correctness-gaps calls #2](correctness-gaps-2026-11-12_calls.md).
+
 **Call.** Worker registration and uncordon call
 `Store::request_capacity_reconcile`, which queues one `node_join` eval with no
 node unless one is already pending. It reconciles configs that are short of
@@ -251,6 +255,14 @@ allocation id, and its CPU and memory stay reserved until teardown.
 heartbeat-starving cases. Moving teardown needs a new "tearing down" state to
 keep the rule that starts wait behind stops, which is a bigger change. The rest
 is in TODO.md.
+
+*Follow-up, 2026-11-12: done.* The rest moved off the lock, with the
+`reaping` set as the "tearing down" state: teardowns and the stop signal run
+from the supervisor, and restarts, edge-boot starts, a `stage` claim's start
+at ratification, a start's directories, and a memory capture's write run
+with the lock released. The calls are in
+[task-start-critical-path-plan_calls.md](task-start-critical-path-plan_calls.md),
+entries 2, 6, and 10.
 
 ## 12. Worker self-fencing survives restarts through a boot fence (W6)
 
@@ -351,6 +363,10 @@ merging this with R4, a fenced manager skips the final sync, because the
 replica belongs to the new primary by then.
 
 ## 17. Fresh plans still count the replaced job's allocations as free (SC7, not changed)
+
+> **Superseded 2026-11-12:** the atomic swap shipped; the apply transaction
+> removes the replaced allocations after the walk binds. See
+> [correctness-gaps calls #1](correctness-gaps-2026-11-12_calls.md).
 
 **Call.** No change. Counting the old config's allocations as free during a
 Fresh plan is deliberate and documented in `plan_and_apply_internal`.

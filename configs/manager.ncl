@@ -192,8 +192,8 @@
     # score_sample = { min_nodes = 1024, sample = 128 },
     # Declarable scheduling indexes (docs/scheduling-indexes.md): ad-hoc
     # candidate generation for the scheduler. A built-in `fit` index
-    # (nearest-fit over free cpu/memory/disk within the task's pool) is
-    # always declared and arms itself once the fleet reaches
+    # (nearest-fit over free cpu/memory/disk within the task's pool, with
+    # nodes at their maxAllocations cap last) is always declared and arms itself once the fleet reaches
     # `index_min_nodes` available nodes (default 128); below that, planning
     # uses the plain scan and indexes cost nothing.
     # index_min_nodes = 128,      # 0 disables indexing entirely
@@ -203,6 +203,11 @@
     #   # else is an exact-match partition key (`pool` = the node's pool).
     #   topo = ["pool", "region", "zone"],
     #   gpu = ["pool", "region", "resources.gpu_vram", "resources.memory"],
+    #   # `devices.<name>` dims count free devices whose group the name
+    #   # matches (`gpu`, `nvidia/gpu`, `nvidia/gpu/<model>`).
+    #   gpus = ["pool", "devices.nvidia/gpu"],
+    #   # A plugin geometry from plugins/indexes/<kind>/; `options` go to it.
+    #   emptiest = { kind = "headroom", partition_by = ["pool"], options = { resource = "cpu" } },
     #   # Full form when the defaults need overriding.
     #   big_jobs = {
     #     partition_by = ["pool"],
@@ -351,9 +356,10 @@
   },
   # Heartbeat cadence and the lost-node window derived from it
   # (docs/heartbeat-cadence-and-scale.md). Omitting the whole block gives
-  # adaptive cadence at 2,500 beats/s: every fleet up to 2,500 nodes keeps
-  # the 2s floor and the historical 10s lost window (5 x 2s), and larger
-  # fleets back off along the ladder instead of flooding the leader.
+  # adaptive cadence: every fleet up to 10,000 nodes keeps the 2s liveness
+  # interval and the historical 10s lost window (5 x 2s), and past 2,500
+  # nodes the full heartbeat backs off along the ladder while workers prove
+  # liveness in between with a ping the manager answers from memory.
   heartbeat = {
     # Missed beats before a node is lost. The lost window is ALWAYS this
     # times THAT node's own interval, so a 2s pool and a 60s pool get
@@ -368,11 +374,17 @@
     # workers then keep their worker-type `heartbeatSeconds` at any size.
     adaptive = true,
 
-    # Aggregate heartbeat rate the served interval is sized for:
+    # Aggregate FULL-heartbeat rate the sync interval is sized for:
     # interval = ceil(headroom x nodes / rate), snapped to the ladder
     # [2, 3, 5, 8, 13, 21, 34, 55, 89, 120]s. Lower it on a smaller
     # control plane; measure yours with `legion node cadence`.
     targetRatePerSecond = 2500,
+
+    # Aggregate liveness-PING rate the liveness interval is sized for, the
+    # same way. Every node's lost window comes from the liveness interval,
+    # so this is the detection knob. Set it equal to targetRatePerSecond to
+    # turn pings off (every beat is then a full heartbeat).
+    pingRatePerSecond = 10000,
 
     # Floor and ceiling on a served interval. Past the ceiling the manager
     # stops backing off and warns instead: the answer is more control plane.

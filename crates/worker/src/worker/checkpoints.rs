@@ -55,7 +55,7 @@ use crate::prelude::*;
 use crate::structs::checkpoint::{SnapshotKind, SnapshotManifest, MANIFEST_API_VERSION};
 use crate::structs::{CheckpointRequest, SnapshotReport, SnapshotRestore, TaskAllocation};
 use crate::task_plugins::{AfterCheckpoint, CheckpointDir};
-use crate::worker::task_manager::WorkerTaskManager;
+use crate::worker::task_manager::{CaptureStart, WorkerTaskManager};
 
 /// Checkpoint bookkeeping, held inside [`WorkerTaskManager`].
 #[derive(Default)]
@@ -341,6 +341,41 @@ pub fn run_capture(
     report
 }
 
+/// The runtime's half of a capture, with the task-manager lock held only to
+/// take the instance out and to put it back: the memory write itself (seconds
+/// for a large guest) holds up no other start, stop, or heartbeat.
+fn begin_unlocked(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    allocation_id: i64,
+    snapshot_id: &str,
+    kind: SnapshotKind,
+    then: AfterCheckpoint,
+) -> R<CaptureContext> {
+    let start = manager.lock().expect("task manager").checkpoint_prepare(
+        allocation_id,
+        snapshot_id,
+        kind,
+        then,
+    )?;
+    let mut pending = match start {
+        CaptureStart::Ready(context) => return Ok(*context),
+        CaptureStart::Memory(pending) => pending,
+    };
+    let parts = pending.run();
+    let (context, cancelled) = manager
+        .lock()
+        .expect("task manager")
+        .checkpoint_put_back(*pending, parts);
+    if let Some(mut cancelled) = cancelled {
+        cancelled.destroy();
+        manager
+            .lock()
+            .expect("task manager")
+            .finish_cancelled_launch(cancelled.allocation_id(), cancelled.resource_assignment());
+    }
+    context
+}
+
 /// Capture one snapshot. Returns the manifest and how long the workload was
 /// paused (a live memory capture only; 0 otherwise).
 fn capture(
@@ -359,7 +394,8 @@ fn capture(
     // 1. The runtime's half, under the lock: pause and capture memory (a
     //    memory runtime), or nothing (a disk checkpoint). A live memory
     //    checkpoint stays paused across the volume half.
-    let context = manager.lock().expect("task manager").checkpoint_begin(
+    let context = begin_unlocked(
+        manager,
         request.allocation_id,
         &request.snapshot_id,
         kind,
@@ -475,7 +511,8 @@ pub(crate) fn capture_for_suspend_then(
     finish: impl FnOnce(&mut WorkerTaskManager, &CaptureContext, &SnapshotManifest) -> R<()>,
 ) -> R<SnapshotManifest> {
     let owner = PinOwner::snapshot(&request.snapshot_id);
-    let context = manager.lock().expect("task manager").checkpoint_begin(
+    let context = begin_unlocked(
+        manager,
         request.allocation_id,
         &request.snapshot_id,
         kind,

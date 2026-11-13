@@ -779,3 +779,189 @@ fn an_unplaced_replica_is_placed_when_a_batch_task_finishes() -> R<()> {
     assert!(drain_evals(&store)?.is_empty());
     Ok(())
 }
+
+/// The same when the room is a lost node that starts heartbeating again. It
+/// does not re-register, so nothing but its capacity event can retry the
+/// job (audit SC4).
+#[test]
+fn an_unplaced_replica_is_placed_when_a_lost_node_heartbeats_again() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    add_node(&store, "node-2")?;
+    store.mark_nodes_as_lost(&["node-2".to_string()])?;
+    // Settle what registration and the loss queued.
+    store.wake_blocked_evals()?;
+    drain_evals(&store)?;
+
+    submit(&store, &job_of("web", vec![service("web", 3, 3072)]))?;
+    drain_evals(&store)?;
+    assert_eq!(
+        allocations_of(&store, "web", "web")?.len(),
+        2,
+        "two fit on node-1; node-2 is lost"
+    );
+    // Nothing has changed yet: the wake pass queues no capacity pass.
+    store.wake_blocked_evals()?;
+    assert!(drain_evals(&store)?.is_empty());
+
+    store.update_node_heartbeat("node-2".to_string())?;
+    assert_eq!(store.get_node("node-2")?.availability, "available");
+    store.wake_blocked_evals()?;
+    let outcomes = drain_evals(&store)?;
+    assert!(
+        outcomes.iter().any(|(kind, _)| kind == "node_join"),
+        "the recovery queues a capacity pass: {outcomes:?}"
+    );
+    let allocations = allocations_of(&store, "web", "web")?;
+    assert_eq!(allocations.len(), 3);
+    assert!(allocations.iter().any(|a| a.node_id == "node-2"));
+    Ok(())
+}
+
+/// A cordon is a capacity event too, but it adds no room: no pass.
+#[test]
+fn a_cordon_queues_no_capacity_pass() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    add_node(&store, "node-2")?;
+    store.wake_blocked_evals()?;
+    drain_evals(&store)?;
+    submit(&store, &job_of("web", vec![service("web", 6, 3072)]))?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "web", "web")?.len(), 4);
+
+    store.set_node_availability("node-2", "drained")?;
+    store.wake_blocked_evals()?;
+    assert!(
+        drain_evals(&store)?
+            .iter()
+            .all(|(kind, _)| kind != "node_join"),
+        "a cordon adds no room"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A resubmit's plan replaces the running version in its own apply (audit
+// SC7). The planner counts the old version's allocations as free, so they
+// must leave in the same transaction as the new ones arrive: no committed
+// state, and no crash between two writes, may hold both on one node.
+// ---------------------------------------------------------------------------
+
+use legion::manager::scheduler::{PlanMode, Scheduler};
+
+fn resubmit(store: &Store, job: &JobConfig) -> R<String> {
+    store.handle_job_submit(job, &[primary_submission(&job.name)])?;
+    Ok(store.get_job_config(&job.name)?.id())
+}
+
+#[test]
+fn a_resubmit_plan_retires_the_old_version_in_its_own_apply() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    let v1 = submit(&store, &job_of("web", vec![service("web", 1, 5120)]))?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "web", "web")?.len(), 1);
+
+    // Over half the 8 GiB node each: the two versions cannot share it.
+    let v2 = resubmit(&store, &job_of("web", vec![service("web", 1, 6144)]))?;
+    assert_ne!(v1, v2);
+    // The plan alone, without the handler's follow-up removal.
+    let outcome = Scheduler::new(&store)?.plan_and_apply(&v2, PlanMode::Fresh)?;
+    assert_eq!(outcome.allocations.len(), 1);
+    let allocations = store.allocs_for_job("web")?;
+    assert_eq!(allocations.len(), 1, "{allocations:?}");
+    assert_eq!(allocations[0].job_config_id, v2);
+    assert!(
+        store.allocs_for_job_config(&v1)?.is_empty(),
+        "the replaced version left in the same apply"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_resubmit_through_its_eval_runs_one_version() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    submit(&store, &job_of("web", vec![service("web", 2, 3072)]))?;
+    drain_evals(&store)?;
+    let v2 = submit(&store, &job_of("web", vec![service("web", 2, 4096)]))?;
+    let outcomes = drain_evals(&store)?;
+    assert!(
+        outcomes.iter().all(|(_, result)| result.is_ok()),
+        "{outcomes:?}"
+    );
+    let allocations = store.allocs_for_job("web")?;
+    assert_eq!(allocations.len(), 2, "{allocations:?}");
+    assert!(allocations.iter().all(|a| a.job_config_id == v2));
+    Ok(())
+}
+
+/// A stateful slot the old version held rebinds to its replacement in the
+/// same apply: it never passes through `rescheduling` with nothing bound.
+#[test]
+fn a_resubmit_rebinds_a_stateful_slot_to_its_replacement() -> R<()> {
+    use legion::structs::job::StatefulConfig;
+    use legion::structs::{InstanceMode, InstanceState};
+    let stateful = |memory: u64| TaskConfig {
+        stateful: Some(StatefulConfig {
+            mode: InstanceMode::Slot,
+            require_id: false,
+            initial_instances: None,
+            on_lost: None,
+            storage: None,
+            envelope: None,
+            promote: None,
+            placement: None,
+            fence_after: None,
+            unknown_fields: Default::default(),
+        }),
+        ..service("db", 1, memory)
+    };
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    submit(&store, &job_of("db", vec![stateful(5120)]))?;
+    drain_evals(&store)?;
+    let instances = store.list_instances("db")?;
+    assert_eq!(instances.len(), 1);
+    let slot = instances[0].instance_id.clone();
+
+    let v2 = resubmit(&store, &job_of("db", vec![stateful(6144)]))?;
+    let outcome = Scheduler::new(&store)?.plan_and_apply(&v2, PlanMode::Fresh)?;
+    assert_eq!(outcome.allocations.len(), 1);
+    let replacement = &outcome.allocations[0];
+    assert_eq!(replacement.instance_id.as_deref(), Some(slot.as_str()));
+    let instance = store.get_instance(&slot)?.context("slot instance")?;
+    assert_eq!(instance.state, InstanceState::Active);
+    assert_eq!(instance.current_alloc_id, Some(replacement.id));
+    assert_eq!(store.allocs_for_job("db")?.len(), 1);
+    Ok(())
+}
+
+/// A plan that placed part of a job says what it left, as a warn-level
+/// `plan.unplaced` event naming each task and its reason.
+#[test]
+fn a_partial_plan_emits_a_plan_unplaced_event() -> R<()> {
+    let store = setup_store()?;
+    add_node(&store, "node-1")?;
+    submit(&store, &job_of("web", vec![service("web", 3, 3072)]))?;
+    drain_evals(&store)?;
+    assert_eq!(allocations_of(&store, "web", "web")?.len(), 2);
+
+    let events = store.list_scheduler_events(&legion::storage::events::SchedulerEventFilter {
+        kind: Some("plan.unplaced".into()),
+        job_id: Some("web".into()),
+        ..Default::default()
+    })?;
+    let event = events.last().context("a plan.unplaced event")?;
+    assert_eq!(event.level, "warn");
+    let metadata: serde_json::Value = serde_json::from_str(&event.metadata_json)?;
+    assert_eq!(metadata["unplaced"], 1);
+    assert_eq!(metadata["tasks"][0]["task"], "web");
+    let reason = store
+        .last_unplaced_reason("web", "web")?
+        .context("the reason is readable back")?;
+    assert_eq!(metadata["tasks"][0]["reason"], reason.as_str());
+    assert!(store.last_unplaced_reason("web", "other")?.is_none());
+    Ok(())
+}

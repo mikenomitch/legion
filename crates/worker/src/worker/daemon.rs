@@ -491,6 +491,15 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         });
     let sessions_config = parse_sessions_payload(&config.artifacts);
+    // The spot interruption watcher, when this worker type asks for one
+    // (docs/spot-interruption.md).
+    if let Some(spot) =
+        serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(&config.artifacts)
+            .ok()
+            .and_then(|payload| payload.spot_interruption)
+    {
+        crate::worker::interruption::spawn_watcher(spot);
+    }
     // Device plugins, static devices, and CDI dirs (docs/devices.md).
     let device_manager = Arc::new(crate::devices::plugin::DeviceManager::new(
         parse_devices_payload(&config.artifacts),
@@ -1157,11 +1166,16 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             node_identity: Some(node_identity.clone()),
             netd: Some(netd.clone()),
         });
+        // Health transitions go to the manager on the stream as they
+        // happen, not on the next heartbeat.
+        let (report_tx, report_rx) = crate::worker::work_stream::report_channel();
+        lock_manager(&task_manager).set_health_reports(report_tx);
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
             move |request| credentials.attach(request),
             name.clone(),
             WORK_MIRROR.clone(),
+            report_rx,
             move |applied| launch_streamed_work(&launcher, applied),
         ));
     }
@@ -1513,10 +1527,10 @@ async fn stop_worker_daemon(
         let counts = crate::worker::task_manager::session_sleep::checkpoint_sessions_on_stop(
             &manager, deadline,
         );
-        manager
-            .lock()
-            .expect("task manager")
-            .sync_session_log(Duration::from_secs(5));
+        let guard = manager.lock().expect("task manager");
+        guard.sync_session_log(Duration::from_secs(5));
+        guard.sync_state_file(Duration::from_secs(5));
+        drop(guard);
         counts
     });
     match tokio::time::timeout(timeout + Duration::from_secs(10), checkpointed).await {
@@ -2422,6 +2436,53 @@ pub(crate) fn adopt_served_interval(
     (target != current).then_some(target)
 }
 
+/// The intervals a manager served on a heartbeat or ping reply.
+///
+/// `liveness` is how often to prove the node is alive (a ping or a full
+/// heartbeat), and the node's lost window derives from it; `sync` is how
+/// often to send a FULL heartbeat. Both absent with adaptive cadence off,
+/// which means "beat at your worker-type interval, every beat a full
+/// heartbeat" (docs/heartbeat-cadence-and-scale.md, "Pings and heartbeats").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServedIntervals {
+    pub liveness: Option<u32>,
+    pub sync: Option<u32>,
+}
+
+/// The full-heartbeat interval to keep, given the liveness interval in force
+/// and what the manager served.
+///
+/// Never shorter than `liveness`: a full heartbeat is a beat too, so the
+/// worker never wants one more often than it beats. A reply with no sync
+/// interval (adaptive cadence off, or an older manager) means "every beat is
+/// a full heartbeat", which is the behavior from before pings existed.
+pub(crate) fn sync_interval_for(liveness: Duration, served_sync: Option<u32>) -> Duration {
+    match served_sync {
+        Some(seconds) => liveness.max(Duration::from_secs(
+            u64::from(seconds).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)),
+        )),
+        None => liveness,
+    }
+}
+
+/// Whether the next beat must be a full heartbeat rather than a ping.
+///
+/// Due once the time since the last full heartbeat reaches the sync interval
+/// less half a liveness tick, so the full heartbeat lands on the liveness
+/// tick nearest its due time instead of one tick late. With the two
+/// intervals equal this is every tick, so a worker served no separate sync
+/// interval never pings.
+pub(crate) fn full_heartbeat_due(
+    since_full: Option<Duration>,
+    liveness: Duration,
+    sync: Duration,
+) -> bool {
+    match since_full {
+        None => true,
+        Some(elapsed) => elapsed + liveness / 2 >= sync,
+    }
+}
+
 /// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
 /// does not stay phase-locked forever — 10k workers heartbeating in the
 /// same instant is a self-inflicted thundering herd (heartbeat-scale plan
@@ -2476,29 +2537,49 @@ async fn start_heartbeats(
         .state_store()
         .clone();
     let configured_interval = heartbeat_interval;
+    // How often a FULL heartbeat goes out. Starts equal to the liveness
+    // interval (every beat a full heartbeat, no pings) until a manager serves
+    // a slower one (docs/heartbeat-cadence-and-scale.md, "Pings and
+    // heartbeats").
+    let mut sync_interval = heartbeat_interval;
+    // When the last full heartbeat succeeded; `None` makes the next beat a
+    // full one (startup, and after an early wake or a `sync_now`).
+    let mut last_full: Option<std::time::Instant> = None;
 
     loop {
         let tick_started = std::time::Instant::now();
-        // Stops on this tick drain for one interval of the cadence the node
-        // is actually on — how long every other node needs to learn an
-        // endpoint is gone (docs/graceful-stop.md).
-        task_manager
-            .lock()
-            .expect("task manager")
-            .set_drain_window(heartbeat_interval);
-        let tick_result = heartbeat_tick(
-            &name,
-            &manager_addr,
-            &node_identity,
-            &client,
-            &task_manager,
-            &identity_manager,
-            &credentials,
-            &netd,
-            spec_cache.as_ref(),
-            managers.as_ref(),
-        )
-        .await;
+        let full = full_heartbeat_due(
+            last_full.map(|at| at.elapsed()),
+            heartbeat_interval,
+            sync_interval,
+        );
+        let tick_result = if full {
+            // Stops on this tick drain for one interval of the cadence other
+            // nodes refresh their endpoints on — how long every other node
+            // needs to learn an endpoint is gone (docs/graceful-stop.md). The
+            // endpoint feed rides the full heartbeat, so that is the sync
+            // interval, not the liveness one.
+            task_manager
+                .lock()
+                .expect("task manager")
+                .set_drain_window(sync_interval);
+            heartbeat_tick(
+                &name,
+                &manager_addr,
+                &node_identity,
+                &client,
+                &task_manager,
+                &identity_manager,
+                &credentials,
+                &netd,
+                spec_cache.as_ref(),
+                managers.as_ref(),
+            )
+            .await
+            .map(|served| (served, false))
+        } else {
+            ping_tick(&name, &client, &credentials).await
+        };
         // Failover bookkeeping: a manager that answered (with anything) is
         // reachable; consecutive transport failures move the worker to the
         // next known manager, and the retry below goes there.
@@ -2513,10 +2594,7 @@ async fn start_heartbeats(
             }
         }
         let worker_metrics = crate::telemetry::worker_metrics();
-        worker_metrics
-            .heartbeat_duration_seconds
-            .observe(tick_started.elapsed().as_secs_f64());
-        worker_metrics.heartbeats_total.inc(&[match &tick_result {
+        let outcome = match &tick_result {
             Ok(_) => "ok",
             Err(err)
                 if err
@@ -2526,32 +2604,61 @@ async fn start_heartbeats(
                 "unauthenticated"
             }
             Err(_) => "error",
-        }]);
+        };
+        if full {
+            worker_metrics
+                .heartbeat_duration_seconds
+                .observe(tick_started.elapsed().as_secs_f64());
+            worker_metrics.heartbeats_total.inc(&[outcome]);
+        } else {
+            worker_metrics.pings_total.inc(&[outcome]);
+        }
         match tick_result {
-            Ok(served) => {
+            Ok((served, sync_now)) => {
+                // A ping proves to the manager that this node is alive just
+                // as a full heartbeat does, so either one resets the
+                // self-fence clock.
                 *last_successful_heartbeat
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
                 record_manager_contact(&contact_store);
                 backoff = HEARTBEAT_RETRY_MIN;
+                if full {
+                    last_full = Some(tick_started);
+                }
+                // A ping that brought the node back from lost: report the
+                // node's state now rather than one sync interval later.
+                if sync_now {
+                    info!(worker = %name, "Manager marked this node lost; sending a full heartbeat now");
+                    last_full = None;
+                }
+                let next_liveness =
+                    adopt_served_interval(heartbeat_interval, configured_interval, served.liveness);
+                sync_interval =
+                    sync_interval_for(next_liveness.unwrap_or(heartbeat_interval), served.sync);
                 // Adopt a manager-served interval, once, with a full-width
                 // re-phase so a fleet that all learns the new value within one
                 // old interval spreads across the new period instead of
                 // re-phasing onto the same boundary.
-                match adopt_served_interval(heartbeat_interval, configured_interval, served) {
+                let woken = match next_liveness {
                     Some(next) => {
                         info!(
                             worker = %name,
                             from_seconds = heartbeat_interval.as_secs(),
                             to_seconds = next.as_secs(),
-                            "Manager served a new heartbeat interval; re-phasing once"
+                            sync_seconds = sync_interval.as_secs(),
+                            "Manager served a new liveness interval; re-phasing once"
                         );
                         heartbeat_interval = next;
-                        sleep_or_work(rephase_sleep(next)).await;
+                        sleep_or_work(rephase_sleep(next)).await
                     }
-                    None => {
-                        sleep_or_work(jittered_heartbeat_interval(heartbeat_interval)).await;
-                    }
+                    None if sync_now => false,
+                    None => sleep_or_work(jittered_heartbeat_interval(heartbeat_interval)).await,
+                };
+                // Work the manager is waiting on goes out on a full
+                // heartbeat now, not on the next sync tick.
+                if woken {
+                    last_full = None;
                 }
             }
             // The node token can be revoked (for example ACLs were just
@@ -2564,7 +2671,11 @@ async fn start_heartbeats(
                     .downcast_ref::<tonic::Status>()
                     .is_some_and(|status| status.code() == tonic::Code::Unauthenticated) =>
             {
-                warn!(worker = %name, "Heartbeat rejected as unauthenticated; re-registering");
+                warn!(
+                    worker = %name,
+                    kind = if full { "heartbeat" } else { "ping" },
+                    "Heartbeat rejected as unauthenticated; re-registering"
+                );
                 credentials.clear_node_token();
                 match register_self(client.clone(), &registration, &credentials).await {
                     Ok(reported) => {
@@ -2582,6 +2693,7 @@ async fn start_heartbeats(
             Err(err) => {
                 warn!(
                     worker = %name,
+                    kind = if full { "heartbeat" } else { "ping" },
                     error = ?err,
                     retry_in_ms = backoff.as_millis() as u64,
                     "Heartbeat failed; retrying (self-fence clock running)"
@@ -2605,6 +2717,29 @@ fn failure_report(
     }
 }
 
+/// Run blocking work from async code: on a multi-threaded runtime the
+/// worker thread hands its other tasks to another thread first
+/// (`block_in_place`), so a wait for the task-manager lock, or the work done
+/// under it, never stalls the heartbeat, the work stream, or an RPC behind
+/// it. A current-thread runtime (tests) runs it directly.
+pub(crate) fn in_place<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
+/// Take the task-manager lock from async code without blocking a runtime
+/// worker while another thread holds it (see [`in_place`]). The task
+/// manager's lock is a std mutex because its holders are mostly blocking
+/// threads (launches, staging, reaps); `heartbeat_tick` takes it about ten
+/// times a beat.
+pub(crate) fn lock_manager(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+) -> std::sync::MutexGuard<'_, WorkerTaskManager> {
+    in_place(|| task_manager.lock().expect("task manager"))
+}
+
 /// One heartbeat round-trip: report running/failed allocations, then
 /// reconcile against the manager's desired set.
 // Same reason as `start_heartbeats`: each per-heartbeat subsystem is threaded
@@ -2621,11 +2756,11 @@ pub async fn heartbeat_tick(
     netd: &Arc<Netd>,
     spec_cache: Option<&crate::worker::edge::SpecCache>,
     managers: Option<&Arc<crate::worker::managers::ManagerEndpoints>>,
-) -> R<Option<u32>> {
+) -> R<ServedIntervals> {
     let mut client_clone = client.clone();
-    // The cadence the manager wants, when it dictates one. `None` (the
-    // default, and every pre-adaptive manager) means "keep your worker-type
-    // interval".
+    // The cadence the manager wants, when it dictates one. `None` (adaptive
+    // cadence off, and every pre-adaptive manager) means "keep your
+    // worker-type interval".
     let served_interval;
 
     {
@@ -2638,7 +2773,7 @@ pub async fn heartbeat_tick(
             volume_reports,
             snapshot_reports,
         ) = {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = lock_manager(task_manager);
             let failures = manager
                 .drain_failures()
                 .into_iter()
@@ -2720,7 +2855,7 @@ pub async fn heartbeat_tick(
                 // the idle policy only (docs/session-mode.md#idle-sessions):
                 // their entries come back out before the report is sent.
                 let (targets, park_held) = {
-                    let manager = task_manager.lock().expect("task manager");
+                    let manager = lock_manager(task_manager);
                     let mut targets = manager.usage_targets();
                     targets.extend(manager.session_idle_targets());
                     (targets, manager.park_held())
@@ -2805,7 +2940,7 @@ pub async fn heartbeat_tick(
         // task that looks fine and cannot reach anything.
         // A capture that recovers puts the allocation's own health back.
         {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = lock_manager(task_manager);
             for status in &net_status {
                 if status.mode != crate::structs::netpolicy::MODE_GATED
                     || !manager.has_allocation(status.allocation_id)
@@ -2825,7 +2960,7 @@ pub async fn heartbeat_tick(
         // arrives, so a failed heartbeat needs no restore: the next diff
         // carries the same change.
         let content_report = {
-            let store = task_manager.lock().expect("task manager").content_store();
+            let store = lock_manager(task_manager).content_store();
             match crate::worker::content_report::advertised_set(store.as_deref()) {
                 Ok(current) => {
                     let mut pending = {
@@ -2894,17 +3029,27 @@ pub async fn heartbeat_tick(
         };
         // Starts refused for a disabled runtime since the last acknowledged
         // beat (docs/runtime-disable.md); put back if this one is lost.
-        let runtime_gate = task_manager.lock().expect("task manager").runtime_gate();
+        let runtime_gate = lock_manager(task_manager).runtime_gate();
         let runtime_refusals = runtime_gate.take_refusals();
         let runtime_refusals_for_redrive = runtime_refusals.clone();
         // One aggregate per isolate task, polled from the hosts now
         // (docs/task-runtime-isolate.md, "Observing").
-        let isolates = task_manager.lock().expect("task manager").isolates();
+        let isolates = lock_manager(task_manager).isolates();
         let (isolate_tasks, isolate_hosts) = match isolates {
             Some(isolates) => isolates.stats("", "").await,
             None => (Vec::new(), Vec::new()),
         };
+        // Gang members restarted in place since the last beat
+        // (docs/gang-scheduling.md, "Local restarts"); put back if this beat
+        // is lost.
+        let gang_restarts = task_manager
+            .lock()
+            .expect("task manager")
+            .drain_gang_restarts();
+        let gang_restarts_for_redrive = gang_restarts.clone();
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            gang_restarts,
+            interruption: crate::worker::interruption::current_notice(),
             runtime_refusals,
             isolate_tasks,
             isolate_hosts,
@@ -2951,7 +3096,7 @@ pub async fn heartbeat_tick(
                 // Drained failure reports must not be lost to a dead
                 // connection: put them back so the next successful
                 // heartbeat still tells the manager about them.
-                let mut manager = task_manager.lock().expect("task manager");
+                let mut manager = lock_manager(task_manager);
                 manager.requeue_failures(failures_for_redrive.into_iter().map(failure_report));
                 // Same for terminal outcomes: a batch task's completion lost
                 // to a dead connection would leave the job "running" forever.
@@ -2963,6 +3108,7 @@ pub async fn heartbeat_tick(
                 // Same for checkpoint outcomes; the manager would re-send the
                 // request anyway, but a capture should not wait a heartbeat.
                 manager.requeue_snapshot_reports(snapshot_reports_for_redrive);
+                manager.requeue_gang_restarts(gang_restarts_for_redrive);
                 // And the direct exec audit, so a dead connection loses no
                 // record of who opened a shell.
                 crate::worker::direct_exec::restore_audit(exec_audit);
@@ -2982,13 +3128,16 @@ pub async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let mut reply = response.into_inner();
-        served_interval = reply.next_interval_seconds;
+        served_interval = ServedIntervals {
+            liveness: reply.next_interval_seconds,
+            sync: reply.sync_interval_seconds,
+        };
         // Terminal reports the manager answered but could not record go out
         // again next beat: a batch task's dependents wait on them. So do
         // failure reports: nothing replaces a failed allocation until one is
         // recorded.
         {
-            let mut manager = task_manager.lock().expect("task manager");
+            let mut manager = lock_manager(task_manager);
             manager.requeue_unrecorded_terminations(
                 terminations_for_redrive,
                 &reply.retry_terminated_allocations,
@@ -3069,7 +3218,7 @@ pub async fn heartbeat_tick(
             .acknowledge(session_report, reply.session_resync);
         // The later copy of a session id another node also runs.
         if !reply.stop_sessions.is_empty() {
-            task_manager.lock().expect("task manager").stop_sessions(
+            lock_manager(task_manager).stop_sessions(
                 &reply.stop_sessions,
                 "duplicate of a session on another node",
             );
@@ -3148,7 +3297,7 @@ pub async fn heartbeat_tick(
         // nobody's, and restore never learned about them.
         if netd.orphan_sweep_pending() {
             let held: std::collections::HashSet<i64> = {
-                let manager = task_manager.lock().expect("task manager");
+                let manager = lock_manager(task_manager);
                 manager
                     .allocations_snapshot()
                     .into_iter()
@@ -3202,7 +3351,7 @@ pub async fn heartbeat_tick(
             // send (a worker that cannot heartbeat self-fences its stateful
             // allocations — one stuck volume must not become an outage).
             // spawn_blocking because drivers shell out (umount, rm -rf).
-            let volumes = task_manager.lock().expect("task manager").volumes_handle();
+            let volumes = lock_manager(task_manager).volumes_handle();
             tokio::task::spawn_blocking(move || {
                 volumes.destroy_requested(&requests);
             });
@@ -3214,7 +3363,7 @@ pub async fn heartbeat_tick(
         // the manager still attaches the restore payload.
         {
             let fresh = {
-                let mut manager = task_manager.lock().expect("task manager");
+                let mut manager = lock_manager(task_manager);
                 // The manager applied (or ignored) the reports this beat
                 // carried before it built the reply, so finished work this
                 // reply leaves out can be forgotten now.
@@ -3294,7 +3443,7 @@ pub async fn heartbeat_tick(
                     // The task must not start without its identities;
                     // report the failure so the manager can reschedule.
                     failed_prepare.push(allocation.allocation_id);
-                    task_manager.lock().expect("task manager").record_failure(
+                    lock_manager(task_manager).record_failure(
                         allocation.allocation_id,
                         format!("Failed to deliver workload identities: {err}"),
                     );
@@ -3337,12 +3486,15 @@ pub async fn heartbeat_tick(
 
         // Gated namespaces already exist (created above, ahead of the
         // datapath listeners bound inside them).
-        let new_allocations = {
-            let mut manager = task_manager.lock().expect("task manager");
+        // The reconcile stops what the node no longer runs (signals, stop
+        // notices, a runtime's own stop), so it runs as blocking work, not on
+        // a runtime worker every other task on the node shares.
+        let new_allocations = in_place(|| {
+            let mut manager = lock_manager(task_manager);
             manager.set_stop_causes(stop_causes);
             manager.set_stop_preemptors(stop_preemptors);
             manager.reconcile_allocations(&desired)
-        };
+        });
         if !new_allocations.is_empty() {
             // Refresh loops are keyed by allocation id and start slightly
             // before the task process registers (the launch below is
@@ -3372,6 +3524,11 @@ pub async fn heartbeat_tick(
             });
         }
 
+        // A gang whose view changed (a scale, a new rank 0, an in-place
+        // restart) restarts its members on this node in place, with the new
+        // `LEGION_GANG_*` values (docs/gang-scheduling.md).
+        apply_gang_views(task_manager, &reply.gang_members);
+
         // Refresh loops must never outlive their allocation — but treat
         // allocations launched this tick as live even if their async launch
         // hasn't registered them in the snapshot yet.
@@ -3384,6 +3541,69 @@ pub async fn heartbeat_tick(
     }
 
     Ok(served_interval)
+}
+
+/// One liveness ping: prove the node is alive and learn the served intervals,
+/// nothing else (`Manager.Ping`, docs/heartbeat-cadence-and-scale.md, "Pings
+/// and heartbeats"). Returns the intervals and whether the manager wants a
+/// full heartbeat now (`sync_now`: this ping brought the node back from lost).
+pub async fn ping_tick(
+    name: &str,
+    client: &ManagerClient<Channel>,
+    credentials: &Arc<WorkerCredentials>,
+) -> R<(ServedIntervals, bool)> {
+    let request = credentials.attach(tonic::Request::new(crate::structs::PingRequest {
+        node_id: name.to_string(),
+    }));
+    let reply = client.clone().ping(request).await?.into_inner();
+    debug!(worker = %name, "Ping acknowledged by manager");
+    Ok((
+        ServedIntervals {
+            liveness: reply.next_interval_seconds,
+            sync: reply.sync_interval_seconds,
+        },
+        reply.sync_now,
+    ))
+}
+
+/// Restart in place every gang member on this node whose gang moved to a
+/// newer epoch (`HeartbeatReply.gang_members`), with its `LEGION_GANG_*`
+/// variables rewritten first. Each restart runs off the heartbeat, like a
+/// live file's `changeMode = "restart"`.
+fn apply_gang_views(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    views: &[crate::structs::GangMemberView],
+) {
+    if views.is_empty() {
+        return;
+    }
+    let restarts: Vec<(i64, u64)> = {
+        let mut manager = task_manager.lock().expect("task manager");
+        views
+            .iter()
+            .filter_map(|view| {
+                manager
+                    .apply_gang_view(view)
+                    .map(|local| (local, view.epoch))
+            })
+            .collect()
+    };
+    for (local, epoch) in restarts {
+        let task_manager = task_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            info!(
+                allocation_id = local,
+                epoch, "Gang view changed; restarting the member in place"
+            );
+            if let Err(err) = task_manager
+                .lock()
+                .expect("task manager")
+                .restart_allocation(local)
+            {
+                warn!(allocation_id = local, error = ?err, "Gang in-place restart failed");
+            }
+        });
+    }
 }
 
 /// Rewrite the `onChange = "update"` KV files of running allocations
@@ -3935,12 +4155,17 @@ fn launch_streamed_work(
             continue;
         }
         let launcher = launcher.clone();
+        let policy = applied
+            .net_policies
+            .iter()
+            .find(|policy| policy.allocation_id == allocation.allocation_id)
+            .cloned();
         tokio::spawn(async move {
             let allocation_id = allocation.allocation_id;
             // `accept_work`, not the `post_work` handler: the stream is
             // already authenticated, and an in-process request carries no
             // manager certificate for the worker-plane check to accept.
-            if let Err(status) = launcher.accept_work(allocation).await {
+            if let Err(status) = launcher.accept_work_with_policy(allocation, policy).await {
                 // Recorded as the allocation's failure by the launch path;
                 // the heartbeat reports it.
                 debug!(allocation_id, error = %status.message(), "Streamed allocation did not start");
@@ -3950,10 +4175,12 @@ fn launch_streamed_work(
 }
 
 /// Sleep for `duration`, or until a work-stream message wakes the loop.
-async fn sleep_or_work(duration: Duration) {
+/// Sleep for `duration`, or until something wakes the heartbeat early.
+/// Returns true when it was woken.
+async fn sleep_or_work(duration: Duration) -> bool {
     tokio::select! {
-        _ = tokio::time::sleep(duration) => {}
-        _ = HEARTBEAT_WAKE.notified() => {}
+        _ = tokio::time::sleep(duration) => false,
+        _ = HEARTBEAT_WAKE.notified() => true,
     }
 }
 
@@ -4686,5 +4913,52 @@ mod tests {
             adopt_served_interval(secs(2), secs(2), Some(10_000)),
             Some(secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS)))
         );
+    }
+
+    #[test]
+    fn sync_interval_is_never_faster_than_the_liveness_interval_test() {
+        let secs = Duration::from_secs;
+        // A served sync interval slower than the beat: full heartbeats back
+        // off, pings fill in.
+        assert_eq!(sync_interval_for(secs(2), Some(21)), secs(21));
+        // A batch pool beating every 60s never sends a full heartbeat more
+        // often than it beats.
+        assert_eq!(sync_interval_for(secs(60), Some(21)), secs(60));
+        // No sync interval served: every beat is a full heartbeat.
+        assert_eq!(sync_interval_for(secs(2), None), secs(2));
+        assert_eq!(
+            sync_interval_for(secs(2), Some(10_000)),
+            secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS))
+        );
+    }
+
+    #[test]
+    fn a_full_heartbeat_lands_on_the_tick_nearest_its_due_time_test() {
+        let secs = Duration::from_secs;
+        // The first beat, and the one after a wake or `sync_now`, is full.
+        assert!(full_heartbeat_due(None, secs(2), secs(21)));
+        // Equal intervals: every tick is a full heartbeat, so no pings.
+        assert!(full_heartbeat_due(
+            Some(Duration::from_millis(1_800)),
+            secs(2),
+            secs(2)
+        ));
+        // 2s beats against a 21s sync: pings until ~20s, then a full one.
+        assert!(!full_heartbeat_due(Some(secs(2)), secs(2), secs(21)));
+        assert!(!full_heartbeat_due(Some(secs(19)), secs(2), secs(21)));
+        assert!(full_heartbeat_due(Some(secs(20)), secs(2), secs(21)));
+        // Count the ticks over a minute of steady 2s beats at a 21s sync:
+        // one full heartbeat about every ten beats, pings in between.
+        let (mut since, mut full, mut pings) = (None, 0, 0);
+        for _ in 0..30 {
+            if full_heartbeat_due(since, secs(2), secs(21)) {
+                full += 1;
+                since = Some(secs(2));
+            } else {
+                pings += 1;
+                since = since.map(|elapsed| elapsed + secs(2));
+            }
+        }
+        assert_eq!((full, pings), (3, 27));
     }
 }

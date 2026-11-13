@@ -147,9 +147,33 @@ neighbor rules a cause in or out, and which knob to turn), see
   with load means contention is being absorbed instead of rejected. Read it
   next to `legion_plan_apply_total{outcome="rejected"}`. The healthy shape is
   `revalidated` climbing while `rejected` stays flat.
+- **`legion_scheduler_plan_node_rows_total{source}`** (counter): node rows
+  the apply walk read inside the plan's transaction, by where the node it
+  then used came from. The row is always read (it is the apply-time fence
+  against cordons and capacity changes). `read_model` means its bytes were
+  exactly what the read model's node serializes to, so the walk used that
+  node without parsing the row; `parsed` means they differed (a cordon or
+  re-registration whose projection had not landed yet, or a row written in
+  another JSON form) and the row was parsed. A steady `parsed` share on a
+  quiet cluster means rows and read model disagree in form, and every
+  apply is paying the parse.
+- **`legion_scheduler_keyed_binds_total{query}`** (counter): keyed
+  placements bound to an instance, by the query that found it. `target` is
+  a ratification's named instance (a point lookup); `unbound` searched only
+  live instances with no current allocation (cost follows the instances
+  waiting for a placement); `live` searched every live instance of the
+  task, because `unbound` found none (a rollout rebinding instances bound
+  under an older config). A steady `live` rate outside rollouts means binds
+  are paying for the whole live population.
 - **`legion_eval_conflict_requeues_total`** (counter): evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
+- **`legion_eval_handler_timeouts_total{kind}`** (counter): eval handlers
+  that ran past the eval loop's five-minute handler deadline. The worker
+  stopped waiting, requeued the eval with a five-minute delay, and moved on
+  to the rest of its batch. The stuck handler's thread is not stopped. Any
+  nonzero value is a stuck handler worth reporting, with the `kind` it names
+  (see [Handler deadline](scheduler-and-eval-loop.md#handler-deadline)).
 - **`legion_evals_blocked{key_kind}`** (gauge): evals waiting blocked on
   capacity, by the kind of key they wait under: `class`, `node`,
   `escaped`, or `runtime` (the task's runtime is
@@ -166,11 +190,21 @@ neighbor rules a cause in or out, and which knob to turn), see
 - **`legion_gang_outcomes_total{outcome}`** (counter): what happened to
   gangs that lost a member or waited too long: `replace` (the member was
   replaced alone, or the survivors kept running for a `replace` top-up),
-  `restart` (the survivors stopped so the whole gang re-places), `fail` (the
+  `restart` (the survivors stopped so the whole gang re-places),
+  `restartInPlace` (the survivors restart on their nodes under a new gang
+  epoch), `fail` (the
   job failed: `onMemberLoss = "fail"` or the move budget ran out), and
   `timeout` (the gang did not reach its quorum within `placementTimeout`).
   A rising `restart` rate is a gang whose members keep dying; see
   [When a member is lost](gang-scheduling.md#when-a-member-is-lost).
+- **`legion_gang_reservations`** (gauge): gangs holding a capacity
+  [reservation](gang-scheduling.md#reservations) because they waited past
+  `schedulerSettings.gangReservation.after`. Set by the scheduler-lane
+  leader's gang sweep; 0 on other managers.
+- **`legion_gang_wakes_skipped_total`** (counter): capacity events that would
+  have woken a blocked gang but did not, because the nodes that could take it
+  still hold fewer members than its quorum needs. Each is a re-plan the gang
+  did not pay for.
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a
@@ -354,6 +388,12 @@ instrument.
   manager. Refreshed on the same tick.
 - **`legion_heartbeats_total`** (counter): worker heartbeat RPCs accepted
   (past authentication) by the manager.
+- **`legion_pings_total`** (counter): worker liveness pings accepted by the
+  manager. Workers ping between full heartbeats once the full heartbeat backs
+  off past the liveness interval, so this stays at zero on a fleet small
+  enough that every beat is a full heartbeat (under 2,500 nodes at the
+  defaults). See
+  [Pings and heartbeats](heartbeat-cadence-and-scale.md#pings-and-heartbeats).
 - **`legion_nodes_marked_lost_total`** (counter): nodes marked lost after
   missed heartbeats. This tells you nodes went away, while
   `legion_nodes{status="lost"}` tells you nodes are currently away.
@@ -629,19 +669,30 @@ Reported on the status-lane leader (the manager that owns node liveness), and
 [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md).
 
 - **`legion_heartbeat_freshness_ratio`** (gauge): alert on this one. It is the
-  fraction of active nodes that checked in within one interval. `1.0` means
-  the fleet is keeping up. False node loss begins at
-  `served_interval / lost_window`, which is `0.20` at the defaults. Reads
-  `0` on a fleet under 20 nodes, where the ratio is noise. Check
-  `legion_heartbeat_sustainable_nodes` to see whether it is measurable at all.
-- **`legion_heartbeat_served_interval_seconds`** (gauge): the interval this
-  manager is telling workers to use. Adaptive cadence is on by default, so
-  this grows with fleet size: 2 up to 2,500 nodes, 21 at 20,000 at the
-  default `targetRatePerSecond`. With `heartbeat.adaptive = false` it reads
-  `minInterval`, the interval freshness is measured against. Record it with
-  every benchmark result.
+  fraction of active nodes that checked in (with a ping or a full heartbeat)
+  within 1.2x their own liveness interval. `1.0` means the fleet is keeping
+  up. False node loss begins at `served_interval / lost_window`, which is
+  `0.20` at the defaults. Reads `0` on a fleet under 20 nodes, where the
+  ratio is noise. Check `legion_heartbeat_sustainable_nodes` to see whether
+  it is measurable at all.
+- **`legion_heartbeat_pool_freshness_ratio{pool}`** (gauge): the same ratio
+  for one node pool. A fleet-wide ratio blends pools, so a small pool falling
+  behind can hide inside a large one keeping up; alert on the minimum over
+  pools as well. Only pools with 20 or more active nodes have a series, and a
+  pool's series disappears when it drops under that.
+- **`legion_heartbeat_served_interval_seconds`** (gauge): the liveness
+  interval this manager is telling workers to use: how often each proves it
+  is alive. Every lost window derives from it. Adaptive cadence is on by
+  default, so this grows with fleet size, but slowly: 2 up to 10,000 nodes,
+  5 at 20,000, at the default `pingRatePerSecond`. With
+  `heartbeat.adaptive = false` it reads `minInterval`. Record it with every
+  benchmark result.
+- **`legion_heartbeat_sync_interval_seconds`** (gauge): the full-heartbeat
+  interval. 2 up to 2,500 nodes, 21 at 20,000, at the default
+  `targetRatePerSecond`. Workers ping between full heartbeats whenever this
+  is above the liveness interval. Reads `0` with adaptive cadence off.
 - **`legion_heartbeat_lost_window_seconds`** (gauge): the window derived
-  from it (`missedBeatsBeforeLost x interval`).
+  from the liveness interval (`missedBeatsBeforeLost x interval`).
 - **`legion_heartbeat_sustainable_nodes`** (gauge): nodes this control plane
   is observed to sustain at the current interval. While the fleet is keeping
   up, this is a lower bound. An unsaturated control plane never reveals its
@@ -1011,6 +1062,10 @@ of worker readiness. Default: disabled.
   A rising `error` rate is the worker-side view of manager unreachability.
   `unauthenticated` means the node credential was revoked or rotated and the
   worker is re-registering.
+- **`legion_worker_pings_total{outcome}`** (counter): liveness pings sent
+  between full heartbeats, by the same outcomes. Zero while the manager
+  serves equal liveness and sync intervals. Either a ping or a full
+  heartbeat resets the stateful self-fence clock.
 - **`legion_net_conns_total{direction,protocol,verdict}`** (counter):
   connections the node datapath decided ([network handlers](network-handlers.md)),
   by direction (`egress` | `ingress`), protocol (`tcp` | `http` | `dns`), and
@@ -1274,6 +1329,11 @@ these in order. Each step rules out a layer.
    with spawn delay in the milliseconds, means blocking handlers have
    saturated the runtime. To tell saturation from load, check whether a
    trivial endpoint (`HealthCheck`) shows the same latency as an expensive one.
+   Every replicated store write waits for its quorum commit off the async
+   worker (`block_in_place`), whichever handler made it, so a burst of
+   `StopJob`, `DestroyJob` or KV writes no longer pins workers for the
+   round trip. A runtime that still saturates is held by something other
+   than a store write: a registry fetch, a slow read, a lock.
 2. **Is the group commit batching?** Compare the `le="1"` bucket of
    `legion_store_coalesce_batch_size` with its `_count`. If nearly all
    batches are size 1, batching never engages, and the path pays a full

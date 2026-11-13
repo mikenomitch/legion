@@ -1382,6 +1382,21 @@ mod plugin_host_test {
         // Unoptimized test builds run wasmi far slower than release; the
         // bound here is only that fuel stopped it at all.
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        // The memory limit gets its own install with a generous deadline:
+        // under the 1ms one, a slow runner hits the deadline before the
+        // module has grown past 4Mi, and the stop reads "deadline".
+        context
+            .plugins()
+            .install_compiled(
+                object(
+                    "c",
+                    &["request"],
+                    json!({ "limits": { "deadline": "1s", "memory": "4Mi" } }),
+                ),
+                2,
+                &module("conformance"),
+            )
+            .unwrap();
         let hog = pipeline(vec![hop("c", "hog")], "policy/p");
         let (outcome, _, _) = request(&context, &hog, 7, "GET", "/").await;
         let ExchangeOutcome::Respond(local) = outcome else {

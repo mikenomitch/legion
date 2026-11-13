@@ -4,7 +4,7 @@
 
 **Status: SHIPPED** (2026-11-08): phases 1–5 below, measured in §12.
 Deliberately deferred:
-the node-row half of SCH5 (§6.2), spot-interruption awareness for gangs
+the node-row half of SCH5 (§6.2, since shipped 2026-11-12), spot-interruption awareness for gangs
 (§6.6), multi-level topology (a gang that spans the fewest racks inside one
 zone), and a balanced-allocation weight an operator can tune. The first
 three have TODO entries; the weight is an open question (§11).
@@ -215,12 +215,12 @@ The fused path hands the walk the request's placements as a slice: no
 candidate lists in memory. JSON is produced only for a rejection's record.
 The staged path keeps reading its row (it was persisted across ops).
 
-Node rows: the walk keeps reading and parsing the node row inside the
-transaction — that read is the apply-time fence against cordons and
-capacity changes that bump no allocation epoch. The read model's
-`Arc<Node>` guarded by `nodes_epoch` would not be sound, and the sound
-alternative (verify the read model's node against a keyed hash of the row's
-bytes) is **deferred** to a TODO entry (calls #2).
+Node rows: the walk keeps reading the node row inside the transaction —
+that read is the apply-time fence against cordons and capacity changes that
+bump no allocation epoch. The read model's `Arc<Node>` guarded by
+`nodes_epoch` would not be sound. **Shipped 2026-11-12** (was deferred): the
+walk uses the read model's node when the row's bytes are exactly what that
+node serializes to, and parses the row otherwise (calls #2, follow-up).
 
 ### 6.3 Claims (SCH3)
 
@@ -309,7 +309,12 @@ $ legion job plan trainer.ncl   # no rack has room
 Validation: `topology.key` must be a non-empty string; `mode` one of
 `required`, `preferred`; unknown fields rejected, as for the rest of `gang`.
 
-### 6.6 Spot interruption (AI7, deferred)
+### 6.6 Spot interruption (AI7, deferred; shipped 2026-11-12)
+
+> Built by its own plan, [spot-interruption-plan.md](spot-interruption-plan.md):
+> the worker's EC2 watcher and `legion node interrupt` record a
+> `legion.interruption` node attribute, gangs keep off such nodes, and their
+> members move first. The text below is the deferral as written.
 
 Evaluated and deferred. A spot notice today reaches Legion, if at all, as a
 node drain (the `aws-asg` plugin or an external handler). A drain is already
@@ -384,7 +389,10 @@ No compatibility shims (AGENTS.md). What changes for an existing cluster:
 - Should the balanced-allocation term be a `schedulerSettings.weights`
   knob? Lean: not until someone needs to turn it; it is a tie-break.
 - Multi-level topology (prefer one rack, else one zone)? Lean: a list of
-  keys later (`keys = ["rack", "zone"]`), when a user asks.
+  keys later (`keys = ["rack", "zone"]`), when a user asks. **Resolved
+  2026-11-12:** `topology.keys` shipped with the gang follow-ups, together
+  with a preemption-aware domain filter that lifts the eight-domain bound to
+  sixteen plausible domains ([gang plan, Revision 3](gang-scheduling-plan.md#revision-3-the-follow-ups-2026-11-12)).
 
 ## 12. Measurements (2026-11-08)
 
@@ -471,6 +479,21 @@ paying a higher apply per plan for the extra nodes.
 No release micro-benchmark (`benchmarks/micro/scheduler_bench.rs`) was run:
 a release build of the crate on this shared host would have held the build
 lock for every other engineer for the better part of an hour.
+
+### 12.1 Node rows from the read model (2026-11-12)
+
+Release `plan_apply_node_rows` (`benchmarks/micro/scheduler_bench.rs`): an
+eight-placement `bin_pack` plan on a 10,000-node fleet whose nodes carry
+realistic attribute bags (~3 KiB of fingerprint), `local_disk` store, a
+4-vCPU container. Base is this change with the read-model comparison turned
+off (every row parsed, as before).
+
+| | base | this change |
+| --- | ---: | ---: |
+| `plan_and_apply` (criterion median) | 4.11 ms | 3.32 ms |
+| `apply` phase mean | 2,404 µs | 1,887 µs |
+
+The apply is 21% cheaper; the rest of the plan is unchanged.
 
 ## 13. Acceptance criteria
 

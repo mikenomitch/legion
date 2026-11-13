@@ -63,6 +63,7 @@ mod gang_waits;
 mod gang_losses;
 // Gang members: each gang allocation's rank, size, and leader address.
 mod gang_members;
+mod gang_sweep;
 // Scaling inputs: the reads behind the rollup loop and GetScalingInputs.
 mod scaling_ops;
 // Task autoscaling's state: scale writes with compare-and-set, pins,
@@ -109,6 +110,10 @@ pub use forget_ops::ForgetOutcome;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
 pub use gang_members::GangMember;
+pub use gang_sweep::{
+    GangReservation, GangReservationSettings, GangSweep, DEFAULT_GANG_RESERVATION_AFTER,
+    DEFAULT_GANG_RESERVATION_HOLD,
+};
 pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
@@ -357,6 +362,97 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Where the plan-apply walk's node rows came from, counted per plan and
+/// published once as `legion_scheduler_plan_node_rows_total{source}`.
+#[derive(Debug, Default)]
+struct NodeRowSources {
+    read_model: u64,
+    parsed: u64,
+}
+
+impl NodeRowSources {
+    fn publish(&self) {
+        let metrics = crate::telemetry::metrics();
+        if self.read_model > 0 {
+            metrics
+                .scheduler_plan_node_rows_total
+                .inc_by(&["read_model"], self.read_model);
+        }
+        if self.parsed > 0 {
+            metrics
+                .scheduler_plan_node_rows_total
+                .inc_by(&["parsed"], self.parsed);
+        }
+    }
+}
+
+/// Whether `row` (a `SELECT {NODE_JOINED_ATTRS}` row) holds exactly what
+/// `node` would serialize to, every column but the heartbeat. Byte equality
+/// is exact, not a digest: serde_json parses its own output back to an
+/// equal value, so a match proves `node_from_row(row)` would build `node`
+/// (less `last_heartbeat`). Allocation-free; a mismatch stops at its first
+/// differing byte.
+fn node_row_matches(node: &Node, row: &Row<'_>) -> Result<bool, rusqlite::Error> {
+    use rusqlite::types::ValueRef;
+    fn text<'a>(row: &'a Row<'_>, index: usize) -> Result<Option<&'a [u8]>, rusqlite::Error> {
+        Ok(match row.get_ref(index)? {
+            ValueRef::Text(bytes) => Some(bytes),
+            _ => None,
+        })
+    }
+    let strings: [(usize, &str); 4] = [
+        (0, &node.id),
+        (1, &node.pool),
+        (2, &node.status),
+        (3, &node.availability),
+    ];
+    for (index, expected) in strings {
+        if text(row, index)? != Some(expected.as_bytes()) {
+            return Ok(false);
+        }
+    }
+    let documents: [(usize, &Value); 4] = [
+        (4, &node.config_attrs),
+        (5, &node.fingerprint_attrs),
+        (6, &node.dynamic_attrs),
+        (7, &node.health_checks),
+    ];
+    for (index, value) in documents {
+        let Some(bytes) = text(row, index)? else {
+            return Ok(false);
+        };
+        if !serializes_to(value, bytes) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `serde_json::to_vec(value)` would equal `expected`, without
+/// building the vector: the serializer writes into a sink that compares as
+/// it goes and fails the write at the first difference.
+fn serializes_to(value: &Value, expected: &[u8]) -> bool {
+    struct Compare<'a> {
+        rest: &'a [u8],
+    }
+    impl std::io::Write for Compare<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.rest.strip_prefix(buf) {
+                Some(rest) => {
+                    self.rest = rest;
+                    Ok(buf.len())
+                }
+                None => Err(std::io::Error::other("differs")),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Compare { rest: expected };
+    serde_json::to_writer(&mut sink, value).is_ok() && sink.rest.is_empty()
+}
+
 /// A node's `publicAddress` config attribute (`LEGION_WORKER_PUBLIC_ADDRESS`
 /// on the worker): where clients outside the private network reach it.
 fn node_public_address(config_attrs: &Value) -> Option<String> {
@@ -432,6 +528,18 @@ impl AllocationRef {
 pub struct AvailableNodes {
     sorted: Vec<Arc<Node>>,
     by_id: HashMap<String, usize>,
+    /// Parallel to `sorted`: the node declares no `restriction` block and no
+    /// `namespaces` list ([`crate::constraints::node_is_unrestricted`]), so
+    /// a permit check reduces to its pool. Computed at most once per node
+    /// per set, on first use, instead of two attribute lookups per node per
+    /// task (candidates-and-indexes plan § 6.2): a scan pays it once and
+    /// every later task reuses it, and a budgeted index walk pays only for
+    /// the nodes it visits.
+    /// `0` = not computed yet, `1` = restricted, `2` = unrestricted. A
+    /// relaxed atomic, not a `OnceLock`: two planners racing to fill one
+    /// slot compute the same value, so the race is harmless and the read
+    /// stays one plain load on the scan's hot path.
+    unrestricted: Vec<std::sync::atomic::AtomicU8>,
 }
 
 impl AvailableNodes {
@@ -444,9 +552,14 @@ impl AvailableNodes {
             .enumerate()
             .map(|(position, node)| (node.id.clone(), position))
             .collect();
+        let unrestricted = nodes
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU8::new(0))
+            .collect();
         AvailableNodes {
             sorted: nodes,
             by_id,
+            unrestricted,
         }
     }
 
@@ -457,6 +570,34 @@ impl AvailableNodes {
 
     pub fn get(&self, id: &str) -> Option<&Node> {
         self.by_id.get(id).map(|position| &*self.sorted[*position])
+    }
+
+    /// [`Self::get`] with the node's unrestricted flag, for
+    /// [`crate::constraints::PermitSet::is_permitted_flagged`].
+    pub fn get_flagged(&self, id: &str) -> Option<(&Node, bool)> {
+        self.by_id
+            .get(id)
+            .map(|position| self.flagged_at(*position))
+    }
+
+    fn flagged_at(&self, position: usize) -> (&Node, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let node = &*self.sorted[position];
+        let slot = &self.unrestricted[position];
+        let unrestricted = match slot.load(Relaxed) {
+            0 => {
+                let unrestricted = crate::constraints::node_is_unrestricted(node);
+                slot.store(if unrestricted { 2 } else { 1 }, Relaxed);
+                unrestricted
+            }
+            known => known == 2,
+        };
+        (node, unrestricted)
+    }
+
+    /// Every node in id order, with its unrestricted flag.
+    pub fn iter_flagged(&self) -> impl Iterator<Item = (&Node, bool)> + '_ {
+        (0..self.sorted.len()).map(|position| self.flagged_at(position))
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -486,6 +627,52 @@ impl AvailableNodes {
                 .cloned()
                 .collect(),
         ))
+    }
+
+    /// The subset of `allowed` that is in the set, built by lookup:
+    /// O(|allowed|), whatever the fleet size. What an in-place rollout tick
+    /// plans against (its old nodes) instead of excluding every other node
+    /// ([`NodeScope::Only`]).
+    pub fn only(&self, allowed: &HashSet<String>) -> Self {
+        Self::new(
+            allowed
+                .iter()
+                .filter_map(|id| self.by_id.get(id.as_str()))
+                .map(|position| Arc::clone(&self.sorted[*position]))
+                .collect(),
+        )
+    }
+}
+
+/// What [`Store::scheduling_index_per_groups`] returns: the serving index's
+/// name and one budgeted walk per `count.per` group token.
+pub type PerGroupWalks<T> = (String, Vec<(String, crate::scheduling_index::IndexWalk<T>)>);
+
+/// Which available nodes a plan may use.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum NodeScope<'a> {
+    /// Every available node.
+    #[default]
+    All,
+    /// Every available node but these (a reschedule away from a failed
+    /// node).
+    Exclude(&'a HashSet<String>),
+    /// Only these, when available (an in-place rollout's old nodes).
+    Only(&'a HashSet<String>),
+}
+
+impl NodeScope<'_> {
+    /// `nodes` narrowed to this scope; shares the input when nothing is
+    /// cut.
+    pub fn apply(self, nodes: Arc<AvailableNodes>) -> Arc<AvailableNodes> {
+        match self {
+            NodeScope::All => nodes,
+            NodeScope::Exclude(excluded) => match nodes.without(excluded) {
+                Some(filtered) => Arc::new(filtered),
+                None => nodes,
+            },
+            NodeScope::Only(allowed) => Arc::new(nodes.only(allowed)),
+        }
     }
 }
 
@@ -882,6 +1069,16 @@ pub struct PlanSubmissionPlacement {
     /// and in the format-1 shape, which bind any unbound instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// The instance whose node-local volume pinned this placement to
+    /// `candidates[0]`. The planner read that pin from SQLite mid-plan, with
+    /// no epoch over it, so the apply re-reads it inside its transaction and
+    /// refuses the candidate when the pin moved or vanished (a `volume
+    /// delete --force` in between): the eval re-plans against current pins
+    /// instead of steering the instance onto a node its data left
+    /// (candidates-and-indexes plan § 6.11). Absent for unpinned placements
+    /// and in rows written before the fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_pin: Option<String>,
 }
 
 /// A successfully applied plan: the inserted allocations plus the candidate
@@ -939,6 +1136,17 @@ struct AppliedEvictions {
     metric_rows: Vec<(String, String, String, u64)>,
 }
 
+/// What a Fresh plan's apply removed of the versions it replaces
+/// ([`Store::retire_replaced_allocations_tx`]).
+#[derive(Debug, Default)]
+struct RetiredAllocations {
+    /// The deleted rows.
+    allocations: Vec<Allocation>,
+    /// `allocation.stopping` and `allocation.removed`, staged in the
+    /// transaction and published after it commits.
+    events: Vec<SchedulerEventRecord>,
+}
+
 /// What a heartbeat from a given node costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BeatDisposition {
@@ -953,10 +1161,25 @@ enum BeatDisposition {
     Ghost,
 }
 
+/// What [`Store::observe_ping`] did with a ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingPath {
+    /// Recorded in memory; nothing else to do.
+    Observed,
+    /// The beat has to be replicated: run [`Store::update_node_heartbeat`]
+    /// off the async runtime. `recovering` is true when the node is coming
+    /// back from `lost`.
+    Replicate { recovering: bool },
+    /// Not a registered node.
+    Ghost,
+}
+
 /// One active node's replicated liveness row, for the status checker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveNodeLiveness {
     pub id: String,
+    /// The node's pool, for the per-pool freshness breakdown.
+    pub pool: String,
     /// Persisted heartbeat clock. DISPLAY state once liveness is off the raft
     /// path; `None` on a row written before the integer column existed.
     pub last_heartbeat_unix: Option<i64>,
@@ -1318,6 +1541,7 @@ impl PlanPlacements {
                 task_id: *task_id,
                 candidates: vec![node_id.clone()],
                 instance_id: None,
+                volume_pin: None,
             })
             .collect()
     }
@@ -1397,11 +1621,12 @@ impl PlanApplyEffects {
         }
     }
 
-    /// Record the allocations this plan evicted: same scopes, spliced
-    /// out. Placed and evicted rows land in ONE publish (they are one
-    /// delta), so the mirror never passes through the intermediate state
-    /// a remove-then-add pair of refreshes exposed.
-    fn touch_evicted(&mut self, allocations: &[Allocation]) {
+    /// Record the allocations this plan removed (its evictions, and the
+    /// older versions a Fresh plan replaced): same scopes, spliced out.
+    /// Placed and removed rows land in ONE publish (they are one delta), so
+    /// the mirror never passes through the intermediate state a
+    /// remove-then-add pair of refreshes exposed.
+    fn touch_removed(&mut self, allocations: &[Allocation]) {
         for allocation in allocations {
             self.node_ids.insert(allocation.node_id.clone());
             self.job_config_ids.insert(allocation.job_config_id.clone());
@@ -2215,44 +2440,70 @@ impl Drop for RedactSecretColumns<'_> {
     }
 }
 
-/// The keyed binding query: the oldest unbound live keyed instance of a
-/// (job, group, task) for one task config, with the node-local and restore
-/// preferences described in `Store::assign_keyed_instance_tx`. Parameters:
-/// `?1` job, `?2` group, `?3` task, `?4` task config id, `?5` node id, `?6`
-/// target instance (or `''`), `?7` now (unix seconds).
-const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, instance.group_name, \
-                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
-                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named, instance.promoted_from, instance.owner \
-                 FROM instance \
-                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
-                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
-                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
-                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
-                 AND instance.task_name = ?3 \
-                 AND instance.mode = 'keyed' \
-                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
-                 AND instance.instance_id IS NOT NULL \
-                 AND NOT EXISTS (\
-                     SELECT 1 FROM allocation \
-                     WHERE allocation.instance_id = instance.instance_id \
-                     AND allocation.task_config_id = ?4\
-                 ) \
-                 AND COALESCE(instance.pending_op, '') != 'fork' \
-                 AND (?6 = '' OR instance.instance_id = ?6) \
-                 AND (instance.restore_from IS NULL OR COALESCE((\
-                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
-                     ELSE snapshot.node_id END FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from\
-                 ), ?5) = ?5) \
-                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
-                     WHERE reschedule_hold.instance_id = instance.instance_id \
-                     AND reschedule_hold.not_before_unix > ?7) ASC, \
-                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
-                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
-                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;";
+/// The keyed binding query, in three variants that differ only in how they
+/// find candidates (`Store::assign_keyed_instance_tx` picks one): the oldest
+/// unbound live keyed instance of a (job, group, task) for one task config,
+/// with the node-local and restore preferences described there. Parameters
+/// for all three: `?1` job, `?2` group, `?3` task, `?4` task config id, `?5`
+/// node id, `?6` target instance (only [`KEYED_BIND_TARGET_SQL`] reads it),
+/// `?7` now (unix seconds).
+macro_rules! keyed_bind_sql {
+    ($from:literal, $candidates:literal) => {
+        concat!(
+            "SELECT instance.instance_id, instance.job_id, instance.group_name, \
+             instance.task_name, instance.mode, instance.state, instance.slot_index, \
+             instance.current_alloc_id, instance.storage_handle, instance.created_at, \
+             instance.updated_at, instance.restore_from, instance.identity_epoch, \
+             instance.named, instance.promoted_from, instance.owner \
+             FROM ",
+            $from,
+            " LEFT JOIN volume ON volume.instance_id = instance.instance_id \
+             AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+             AND instance.task_name = ?3 \
+             AND instance.mode = 'keyed' \
+             AND instance.state NOT IN ('terminated', 'stopped', 'suspended') ",
+            $candidates,
+            " AND instance.instance_id IS NOT NULL \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM allocation \
+                 WHERE allocation.instance_id = instance.instance_id \
+                 AND allocation.task_config_id = ?4\
+             ) \
+             AND COALESCE(instance.pending_op, '') != 'fork' \
+             AND (instance.restore_from IS NULL OR COALESCE((\
+                 SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
+                 ELSE snapshot.node_id END FROM snapshot \
+                 WHERE snapshot.snapshot_id = instance.restore_from\
+             ), ?5) = ?5) \
+             ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
+                 WHERE reschedule_hold.instance_id = instance.instance_id \
+                 AND reschedule_hold.not_before_unix > ?7) ASC, \
+             (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+             COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
+                 WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
+             instance.created_at ASC, instance.instance_id ASC LIMIT 1;"
+        )
+    };
+}
+
+/// Every live keyed instance of the task: the general form, and the
+/// fallback when [`KEYED_BIND_UNBOUND_SQL`] finds nothing. Visits each live
+/// instance once, two index probes each.
+const KEYED_BIND_SQL: &str = keyed_bind_sql!("instance", "");
+
+/// Only live instances with no current allocation, from
+/// `idx_instance_keyed_unbound`: cost follows the instances waiting for a
+/// placement, not the live population. Pinned to its index because the
+/// live index matches the same equality prefix and SQLite could take it.
+const KEYED_BIND_UNBOUND_SQL: &str = keyed_bind_sql!(
+    "instance INDEXED BY idx_instance_keyed_unbound",
+    "AND instance.current_alloc_id IS NULL"
+);
+
+/// A ratification's named instance: a point lookup by its key.
+const KEYED_BIND_TARGET_SQL: &str = keyed_bind_sql!("instance", "AND instance.instance_id = ?6");
 
 impl Store {
     #[instrument(err, skip_all)]
@@ -2282,10 +2533,15 @@ impl Store {
         let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
         let checkpoint_conn: MemSafeConn = Arc::new(Mutex::new(Connection::open(&db_path)?));
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
-        let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
+        let mut index_settings = IndexSettings::from_scheduler_settings(
             config.scheduler_settings.as_ref(),
             &config.scheduling_policy,
-        )?);
+        )?;
+        // `kind = "<plugin>"` indexes take their geometry from
+        // `plugins/indexes/<plugin>/`; a missing or broken one fails startup
+        // like any malformed declaration (docs/scheduling-indexes.md).
+        crate::manager::scheduler::index_kinds::resolve_plugin_kinds(&mut index_settings)?;
+        let index_settings = Arc::new(index_settings);
 
         let resource_policy_fingerprint: Arc<str> = resource_policy.fingerprint().into();
         let store = Store {
@@ -3090,7 +3346,7 @@ impl Store {
         let mut conn = Self::lock_conn(conn, "migration")?;
         info!("Running migrations");
         let fresh: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
-        migrations.to_latest(&mut conn)?;
+        crate::storage::migrations::migrate_to_latest(&migrations, &mut conn)?;
         // A brand-new database has no rows for any data step to migrate:
         // record them all as done (`storage::data_migrations` module docs).
         if fresh == 0 {
@@ -3208,8 +3464,12 @@ impl Store {
             if capture::in_local_projection() {
                 return f(self);
             }
-            return capture::local_projected_mutation(self, f, |store| {
-                store.shadow_check_read_model(op)
+            // Off the runtime like the raft path's quorum wait: the commit
+            // takes the write lock and syncs the WAL.
+            return crate::storage::block_off_runtime(|| {
+                capture::local_projected_mutation(self, f, |store| {
+                    store.shadow_check_read_model(op)
+                })
             });
         }
 
@@ -3775,7 +4035,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale, run, children
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale, run, children, index_hint
             FROM task_config;
             "#,
         )?;
@@ -3798,6 +4058,7 @@ impl Store {
                 suspend: parse_json_column(31, row.get(31)?)?,
                 run: parse_json_column(35, row.get(35)?)?,
                 children: parse_json_column(36, row.get(36)?)?,
+                index_hint: row.get(37)?,
                 gang: parse_json_column(32, row.get(32)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
@@ -4939,6 +5200,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// The nodes running allocations of `task_config_id`: where a whole
+    /// gang's members are, for whole-gang preemption
+    /// (docs/gang-scheduling.md, "Preemption"). One range over
+    /// `idx_allocation_task_config_id`.
+    pub fn nodes_of_task(&self, task_config_id: i64) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT node_id FROM allocation WHERE task_config_id = ?1 ORDER BY node_id;",
+        )?;
+        let rows = stmt.query_map([task_config_id], |row| row.get::<_, String>(0))?;
+        Self::collect_rows(rows)
+    }
+
     /// How many allocations each of `task_config_ids` has across the whole
     /// fleet: what a `disruption.minAvailable` floor is measured against.
     ///
@@ -4974,7 +5248,7 @@ impl Store {
     pub fn scheduling_index_query(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &crate::scheduling_index::IndexRequest,
         budget: Option<usize>,
         ordered: bool,
     ) -> R<crate::scheduling_index::IndexQueryOutcome> {
@@ -4991,7 +5265,7 @@ impl Store {
     pub fn scheduling_index_walk<T>(
         &self,
         bindings: &HashMap<String, Value>,
-        request: &HashMap<String, f64>,
+        request: &crate::scheduling_index::IndexRequest,
         budget: usize,
         verify: impl FnMut(&str) -> Option<T>,
     ) -> R<Result<crate::scheduling_index::IndexWalk<T>, crate::scheduling_index::IndexQueryOutcome>>
@@ -5000,6 +5274,44 @@ impl Store {
             .read_model_reader()?
             .indexes
             .walk_verified(bindings, request, budget, verify))
+    }
+
+    /// `count.per` partition enumeration plus one budgeted walk per
+    /// enumerated shard, under one read-model guard
+    /// ([`crate::scheduling_index::IndexSet::enumerate_partitions`]). `None`
+    /// when no index can serve the per key. `budget(token)` sizes each
+    /// group's walk; `verify` runs with the guard held and must not touch
+    /// the store.
+    pub fn scheduling_index_per_groups<T>(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &crate::scheduling_index::IndexRequest,
+        per_key: &str,
+        mut budget: impl FnMut(&str) -> usize,
+        mut verify: impl FnMut(&str) -> Option<T>,
+    ) -> R<Option<PerGroupWalks<T>>> {
+        let guard = self.read_model_reader()?;
+        let Some(enumeration) = guard
+            .indexes
+            .enumerate_partitions(bindings, request, per_key)
+        else {
+            return Ok(None);
+        };
+        let groups = enumeration
+            .groups
+            .iter()
+            .map(|(token, shard)| {
+                let walk = guard.indexes.walk_shard_verified(
+                    enumeration.index_pos,
+                    shard,
+                    request,
+                    budget(token),
+                    &mut verify,
+                );
+                (token.clone(), walk)
+            })
+            .collect();
+        Ok(Some((enumeration.index, groups)))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
@@ -5938,6 +6250,7 @@ impl Store {
                         task_id,
                         candidates: vec![node_id],
                         instance_id: None,
+                        volume_pin: None,
                     })
                     .collect()
             }
@@ -6248,7 +6561,11 @@ impl Store {
         // the whole candidate union would parse ~k× more node-attr JSON
         // than the pre-candidate code for nothing (measurable at 10k
         // nodes); a placement only pays for the rows its skips touched.
-        let mut nodes_by_id: HashMap<String, Option<Node>> = HashMap::new();
+        // Each row is still READ here (it is the apply-time fence), but it
+        // is parsed only when it differs from the read model's node: see
+        // `node_for_apply_tx`.
+        let mut nodes_by_id: HashMap<String, Option<Arc<Node>>> = HashMap::new();
+        let mut node_rows = NodeRowSources::default();
         let node_row_sql =
             format!("SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id = ?1;");
 
@@ -6268,10 +6585,11 @@ impl Store {
         //
         // Mirror the planner's ledger view: a Fresh plan replaces the JOB's
         // allocations wholesale, so `plan_and_apply` drops every allocation
-        // of the planned config's job before planning (`drop_replaced`) —
-        // `handle_job_submit` only deletes the previous config's rows after
-        // this apply, so those rows are still in the table here and must not
-        // be double counted. Reschedule plans drop nothing.
+        // of the planned config's job before planning (`SnapshotDrop::Job`).
+        // The previous config's rows are still in the table during the walk
+        // (this transaction removes them after it binds,
+        // `retire_replaced_allocations_tx`), so they must not be double
+        // counted. Reschedule plans drop nothing.
         let drop_own = plan_mode == "fresh";
         let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
         // What each rebuilt pool was derived from, kept so the plan can hand
@@ -6418,10 +6736,8 @@ impl Store {
                 let node = match nodes_by_id.entry(node_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
-                        let row = tx
-                            .prepare_cached(&node_row_sql)?
-                            .query_row([node_id], |row| self.node_from_row(row))
-                            .optional()?;
+                        let row =
+                            self.node_for_apply_tx(tx, &node_row_sql, node_id, &mut node_rows)?;
                         entry.insert(row)
                     }
                 };
@@ -6439,6 +6755,30 @@ impl Store {
                         ));
                     }
                     continue;
+                }
+                // A volume-pinned placement goes only where its instance's
+                // data still is. The planner read the pin outside any
+                // epoch, so re-read it here: a pin that moved or vanished
+                // since (a forced volume delete) refuses the candidate, the
+                // plan is rejected, and the eval re-plans against the pins
+                // as they are now (candidates-and-indexes plan § 6.11).
+                if let Some(instance_id) = placement.volume_pin.as_deref() {
+                    let pinned = self.pinned_node_for_instance_tx(tx, instance_id)?;
+                    if pinned.as_deref() != Some(node_id.as_str()) {
+                        if first_skip_reason.is_none() {
+                            first_skip_reason = Some(match pinned {
+                                Some(moved) => format!(
+                                    "instance {instance_id}'s node-local volume is now on node \
+                                     {moved}, not {node_id} (it changed since the plan snapshot)"
+                                ),
+                                None => format!(
+                                    "instance {instance_id} no longer holds a node-local volume \
+                                     on node {node_id} (it was removed since the plan snapshot)"
+                                ),
+                            });
+                        }
+                        continue;
+                    }
                 }
                 if !state
                     .constraints
@@ -6615,6 +6955,21 @@ impl Store {
         // Hand the next plan a warm cache. Runs AFTER the epoch bumps above,
         // because the epoch is part of the fingerprint the next plan checks.
         self.publish_node_usage_tx(tx, &mut pool_usage, &allocations, &task_requests)?;
+        // A Fresh plan was built, and its pools above were rebuilt, as
+        // though the job's older configs held nothing (`drop_own`). Make
+        // that true in this same transaction: their allocations leave as
+        // the new ones arrive, so no committed state, and no crash between
+        // two writes, has both versions on a node (audit SC7). After the
+        // walk on purpose: the walk's node-epoch fence compares against the
+        // plan's snapshot, and these removals are this plan's own writes;
+        // and the new allocations already exist, so a stateful instance the
+        // old version held rebinds to its replacement rather than passing
+        // through `rescheduling` (`release_instance_bindings_tx`).
+        let replaced = if plan_mode == "fresh" && target_instance.is_none() {
+            self.retire_replaced_allocations_tx(tx, &submission.job_config_id)?
+        } else {
+            RetiredAllocations::default()
+        };
         if body_savepoint {
             tx.execute_batch("RELEASE legion_plan_body;")?;
         }
@@ -6624,13 +6979,18 @@ impl Store {
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
                 .and_then(|draft| self.stage_event_locked(tx, draft));
         let mut effects = PlanApplyEffects {
-            events: placed_event.into_iter().chain(preempted.events).collect(),
+            events: placed_event
+                .into_iter()
+                .chain(preempted.events)
+                .chain(replaced.events)
+                .collect(),
             ..PlanApplyEffects::default()
         };
-        // Evicted and placed rows refresh together, in one read of
-        // committed state — the mirror never passes through the
+        // Evicted, replaced and placed rows refresh together, in one read
+        // of committed state — the mirror never passes through the
         // intermediate state a remove-then-add pair of refreshes exposed.
-        effects.touch_evicted(&preempted.victims);
+        effects.touch_removed(&preempted.victims);
+        effects.touch_removed(&replaced.allocations);
         effects.touch_placed(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         debug!(
@@ -6648,6 +7008,7 @@ impl Store {
         for rank in &candidate_ranks {
             metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
         }
+        node_rows.publish();
         for revalidated in &bind_passes {
             metrics.scheduler_plan_bind_pass.inc(&[if *revalidated {
                 "revalidated"
@@ -7204,6 +7565,79 @@ impl Store {
         })
     }
 
+    /// Remove, inside a Fresh plan's apply transaction, every allocation of
+    /// the planned job that belongs to another of its configs: the version
+    /// the plan replaces. The planner and the apply walk both counted these
+    /// rows as free (`SnapshotDrop::Job`, `drop_own`), so leaving them for
+    /// a later write overcommitted their nodes until it landed, and a crash
+    /// in between kept the overcommit until the next failover (audit SC7).
+    ///
+    /// The removal is what `remove_allocs_for_job_config` did after the
+    /// apply, moved into it: the stateful instances the rows held rebind to
+    /// the plan's new allocations (or go to `rescheduling` when the plan
+    /// left theirs unplaced), the epochs move, the workers get an `update`
+    /// stop notice, and the events are staged. The planned config's own
+    /// rows are left alone, as before: `job_update` removes them before its
+    /// plan, and a first submit has none.
+    fn retire_replaced_allocations_tx(
+        &self,
+        tx: &Connection,
+        job_config_id: &str,
+    ) -> R<RetiredAllocations> {
+        let attrs = crate::storage::queries::ALLOCATION_WITH_JOB_ATTRS;
+        let mut stmt = tx.prepare_cached(&format!(
+            "SELECT {attrs} FROM allocation \
+             INNER JOIN job_config ON job_config.id = allocation.job_config_id \
+             WHERE job_config.job_id = (SELECT job_id FROM job_config WHERE id = ?1) \
+               AND allocation.job_config_id != ?1 \
+             ORDER BY allocation.id;"
+        ))?;
+        let replaced = Self::collect_rows(
+            stmt.query_map([job_config_id], |row| self.allocation_from_row(row))?,
+        )?;
+        drop(stmt);
+        if replaced.is_empty() {
+            return Ok(RetiredAllocations::default());
+        }
+
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM allocation WHERE id = ?;")?;
+            for allocation in &replaced {
+                delete.execute([allocation.id])?;
+            }
+        }
+        self.release_instance_bindings_tx(tx, &replaced)?;
+        self.bump_epochs_for_allocations_tx(tx, &replaced)?;
+
+        let mut events = Vec::new();
+        if let Some(event) = self.record_stop_notices_tx(tx, &replaced, StopCause::Update)? {
+            events.push(event);
+        }
+        let mut by_config: BTreeMap<&str, Vec<Allocation>> = BTreeMap::new();
+        for allocation in &replaced {
+            by_config
+                .entry(allocation.job_config_id.as_str())
+                .or_default()
+                .push(allocation.clone());
+        }
+        for (replaced_config, group) in by_config {
+            if let Some(event) = drafts::allocations_removed_for_job_config(replaced_config, &group)
+                .and_then(|draft| self.stage_event_locked(tx, draft))
+            {
+                events.push(event);
+            }
+        }
+        debug!(
+            %job_config_id,
+            replaced = replaced.len(),
+            "Fresh plan retired the allocations of the version it replaces"
+        );
+        Ok(RetiredAllocations {
+            allocations: replaced,
+            events,
+        })
+    }
+
     /// The eval-queue priority implied by a job's priority band.
     ///
     /// Prefers the exact config the eval names; falls back to the job's
@@ -7453,6 +7887,55 @@ impl Store {
         };
 
         Ok(job)
+    }
+
+    /// One candidate's node for the plan-apply walk, read inside the apply
+    /// transaction (`sql` is `SELECT {NODE_JOINED_ATTRS} … WHERE node.id =
+    /// ?1`). `None` when the row is gone.
+    ///
+    /// The row is always read: it is the apply-time fence against cordons,
+    /// node loss and re-registrations that bump no allocation epoch. What
+    /// this skips is the *parse*. When the read model holds a node whose
+    /// fields serialize to exactly the row's bytes, that `Arc<Node>` is
+    /// returned instead of a freshly parsed one: equal bytes parse to an
+    /// equal node, so the walk sees what parsing would have given it, and
+    /// the cost is a streaming serialize-and-compare that stops at the first
+    /// differing byte instead of building four JSON trees. Any difference —
+    /// a projection that has not landed yet, a row written in a
+    /// non-canonical form, a lock the read model's writer holds — falls back
+    /// to the parse, so the read model is never trusted, only checked.
+    ///
+    /// The one field not compared is `last_heartbeat`, which the walk never
+    /// reads (the row's value is not authoritative on a liveness owner
+    /// either: `node_from_row` replaces it with the live beat).
+    fn node_for_apply_tx(
+        &self,
+        tx: &Connection,
+        sql: &str,
+        node_id: &str,
+        sources: &mut NodeRowSources,
+    ) -> R<Option<Arc<Node>>> {
+        // `try_read`: never wait on the read model while holding the write
+        // connection. A writer holding it means a projection is in flight,
+        // and the row is the safer answer anyway.
+        let cached = self
+            .read_model
+            .try_read()
+            .ok()
+            .and_then(|model| model.nodes.get(node_id).cloned());
+        let mut stmt = tx.prepare_cached(sql)?;
+        let mut rows = stmt.query([node_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        if let Some(cached) = cached {
+            if node_row_matches(&cached, row)? {
+                sources.read_model += 1;
+                return Ok(Some(cached));
+            }
+        }
+        sources.parsed += 1;
+        Ok(Some(Arc::new(self.node_from_row(row)?)))
     }
 
     fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
@@ -7913,6 +8396,7 @@ impl Store {
             autoscale: parse_json_column(35, row.get(35)?)?,
             run: parse_json_column(36, row.get(36)?)?,
             children: parse_json_column(37, row.get(37)?)?,
+            index_hint: row.get(38)?,
         };
 
         Ok(task_config)
@@ -9130,6 +9614,30 @@ impl Store {
         }
     }
 
+    /// The fast path of a liveness ping (`Manager.Ping`): one read-model
+    /// lookup and one liveness-table write, on the calling thread.
+    ///
+    /// Safe on an async worker because the only case it handles itself —
+    /// an active node outside the mixed-version fallback — never commits.
+    /// Everything that may commit (a `lost -> active` transition, a beat
+    /// that has to travel as a replicated write) comes back as
+    /// [`PingPath::Replicate`] for the caller to run
+    /// [`Self::update_node_heartbeat`] on the blocking pool, exactly as a
+    /// heartbeat would.
+    pub fn observe_ping(&self, id: &str) -> PingPath {
+        match self.beat_disposition(id) {
+            BeatDisposition::Ghost => PingPath::Ghost,
+            BeatDisposition::Transition => PingPath::Replicate { recovering: true },
+            BeatDisposition::Active if self.liveness.digest_fallback() => {
+                PingPath::Replicate { recovering: false }
+            }
+            BeatDisposition::Active => {
+                self.liveness.observe(id);
+                PingPath::Observed
+            }
+        }
+    }
+
     /// Put a recovered node back in the scheduling pool.
     ///
     /// Node loss is a CROSS-LANE composite: the status lane records `lost`,
@@ -9346,7 +9854,8 @@ impl Store {
         let conn = self.read_connection()?;
         // Anchored on `node` (a node_health row orphaned by node removal must
         // not resurrect a ghost), same as `get_node_ids_and_heartbeats`.
-        let sql = "SELECT node.id, node_health.last_heartbeat_unix, node_health.lost_after_seconds
+        let sql = "SELECT node.id, node_health.last_heartbeat_unix, node_health.lost_after_seconds,
+                          node.pool
                    FROM node LEFT JOIN node_health ON node_health.node_id = node.id
                    WHERE COALESCE(node_health.status, 'active') = 'active'";
         let mut stmt = conn.prepare(sql)?;
@@ -9355,6 +9864,7 @@ impl Store {
                 id: row.get(0)?,
                 last_heartbeat_unix: row.get(1)?,
                 lost_after_seconds: row.get(2)?,
+                pool: row.get(3)?,
             })
         })?)?;
         Ok(rows)
@@ -11801,6 +12311,7 @@ impl Store {
                 ":autoscale": autoscale,
                 ":run": run,
                 ":children": children,
+                ":index_hint": t.index_hint,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -15421,39 +15932,65 @@ impl Store {
         // that captured it (which still holds the parts).
         //
         // This runs once per keyed placement, inside the plan apply, so it is
-        // serial scheduler-lane time, and it must not grow with the task's
-        // suspended or retired population. Two things keep it lean
-        // (migration `idx_instance_keyed_live`):
+        // serial scheduler-lane time, and it must grow with neither the
+        // task's parked population nor its live one. Three variants of one
+        // query (`keyed_bind_sql!`) keep it lean:
         //
-        // - The `mode`/`state` terms match the partial index
-        //   `idx_instance_keyed_live` word for word, so only live keyed rows
-        //   are visited. Suspended, stopped, and terminated rows, most of a
-        //   large sandbox population, are never read. SQLite uses a partial
-        //   index only when the query's WHERE implies the index's, so editing
-        //   either term can silently fall back to scanning every instance of
-        //   the job (`keyed_bind_query_uses_the_live_partial_index` guards it).
-        // - "Unbound for this config" is a correlated `NOT EXISTS` probe of
-        //   `idx_allocation_instance_config`, answered from the two indexes
-        //   alone, so a bound row costs two index lookups and no table read.
-        //   The `NOT IN (SELECT ...)` it replaces built an ephemeral B-tree of
-        //   every allocation of the config on every placement. The explicit
-        //   `instance_id IS NOT NULL` keeps the forms equivalent: `NOT IN`
-        //   never matched a NULL id, and `NOT EXISTS` alone would.
-        let instance: Option<Instance> = tx
-            .prepare_cached(KEYED_BIND_SQL)?
-            .query_row(
-                params![
-                    job_id,
-                    group,
-                    task_name,
-                    task_id,
-                    node_id,
-                    target_instance.unwrap_or_default(),
-                    Self::now_unix()
-                ],
-                |row| self.instance_from_row(row),
-            )
-            .optional()?;
+        // - A ratification names its instance: a point lookup.
+        // - Otherwise, first only the live instances with no current
+        //   allocation (`idx_instance_keyed_unbound`): a new instance, a
+        //   resume, a replacement after a lost node. In steady state these
+        //   are exactly the instances waiting for this placement, so the
+        //   cost follows the queue, not the live population
+        //   (scheduler-lane-entry-cost plan §11).
+        // - Only when none of those fits, every live instance
+        //   (`idx_instance_keyed_live`): an instance still bound under an
+        //   older config of the task (a create-first rollout rebinding it),
+        //   or one whose current pointer is set while it has no allocation
+        //   of this config. That is the pre-index cost, paid only when the
+        //   cheap set is empty.
+        //
+        // All three keep the same terms, so the choice changes cost, never
+        // which instances qualify. It can change which qualifying instance
+        // binds: while both an unpointed instance and one bound under an
+        // older config wait, the unpointed one binds first even if it is
+        // younger (calls: scheduler-lane-entry-cost #2).
+        //
+        // The `mode`/`state` terms match the partial indexes word for word,
+        // which is what lets SQLite use them; the query-plan tests guard
+        // that. "Unbound for this config" is a correlated `NOT EXISTS` probe
+        // of `idx_allocation_instance_config`, answered from indexes alone;
+        // `instance_id IS NOT NULL` keeps it equivalent to the `NOT IN` it
+        // replaced, which never matched a NULL id.
+        let target = target_instance.filter(|id| !id.is_empty());
+        let bind = |sql: &str| -> R<Option<Instance>> {
+            Ok(tx
+                .prepare_cached(sql)?
+                .query_row(
+                    params![
+                        job_id,
+                        group,
+                        task_name,
+                        task_id,
+                        node_id,
+                        target.unwrap_or_default(),
+                        Self::now_unix()
+                    ],
+                    |row| self.instance_from_row(row),
+                )
+                .optional()?)
+        };
+        let metrics = &crate::telemetry::metrics().scheduler_keyed_binds_total;
+        let instance: Option<Instance> = if target.is_some() {
+            metrics.inc(&["target"]);
+            bind(KEYED_BIND_TARGET_SQL)?
+        } else if let Some(instance) = bind(KEYED_BIND_UNBOUND_SQL)? {
+            metrics.inc(&["unbound"]);
+            Some(instance)
+        } else {
+            metrics.inc(&["live"]);
+            bind(KEYED_BIND_SQL)?
+        };
 
         let instance = match instance {
             Some(instance) => instance,
@@ -17688,6 +18225,18 @@ impl Store {
                             "Reconciled job config allocations"
                         );
                     }
+                    // A capacity pass or a lost node's replan that still
+                    // left work behind says so, like an eval's plan does.
+                    if !outcome.unplaced.is_empty() {
+                        if let Some(job_id) = self.job_id_for_job_config(job_config_id)? {
+                            self.events().plan_unplaced(
+                                &job_id,
+                                job_config_id,
+                                None,
+                                &outcome.unplaced,
+                            );
+                        }
+                    }
                     return Ok(());
                 }
                 Err(err) if Eval::error_is_plan_conflict(&err) => {
@@ -17720,7 +18269,7 @@ impl Store {
 
     /// Reconcile several job configs, isolating failures.
     ///
-    /// The node-loss, drain, and new-node passes call this AFTER they have
+    /// The node-loss and drain passes call this AFTER they have
     /// already removed the allocations being replaced, so a reconcile that
     /// fails with nothing queued behind it leaves the job under-count with
     /// no retry: the node holds no allocations any more, so the lost-node
@@ -18184,7 +18733,41 @@ impl Store {
                 job_config_ids.push(job_config_id);
             }
         }
-        self.reconcile_job_configs_or_requeue(job_config_ids)
+        // Unlike the node-loss and drain passes, this one removed nothing
+        // first, so a plan that still finds no room leaves the job exactly
+        // as it was: waiting, with `capacity_waiters` set again by that
+        // plan, for the next capacity event. A delayed `job_reschedule`
+        // here would only make the next pass skip the job (it has an eval
+        // queued) until the delay ran out. Any other failure still gets
+        // the retry.
+        let mut unqueued_error = None;
+        for job_config_id in job_config_ids {
+            let Err(error) = self.reconcile_job_config_allocations(&job_config_id) else {
+                continue;
+            };
+            if crate::manager::blocked::PlacementBlocked::in_chain(&error).is_some() {
+                debug!(
+                    %job_config_id,
+                    error = %format!("{error:#}"),
+                    "Capacity pass still found no room; the job waits for the next capacity event"
+                );
+                continue;
+            }
+            // Otherwise as `reconcile_job_configs_or_requeue`.
+            let Some(job_id) = self.job_id_for_job_config(&job_config_id)? else {
+                continue;
+            };
+            if self
+                .queue_reschedule_retry(&job_id, &job_config_id, &error)
+                .is_err()
+            {
+                unqueued_error.get_or_insert(error);
+            }
+        }
+        match unqueued_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     #[instrument(err, skip_all)]
@@ -23299,6 +23882,97 @@ mod tests {
         }
     }
 
+    /// A job whose name is all digits round-trips. Under the old NUMERIC
+    /// affinity its id and name were stored as an INTEGER, which every
+    /// `String` read of the row refused.
+    #[test]
+    fn a_job_named_with_digits_reads_back_test() -> R<()> {
+        let store = setup_store()?;
+        submit_job(&store, "2026", vec![task("api")])?;
+        assert_eq!(store.get_job_config("2026")?.name, "2026");
+        let conn = store.read_connection()?;
+        let stored: String = conn.query_row(
+            "SELECT typeof(id) FROM job WHERE name = '2026';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, "text");
+        Ok(())
+    }
+
+    /// The plan-apply walk reads each candidate's row but reuses the read
+    /// model's node only when the row holds exactly the bytes that node
+    /// serializes to; anything else is parsed.
+    #[test]
+    fn plan_apply_reuses_a_read_model_node_only_for_an_identical_row_test() -> R<()> {
+        let store = setup_store()?;
+        let mut msg = make_node_msg("n1", "active");
+        msg.config_attrs = json!({ "class": "web", "zone": "a" }).to_string();
+        msg.fingerprint_attrs = json!({ "memory_total": "8589934592", "cpu": 4 }).to_string();
+        store.insert_node(msg)?;
+        let sql = format!("SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id = ?1;");
+        let check = |store: &Store| -> R<(Option<Arc<Node>>, NodeRowSources)> {
+            let conn = store.write_connection()?;
+            let mut sources = NodeRowSources::default();
+            let node = store.node_for_apply_tx(&conn, &sql, "n1", &mut sources)?;
+            Ok((node, sources))
+        };
+
+        // Fresh registration: the row is what the read model holds.
+        let cached = store.scheduling_read_model()?.nodes["n1"].clone();
+        let (node, sources) = check(&store)?;
+        let node = node.expect("row exists");
+        assert!(
+            Arc::ptr_eq(&node, &cached),
+            "an identical row reuses the read model's node"
+        );
+        assert_eq!((sources.read_model, sources.parsed), (1, 0));
+
+        // The same document with other whitespace and key order: equal as
+        // JSON, different bytes. Parsed, and the parse agrees.
+        store.write_connection()?.execute(
+            "UPDATE node SET config_attrs = '{ \"zone\": \"a\", \"class\": \"web\" }' WHERE id = 'n1';",
+            [],
+        )?;
+        let (node, sources) = check(&store)?;
+        assert_eq!((sources.read_model, sources.parsed), (0, 1));
+        assert_eq!(node.expect("row").config_attrs, cached.config_attrs);
+
+        // A cordon the read model has not seen (a projection still in
+        // flight): the row wins.
+        store.write_connection()?.execute(
+            "UPDATE node SET availability = 'draining' WHERE id = 'n1';",
+            [],
+        )?;
+        assert_eq!(
+            store.scheduling_read_model()?.nodes["n1"].availability,
+            "available"
+        );
+        let (node, sources) = check(&store)?;
+        assert_eq!(node.expect("row").availability, "draining");
+        assert_eq!((sources.read_model, sources.parsed), (0, 1));
+
+        // A row that is gone is gone, whatever the read model says.
+        store
+            .write_connection()?
+            .execute("DELETE FROM node WHERE id = 'n1';", [])?;
+        assert!(check(&store)?.0.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_to_compares_without_allocating_test() {
+        let value = json!({ "b": [1, 2.5, "x"], "a": { "nested": true } });
+        let canonical = serde_json::to_vec(&value).unwrap();
+        assert!(serializes_to(&value, &canonical));
+        assert!(!serializes_to(&value, &canonical[..canonical.len() - 1]));
+        let mut longer = canonical.clone();
+        longer.push(b' ');
+        assert!(!serializes_to(&value, &longer));
+        assert!(!serializes_to(&value, b"{}"));
+        assert!(serializes_to(&json!({}), b"{}"));
+    }
+
     fn make_node_msg(id: &str, status: &str) -> NodeMsg {
         NodeMsg {
             id: id.to_string(),
@@ -26688,6 +27362,7 @@ mod tests {
                     task_id,
                     candidates: vec!["node-a".to_string()],
                     instance_id: None,
+                    volume_pin: None,
                 }]),
                 expected_versions: versions,
                 evictions: Vec::new(),
@@ -27719,6 +28394,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -27757,6 +28433,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
             &[PlanEviction {
@@ -27797,6 +28474,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -27866,6 +28544,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28111,6 +28790,7 @@ mod tests {
                         task_id,
                         candidates: vec![node.clone()],
                         instance_id: None,
+                        volume_pin: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -28239,6 +28919,7 @@ mod tests {
                         task_id,
                         candidates: vec![node.clone()],
                         instance_id: None,
+                        volume_pin: None,
                     })
                     .collect();
                 batch.push(PlanApplyRequest {
@@ -28411,6 +29092,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28427,6 +29109,92 @@ mod tests {
             }
             PlanApplyOutcome::Rejected { reason, .. } => {
                 bail!("expected the walk to bind the fallback candidate: {reason}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A `distinct` task's replicas carry real fallback lists (no longer a
+    /// coupled component), so the apply walk is what keeps them apart: a
+    /// replica that falls back onto a zone its sibling planned for pushes
+    /// the sibling down its own list, and when the sibling has nowhere else
+    /// to go the plan is rejected rather than doubling up a zone.
+    #[test]
+    fn plan_walk_enforces_distinct_across_fallbacks() -> R<()> {
+        let zoned = |id: &str, zone: &str| NodeMsg {
+            config_attrs: json!({ "zone": zone }).to_string(),
+            ..make_node_msg(id, "ready")
+        };
+        let distinct_task = |name: &str| TaskConfig {
+            count: TaskCount::new(2),
+            constraints: json!([{ "key": "zone", "operator": "distinct" }]),
+            ..task(name)
+        };
+        let walk = |store: &Store, job: &str, lists: [&[&str]; 2]| -> R<PlanApplyOutcome> {
+            let (job_config_id, task_id) = submit_walk_job(store, job, distinct_task("api"))?;
+            let nodes: HashSet<String> = lists
+                .iter()
+                .flat_map(|list| list.iter().map(|node| node.to_string()))
+                .collect();
+            let expected_versions = store.allocation_version_vector(&job_config_id, &nodes)?;
+            let placements: Vec<PlanSubmissionPlacement> = lists
+                .iter()
+                .map(|list| PlanSubmissionPlacement {
+                    task_id,
+                    candidates: list.iter().map(|node| node.to_string()).collect(),
+                    instance_id: None,
+                    volume_pin: None,
+                })
+                .collect();
+            let submission = store.insert_plan_submission_with_candidates(
+                &job_config_id,
+                "fresh",
+                &placements,
+                &expected_versions,
+            )?;
+            // Between the sample and the apply, node-a is drained: replica 0
+            // falls back onto node-b, the zone replica 1 planned for.
+            store.set_node_availability("node-a", "drained")?;
+            store.apply_plan_submission(&submission)
+        };
+
+        let store = setup_store()?;
+        store.insert_node(zoned("node-a", "z1"))?;
+        store.insert_node(zoned("node-b", "z2"))?;
+        store.insert_node(zoned("node-c", "z3"))?;
+        match walk(
+            &store,
+            "distinct-slides",
+            [&["node-a", "node-b"], &["node-b", "node-c"]],
+        )? {
+            PlanApplyOutcome::Applied(applied) => {
+                let bound: Vec<&str> = applied
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.node_id.as_str())
+                    .collect();
+                assert_eq!(bound, vec!["node-b", "node-c"], "one replica per zone");
+                assert_eq!(applied.candidate_ranks, vec![1, 1]);
+            }
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                bail!("replica 1 had a free zone to fall back to: {reason}")
+            }
+        }
+
+        let store = setup_store()?;
+        store.insert_node(zoned("node-a", "z1"))?;
+        store.insert_node(zoned("node-b", "z2"))?;
+        match walk(
+            &store,
+            "distinct-full",
+            [&["node-a", "node-b"], &["node-b"]],
+        )? {
+            PlanApplyOutcome::Applied(applied) => bail!(
+                "two replicas bound into {} zone(s) with only z2 left",
+                applied.allocations.len()
+            ),
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(reason.contains("does not satisfy constraints"), "{reason}");
             }
         }
         Ok(())
@@ -28458,6 +29226,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28509,6 +29278,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28547,6 +29317,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28612,6 +29383,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -28649,6 +29421,7 @@ mod tests {
             task_id,
             candidates: vec!["node-a".to_string()],
             instance_id: None,
+            volume_pin: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -28708,6 +29481,7 @@ mod tests {
             task_id,
             candidates: vec!["node-a".to_string(), "node-b".to_string()],
             instance_id: None,
+            volume_pin: None,
         };
         let submission = store.insert_plan_submission_with_candidates(
             &job_config_id,
@@ -28756,6 +29530,7 @@ mod tests {
                 task_id,
                 candidates: vec!["node-a".to_string(), "node-b".to_string()],
                 instance_id: None,
+                volume_pin: None,
             }],
             &expected_versions,
         )?;
@@ -30969,6 +31744,93 @@ mod tests {
             !plan.contains("LIST SUBQUERY"),
             "no materialized list of every allocation of the config:\n{plan}"
         );
+        Ok(())
+    }
+
+    /// The two cheap variants seek: the unbound query reads only
+    /// instances with no current allocation, and a ratification's named
+    /// instance is a point lookup. Neither walks the live index.
+    #[test]
+    fn keyed_bind_variants_seek_their_indexes_test() -> R<()> {
+        let store = setup_store()?;
+        let conn = store.read_connection()?;
+        let plan_of = |sql: &str| -> R<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let details: Vec<String> = stmt
+                .query_map(
+                    params!["job", "default", "task", 1i64, "node-a", "user-1", 0i64],
+                    |row| row.get::<_, String>(3),
+                )?
+                .collect::<Result<_, _>>()?;
+            Ok(details.join("\n"))
+        };
+        let unbound = plan_of(KEYED_BIND_UNBOUND_SQL)?;
+        assert!(
+            unbound.contains("USING INDEX idx_instance_keyed_unbound"),
+            "the unbound bind must seek its partial index:\n{unbound}"
+        );
+        assert!(!unbound.contains("idx_instance_keyed_live"), "{unbound}");
+        let target = plan_of(KEYED_BIND_TARGET_SQL)?;
+        // The primary key or the live index's full key: either is a point
+        // lookup of the one instance.
+        assert!(
+            target.contains("SEARCH instance USING")
+                && target
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("instance_id=?)")),
+            "a named bind must be a point lookup of the instance:\n{target}"
+        );
+        for plan in [&unbound, &target] {
+            assert!(
+                plan.contains("USING COVERING INDEX idx_allocation_instance_config"),
+                "{plan}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The cheap query binds the instances that have no allocation; the
+    /// live query still finds an instance bound only under an older config,
+    /// so a rollout rebinds every live instance as before.
+    #[test]
+    fn keyed_binds_take_the_unbound_query_and_fall_back_for_a_rollout_test() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-cheap";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+        let old_task = task_id_for(&store, "sandbox", job_id)?;
+        for id in ["one", "two"] {
+            store.create_keyed_instance(job_id, "default", "sandbox", Some(id))?;
+        }
+        let binds = &crate::telemetry::metrics().scheduler_keyed_binds_total;
+        let unbound_before = binds.get(&["unbound"]);
+        let first = store.place_alloc("node-a", old_task)?;
+        let second = store.place_alloc("node-a", old_task)?;
+        let mut bound = vec![first.instance_id.unwrap(), second.instance_id.unwrap()];
+        bound.sort();
+        assert_eq!(bound, ["one", "two"]);
+        assert!(binds.get(&["unbound"]) >= unbound_before + 2);
+        for id in ["one", "two"] {
+            assert!(store
+                .get_instance(id)?
+                .context("instance")?
+                .current_alloc_id
+                .is_some());
+        }
+
+        // A new config: both instances still point at old-config
+        // allocations, so only the live query can rebind them.
+        let updated = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            ..stateful_keyed_task("sandbox", false)
+        };
+        let new_config = submit_job(&store, job_id, vec![updated])?;
+        let new_task = task_id_for_config(&store, "sandbox", &new_config)?;
+        let live_before = binds.get(&["live"]);
+        let rebound = store.place_alloc("node-a", new_task)?;
+        assert!(rebound.instance_id.is_some());
+        assert!(binds.get(&["live"]) > live_before);
         Ok(())
     }
 

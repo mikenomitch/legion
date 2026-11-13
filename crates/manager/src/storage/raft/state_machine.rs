@@ -2545,4 +2545,155 @@ mod tests {
         assert_eq!(kv_value(&follower, "spec/leader")?.as_deref(), Some("l"));
         Ok(())
     }
+
+    // ── Power cut after a purge (raft-write-path plan §6.1) ──────────────
+    //
+    // `scripts/power-cut-test.sh` runs these as root: the state DB and the
+    // raft log each live on their own loop-mounted ext4 image with
+    // background writeback off, so a write reaches the image only when
+    // something fsyncs it. "Cutting power" is copying the images; the
+    // copies are mounted (ext4 replays its journal, as after a crash) and
+    // read back. Separate filesystems keep one file's fsync from flushing
+    // the other's pages through a shared journal commit, which would hide
+    // the bug the barrier exists to prevent.
+
+    /// The harness's directories and its cut hook, or `None` outside it.
+    struct PowerCutHarness {
+        state: PathBuf,
+        log: PathBuf,
+        hook: PathBuf,
+        cut_state: PathBuf,
+        cut_log: PathBuf,
+    }
+
+    impl PowerCutHarness {
+        fn from_env() -> Option<Self> {
+            let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+            Some(Self {
+                state: var("LEGION_POWER_CUT_STATE")?,
+                log: var("LEGION_POWER_CUT_LOG")?,
+                hook: var("LEGION_POWER_CUT_HOOK")?,
+                cut_state: var("LEGION_POWER_CUT_CUT_STATE")?,
+                cut_log: var("LEGION_POWER_CUT_CUT_LOG")?,
+            })
+        }
+
+        /// Copy both images as they stand and mount the copies.
+        fn cut(&self) -> R<()> {
+            let status = std::process::Command::new(&self.hook).arg("cut").status()?;
+            anyhow::ensure!(status.success(), "power-cut hook failed: {status}");
+            Ok(())
+        }
+    }
+
+    /// Apply 20 entries, purge through 15, cut power, and return the
+    /// survivors' `(applied index, purged index)`.
+    async fn applied_and_purged_after_a_power_cut(
+        harness: &PowerCutHarness,
+        case: &str,
+        barrier: bool,
+    ) -> R<(u64, u64)> {
+        use crate::storage::raft::log_store::RaftLogStore;
+        use openraft::storage::{RaftLogStorage, RaftLogStorageExt};
+
+        let store_path = harness.state.join(case);
+        let store = Store::start_storage(&ManagerConfigFull {
+            store_path: store_path.to_str().context("store path")?.to_string(),
+            ..Default::default()
+        })?;
+        let log_dir = harness.log.join(case);
+        let log_store = RaftLogStore::open(&log_dir, Lane::Control)?;
+        let mut log_store = if barrier {
+            let synced = store.clone();
+            log_store.with_purge_barrier(Arc::new(move || synced.sync_state_db_to_disk()))
+        } else {
+            log_store
+        };
+        // Everything up to here (the schema, the keyring's root key) is
+        // durable: what follows is the scenario.
+        anyhow::ensure!(
+            std::process::Command::new("sync").status()?.success(),
+            "sync failed"
+        );
+
+        let entries: Vec<Entry<TypeConfig>> = (1..=20)
+            .map(|index| Entry {
+                log_id: log_id(1, index),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        log_store.blocking_append(entries.clone()).await.unwrap();
+        let mut sm = state_machine(Lane::Control, store.clone());
+        sm.apply(entries).await.unwrap();
+        assert_eq!(sm.applied_state().await.unwrap().0, Some(log_id(1, 20)));
+        log_store.purge(log_id(1, 15)).await.unwrap();
+
+        harness.cut()?;
+
+        let survivor = Store::start_storage(&ManagerConfigFull {
+            store_path: harness
+                .cut_state
+                .join(case)
+                .to_str()
+                .context("cut store path")?
+                .to_string(),
+            ..Default::default()
+        })?;
+        let applied = state_machine(Lane::Control, survivor)
+            .applied_state()
+            .await
+            .unwrap()
+            .0
+            .map_or(0, |id| id.index);
+        let purged = RaftLogStore::open(&harness.cut_log.join(case), Lane::Control)?
+            .get_log_state()
+            .await
+            .unwrap()
+            .last_purged_log_id
+            .map_or(0, |id| id.index);
+        eprintln!("power cut ({case}): applied marker {applied}, purged through {purged}");
+        Ok((applied, purged))
+    }
+
+    /// With the barrier, a purge never outlives the applied marker it
+    /// relies on: after the cut the marker is at or above the purge.
+    #[tokio::test]
+    #[ignore = "needs root and loop devices: run scripts/power-cut-test.sh"]
+    async fn power_cut_after_a_purge_keeps_the_applied_marker_at_or_above_it() -> R<()> {
+        let Some(harness) = PowerCutHarness::from_env() else {
+            return Ok(());
+        };
+        let (applied, purged) =
+            applied_and_purged_after_a_power_cut(&harness, "with-barrier", true).await?;
+        assert_eq!(
+            purged, 15,
+            "the purge itself is durable (the log runs FULL)"
+        );
+        assert!(
+            applied >= purged,
+            "applied marker {applied} regressed below the purge horizon {purged}"
+        );
+        Ok(())
+    }
+
+    /// The control: without the barrier the same cut loses the unsynced
+    /// marker while the purge survives. If this ever passes vacuously
+    /// (applied >= purged), the harness has stopped modelling a power cut
+    /// and the test above proves nothing.
+    #[tokio::test]
+    #[ignore = "needs root and loop devices: run scripts/power-cut-test.sh"]
+    async fn power_cut_without_the_barrier_loses_the_marker_the_purge_relies_on() -> R<()> {
+        let Some(harness) = PowerCutHarness::from_env() else {
+            return Ok(());
+        };
+        let (applied, purged) =
+            applied_and_purged_after_a_power_cut(&harness, "without-barrier", false).await?;
+        assert_eq!(purged, 15);
+        assert!(
+            applied < purged,
+            "the harness did not drop unsynced state-DB writes (applied {applied}, purged \
+             {purged}): it is not simulating a power cut"
+        );
+        Ok(())
+    }
 }

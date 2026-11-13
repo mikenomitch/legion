@@ -108,6 +108,50 @@ pub fn config() -> Command {
         )
         .arg(json_flag());
 
+    let interrupt_node_cmd = Command::new("interrupt")
+        .about("Record a pending interruption of a node: gangs move off it before it goes")
+        .long_about(
+            "\
+        Record a pending interruption of a node (docs/spot-interruption.md)\n\
+        \n\
+        For a spot reclaim, a scheduled maintenance, or anything else that\n\
+        will take the node away at a known time. Gang members on the node are\n\
+        treated as lost now (their gang's onMemberLoss applies, so a restart\n\
+        re-places the whole gang elsewhere) and no gang places on the node\n\
+        while the notice stands. Other work is not moved: drain the node for\n\
+        that. --clear withdraws the notice. A worker with a spotInterruption\n\
+        watcher records and withdraws its own notices.\n\
+        \n\
+        Example: legion node interrupt <id> --in 2m --detail \"spot reclaim\"\
+        ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node")
+                .required(true),
+        )
+        .arg(
+            Arg::new("in")
+                .long("in")
+                .value_name("DURATION")
+                .help("When the node goes, from now (default: now)"),
+        )
+        .arg(
+            Arg::new("detail")
+                .long("detail")
+                .value_name("TEXT")
+                .help("Why, for people reading the node (a ticket, a reason)"),
+        )
+        .arg(
+            Arg::new("clear")
+                .long("clear")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["in", "detail"])
+                .help("Withdraw the node's interruption notice"),
+        )
+        .arg(json_flag());
+
     let restart_node_cmd = Command::new("restart")
         .about("Restart a worker node")
         .arg(
@@ -211,6 +255,7 @@ pub fn config() -> Command {
         .subcommand(get_nodes_cmd)
         .subcommand(cadence_cmd)
         .subcommand(update_node_cmd)
+        .subcommand(interrupt_node_cmd)
         .subcommand(node_info_cmd)
         .subcommand(node_usage_cmd)
         .subcommand(node_content_cmd)
@@ -264,6 +309,23 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             }
 
             let format = OutputFormat::from_matches(arg_matches);
+            update_node(id.into(), dynamic_diff, format).await
+        }
+        Some(("interrupt", arg_matches)) => {
+            let id = arg_matches
+                .get_one::<String>("id")
+                .context("Must provide id")?;
+            let format = OutputFormat::from_matches(arg_matches);
+            let mut dynamic_diff = Map::new();
+            dynamic_diff.insert(
+                crate::structs::INTERRUPTION_ATTR.to_string(),
+                interruption_notice(
+                    arg_matches.get_flag("clear"),
+                    arg_matches.get_one::<String>("in").map(String::as_str),
+                    arg_matches.get_one::<String>("detail").map(String::as_str),
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )?,
+            );
             update_node(id.into(), dynamic_diff, format).await
         }
         Some(("cadence", arg_matches)) => {
@@ -396,6 +458,19 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
             "adaptiveEnabled": reply.adaptive_enabled,
             "atMaxInterval": reply.at_max_interval,
             "isLivenessOwner": reply.is_liveness_owner,
+            "syncIntervalSeconds": reply.sync_interval_seconds,
+            "pools": reply
+                .pools
+                .iter()
+                .map(|pool| json!({
+                    "pool": pool.pool,
+                    "activeNodes": pool.active_nodes,
+                    "intervalSeconds": pool.interval_seconds,
+                    "lostWindowSeconds": pool.lost_window_seconds,
+                    "freshnessRatio": pool.freshness_ratio,
+                    "freshnessMeasurable": pool.freshness_measurable,
+                }))
+                .collect::<Vec<_>>(),
         }));
         return Ok(());
     }
@@ -410,7 +485,7 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
 
     println!("Fleet             {} nodes", reply.active_nodes);
     println!(
-        "Served interval   {}s{}",
+        "Liveness interval {}s{}",
         reply.served_interval_seconds,
         if reply.adaptive_enabled {
             if reply.at_max_interval {
@@ -422,6 +497,17 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
             "  (workers use their worker-type heartbeatSeconds)"
         }
     );
+    if reply.sync_interval_seconds > reply.served_interval_seconds {
+        println!(
+            "Full heartbeat    every {}s  (pings in between)",
+            reply.sync_interval_seconds
+        );
+    } else if reply.sync_interval_seconds > 0 {
+        println!(
+            "Full heartbeat    every {}s  (every beat; no pings)",
+            reply.sync_interval_seconds
+        );
+    }
     println!(
         "Lost window       {}s  ({} missed beats)",
         reply.lost_window_seconds, reply.missed_beats_before_lost
@@ -456,6 +542,30 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
             "Freshness         not measurable on a fleet this small (under {} nodes)",
             crate::prelude::HEARTBEAT_FRESHNESS_MIN_FLEET
         );
+    }
+    // Per pool, only when there is more than one: a pool falling behind can
+    // hide inside a fleet-wide ratio that looks fine.
+    if reply.pools.len() > 1 {
+        println!();
+        println!(
+            "{:<20} {:>7} {:>9} {:>12} {:>10}",
+            "POOL", "NODES", "INTERVAL", "LOST WINDOW", "FRESHNESS"
+        );
+        for pool in &reply.pools {
+            let freshness = if pool.freshness_measurable {
+                format!("{:.2}", pool.freshness_ratio)
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{:<20} {:>7} {:>8}s {:>11}s {:>10}",
+                pool.pool,
+                pool.active_nodes,
+                pool.interval_seconds,
+                pool.lost_window_seconds,
+                freshness
+            );
+        }
     }
 
     Ok(())
@@ -1077,6 +1187,25 @@ fn render_pressure_order(reply: &GetNodeUsageReply) -> String {
     out.push_str(&Table::new(rows).with(Style::blank()).to_string());
     out.push('\n');
     out
+}
+
+/// The `legion.interruption` value `legion node interrupt` writes: `null`
+/// to clear, else `{ deadline, source: "operator", detail }` with the
+/// deadline `in_` from `now` (docs/spot-interruption.md).
+fn interruption_notice(clear: bool, in_: Option<&str>, detail: Option<&str>, now: i64) -> R<Value> {
+    if clear {
+        return Ok(Value::Null);
+    }
+    let after = match in_ {
+        Some(raw) => humantime::parse_duration(raw)
+            .with_context(|| format!("--in {raw:?} is not a duration (like 2m)"))?,
+        None => std::time::Duration::ZERO,
+    };
+    Ok(json!({
+        "deadline": now.saturating_add(after.as_secs() as i64),
+        "source": "operator",
+        "detail": detail.unwrap_or("legion node interrupt"),
+    }))
 }
 
 #[instrument(skip_all)]

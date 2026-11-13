@@ -9,6 +9,11 @@ mutex per lane (needs one database file per lane, §6.4), true pipelining of
 a lane (capturing entry N+1 while N's quorum wait is in flight, §6.2.4),
 speculative execution under the `lanes` topology (§6.3.6), and logical
 commands / name-keyed changesets (§6.5.5).
+The first three are now planned together in
+[lane-isolation-plan.md](lane-isolation-plan.md) (2026-11-12). The power-cut
+test of the purge barrier (§6.1) ran on loop-mounted ext4 images
+(`scripts/power-cut-test.sh`, 2026-11-12): marker 20 ≥ purge 15 with the
+barrier, 0 without it.
 
 ## 1. Problem statement
 

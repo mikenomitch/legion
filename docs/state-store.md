@@ -232,10 +232,25 @@ job-intake write paths. A migration rebuilds the affected tables in place.
 It preserves data, column order, indexes, and rowids, so a rolling manager
 upgrade across it is safe.
 
-`STRING` and `TIMESTAMP` columns keep NUMERIC affinity on purpose. For those
-columns SQLite's numeric conversion can succeed (numeric-looking ids,
-unix-seconds timestamps), so changing their type would change what is stored
-and break comparisons against existing rows.
+Columns once declared `STRING` and `TIMESTAMP` had the same NUMERIC
+affinity, with a worse effect: for them the conversion could succeed, so a
+numeric-looking value (a job named `2026`, an id made of digits) was stored
+as an INTEGER, and reading it back as text failed. They are now `TEXT`,
+except `job.created_at`, which stores unix seconds and is `INTEGER` like
+`job.updated_at`. The migration rewrites the declared types in place
+(column order, rowids, indexes and foreign keys are untouched, so raft
+changesets are unaffected). In the same transaction it rewrites any value
+those columns had stored as a number back to the text it was written as,
+rebuilds the indexes of the tables it touched, and checks every foreign key
+(it runs with foreign-key enforcement off for that one migration, because
+SQLite's deferred-constraint counter miscounts keys whose comparison
+changes mid-transaction). A manager logs `Rewrote numeric values in
+re-typed TEXT columns` when there were any.
+
+New columns are declared `TEXT`, `INTEGER`, `REAL` or `BLOB`; a test fails
+when any column of the schema is declared `STRING` or `TIMESTAMP`, or when
+a foreign key has no index on its child side (deleting a parent row would
+scan the child table).
 
 ## Allocation Epoch and Plan Submission Safety
 
@@ -266,6 +281,16 @@ Workers have a separate local JSON state file (`WorkerStateStore`):
 - default path root: `<data dir>/workers/<worker-id>/worker_state.json`
 - stores allocation, task, and PID records
 - used for restart recovery when a tracked PID is still running
+- written whole, atomically (a temp file renamed into place, fsynced), by
+  one writer thread per file: a start or stop hands it the newest snapshot
+  and moves on, and a burst of them is written as often as the disk takes
+  it, newest last, never once per change under the task manager's lock. A
+  gracefully stopping worker waits up to 5 seconds for the last write. A
+  worker that dies between a change and its write restarts from the
+  snapshot before it. A task it was stopping is then re-adopted and stopped
+  again. A task it had just started is not in the file, so the restarted
+  worker does not know its process, as when a worker died between a spawn
+  and its write before; the window is now up to one write longer.
 
 This store holds local worker runtime state. It is not shared cluster state.
 

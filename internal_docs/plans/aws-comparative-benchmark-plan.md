@@ -325,6 +325,15 @@ liveness").
 
 ### Campaign runs still owed
 
+- [ ] **20k nodes with liveness pings at the defaults**: confirm the 25s lost
+      window, `legion_pings_total` near 3,000/s, and the leader's CPU for
+      pings against full heartbeats; then compare `targetRatePerSecond` 5,000
+      and 10,000 for report latency, which pings no longer gate on detection.
+      Transport is most of a ping's cost (116 µs client and server on
+      loopback, against a 0.6 µs handler), so moving pings onto `StreamWork`
+      frames is the lever for a 10s window at 20k nodes
+      ([ping plan](liveness-ping-split-plan.md) ·
+      [calls #1, #4](../calls/liveness-ping-split-plan_calls.md)).
 - [ ] **The rest of the cross-system matrix**: the CLI control row (row 5)
       on the NVMe rig, the 10k storm on all three systems, memory per cell
       (row 6), and `REPORT.md`.

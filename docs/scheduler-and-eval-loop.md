@@ -98,6 +98,48 @@ convergence steps, so running an eval again after a failover wastes work
 but never duplicates effects; the old recovery relied on the same property.
 The batch cap bounds how much one crash makes repeat.
 
+### Handler deadline
+
+A worker waits **at most five minutes** for one eval's handler. A handler
+still running after that is treated as stuck, not slow. Its legitimate
+worst case is far shorter: the plan-conflict loop runs at most
+`plan_conflict_max_retries` attempts (clamped to 20), with backoffs capped
+by `plan_conflict_backoff_max_ms`, and a raft write that can't reach a
+leader fails within 15 seconds. When the deadline passes, the worker:
+
+1. stops waiting for that handler;
+2. requeues the eval: it goes back to `pending` and can't be claimed again
+   for five minutes;
+3. records an `eval.requeued` event with `meta.reason: "handler_timeout"`,
+   increments `legion_eval_handler_timeouts_total{kind}`, and logs `Eval
+   handler ran past its deadline` at `warn`;
+4. carries on with the rest of its batch.
+
+The requeue goes through the batch's ordinary settle, so it is fenced by
+the claim epoch like any other outcome.
+
+Without the deadline, a stuck handler kept its own eval and every eval
+behind it in the batch claimed until scheduler-lane leadership changed. On
+a stable leader, that is never.
+
+What it does not do:
+
+- **It doesn't stop the handler.** Handlers run synchronously on tokio's
+  blocking pool, and a blocking task can't be cancelled. The stuck thread
+  keeps running, and whatever it returns is discarded. Writes it makes in
+  the meantime are the same idempotent reconcile a second run would make.
+  A plan it applies is still fenced by the job-config epoch. If its plan
+  settles its own eval, it deletes a row that would otherwise just run
+  again.
+- **It doesn't fail the eval.** A stuck handler says nothing about whether
+  the eval's work is wanted, so the eval is retried rather than dropped.
+  An eval that hangs every time it runs is retried every ten minutes or so
+  (five of waiting, five of delay), and each attempt strands one
+  blocking-pool thread. Watch `legion_eval_handler_timeouts_total`: any
+  nonzero value is a bug to report, with the eval kind it names.
+- **It isn't configurable.** The deadline and the requeue delay are fixed
+  at five minutes.
+
 When the queue is empty, workers block on either:
 
 - `Notify` wake-up (an eval became claimable: an enqueue of zero-delay
@@ -270,7 +312,15 @@ Main paths in `Scheduler`:
 
 Modes:
 
-- `Fresh`: place full desired set.
+- `Fresh`: place full desired set. A Fresh plan replaces the job's
+  allocations wholesale, so it plans as though the job held nothing. A
+  resubmit (`job_submit` for a changed spec) applies it while the previous
+  version still runs, and the apply transaction that inserts the new
+  allocations removes the previous version's allocations too: no committed
+  state holds both versions, so a node is never overcommitted by a resubmit,
+  even across a crash. A stateful instance the old version held rebinds to
+  its replacement in that same transaction. A restart (`job_update`) removes
+  the job's allocations before it plans.
 - `Reschedule`: place only missing count relative to existing allocations.
 
 ## Placement Application and Conflict Safety
@@ -350,8 +400,10 @@ transaction's own re-validation, whatever its epoch. A concurrent plan that
 touched the first choice costs a fallback rank, or nothing, instead of a
 whole-plan rejection.
 
-Coupled placements (shared `distinct` keys, multi-task groups) keep exact
-all-or-nothing semantics. Overlapping candidate lists are not coupling.
+Only multi-task co-placement groups are coupled and keep exact
+all-or-nothing semantics. Overlapping candidate lists are not coupling, and
+neither is a `distinct` constraint: the walk re-checks `distinct` against
+committed rows and the plan's own binds.
 Candidate lists are on by default (`schedulerSettings.plan_candidates = 8`),
 and `0` disables them and restores single-node submissions. The epoch
 sample (below) covers the union of every placement's candidate list, and
@@ -509,7 +561,19 @@ inserting it:
   transaction, and every placement must still fit, with earlier placements
   in the same plan debited. The free pool is current capacity minus the
   allocation rows the transaction can see, excluding a Fresh plan's own
-  replaced job. This is the same arithmetic as the planner's ledger.
+  replaced job. This is the same arithmetic as the planner's ledger. The
+  replaced rows are then deleted in the same transaction, after every
+  placement has bound.
+
+The fresh node row is always read, but it is not always parsed. When the
+row's bytes are exactly what the read model's copy of the node serializes
+to, the walk uses that copy; equal bytes parse to an equal node, so the
+checks above see the same values either way. When they differ — a cordon
+or re-registration whose read-model projection has not landed yet, or a
+row written in a different JSON form — the row is parsed and wins. The
+read model is never trusted, only compared against.
+`legion_scheduler_plan_node_rows_total{source}` counts which happened
+([metrics](metrics.md)).
 
 #### The per-node usage cache
 
@@ -593,19 +657,28 @@ tasks of the job, and the replicas of this task that did fit, are applied.
   could help appears (see [Blocked evals](#blocked-evals)). The error it
   blocks with carries the same message, so `job plan`, the eval outcome and
   the `eval.blocked` event all name the same reason.
-- A **partially placed** plan succeeds, and its unplaced remainder is placed
+- A **partially placed** plan succeeds, writes one `plan.unplaced` warn
+  event naming each task it left and why (see
+  [event-stream.md](event-stream.md)), and its unplaced remainder is placed
   by the next pass that has room: the **capacity pass**, a `node_join` eval
   with no node that re-plans every active job short of its count. It is
   queued when a node registers or is uncordoned, and, while some plan has
-  left replicas unplaced, whenever capacity frees up: a worker reports an
-  allocation finished, a failed allocation is removed, a job stops, or a job
-  scales in. One pass covers any number of frees (it is not queued again
-  while one is pending), and when nothing is waiting a free queues nothing.
+  left replicas unplaced, whenever capacity appears: a worker reports an
+  allocation finished, a failed allocation is removed, a job stops, a job
+  scales in, and any other capacity event on a schedulable node (the same
+  events that wake [blocked evals](#blocked-evals): a lost node that
+  heartbeats again, a node's pool or attributes changing, allocations
+  leaving a node through preemption or a drain). A cordon or a node going
+  lost queues nothing. One pass covers any number of events (it is not
+  queued again while one is pending), and when nothing is waiting an event
+  queues nothing.
 - Only the manager that leads the scheduler lane queues the pass. After a
   restart or a leadership change the first freed capacity runs one pass,
   which finds out whether anything is waiting.
 - A job with an eval already queued, or blocked, is skipped by the pass
-  (that eval runs against the new capacity anyway).
+  (that eval runs against the new capacity anyway). A job the pass re-plans
+  and still cannot place keeps waiting for the next capacity event; the pass
+  queues no retry for it.
 - A batch task is retried only while it has not finished (its status is not
   `success`, `complete`, or `failed`).
 
@@ -644,8 +717,9 @@ What this means in practice:
   holds the port stops the old allocation first (see
   [rollouts.md](rollouts.md#static-ports-and-surge)).
 
-Ports a Fresh plan's own previous allocations hold count as taken until the
-handler removes those rows, matching what the apply sees. Ports assigned
+Ports a Fresh plan's own previous allocations hold count as taken, matching
+what the apply sees: its placements bind before the same transaction removes
+those rows. Ports assigned
 dynamically by this same plan are not known until apply, so a static port
 inside the dynamic range can still collide at apply time with a dynamic port
 handed out in the same plan; the candidate walk then falls back to the next
@@ -744,16 +818,21 @@ Per task, the candidate set is then built one of two ways:
   the node's own `namespaces` restriction: a node whose worker type lists
   namespaces is ineligible for a job outside them, whatever the permit says
   ([namespaces.md](namespaces.md#nodes-that-accept-only-some-namespaces)).
-  The check is one attribute lookup per node, and it rides inside the permit
-  check, so the scan, the index walk, and the apply recheck all make it.
+  The check rides inside the permit check, so the scan, the index walk, and
+  the apply recheck all make it. The plan's cached node set records, per
+  node, whether it declares any restriction block or `namespaces` list; for
+  the common node that declares neither, the permit check reads only its
+  pool, with no attribute lookups.
 - **Scheduling index** ([scheduling-indexes.md](scheduling-indexes.md)):
   when the fleet is at or above `schedulerSettings.index_min_nodes` and a
   declared index binds the task's equality constraints, candidates come
   from that index (partition shard lookup plus a nearest-fit walk over
   free resources). Only those candidates are re-verified with the same
-  predicate the scan applies. The scan remains the authoritative fallback
-  (unusable index, empty coverage, or a truncated list running dry), and
-  `job plan` reports which path served each task.
+  predicate the scan applies. Single tasks, co-placed groups, and each
+  `count.per` group get their own budgeted list; nodes a placement is pinned
+  to are added to it. The scan remains the authoritative fallback (unusable
+  index, empty coverage, or a truncated list running dry), and `job plan`
+  reports which path served each task.
 
 When neither path yields a node with room, and the job's band outranks work
 running on a node it is otherwise allowed on, a **preemption pass** runs.
@@ -1110,7 +1189,10 @@ Typical triggers:
 - A node registering or being uncordoned -> one cluster-wide `node_join`
   capacity pass, which re-plans only jobs short of their count that have no
   pending or blocked eval (a backstop: a job that could not place normally
-  has a blocked eval, which the wake pass handles).
+  has a blocked eval, which the wake pass handles). While some plan has left
+  replicas unplaced, freed capacity and any other capacity event on a
+  schedulable node (a lost node heartbeating again, say) queue the same
+  pass.
 - Capacity events -> blocked evals back to `pending` (see
   [Blocked evals](#blocked-evals)).
 

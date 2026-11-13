@@ -1711,8 +1711,10 @@ caller is trusted, as everywhere else, and a UI press is recorded by
   and the override stays. The rest is placed when capacity appears: a worker
   registering or a node being uncordoned queues a capacity pass that
   reschedules jobs short of their count
-  ([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
-  Capacity freed by other jobs stopping does not trigger it. While more than
+  ([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)),
+  and so does capacity freed by other jobs stopping, scaling in, or
+  finishing, or a lost node heartbeating again. The plan that left the rest
+  writes a `plan.unplaced` warn event saying why. While more than
   half of its last scale-out is unplaced, the autoscaler holds further
   scale-out (`limited`).
 - **The autoscaler is not running**: `legion scaling status` says `NOT

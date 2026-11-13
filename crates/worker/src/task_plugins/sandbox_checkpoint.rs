@@ -919,7 +919,8 @@ pub(crate) trait TapHost {
     fn set_master(&self, device: &str, master: &str) -> R<()>;
 }
 
-/// The real host: `/sys/class/net`, a `TUNSETIFF` probe, and `ip`.
+/// The real host: `/sys/class/net`, a `TUNSETIFF` probe, and the ioctl and
+/// rtnetlink calls in [`tap_link`](crate::task_plugins::tap_link).
 pub(crate) struct HostTaps;
 
 /// Written into the scratch dir when a restore created the allocation's TAP
@@ -944,22 +945,6 @@ pub fn attached_tap(scratch: &Path) -> Option<String> {
     let device = std::fs::read_to_string(scratch.join(TAP_DEVICE_RECORD)).ok()?;
     let device = device.trim();
     (!device.is_empty()).then(|| device.to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn run_ip(args: &[&str]) -> R<()> {
-    let output = Command::new("ip")
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run `ip {}`", args.join(" ")))?;
-    if !output.status.success() {
-        bail!(
-            "`ip {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
 }
 
 /// Attach to `device` through `/dev/net/tun` and let go again. `EBUSY` means
@@ -1035,7 +1020,7 @@ impl TapHost for HostTaps {
 
     #[cfg(target_os = "linux")]
     fn create(&self, device: &str) -> R<()> {
-        run_ip(&["tuntap", "add", "dev", device, "mode", "tap"])
+        crate::task_plugins::tap_link::create_persistent_tap(device)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1045,7 +1030,7 @@ impl TapHost for HostTaps {
 
     #[cfg(target_os = "linux")]
     fn set_up(&self, device: &str) -> R<()> {
-        run_ip(&["link", "set", "dev", device, "up"])
+        crate::task_plugins::tap_link::set_link_up(device, true)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1055,7 +1040,7 @@ impl TapHost for HostTaps {
 
     #[cfg(target_os = "linux")]
     fn delete(&self, device: &str) -> R<()> {
-        run_ip(&["link", "delete", device])
+        crate::task_plugins::tap_link::delete_link(device)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1080,7 +1065,7 @@ impl TapHost for HostTaps {
 
     #[cfg(target_os = "linux")]
     fn set_master(&self, device: &str, master: &str) -> R<()> {
-        run_ip(&["link", "set", "dev", device, "master", master])
+        crate::task_plugins::tap_link::set_master(device, master)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3257,7 +3242,7 @@ mod tests {
             network: json!({ "mode": "gated" }).to_string(),
             ..Default::default()
         };
-        assert_eq!(netd.bind_launch(&delivered).await, Some(true));
+        assert_eq!(netd.bind_launch(&delivered, None).await, Some(true));
 
         let ch = Backend::CloudHypervisor {
             binary: "/usr/bin/true".into(),

@@ -980,6 +980,17 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "node.interrupt",
+            cli: "legion node interrupt <ID> [--in DURATION] [--detail TEXT] | --clear",
+            grpc: Some("Manager/UpdateNodeDynamic"),
+            summary: "Record (or --clear) a pending interruption of a node, such as a spot \
+                 reclaim: gang members on it are treated as lost now, so their gangs restart \
+                 or replace them elsewhere, and no gang places there while it stands. Other \
+                 work is not moved (drain for that).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "node.uncordon",
             cli: "legion node uncordon <ID>",
             grpc: Some("Manager/SetNodeAvailability"),

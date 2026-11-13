@@ -521,6 +521,10 @@ In `single` topology:
   preceded by a **purge barrier** that makes the applied index the purge
   relies on durable. A barrier that fails fails the purge and keeps the
   log. `legion_raft_state_syncs_total{lane,outcome}` counts barriers.
+  A power-cut test exercises this on real ext4 images: after a cut right
+  after a purge, the surviving applied marker is at or above the purge,
+  and the same cut without the barrier loses it
+  ([testing-and-benchmarks.md](testing-and-benchmarks.md#power-cut-test-of-the-raft-logs-purge-barrier)).
 
 In `lanes` topology, the policy, compaction, retention, and recovery are the
 same **per lane**, but the snapshot's scope differs. A whole-DB image would

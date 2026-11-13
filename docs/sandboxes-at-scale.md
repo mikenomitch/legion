@@ -288,10 +288,13 @@ runtime's own boot or restore time for the end-to-end figure.
 - **A large node's boot rate is bound by its root disks, not its CPUs.**
   Small and mid-size nodes reach their CPU first. A 96-vCPU node sustains
   about 150 boots a second with worker state on EBS, where it runs out of
-  IOPS, and about 200 on fast local storage, where starts wait on cloning
+  IOPS, and about 200 on fast local storage, where starts waited on cloning
   the image's shared base disk and writing each sandbox's files into its
-  clone. Put the worker's state directory on local NVMe, and add nodes
-  rather than cores past that ([Measured on AWS](#measured-on-aws)).
+  clone. Such a node now spreads its clones over several full copies of
+  each base ([The root disk cache](task-runtime-sandbox.md#the-root-disk-cache)),
+  which takes the shared extents out of that path; its new ceiling has not
+  been measured. Put the worker's state directory on local NVMe, and add
+  nodes rather than cores past that ([Measured on AWS](#measured-on-aws)).
 - **Every keyed sandbox is a row.** A named one leaves a tombstone after
   destroy for the life of its job; a server-minted one leaves no row
   ([Id rules](stateful-workloads.md#id-rules)). A pending instance row is
@@ -321,12 +324,17 @@ runtime's own boot or restore time for the end-to-end figure.
   not lanes, so they do not raise the ceiling. Measure your own hardware
   with the tools [above](#measuring-it-on-your-hardware). Unnamed
   [sessions](session-mode.md) do not use the lane to start or stop.
-- **A keyed placement costs more as its task's live instances grow.** The
-  placement binds the oldest unbound instance of the task in the same lane
-  entry, and to find it the manager looks at every *live* instance of that
-  task (pending, active, or rescheduling), two index lookups each.
-  Suspended, stopped, and destroyed instances are not looked at, so parking
-  idle sandboxes keeps placements fast however many there are. A task with
-  tens of thousands of running instances adds milliseconds of lane time to
-  each placement. Splitting them across tasks (one per tenant, say) keeps
-  each placement's share small.
+- **A keyed placement's cost follows the instances waiting for one, except
+  during a rollout.** The placement binds the oldest unbound instance of the
+  task in the same lane entry. To find it, the manager first looks only at
+  live instances that have no current allocation (a new instance, a resume,
+  a replacement after a lost node), so running and parked instances add
+  nothing however many there are. When none of those fits — a rollout of a
+  new task config rebinding instances that are still bound under the old
+  one — it looks at every *live* instance of the task (pending, active, or
+  rescheduling), two index lookups each, so each of a rollout's placements
+  costs milliseconds of lane time on a task with tens of thousands of
+  running instances. `legion_scheduler_keyed_binds_total{query}` counts
+  which search each bind used ([metrics](metrics.md)). While both kinds
+  wait at once, an instance with no allocation binds before one bound under
+  an older config, even if it is younger.

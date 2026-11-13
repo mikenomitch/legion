@@ -4,11 +4,13 @@
 
 **Status: SHIPPED** (phases 0–3 in one release; public doc
 [`docs/scheduling-indexes.md`](../../docs/scheduling-indexes.md)).
-Deliberately deferred, tracked in `TODO.md`: pluggable index kinds,
-`count.per` partition enumeration, device-set (`ResourceValue::Items`) dims,
-a task-level `index_hint` job-spec field, and index-served candidates for
-**multi-task group** co-placement (groups still scan — execution deviation,
-calls entry 10). Two more execution deviations worth knowing before reading
+Deferred here and since shipped by
+[`candidates-and-indexes-plan.md`](candidates-and-indexes-plan.md)
+(2026-11-12): pluggable index kinds, `count.per` partition enumeration,
+device-set (`ResourceValue::Items`) dims, a task-level `index_hint` job-spec
+field (`indexHint`), incremental orthant enumeration, and index-served
+candidates for **multi-task group** co-placement (calls entry 10 records
+why v1 left groups on the scan). Two more execution deviations worth knowing before reading
 on: the default `fit` index shipped `mode: "on"` directly rather than
 through a production shadow soak (calls entry 3), and the equivalence
 property is asserted at candidate-*set* level because placement tie-breaking

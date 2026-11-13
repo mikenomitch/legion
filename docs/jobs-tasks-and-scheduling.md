@@ -224,13 +224,18 @@ Important `TaskConfig` fields:
 - `count`:
   - integer count
   - or `{ num, per }` for per-attribute placement
-- `gang`: `true` or `{ min, placementTimeout, onMemberLoss }`. The task's
-  replicas place all together (or at least `min` of them together) or not at
-  all, and a gang that does not fit waits, blocked and holding nothing,
-  instead of placing what fits. `placementTimeout` fails the job if the wait
-  runs too long, and a lost member restarts the whole gang (or, with
-  `onMemberLoss`, is replaced alone or fails the job). See
-  [Gang Scheduling](gang-scheduling.md).
+- `gang`: `true` or `{ min, placementTimeout, readyTimeout, onMemberLoss,
+  onLocalRestart, topology }`. The task's replicas place all together (or at
+  least `min` of them together) or not at all, and a gang that does not fit
+  waits, blocked and holding nothing, instead of placing what fits.
+  `placementTimeout` fails the job if the wait runs too long, `readyTimeout`
+  replaces a member that never comes up, and a lost member restarts the whole
+  gang (or, with `onMemberLoss`, restarts it in place, is replaced alone, or
+  fails the job). See [Gang Scheduling](gang-scheduling.md).
+- `indexHint`: the scheduling index the task's candidates come from, or
+  `"scan"` for the full scan. Advisory: an unknown or unusable hint falls back
+  to automatic selection and `job plan` says why. See
+  [Scheduling Indexes](scheduling-indexes.md#hinting-an-index).
 - `group`: task grouping for rollouts and automatic anti-affinity
 - `runtime`: task-runtime plugin (`exec`, `container`, etc.)
 - `resources`: normalized by the manager's `ResourcePolicy`
@@ -527,7 +532,10 @@ blocked eval:
 
 - Worker registration (`worker_register`) inserts the node, then queues a
   capacity pass: one `node_join` eval with no node. Uncordoning a node
-  (`legion node uncordon`) queues the same pass.
+  (`legion node uncordon`) queues the same pass. So does, while some plan has
+  left replicas unplaced, capacity appearing any other way: allocations
+  finishing or leaving a node, a job stopping or scaling in, or a lost node
+  that starts heartbeating again without re-registering.
 - The pass re-evaluates, with a `Reschedule` plan, every active job that has
   no live rollout and nothing already queued or blocked, when its config has
   a `count.per` task, a service or sidecar task with fewer allocations than
