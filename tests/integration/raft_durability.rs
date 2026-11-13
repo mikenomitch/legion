@@ -627,7 +627,6 @@ fn leader_loss_mid_burst() -> R<()> {
         });
     }
     nodes[leader_idx].partition()?;
-    stop.store(true, Ordering::SeqCst);
     nodes[leader_idx].store = None;
 
     // A new leader emerges among the survivors...
@@ -645,6 +644,12 @@ fn leader_loss_mid_burst() -> R<()> {
     }
     let new_leader = new_leader.expect("a survivor must take over leadership");
     assert_ne!(new_leader.name, leader_name);
+    // Stop the writers only now. Stopping them right at the partition let
+    // every writer that was between writes, or whose entry had already
+    // replicated, exit cleanly, so nothing was left unacked. Running them
+    // through an election makes each one attempt a write the partitioned
+    // leader can never commit.
+    stop.store(true, Ordering::SeqCst);
 
     // ...and the survivors converge with each other. Give acks that were
     // racing the kill a moment to land in the set first: any ack recorded
