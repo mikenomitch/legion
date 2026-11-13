@@ -174,10 +174,30 @@ fn every_log_purge_fsyncs_the_state_db_first() -> R<()> {
         store.put_kv(&format!("purge/{i}"), "v", KvValueType::String, None, None)?;
     }
     let log_db = dir.path().join("raft").join("control").join("log.sqlite");
+    // openraft checks the snapshot policy only when an entry commits, and
+    // drops the check while a snapshot is still building. On a loaded
+    // runner one slow build can swallow every trigger from the writes
+    // above, leaving the last snapshot below the purge point with nothing
+    // left to commit. Keep committing while waiting so the policy is
+    // checked again once the build finishes.
+    let mut tick = 0;
     wait_for(
         Duration::from_secs(60),
         "the retention task to purge behind a snapshot",
         || {
+            tick += 1;
+            if store
+                .put_kv(
+                    &format!("purge/tick/{tick}"),
+                    "v",
+                    KvValueType::String,
+                    None,
+                    None,
+                )
+                .is_err()
+            {
+                return false;
+            }
             let Ok(conn) = read_only(&log_db) else {
                 return false;
             };
